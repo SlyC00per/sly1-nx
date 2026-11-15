@@ -40,14 +40,21 @@ Checked on this machine (macOS 14.5, Apple Silicon):
 | Host build | **yes**: Apple Clang 15, CMake 3.29.3, Ninja; ASan and UBSan |
 | Switch build | **yes, to an `.nro`**: `$DEVKITPRO=/opt/devkitpro` has devkitA64, libnx, deko3d, `uam`, `nxlink`, `Switch.cmake` |
 | The disc | **yes**: the NTSC-U image in the decompilation checkout's `baserom/`, passed with `--iso` |
-| Running the `.nro` in an emulator | **no**: no Switch emulator is installed here |
+| Running the `.nro` in an emulator | **yes**, since 2026-11-14: Ryujinx 1.3.353 headless through `tools/run_ryujinx.py`; `tests/switch_smoke` draws with deko3d, reads the frame back and writes it to the emulated SD card (12.5 s a run). An emulator is not the hardware: what only Ryujinx has shown is reported as such |
 | Running on the Switch Lite | **only with you**: I can send a build with `nxlink -s` and read its log; I cannot see the screen, hear it or press buttons |
 | The matching build in the submodule | **not tried yet**: `SLY1_TOOLCHAIN` is not set in this shell and the submodule has no `baserom/`; wine is installed. I will set it up before milestone 1 and report what `tools/build.py` prints |
 | libclang for the generation step | not installed; `pip install libclang` in a venv (a build tool, not linked into the port) |
 | Windows and Linux | only through CI |
 
-Consequence: everything up to the renderer's draw list I can verify myself on the host. What
-deko3d actually puts on a screen, and sound by ear, I cannot. Section 7 proposes a host
+Consequence: everything up to the renderer's draw list I can verify myself on the host, and
+deko3d's output in Ryujinx. What the real hardware puts on its screen, and sound by ear, I
+cannot.
+
+**Found in the first emulator run, to check on hardware:** with deko3d's default device flags
+(`OriginUpperLeft`, depth 0 to 1), Ryujinx puts clip-space y = +1 at the top of the window (a
+vertex at y = -0.8 lands near the bottom), while window row 0 is the top (a scissored clear at
+rows 0-99 lands at the top of the read-back). The renderer must not rely on the sign of clip
+space y until the smoke test has been run on the Switch Lite and agrees. Section 7 proposes a host
 reference backend so that frames can still be dumped and looked at here; anything checked
 only that way will be reported as "host reference only, not seen on a Switch".
 

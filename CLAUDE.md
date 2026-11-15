@@ -55,8 +55,12 @@ Fill these in as the build takes shape; keep them current. They must work on mac
   `cmake -B build-host -DPLATFORM=HOST_ASAN -G Ninja && cmake --build build-host && build-host/sly1_headless --iso <path> --verify-levels`
 - Switch: `cmake -B build-switch -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake -G Ninja && cmake --build build-switch`
 - Shaders: `$DEVKITPRO/tools/bin/uam -s <vert|frag> <in> -o <out.dksh>` (run by the build)
-- Run in the emulator (Ryujinx): open `build-switch/sly1.nro`; output at 1280x720 and, in
-  docked mode, 1920x1080.
+- Run in the emulator (Ryujinx), unattended: `python3 tools/run_ryujinx.py build-switch/sly1.nro`
+  (headless, its own data folder `build-ryujinx/`; prints the program's debug-output lines, stops
+  at "<name>: done, status N" and exits with N; copies `sdmc:/sly1/` next to the .nro, frames as
+  PNG; `--docked` for 1920x1080). Ryujinx from `--ryujinx`, `$SLY1_RYUJINX` or the usual places.
+  Homebrew needs no firmware or keys.
+- Switch smoke test (toolchain and emulator, no game code): `cmake -S tests/switch_smoke -B build-smoke -G Ninja -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake && cmake --build build-smoke && python3 tools/run_ryujinx.py build-smoke/sly1_smoke.nro`
 - Run on the Switch Lite (handheld only): `$DEVKITPRO/tools/bin/nxlink -s build-switch/sly1.nro`
   with hbmenu's netloader open.
 - Symbolicate a crash: `$DEVKITPRO/devkitA64/bin/aarch64-none-elf-addr2line -e build-switch/sly1.elf -f -C -p <offset>`
