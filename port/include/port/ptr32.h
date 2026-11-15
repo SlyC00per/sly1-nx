@@ -69,8 +69,12 @@ template <class T> inline T* FromGameAddr(std::uint32_t addr) { return (T*)Nativ
 template <class T> class Ptr32 {
 public:
     Ptr32() = default;
-    Ptr32(std::nullptr_t) : addr_(0) {}
+    // No nullptr_t constructor: `p = 0` must have one meaning, and 0 and nullptr reach T*.
     Ptr32(T* p) : addr_(GameAddr((const void*)p)) {}
+    // A cast to a stored pointer type from another pointer type, as a cast to T* would be
+    // ((Fn)func with Fn a typedef of a stored function pointer).
+    template <class U, class = std::enable_if_t<!std::is_convertible<U*, T*>::value>>
+    explicit Ptr32(U* p) : addr_(GameAddr((const void*)p)) {}
     template <class U, class = std::enable_if_t<!std::is_same<U, T>::value &&
                                                 std::is_convertible<U*, T*>::value>>
     Ptr32(const Ptr32<U>& p) : Ptr32(static_cast<T*>(p.get())) {}
@@ -98,6 +102,9 @@ public:
 private:
     std::uint32_t addr_;
 };
+
+// A stored pointer made an integer: its game address, unchanged.
+template <class T> inline std::uint32_t GameAddrOf(const Ptr32<T>& p) { return p.addr(); }
 
 }  // namespace port
 
