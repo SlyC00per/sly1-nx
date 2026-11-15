@@ -207,6 +207,32 @@ behaviour.
   (sleeping, not spinning). Headless runs feed exactly 1/60 s per frame, so they are
   repeatable.
 
+### The anti-tamper checks
+
+Retail has two checks for a modified executable (a patched copy, a cheat device, a loader's
+hooks), found while giving the game's symbols a place in memory:
+
+- **The code checksum** (`VerifyCodeChecksum`, called once when the render thread starts): a
+  CRC-32 over `0x148D74` bytes from `0x100000`, about 1.3 MB, all of the executable's code
+  including its controller and kernel libraries. A nonzero result sets `g_codeChecksumFailed`.
+  Then, after a random 30 to 120 seconds of play, the function that picks the player's next
+  action from nearby targets keeps its current state instead (`player_target.cpp`): Sly stops
+  latching onto ledges, hooks and other context moves.
+- **The memory checksum** (`StepMemoryChecksum`, 32 words per world update): a running CRC from
+  `0x100004`. A nonzero result at the end of a pass sets `D_00275C34`. Then each update has a 20%
+  chance of marking one of the level's collected items uncollected again (`object_gatherer.cpp`),
+  and a level-record counter stops counting (`state_notifier.cpp`).
+
+Both are quiet and delayed, so that the effect looks like a bug and is hard to trace back to the
+check, a common design around 2000. A known real-world effect: Open PS2 Loader's In-Game Reset
+hooks the game's code, so without its compatibility Mode 6 (which disables the reset) the hook
+stops working early in the first level. This explanation is ours, from the code; the developers
+have not described the checks.
+
+The port's code is not retail's machine code, so both checks could never pass. Two named
+patches (`tools/patches.py`) remove only the lines that set the flags: the checks still run and
+the game keeps the outcome a genuine copy has, as the port's rule of retail behaviour requires.
+
 ## 7. Rendering
 
 ### First-pass survey of the draw paths

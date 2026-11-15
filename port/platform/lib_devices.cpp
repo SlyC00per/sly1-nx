@@ -32,7 +32,9 @@ s32 InitDiscLibrary(s32) { return 1; }
 s32 WaitDiscReady(s32) { return 2; }                 // ready
 s32 SyncDiscNCommand(s32) { return 0; }              // the command has ended / none is running
 u32 SendDiscSCommand22(u32) { return 1; }
-s32 GetDiscStatus() { return 0x0A; }                 // paused, a disc in the drive
+// The disc's kind as the drive reports it: 0x14, a PS2 DVD, the value the game waits for
+// (RefreshDiscStatus; LoadIopModules hangs on purpose without it, as a PS2 with no disc does).
+s32 GetDiscStatus() { return 0x14; }
 s32 GetDiscError() { return 0; }
 s32 StopDiscRead() { return 1; }
 s32 GetDiscReadPosition() { return (s32)g_discReadCount; }

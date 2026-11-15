@@ -314,7 +314,7 @@ class Walker:
         self.texts = {}          # file -> bytes, for char_at
         self.macro_starts = set()  # (file, offset) where a macro is expanded, in this unit
         self.rename = {}           # (file, offset) of a parameter -> its name in the signature
-        self.global_defs = set()   # D_XXXXXXXX globals the C defines
+        self.global_defs = {}      # D_XXXXXXXX globals the C defines -> their size in bytes
         self.global_decls = []     # their declarations: (name, file, start, end, type, shared, line)
 
     def char_at(self, loc):
@@ -559,7 +559,8 @@ class Walker:
         if not GLOBAL_NAME.match(name):
             return
         if c.is_definition():
-            self.global_defs.add(name)
+            size = c.type.get_size()
+            self.global_defs[name] = max(self.global_defs.get(name, 0), size if size > 0 else 0)
             return
         f = c.location.file.name
         start, end = c.extent.start.offset, c.extent.end.offset
@@ -809,10 +810,11 @@ def rewrite(units, out, args, report, jobs=None):
     edits = Edits()
     diagnostics = 0
     kinds = {}
-    global_defs, global_decls = set(), []
+    global_defs, global_decls = {}, []
     for replace, insert, unsupported, diag, k, gdefs, gdecls in results:
         kinds.update(k)
-        global_defs |= gdefs
+        for name, size in gdefs.items():
+            global_defs[name] = max(global_defs.get(name, 0), size)
         global_decls += gdecls
         for f, reps in replace.items():
             for (a, b), text in reps.items():

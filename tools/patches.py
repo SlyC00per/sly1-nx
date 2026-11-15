@@ -102,6 +102,21 @@ PATCHES = [
      "(void (*)(void))((u8*)func_0015E678 + 0x30)",
      "(void (*)(void))func_0015E6A8",
      "the port has no addresses inside code: the handler by the function retail's address names"),
+    # Three property accessors, assembly in retail, are declared with no parameters: the
+    # property table calls them with the object and a vector, which the PS2's registers carried.
+    # The port's C++ versions (port/game_asm/game_asm.cpp) take them as parameters.
+    ("src/main/object_host_functions.cpp",
+     "void GetPlacedObjectLocalVelocity();",
+     "void GetPlacedObjectLocalVelocity(void* self, void* out);",
+     "the getter's real parameters, for the port's C++ version of the assembly"),
+    ("src/main/object_host_functions.cpp",
+     "void StorePlacedObjectLocalVelocity();",
+     "void StorePlacedObjectLocalVelocity(void* self, void* in);",
+     "the setter's real parameters, for the port's C++ version of the assembly"),
+    ("src/main/object_host_functions.cpp",
+     "void StorePlacedObjectLocalSpin();",
+     "void StorePlacedObjectLocalSpin(void* self, void* in);",
+     "the setter's real parameters, for the port's C++ version of the assembly"),
     # The heap's top: retail's is the 32 MB end of the PS2's memory, a fixed address; the port's
     # is the end of its heap arena (port/memory.h), as a game address.
     ("src/main/heap.cpp",

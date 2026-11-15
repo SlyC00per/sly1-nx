@@ -32,7 +32,7 @@ namespace {
 
 constexpr int kThreads = 32;
 constexpr int kSemaphores = 256;
-constexpr std::size_t kStackSize = 2 << 20;
+constexpr std::size_t kStackSize = 1 << 20;
 constexpr int kIdle = 0;
 
 enum State { Free, Dormant, Ready, Waiting, Ended };
@@ -58,7 +58,7 @@ Thread g_threads[kThreads];
 Sema g_semas[kSemaphores];
 int g_current = kIdle;        // the game thread that runs, or none
 
-alignas(16) unsigned char g_stacks[8][kStackSize];
+alignas(16384) unsigned char g_stacks[8][kStackSize];   // page-aligned for pthread_attr_setstack
 bool g_stackUsed[8];
 
 void (*g_handlers[16])(void);
@@ -135,6 +135,27 @@ void KernelStartMainThread()
 
 std::int32_t CurrentThreadId() { return t_self; }
 
+// The kernel's threads, for a diagnosis when the port stops: state, priority, what each waits on.
+void KernelDump()
+{
+    static const char* kStates[] = {"free", "dormant", "ready", "waiting", "ended"};
+    for (int i = 1; i < kThreads; i++) {
+        if (g_threads[i].state == Free)
+            continue;
+        std::fprintf(stderr, "kernel: thread %d %s, priority %d%s", i, kStates[g_threads[i].state],
+                     g_threads[i].priority, i == g_current ? ", running" : "");
+        if (g_threads[i].state == Waiting)
+            std::fprintf(stderr, ", on semaphore %d (count %d)", g_threads[i].waitSema,
+                         g_semas[g_threads[i].waitSema].count);
+        std::fprintf(stderr, "\n");
+    }
+    std::fprintf(stderr, "kernel: running %d; interrupt handlers:", g_current);
+    for (int c = 0; c < 16; c++)
+        if (g_handlers[c])
+            std::fprintf(stderr, " %d%s", c, g_enabled[c] ? "" : " (disabled)");
+    std::fprintf(stderr, "\n");
+}
+
 // Calls the handlers of an interrupt cause, from the port's clock or a device.
 void RaiseInterrupt(int cause)
 {
@@ -183,7 +204,10 @@ void RunThread(s32 id, void* arg)
     g_threads[id].arg = arg;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstack(&attr, g_stacks[s], kStackSize);
+    if (pthread_attr_setstack(&attr, g_stacks[s], kStackSize) != 0) {
+        std::fprintf(stderr, "port: a game thread's stack in game memory was refused\n");
+        std::abort();
+    }
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     pthread_t h;
     pthread_create(&h, &attr, HostEntry, (void*)(std::intptr_t)id);
@@ -269,12 +293,12 @@ static s32 Signal(s32 id, bool fromGameThread)
     return id;
 }
 
-s32 PostSemaphore(void* a) { return Signal((s32)port::GameAddr(a), t_self != kIdle); }
+s32 PostSemaphore(void* a) { return Signal((s32)port::WordArg(a), t_self != kIdle); }
 void PostSemaphoreFromInterrupt(s32 sema) { Signal(sema, false); }
 
 s32 AwaitSemaphore(void* a)
 {
-    s32 id = (s32)port::GameAddr(a);
+    s32 id = (s32)port::WordArg(a);
     std::unique_lock<std::mutex> lk(g_kernel);
     if (id < 1 || id >= kSemaphores || !g_semas[id].used)
         return -1;

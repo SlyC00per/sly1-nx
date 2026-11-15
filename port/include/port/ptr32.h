@@ -10,8 +10,12 @@
 //   0                                    null
 //   0x00000000 + x, x < kGameMemorySize  the program image at offset x (code, data, the
 //                                        game's heap and stacks all live in the image)
-//   0x20000000 + x, 0x30000000 + x       the same memory: the PS2's uncached aliases of RAM
+//   0x20000000 + x                       the same memory: the PS2's uncached alias of RAM (the game
+//                                        writes its deferred requests through it; 0x30000000, the
+//                                        accelerated alias, it never uses, so those words are kept)
 //   0x70000000 + x, x < 0x4000           the scratchpad (a 16 KiB buffer of the port's)
+//   0x10000000 + x, x < 0x10000;         the hardware registers the game uses: plain memory of the
+//   0x12000000 + x, x < 0x2000           port's (port/platform/game_memory.cpp)
 //   anything else                        not memory here: a word carried in a pointer (the
 //                                        game passes float bits as void*, 0x3F800000 is 1.0f),
 //                                        or a hardware register's address
@@ -26,9 +30,10 @@
 
 namespace port {
 
-// Bytes of the program image game addresses can reach. The image (code, data, the game's heap
-// and stacks) must lie within this many bytes of its base; ImageBase() checks it at start-up.
-constexpr std::uint32_t kGameMemorySize = 0x04000000;
+// The most the program image may span: game addresses below this are image offsets. The image's
+// real extent (ImageSize(), measured at start-up) decides what is game memory: a pointer is an
+// image pointer only inside it, and a word only becomes one when it is within it.
+constexpr std::uint32_t kGameMemorySize = 0x08000000;
 constexpr std::uint32_t kScratchpadAddr = 0x70000000;
 constexpr std::uint32_t kScratchpadSize = 0x4000;
 // The tag that marks a native pointer holding a word that is not memory. Not a valid address on
@@ -38,8 +43,10 @@ constexpr std::uintptr_t kWordTag = std::uintptr_t(1) << 63;
 // The start of the program image, the anchor of every game address. Found once and cached; the
 // cache is a zero-initialised global, so it is valid even during static initialisation.
 extern std::uintptr_t g_imageBase;
+extern std::uintptr_t g_imageSize;
 std::uintptr_t FindImageBase();
 inline std::uintptr_t ImageBase() { return g_imageBase ? g_imageBase : FindImageBase(); }
+inline std::uintptr_t ImageSize() { return g_imageBase ? g_imageSize : (FindImageBase(), g_imageSize); }
 // The port's scratchpad buffer (inside the image).
 unsigned char* Scratchpad();
 
@@ -49,7 +56,7 @@ std::uint32_t GameAddrSlow(const void* p);
 
 inline void* Native(std::uint32_t addr)
 {
-    if (addr - 1u < kGameMemorySize - 1u)
+    if (addr - 1u < ImageSize() - 1u)
         return reinterpret_cast<void*>(ImageBase() + addr);
     return NativeSlow(addr);
 }
@@ -57,9 +64,18 @@ inline void* Native(std::uint32_t addr)
 inline std::uint32_t GameAddr(const void* p)
 {
     std::uintptr_t d = reinterpret_cast<std::uintptr_t>(p) - ImageBase();
-    if (d - 1u < std::uintptr_t(kGameMemorySize) - 1u)
+    if (d - 1u < ImageSize() - 1u)
         return static_cast<std::uint32_t>(d);
     return GameAddrSlow(p);
+}
+
+// A word the game passes where a declaration says pointer and another says integer (a semaphore's
+// id, both through one C-linkage function): a plain number arrives as itself, below the image; a
+// word the pointer rewrite converted arrives as its native pointer. Either gives the word back.
+inline std::uint32_t WordArg(const void* p)
+{
+    std::uintptr_t v = reinterpret_cast<std::uintptr_t>(p);
+    return v < ImageBase() ? static_cast<std::uint32_t>(v) : GameAddr(p);
 }
 
 // The overloads tools/gen.py writes for a cast between a pointer and an integer.

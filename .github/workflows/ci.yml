@@ -34,7 +34,7 @@ jobs:
       - name: tools
         if: runner.os == 'macOS'
         run: brew install ninja
-      - run: cmake -B build-host -G Ninja -DPLATFORM=${{ matrix.platform }}
+      - run: cmake -B build-host -G Ninja -DPLATFORM=${{ matrix.platform }} -DSLY1_BUILD_GAME=OFF
       - run: cmake --build build-host
       - run: ctest --test-dir build-host --output-on-failure
 
@@ -55,7 +55,7 @@ jobs:
             mingw-w64-clang-x86_64-cmake
             mingw-w64-clang-x86_64-ninja
       # Sanitizers are not assumed on MSYS2's Clang yet: a plain host build there.
-      - run: cmake -B build-host -G Ninja -DPLATFORM=HOST
+      - run: cmake -B build-host -G Ninja -DPLATFORM=HOST -DSLY1_BUILD_GAME=OFF
       - run: cmake --build build-host
       - run: ctest --test-dir build-host --output-on-failure
 
@@ -67,7 +67,7 @@ jobs:
         with:
           submodules: recursive
       - run: apt-get update && apt-get install -y ninja-build
-      - run: cmake -B build-switch -G Ninja -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake
+      - run: cmake -B build-switch -G Ninja -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake -DSLY1_BUILD_GAME=OFF
       - run: cmake --build build-switch
       - run: cmake -S tests/switch_smoke -B build-smoke -G Ninja -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake
       - run: cmake --build build-smoke

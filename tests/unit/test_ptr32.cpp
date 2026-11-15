@@ -60,8 +60,13 @@ UNIT_TEST(ptr32_aliases_and_scratchpad)
 {
     Ptr32<int> p = port::P32(&g_array[1]);
     CHECK(port::Native(p.addr() | 0x20000000u) == &g_array[1]);  // uncached alias
-    CHECK(port::Native(p.addr() | 0x30000000u) == &g_array[1]);  // uncached accelerated
+    CHECK(port::GameAddr(port::Native(p.addr() | 0x30000000u)) == (p.addr() | 0x30000000u));  // a word, kept
     CHECK(port::Native(0x70002000u) == port::Scratchpad() + 0x2000);
+    // A hardware register: memory that keeps what is written, and its address back.
+    std::uint32_t* csr = (std::uint32_t*)port::Native(0x12001000u);
+    *csr = 0x2000;
+    CHECK(*(std::uint32_t*)port::Native(0x12001000u) == 0x2000);
+    CHECK(port::GameAddr(csr) == 0x12001000u);
 }
 
 UNIT_TEST(ptr32_operators)

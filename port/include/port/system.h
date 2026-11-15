@@ -20,6 +20,8 @@ void SetGameFloatMode();
 // thread, running; and an interrupt cause's handler is called (the clock: 2, vertical blank).
 void KernelStartMainThread();
 void RaiseInterrupt(int cause);
+// The kernel's threads and handlers, printed, for a diagnosis.
+void KernelDump();
 
 }  // namespace port
 

@@ -448,8 +448,9 @@ def clang_args(out):
 def write_retail_aliases(out, undefined, defined):
     """port_retail_data.cpp, the table behind port::RetailData for the globals the C declares and
     nothing defines (port/retail_data.h):
-      - a label inside a global the C defines (sly1-decomp config/us/c_data.tsv, a symbol the
-        generated code defines): that global plus the offset;
+      - a label inside a global the C defines (by that global's address and the size of its C type:
+        config/us/c_data.tsv's entries can be a whole file's data section, several globals): that
+        global plus the offset;
       - a label in the executable's data that is the decompilation's retail bytes (INCLUDE_DATA,
         INCLUDE_RODATA, a constant the C reads but does not write): storage of its own, sized to
         the next known label, which the port fills from the executable on the player's disc at
@@ -469,9 +470,10 @@ def write_retail_aliases(out, undefined, defined):
     labels |= {int(n[2:], 16) for n in undefined} | {int(n[2:], 16) for n in defined}
     labels = sorted(labels)
     aliases, bases, own = [], set(), []
+    sized = sorted((int(n[2:], 16), s, n) for n, s in defined.items() if s > 0)
     for name in sorted(undefined):
         a = int(name[2:], 16)
-        g = next(((ga, gs, gn) for ga, gs, gn in cdata if ga <= a < ga + gs and gn in defined), None)
+        g = next(((ga, gs, gn) for ga, gs, gn in sized if ga <= a < ga + gs), None)
         if g:
             aliases.append((a, g[2], a - g[0]))
             bases.add(g[2])
@@ -502,6 +504,51 @@ def write_retail_aliases(out, undefined, defined):
     print("gen: %d globals nothing defines: %d labels inside C globals, %d labels of retail bytes "
           "(%d bytes, read from the player's executable at start-up), the rest in fixed ranges"
           % (len(undefined), len(aliases), len(own), sum(s for _, s in own)))
+
+
+def add_missing_returns(units, out):
+    """Every function that can reach its end without returning a value (the compiler's
+    -Wreturn-type) gets `return {};` there. Retail returned whatever the return register held,
+    which callers ignore; in C++ reaching the end is undefined behaviour that an optimiser may
+    treat as unreachable. Returns how many were added."""
+    import concurrent.futures
+    import subprocess
+    flags = ["c++", "-fsyntax-only", "-fno-caret-diagnostics", "-Wno-everything", "-Wreturn-type"] + \
+        [a for a in clang_args(out) if a not in ("-w", "-fms-extensions", "-nostdinc", "-nostdinc++")
+         and not a.startswith("-ferror-limit")]
+    # system_includes() gives -isystem pairs; the compiler finds its own, so drop them.
+    cleaned, skip = [], False
+    for a in flags:
+        if skip:
+            skip = False
+            continue
+        if a == "-isystem":
+            skip = True
+            continue
+        cleaned.append(a)
+    pattern = re.compile(r"^(?P<file>[^:\n]+):(?P<line>\d+):(?P<col>\d+): warning: non-void function does not "
+                         r"return a value", re.M)
+
+    def run(unit):
+        r = subprocess.run(cleaned + [str(out / unit)], capture_output=True, text=True)
+        return [(m.group("file"), int(m.group("line")), int(m.group("col"))) for m in pattern.finditer(r.stderr)]
+
+    found = set()
+    with concurrent.futures.ThreadPoolExecutor(8) as ex:
+        for hits in ex.map(run, units):
+            found |= set(hits)
+    by_file = {}
+    for f, line, col in found:
+        by_file.setdefault(f, []).append((line, col))
+    for f, places in by_file.items():
+        lines = Path(f).read_text().split("\n")
+        for line, col in sorted(places, reverse=True):
+            text = lines[line - 1]
+            i = col - 1
+            if i < len(text) and text[i] == "}":
+                lines[line - 1] = text[:i] + "return {}; /* port: retail fell off the end (tools/gen.py) */ " + text[i:]
+        Path(f).write_text("\n".join(lines))
+    return len(found)
 
 
 def main():
@@ -550,6 +597,8 @@ def main():
           % (report["tails"], report.get("tail_rounds", 0)))
     for u in report.get("tail_unsupported", []):
         print("  not padded: " + u)
+    n = add_missing_returns(units, out)
+    print("gen: %d functions that fell off their end without a value now return 0" % n)
     differ = gen_layout.assert_offsets(units, out, analysis, report)
     print("gen: %d retail offsets asserted; %d views of a larger object set aside; "
           "%d records differ from retail here" % (report["offset_asserts"], len(report["views"]), len(differ)))

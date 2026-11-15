@@ -31,7 +31,10 @@ endif()
 message(STATUS "sly1-nx: platform ${PLATFORM}")
 
 if(PLATFORM STREQUAL "HOST_ASAN")
-    set(SANITIZE -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined)
+    # No stack-use-after-return detection: it moves locals to a heap of its own, and the game's
+    # locals must stay on its stacks in game memory (port/ptr32.h).
+    set(SANITIZE -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined
+        -fsanitize-address-use-after-return=never)
     add_compile_options(${SANITIZE} -g)
     add_link_options(${SANITIZE})
 endif()
@@ -59,7 +62,10 @@ endif()
 target_compile_options(sly1_unit PRIVATE -Wall -Wextra)
 
 # --- The game: sly1-decomp's code, written again for the port by tools/gen.py (docs/DESIGN.md,
-# section 3), into the build folder. The submodule is never changed.
+# section 3), into the build folder. The submodule is never changed. Needs Python with the libclang
+# package (venv/ at the root, or the system's); CI builds without it for now (SLY1_BUILD_GAME=OFF).
+option(SLY1_BUILD_GAME "Build the game (needs Python with libclang)" ON)
+if(SLY1_BUILD_GAME)
 set(SLY1_DECOMP ${CMAKE_SOURCE_DIR}/sly1-decomp)
 set(GEN_DIR ${CMAKE_BINARY_DIR}/gen)
 if(EXISTS ${CMAKE_SOURCE_DIR}/venv/bin/python)
@@ -100,6 +106,13 @@ set(GAME_INCLUDES ${CMAKE_SOURCE_DIR}/port/include ${GEN_DIR}/include ${GEN_DIR}
 
 add_library(sly1_game OBJECT ${GEN_UNITS})
 target_compile_options(sly1_game PRIVATE ${GAME_FLAGS})
+if(PLATFORM STREQUAL "HOST_ASAN")
+    # The game indexes past a member array on purpose (views that start before an array or run on
+    # into the next member, inside the same object, in retail's layout): UBSan's declared-bounds
+    # check stays on for the port's own code; AddressSanitizer still catches any access outside an
+    # object.
+    target_compile_options(sly1_game PRIVATE -fno-sanitize=bounds)
+endif()
 target_include_directories(sly1_game PRIVATE ${GAME_INCLUDES})
 
 # The platform layer: what replaces sly1-decomp's src/lib and src/libm.
@@ -111,9 +124,16 @@ target_compile_options(port_platform PRIVATE ${GAME_FLAGS})
 target_include_directories(port_platform PRIVATE ${GAME_INCLUDES})
 add_dependencies(port_platform sly1_gen)
 
+# The game's hand-written assembly functions, in C++ (port/game_asm), with the game's headers.
+add_library(port_game_asm STATIC port/game_asm/game_asm.cpp)
+target_compile_options(port_game_asm PRIVATE ${GAME_FLAGS})
+target_include_directories(port_game_asm PRIVATE ${GAME_INCLUDES})
+add_dependencies(port_game_asm sly1_gen)
+
 if(NOT PLATFORM STREQUAL "SWITCH")
     find_package(Threads REQUIRED)
     add_executable(sly1_headless port/host/main.cpp $<TARGET_OBJECTS:sly1_game>)
     target_include_directories(sly1_headless PRIVATE port/include)
-    target_link_libraries(sly1_headless PRIVATE port_platform port_core Threads::Threads)
+    target_link_libraries(sly1_headless PRIVATE port_game_asm port_platform port_core Threads::Threads)
 endif()
+endif()  # SLY1_BUILD_GAME

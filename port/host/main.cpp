@@ -24,8 +24,31 @@ extern "C" void func_00185758(int argc, int argv);   // RunMainLoop
 
 namespace {
 
-alignas(16) unsigned char g_mainStack[8 << 20];
+// Page-aligned (16 KiB pages on Apple Silicon): pthread_attr_setstack refuses anything less.
+alignas(16384) unsigned char g_mainStack[4 << 20];
+// The interrupt handlers are game code too (they link stack frames into game structures), so
+// the clock that calls them runs on a stack in game memory as well.
+alignas(16384) unsigned char g_clockStack[1 << 20];
 std::atomic<bool> g_started;
+int g_seconds = 10;
+
+// The vertical blank, 60 times a second (NTSC), for the game's handler (cause 2); then the end.
+void* Clock(void*)
+{
+    port::SetGameFloatMode();
+    auto next = std::chrono::steady_clock::now();
+    auto stop = next + std::chrono::seconds(g_seconds);
+    while (std::chrono::steady_clock::now() < stop) {
+        next += std::chrono::microseconds(16683);
+        std::this_thread::sleep_until(next);
+        if (g_started)
+            port::RaiseInterrupt(2);
+    }
+    std::fprintf(stderr, "sly1: stopping after %d s\n", g_seconds);
+    port::KernelDump();
+    std::fflush(stderr);
+    std::_Exit(0);
+}
 
 void* GameMain(void*)
 {
@@ -47,7 +70,7 @@ int FillRetailBytes();
 int main(int argc, char** argv)
 {
     std::string iso;
-    int seconds = 10;
+    int& seconds = g_seconds;
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--iso") && i + 1 < argc)
             iso = argv[++i];
@@ -66,22 +89,24 @@ int main(int argc, char** argv)
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstack(&attr, g_mainStack, sizeof g_mainStack);
+    if (pthread_attr_setstack(&attr, g_mainStack, sizeof g_mainStack) != 0) {
+        std::fprintf(stderr, "sly1: the game thread's stack in game memory was refused\n");
+        return 1;
+    }
     pthread_t game;
     if (pthread_create(&game, &attr, GameMain, nullptr) != 0) {
         std::fprintf(stderr, "sly1: cannot start the game thread\n");
         return 1;
     }
-    // The vertical blank, 60 times a second (NTSC), for the game's handler (cause 2).
-    auto next = std::chrono::steady_clock::now();
-    auto stop = next + std::chrono::seconds(seconds);
-    while (std::chrono::steady_clock::now() < stop) {
-        next += std::chrono::microseconds(16683);
-        std::this_thread::sleep_until(next);
-        if (g_started)
-            port::RaiseInterrupt(2);
+    pthread_attr_t clockAttr;
+    pthread_attr_init(&clockAttr);
+    if (pthread_attr_setstack(&clockAttr, g_clockStack, sizeof g_clockStack) != 0) {
+        std::fprintf(stderr, "sly1: the clock thread's stack in game memory was refused\n");
+        return 1;
     }
-    std::fprintf(stderr, "sly1: stopping after %d s\n", seconds);
-    std::fflush(stderr);
-    std::_Exit(0);
+    pthread_t clock;
+    pthread_create(&clock, &clockAttr, Clock, nullptr);
+    pthread_join(clock, nullptr);
+    return 0;
 }
+
