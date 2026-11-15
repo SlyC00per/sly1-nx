@@ -43,6 +43,18 @@ STORAGE_WORDS = {"extern", "static", "inline", "__inline__", "__inline", "regist
 DECLARATOR_STOP = {"=", ";", ",", "{", ":", "__attribute__"}
 
 
+GLOBAL_NAME = re.compile(r"^D_[0-9A-F]{8}$")
+
+
+def pr_named(type_text, name):
+    """A declaration of name from a type written without a name (`u8 []`, `Ptr32<T>`): the
+    name goes before an array's bounds, after the type otherwise."""
+    i = type_text.find("[")
+    if i >= 0:
+        return type_text[:i].rstrip() + " " + name + type_text[i:]
+    return type_text + " " + name
+
+
 class Unsupported(Exception):
     pass
 
@@ -302,6 +314,8 @@ class Walker:
         self.texts = {}          # file -> bytes, for char_at
         self.macro_starts = set()  # (file, offset) where a macro is expanded, in this unit
         self.rename = {}           # (file, offset) of a parameter -> its name in the signature
+        self.global_defs = set()   # D_XXXXXXXX globals the C defines
+        self.global_decls = []     # their declarations: (name, file, start, end, type, shared, line)
 
     def char_at(self, loc):
         f = loc.file
@@ -539,6 +553,31 @@ class Walker:
             if pointer:
                 self._wrap_pointer_value(e, depth, "stored pointer initialisers")
 
+    def record_global(self, c):
+        """A global of the game: its definition, or a declaration with what replacing it needs."""
+        name = c.spelling
+        if not GLOBAL_NAME.match(name):
+            return
+        if c.is_definition():
+            self.global_defs.add(name)
+            return
+        f = c.location.file.name
+        start, end = c.extent.start.offset, c.extent.end.offset
+        data = self.texts.get(f)
+        if data is None:
+            data = self.texts[f] = Path(f).read_bytes()
+        j = end
+        while j < len(data) and data[j:j + 1] in b" \t":
+            j += 1
+        shared = data[j:j + 1] == b","            # `extern s32 D_a, D_b;`: not one declaration
+        if data[j:j + 1] == b";":
+            j += 1
+        try:
+            type_text = pr(c.type, "", True)
+        except Unsupported:
+            type_text = None
+        self.global_decls.append((name, f, start, j, type_text, shared, c.location.line))
+
     def member_initialisers(self, c, depth):
         """`: a(p)` in a constructor, for a member a that is a stored pointer: `a(port::P32(p))`."""
         kids = list(c.get_children())
@@ -690,6 +729,8 @@ class Walker:
                 self.declaration(ch, True)
             elif k == CK.VAR_DECL:
                 local = in_func and ch.storage_class not in (ci.StorageClass.STATIC, ci.StorageClass.EXTERN)
+                if not local:
+                    self.record_global(ch)
                 addressed = (ch.location.file.name, ch.location.offset) in self.addressed
                 self.declaration(ch, not local or addressed)
                 if not local or addressed:
@@ -747,7 +788,7 @@ def _collect(job):
         walker.walk_cursors(cursors)
         walker.flush_groups()
     return ({f: dict(r) for f, r in edits.replace.items()}, {f: set(i) for f, i in edits.insert.items()},
-            edits.unsupported, diagnostics, edits.kinds)
+            edits.unsupported, diagnostics, edits.kinds, walker.global_defs, walker.global_decls)
 
 
 def rewrite(units, out, args, report, jobs=None):
@@ -768,8 +809,11 @@ def rewrite(units, out, args, report, jobs=None):
     edits = Edits()
     diagnostics = 0
     kinds = {}
-    for replace, insert, unsupported, diag, k in results:
+    global_defs, global_decls = set(), []
+    for replace, insert, unsupported, diag, k, gdefs, gdecls in results:
         kinds.update(k)
+        global_defs |= gdefs
+        global_decls += gdecls
         for f, reps in replace.items():
             for (a, b), text in reps.items():
                 edits.rep(f, a, b, text, None)
@@ -787,6 +831,42 @@ def rewrite(units, out, args, report, jobs=None):
         for item in ins:
             if (f,) + item in kinds:
                 edits.counts[kinds[(f,) + item]] += 1
+    # Globals the C declares and nothing defines: each declaration becomes a macro of the same
+    # name over port::RetailRef (port/retail_data.h), with that declaration's own type.
+    undefined = {}
+    # A declaration statement can name several globals (`extern u8 A[], B[];`): its members share
+    # the statement's start. Such a statement is replaced whole, each member by itself.
+    statements = collections.defaultdict(dict)
+    for name, f, start, end, type_text, shared, line in global_decls:
+        statements[(f, start)][name] = (end, type_text, line)
+    for (f, start), members in statements.items():
+        if all(n in global_defs for n in members):
+            continue
+        data = Path(f).read_bytes()
+        end = max(e for e, _, _ in members.values())
+        while end < len(data) and data[end - 1:end] != b";":
+            end += 1                       # through the statement's own semicolon
+        if any(tt is None for _, tt, _ in members.values()):
+            line = min(l for _, _, l in members.values())
+            edits.unsupported.append("%s:%d: a declaration of a global nothing defines, with a type "
+                                     "the tool cannot write" % (f, line))
+            continue
+        text = ""
+        for name, (_, type_text, line) in sorted(members.items(), key=lambda m: m[1][0]):
+            if name in global_defs:
+                text += "\nextern %s;" % pr_named(type_text, name)
+            else:
+                undefined.setdefault(name, []).append((f, line))
+                text += "\n#undef %s\n#define %s (port::RetailRef< %s >(0x%08XU))" % (
+                    name, name, type_text, int(name[2:], 16))
+        text += "\n"
+        reps = edits.replace.get(f, {})
+        for key in [k for k in reps if start <= k[0] < end]:
+            del reps[key]
+        edits.insert[f] = {i for i in edits.insert.get(f, set()) if not (start <= i[0] < end)}
+        edits.rep(f, start, end, text, "globals nothing defines")
+    report["undefined_globals"] = undefined
+    report["global_defs"] = global_defs
     files = edits.apply(out)
     report["files_changed"] = len(files)
     report["counts"] = dict(edits.counts)

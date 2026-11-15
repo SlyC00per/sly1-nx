@@ -83,6 +83,25 @@ PATCHES = [
      "    void* ap = (char*)port_slots;\n"
      "    { std::va_list va; va_start(va, fmt); port::FormatSlots(fmt, va, port_slots, 64); va_end(va); }",
      "variadic arguments of FormatToStringBounded: as the format consumes them (port::FormatSlots)"),
+    # The anti-tamper checksums: a CRC over the game's own code (from 0x100000) and one over
+    # memory. On a genuine retail copy both come out right and their flags stay 0; the port's
+    # machine code is not retail's, so they could never pass, and a failed flag changes the
+    # gameplay (player_target.cpp after 30 to 120 s, state_notifier.cpp, object_gatherer.cpp).
+    # The port keeps the genuine copy's outcome: the flags are never set.
+    ("src/main/render_frame.cpp",
+     "        g_codeChecksumFailed = 1;",
+     "        /* port: the genuine copy's outcome, the flag stays 0 (tools/patches.py) */",
+     "the code checksum covers retail's machine code, which the port does not have"),
+    ("src/main/warp_menu.cpp",
+     "        D_00275C34 = 1;",
+     "        /* port: the genuine copy's outcome, the flag stays 0 (tools/patches.py) */",
+     "the memory checksum covers retail's code and data addresses, which the port does not have"),
+    # The heap's top: retail's is the 32 MB end of the PS2's memory, a fixed address; the port's
+    # is the end of its heap arena (port/memory.h), as a game address.
+    ("src/main/heap.cpp",
+     "    g_heapEnd = 0x2000000;",
+     "    g_heapEnd = port::HeapEndAddr();   /* port: the heap arena's end, not the PS2's 32 MB */",
+     "game addresses are offsets in the port's image, so the heap ends where its arena does"),
     # Their callers end a list of addresses with a bare 0: an int, which a 64-bit ABI need not
     # widen into a pointer's slot (Apple's arm64 passes variadic ints in 8-byte stack slots with
     # undefined upper halves). A null pointer there instead.

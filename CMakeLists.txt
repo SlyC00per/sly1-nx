@@ -29,7 +29,8 @@ endif()
 
 # The port's own code: game memory and, later, the platform layer.
 add_library(port_core STATIC port/platform/game_memory.cpp port/platform/varargs.cpp
-    port/platform/system.cpp)
+    port/platform/system.cpp
+    port/platform/memory.cpp)
 target_include_directories(port_core PUBLIC port/include)
 target_compile_options(port_core PRIVATE -Wall -Wextra)
 

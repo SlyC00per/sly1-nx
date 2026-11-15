@@ -400,7 +400,7 @@ def text_stage(out):
 # The flags the game code is compiled with, for libclang and for the build (CMakeLists.txt).
 COMPILE_FLAGS = ["-x", "c++", "-std=gnu++17", "-Wno-register", "-Wno-c++11-narrowing",
                  "-include", "port/gxx_ext.h", "-include", "port/ptr32.h",
-                 "-include", "port/varargs.h"]
+                 "-include", "port/varargs.h", "-include", "port/retail_data.h"]
 
 
 def system_includes():
@@ -435,6 +435,65 @@ def clang_args(out):
     # (the analysis only; the build compiles without it).
     return COMPILE_FLAGS + ["-w", "-ferror-limit=0", "-fms-extensions", "-nostdinc", "-nostdinc++"] + system_includes() + \
         ["-I" + str(PORT_INCLUDE), "-I" + str(out / "include"), "-I" + str(out / "src")]
+
+
+def write_retail_aliases(out, undefined, defined):
+    """port_retail_data.cpp, the table behind port::RetailData for the globals the C declares and
+    nothing defines (port/retail_data.h):
+      - a label inside a global the C defines (sly1-decomp config/us/c_data.tsv, a symbol the
+        generated code defines): that global plus the offset;
+      - a label in the executable's data that is the decompilation's retail bytes (INCLUDE_DATA,
+        INCLUDE_RODATA, a constant the C reads but does not write): storage of its own, sized to
+        the next known label, which the port fills from the executable on the player's disc at
+        start-up (zero until then);
+      - the others fall in RetailData's fixed ranges."""
+    import csv
+    cdata = []
+    with open(DECOMP / "config/us/c_data.tsv") as f:
+        for row in csv.reader(f, delimiter="\t"):
+            if row and row[0] != "name":
+                cdata.append((int(row[1], 16), int(row[2]), row[0]))
+    labels = {a for a, _, _ in cdata}
+    with open(DECOMP / "config/names/data.tsv") as f:
+        for row in csv.reader(f, delimiter="\t"):
+            if row and re.match(r"D_[0-9A-F]{8}$", row[0]):
+                labels.add(int(row[0][2:], 16))
+    labels |= {int(n[2:], 16) for n in undefined} | {int(n[2:], 16) for n in defined}
+    labels = sorted(labels)
+    aliases, bases, own = [], set(), []
+    for name in sorted(undefined):
+        a = int(name[2:], 16)
+        g = next(((ga, gs, gn) for ga, gs, gn in cdata if ga <= a < ga + gs and gn in defined), None)
+        if g:
+            aliases.append((a, g[2], a - g[0]))
+            bases.add(g[2])
+        elif 0x217380 <= a < 0x27B300:          # .rodata to the end of the file's data
+            nxt = next((l for l in labels if l > a), a + 16)
+            own.append((a, min(nxt - a, 0x400)))
+    lines = ["// Written by tools/gen.py: the table behind port::RetailData (port/retail_data.h).",
+             '#include "port/retail_data.h"', "", "namespace port {",
+             "struct RetailAlias { unsigned addr; unsigned char* base; unsigned offset; };",
+             "struct RetailBytes { unsigned addr; unsigned offset; unsigned size; };", "}", ""]
+    lines += ['extern "C" unsigned char %s[];' % b for b in sorted(bases)]
+    total = sum((s + 15) & ~15 for _, s in own)
+    lines += ["", "namespace port {",
+              "alignas(16) unsigned char kRetailBytesStorage[%d];" % max(total, 16),
+              "extern const RetailAlias kRetailAliases[] = {"]
+    lines += ["    {0x%08XU, %s, 0x%X}," % (a, b, o) for a, b, o in aliases] or ["    {0, nullptr, 0},"]
+    lines += ["};", "extern const int kRetailAliasCount = %d;" % len(aliases),
+              "// Labels whose bytes only the player's executable has: filled at start-up.",
+              "extern const RetailBytes kRetailBytes[] = {"]
+    off = 0
+    for a, s in own:
+        lines.append("    {0x%08XU, 0x%X, 0x%X}," % (a, off, s))
+        off += (s + 15) & ~15
+    if not own:
+        lines.append("    {0, 0, 0},")
+    lines += ["};", "extern const int kRetailBytesCount = %d;" % len(own), "}  // namespace port", ""]
+    (out / "port_retail_data.cpp").write_text("\n".join(lines))
+    print("gen: %d globals nothing defines: %d labels inside C globals, %d labels of retail bytes "
+          "(%d bytes, read from the player's executable at start-up), the rest in fixed ranges"
+          % (len(undefined), len(aliases), len(own), sum(s for _, s in own)))
 
 
 def main():
@@ -475,6 +534,7 @@ def main():
             shown = sorted(set(lines), key=lambda x: int(x) if x.isdigit() else 0)
             print("  %s: %s (%d, lines %s%s)" % (f, why, len(lines), ", ".join(shown[:6]),
                                                  "..." if len(shown) > 6 else ""))
+    write_retail_aliases(out, report.get("undefined_globals", {}), report.get("global_defs", set()))
     import gen_layout
     analysis = [a for a in clang_args(out) if a != "-fms-extensions"]
     gen_layout.pad_tails(units, out, analysis, report)
