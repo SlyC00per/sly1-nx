@@ -1,8 +1,8 @@
 # Design note
 
-Status: **proposed**, waiting for the maintainer's go-ahead. Nothing here is built yet. Where
-a claim was measured, the command's result is given; where it is a plan or an assumption, it
-says so. Written on 2026-11-14 against `sly1-decomp` at `8f7a85a3` (its `master` that day).
+Status: **accepted** (maintainer's go-ahead, 2026-11-14), with the decisions of section 11.
+Where a claim was measured, the command's result is given; where it is a plan or an
+assumption, it says so. Written on 2026-11-14 against `sly1-decomp` at `8f7a85a3`.
 
 ## 1. What is there
 
@@ -322,16 +322,15 @@ first code commit.
    functions; platform stubs.
 4. `.iso` sector reads; boot to the level loader; `--verify-levels`.
 
-## 11. Decisions for you
+## 11. Decisions (maintainer, 2026-11-14)
 
-1. The pointer model: (b), 32-bit game pointers with retail's layouts (recommended), or
-   (a), growing structures as the brief's checklist assumes.
-2. A host reference rasteriser as a second back end (recommended), or deko3d only,
-   verified by you on the Switch Lite or in an emulator you install.
-3. ~~Video decoding~~: decided, (i) for the PS2 videos; FFmpeg only for PS3 replacements, if wanted (section 8).
-4. Whether you can supply retail references (memory dumps, audio recordings) for the
-   comparisons in sections 8 and 9.
-5. `libclang` (Apache-2.0 with the LLVM exception) as a build-time tool dependency.
+1. **The pointer model: (b)**, 32-bit game pointers with retail's layouts, confirmed or
+   reversed by the spike of section 10.
+2. **A host reference rasteriser** as a second back end, beside deko3d.
+3. **Video decoding: (i)** for the PS2 videos; FFmpeg only for PS3 replacements, if wanted
+   (section 8).
+4. **Retail references** (memory dumps, recordings) when the maintainer can supply them.
+5. **`libclang`** (Apache-2.0 with the LLVM exception) as a build-time tool dependency.
 
 ## Credits
 
