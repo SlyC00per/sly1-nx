@@ -18,6 +18,18 @@ Further PS3 differences are added to this table as they are observed. PS3 platfo
 with no Switch equivalent (trophies, stereoscopic 3D) are not planned unless the maintainer
 asks.
 
+## Status
+
+- **Saving** (2026-11-15). The port answers the memory card library's requests from a folder of
+  the player's (port/platform/memory_card.cpp; `--save FOLDER` on the host): an 8 MB card in
+  port 0 that is always there and formatted, so the "no card", "unformatted" and "card full"
+  pages never come. Where the game would ask whether to create its save file, it creates it (a
+  named patch in tools/patches.py). The game's own save code writes its files there as on a
+  card (its directory, `icon.sys`, the icon, three slot files) and reads them back next time.
+  Left: the messages the game shows while saving still name the "Memory Card (PS2)"; how the
+  PS3 release words or hides them is to be observed on the maintainer's copy. On the Switch the
+  folder goes to the console's save data (milestone 2).
+
 ## Sourcing
 
 - The PS3 release is a reference for **behaviour**, observed on the maintainer's own copy. No

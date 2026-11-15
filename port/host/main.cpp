@@ -19,6 +19,7 @@
 
 #include "port/dmac.h"
 #include "port/iso.h"
+#include "port/memory_card.h"
 #include "port/retail_data.h"
 #include "port/system.h"
 
@@ -54,6 +55,8 @@ void* Clock(void*)
         std::fprintf(stderr, "sly1: semaphores: vblank %d, GS finish %d, frame ready %d, frame done %d; "
                      "render thread waiting %d, GS finish awaited %d\n", w(0x002BE460), w(0x002BE464),
                      w(0x002623B0), w(0x002623B4), w(0x002623B8), w(0x002BE468));
+        std::fprintf(stderr, "sly1: memory card: state %d, target %d, display mode %d, free %d KB\n",
+                     w(0x00264A40 + 0x0C), w(0x00264A40 + 0x14), w(0x00264A40 + 0x18), w(0x00264A40 + 0x28));
     }
     std::fflush(stderr);
     std::_Exit(0);
@@ -83,8 +86,10 @@ int main(int argc, char** argv)
             iso = argv[++i];
         else if (!std::strcmp(argv[i], "--seconds") && i + 1 < argc)
             seconds = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--save") && i + 1 < argc)
+            port::SetSaveFolder(argv[++i]);
         else {
-            std::fprintf(stderr, "usage: %s --iso DISC.iso [--seconds N]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s --iso DISC.iso [--seconds N] [--save FOLDER]\n", argv[0]);
             return 2;
         }
     }

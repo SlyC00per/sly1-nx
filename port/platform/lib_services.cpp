@@ -5,8 +5,7 @@
 // Memory and strings: the C library's. Random numbers: the library's own generator, exact
 // (state * 0x41C64E6D + 0x3039, the low 31 bits), seeded with the record's initial seed from the
 // player's executable. Files and IOP modules: the port has no IOP; module loads and resets
-// succeed, the console file handles go to the log. Memory card: no card yet (the PS3 release's
-// saves without a card are milestone 2, docs/PS3_PARITY.md). MPEG: no decoder yet (milestone 3):
+// succeed, the console file handles go to the log. MPEG: no decoder yet (milestone 3):
 // every movie ends at once. The GS paths: always idle.
 #include <cstdio>
 #include <cstring>
@@ -129,37 +128,7 @@ void* AllocateOrThrow(u32 size)
 void ResetGsPaths() {}
 s32 WaitGsPaths(s32, s32) { return 0; }
 
-// --- the memory card: none yet
-
-namespace {
-s32 g_cardOp;
-}
-
-s32 InitMemoryCardClient() { return 1; }
-s32 OpenCardFile(s32, s32, const char*, s32) { g_cardOp = 2; return 0; }
-s32 MakeCardDirectory(s32, s32, const char*) { g_cardOp = 2; return 0; }
-s32 CloseCardFile(s32) { g_cardOp = 3; return 0; }
-s32 ReadCardFile(s32, void*, s32) { g_cardOp = 5; return 0; }
-s32 WriteCardFile(s32, const void*, s32) { g_cardOp = 6; return 0; }
-s32 GetCardInfo(s32, s32, s32* type, s32* free, s32* format)
-{
-    g_cardOp = 1;
-    if (type) *type = 0;
-    if (free) *free = 0;
-    if (format) *format = 0;
-    return 0;
-}
-s32 ReadCardDirectory(s32, s32, const char*, s32, s32, void*) { g_cardOp = 0xD; return 0; }
-s32 RequestCardFormat(s32, s32) { g_cardOp = 0x10; return 0; }
-s32 RequestCardSpaceForPath(s32, s32, const char*) { g_cardOp = 0x12; return 0; }
-
-// The request in flight has ended: its operation, and the result "no card" (-10).
-s32 SyncCardRequest(s32, s32* op, s32* result)
-{
-    if (op) *op = g_cardOp;
-    if (result) *result = -10;
-    return 1;
-}
+// The memory card: port/platform/memory_card.cpp.
 
 // --- MPEG: no decoder yet
 

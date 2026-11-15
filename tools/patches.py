@@ -170,6 +170,15 @@ PATCHES = [
      '((void (*)(PacketWriter*, s32, void*))AddDmaRefTag)(self, n >> 4, c);',
      'AddDmaRefTag(self, n >> 4, (s32)port::GameAddrOf(c));',
      "a DMA reference tag's address: the pointer's game address, not its low 32 bits"),
+
+    # PS3 parity (docs/PS3_PARITY.md): no memory card questions. The port's card is always there,
+    # formatted and roomy (port/platform/memory_card.cpp); where the game would ask whether to
+    # create its save file (page 7), it creates it, as the answer "Yes" does.
+    ("src/main/memory_card.cpp",
+     "            case 3: SetPauseMenuLayerPage(&g_pauseMenuElement, 1, 7); break;",
+     "            case 3: { s32 CreateMemoryCardSaveFiles(MemoryCard* self);\n"
+     "                StartBackgroundJob(&g_backgroundJob, (void*)CreateMemoryCardSaveFiles, self); break; }",
+     "the save file is created without asking, as the PS3 release has no memory card questions"),
 ]
 
 

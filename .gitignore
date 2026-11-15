@@ -41,3 +41,6 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+
+# The host build's save folder (the player's save data)
+/save/
