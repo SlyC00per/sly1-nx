@@ -157,8 +157,13 @@ void KernelDump()
 }
 
 // Calls the handlers of an interrupt cause, from the port's clock or a device.
+// One handler at a time, as on the PS2: the clock's and the devices' (a DMA transfer raises its
+// interrupts on the game thread that started it) never overlap; a handler that starts a transfer
+// may raise another inside it.
 void RaiseInterrupt(int cause)
 {
+    static std::recursive_mutex interrupts;
+    std::lock_guard<std::recursive_mutex> lk(interrupts);
     if (cause >= 0 && cause < 16 && g_enabled[cause] && g_handlers[cause])
         g_handlers[cause]();
 }

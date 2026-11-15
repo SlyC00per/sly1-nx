@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <functional>
+#include <mutex>
 #include <vector>
 #include <cstdlib>
 
@@ -206,6 +207,14 @@ const FunctionIndex& Functions()
 
 }  // namespace
 
+void* FindFunction(std::uint32_t addr)
+{
+    const FunctionIndex& index = Functions();
+    auto it = std::lower_bound(index.byAddr.begin(), index.byAddr.end(), addr,
+                               [](const FunctionEntry& e, std::uint32_t a) { return e.addr < a; });
+    return it != index.byAddr.end() && it->addr == addr ? it->fn : nullptr;
+}
+
 void* NativeFunction(std::uint32_t addr)
 {
     const FunctionIndex& index = Functions();
@@ -213,7 +222,20 @@ void* NativeFunction(std::uint32_t addr)
                                [](const FunctionEntry& e, std::uint32_t a) { return e.addr < a; });
     if (it != index.byAddr.end() && it->addr == addr)
         return it->fn;
-    return Native(addr);
+    // An address in retail's code with no function: the call would run data. Said once per address.
+    void* native = Native(addr);
+    std::uintptr_t off = (std::uintptr_t)native - (std::uintptr_t)port_ram;
+    if (off - 0x00100000u < 0x00150000u) {
+        static std::mutex lock;
+        static std::vector<std::uint32_t> said;
+        std::lock_guard<std::mutex> lk(lock);
+        if (std::find(said.begin(), said.end(), addr) == said.end()) {
+            said.push_back(addr);
+            std::fprintf(stderr, "port: no function at retail address 0x%08X (%zu in the table)\n", addr,
+                         index.byAddr.size());
+        }
+    }
+    return native;
 }
 
 std::uint32_t FunctionAddr(const void* fn)
@@ -225,6 +247,32 @@ std::uint32_t FunctionAddr(const void* fn)
     if (it != index.byFn.end() && it->fn == fn)
         return it->addr;
     return GameAddr(fn);
+}
+
+// --- writable copies of the game's stored string literals (port/ptr32.h)
+
+char* WritableString(const char* literal)
+{
+    // Built during static initialisation, before the game's threads; function-local, so that it
+    // exists whenever the first initialiser asks.
+    static std::mutex lock;
+    static std::vector<std::pair<const char*, char*>> copies;
+    static char pool[256 * 1024];
+    static std::size_t used;
+    std::lock_guard<std::mutex> lk(lock);
+    for (auto& c : copies)
+        if (c.first == literal)
+            return c.second;
+    std::size_t n = std::strlen(literal) + 1;
+    if (used + n > sizeof pool) {
+        std::fprintf(stderr, "port: the pool of the game's strings is full\n");
+        std::abort();
+    }
+    char* copy = pool + used;
+    std::memcpy(copy, literal, n);
+    used += (n + 3) & ~std::size_t(3);
+    copies.emplace_back(literal, copy);
+    return copy;
 }
 
 }  // namespace port

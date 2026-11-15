@@ -13,6 +13,7 @@
 #include <cstring>
 
 #include "common.h"
+#include "port/dmac.h"
 #include "port/iso.h"
 #include "port/ptr32.h"
 
@@ -92,8 +93,29 @@ u32 GetDmaChannel(u32 index)
     return index < 10 ? kChannels[index] : 0;
 }
 s32 ResetDmaController(s32) { return 0; }
-void StartDmaChain(void*, void*) {}
-void StartDmaChainToMemory(void*) {}
+// As the library starts a source chain (TADR unless it holds 0xFFFFFFFF, QWC 0, CHCR's mode and STR),
+// and the transfer then runs (port/dmac.h).
+void StartDmaChain(void* ch, void* tadr)
+{
+    volatile u32* r = (volatile u32*)ch;
+    std::uint32_t addr = port::GameAddr(tadr);
+    if (addr - 0x70000000u < 0x4000u)   // the scratchpad, as a tag address names it
+        addr = (addr & 0x3FF0u) | 0x80000000u;
+    if (r[0x30 / 4] != 0xFFFFFFFFu)
+        r[0x30 / 4] = addr;
+    r[0x20 / 4] = 0;
+    r[0] = (r[0] & ~0xCu) | 0x105u;
+    port::RunDmaChain(port::GameAddr(ch), r[0x30 / 4]);
+}
+// As the library starts a destination chain (QWC 0, CHCR's mode, STR), and the transfer runs.
+void StartDmaChainToMemory(void* ch)
+{
+    volatile u32* r = (volatile u32*)ch;
+    r[0x20 / 4] = 0;
+    r[0] = ((r[0] & ~0xCu) | 0x4u) & ~0x1u;
+    r[0] |= 0x100u;
+    port::RunFromSprChain(port::GameAddr(ch));
+}
 s32 WaitDmaChannel(void*, s32, s32) { return 0; }
 
 }  // extern "C"

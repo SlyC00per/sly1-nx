@@ -143,6 +143,33 @@ PATCHES = [
      "m->p = (u16*)((u8*)m->p + (m->addr - start));",
      "m->p = (u16*)((u8*)m->p + (s32)(m->addr - start));",
      "the morph target's words move by the difference of two u32 addresses, which may be negative"),
+
+    # Frame layout: g++ 2.95 put t right after arr[32] in the frame, and the cleanup walks back from
+    # &t; a modern compiler places locals as it likes.
+    ("src/main/script_machine.cpp",
+     "    p = &t;\n    while (arr != p) {",
+     "    p = arr + 32;\n    while (arr != p) {",
+     "the call's argument array is destroyed from its end, which is &t only in retail's frame"),
+
+    # AddDmaRefTag takes the block's address as an s32 (the tag's upper word); four callers pass a
+    # pointer through a cast of the function, which on 64 bits keeps the pointer's low half. Each
+    # passes the pointer's game address instead.
+    ('src/main/render_frame.cpp',
+     '((void (*)(PacketWriter*, s32, void*))AddDmaRefTag)((PacketWriter*)list, ((u32)((u8*)end - (u8*)value) + 15) >> 4, value);',
+     'AddDmaRefTag((PacketWriter*)list, ((u32)((u8*)end - (u8*)value) + 15) >> 4, (s32)port::GameAddrOf(value));',
+     "a DMA reference tag's address: the pointer's game address, not its low 32 bits"),
+    ('src/main/game_progress.cpp',
+     '((void (*)(PacketWriter*, s32, void*))AddDmaRefTag)(&g_vifPacketWriter, self->tex[t]->n, self->tex[t]->data);',
+     'AddDmaRefTag(&g_vifPacketWriter, self->tex[t]->n, (s32)port::GameAddrOf(self->tex[t]->data));',
+     "a DMA reference tag's address: the pointer's game address, not its low 32 bits"),
+    ('src/main/display.cpp',
+     '((void (*)(PacketWriter*, s32, void*))AddDmaRefTag)((PacketWriter*)&a, 0x2C, g_screenClearPacketC);',
+     'AddDmaRefTag((PacketWriter*)&a, 0x2C, (s32)port::GameAddrOf(g_screenClearPacketC));',
+     "a DMA reference tag's address: the pointer's game address, not its low 32 bits"),
+    ('src/main/warp_menu.cpp',
+     '((void (*)(PacketWriter*, s32, void*))AddDmaRefTag)(self, n >> 4, c);',
+     'AddDmaRefTag(self, n >> 4, (s32)port::GameAddrOf(c));',
+     "a DMA reference tag's address: the pointer's game address, not its low 32 bits"),
 ]
 
 

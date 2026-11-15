@@ -47,6 +47,9 @@ UNIT_TEST(ptr32_functions_by_retail_address)
     CHECK(from_data.get() == &Retail);
     CHECK(port::FromGameAddr<void (int*)>(0x00123450u) == &Retail);
     CHECK(port::GameAddrOf(&Retail) == 0x00123450u);
+    // A slot typed void*, cast to a function pointer, as the game calls table slots.
+    Ptr32<void> slot = Ptr32<void>::FromAddr(0x00123450u);
+    CHECK((void (*)(int*))slot == &Retail);
     // A function outside the table: an image address, still a round trip.
     Ptr32<void (int*)> other = port::P32(Bump);
     CHECK(other.addr() >= port::kImageAddr && other.get() == &Bump);

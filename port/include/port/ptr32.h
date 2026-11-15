@@ -86,6 +86,7 @@ struct FunctionTable {
     const NamedFunction* named;   // or a table of the port's own, by name
 };
 void* NativeFunction(std::uint32_t addr);       // the function at a retail address, else Native(addr)
+void* FindFunction(std::uint32_t addr);         // the function at a retail address, or null
 std::uint32_t FunctionAddr(const void* fn);     // a game function's retail address, else GameAddr(fn)
 
 }  // namespace port
@@ -168,8 +169,10 @@ template <class T> struct Ptr32 {
     // To T* implicitly, as the game's code uses a pointer; to another pointer type only through
     // a cast, as C++ requires for a native pointer.
     operator T*() const { return get(); }
+    // A cast to a function pointer reads the word as a function's address, whatever the stored
+    // pointer's own type (the game calls table slots typed void*).
     template <class U, class = std::enable_if_t<!std::is_same<U, T>::value>>
-    explicit operator U*() const { return (U*)get(); }
+    explicit operator U*() const { return AtAddr<U>(addr_); }
 
     T* operator->() const { return get(); }
 
@@ -193,6 +196,11 @@ struct GameWord {
 template <class T> inline GameWord P32(T* p) { return GameWord{AddrOf(p)}; }
 template <class T> inline GameWord P32(const Ptr32<T>& p) { return GameWord{p.addr_}; }
 inline GameWord P32(std::nullptr_t) { return GameWord{0}; }
+
+// A string literal stored in the game's data: a writable copy of it in the port's memory (one per
+// literal), as the PS2 let the game edit any string in place (port/platform/game_memory.cpp).
+char* WritableString(const char* literal);
+inline GameWord P32Str(const char* literal) { return GameWord{GameAddr(WritableString(literal))}; }
 
 // A stored pointer made an integer: its game address, unchanged.
 template <class T> inline std::uint32_t GameAddrOf(const Ptr32<T>& p) { return p.addr(); }

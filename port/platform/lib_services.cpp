@@ -89,7 +89,30 @@ s32 ResetIop(char*) { return 1; }
 // --- the C++ runtime
 
 // The host's runtime runs the game's static constructors before main.
-void RunConstructorsOnce() {}
+// The game's global constructors, once: the list at 0x0027B130 in retail's data (its count, then
+// the static initialisers by retail address), walked from its end as retail's runtime does. The
+// ones the decompilation writes as functions are called; the ones g++ generated from C++
+// initialisers are the host compiler's here and ran before main, on the initial values start-up
+// copies into main memory; the library's (its exception frames' registration) has no role.
+void RunConstructorsOnce()
+{
+    static bool done;
+    if (done)
+        return;
+    done = true;
+    const u32* list = (const u32*)port::Native(0x0027B130u);
+    int called = 0, skipped = 0;
+    for (u32 i = list[0]; i >= 1; i--) {
+        void* fn = port::FindFunction(list[i]);
+        if (fn) {
+            ((void (*)())fn)();
+            called++;
+        } else {
+            skipped++;
+        }
+    }
+    std::fprintf(stderr, "sly1: %d global constructors run, %d the host's own\n", called, skipped);
+}
 
 void* AllocateOrThrow(u32 size)
 {

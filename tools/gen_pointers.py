@@ -503,7 +503,10 @@ class Walker:
         if words in (["0"], ["NULL"], ["nullptr"]):
             self.edits.rep(f, a, b, "{}", kind)
             return
-        self.edits.wrap(f, a, b, "port::P32(", ")", depth + 1, kind)
+        # A string literal the game stores in its data may be edited in place (the menus wrap their
+        # text by writing newlines into it, as the PS2 allowed): it gets a writable copy.
+        helper = "port::P32Str(" if text.lstrip().startswith('"') else "port::P32("
+        self.edits.wrap(f, a, b, helper, ")", depth + 1, kind)
 
     def initializer(self, c, depth):
         """A stored pointer variable's initialiser: `Ptr32<T> g = port::P32(&x);`."""

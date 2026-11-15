@@ -17,6 +17,7 @@
 
 #include <pthread.h>
 
+#include "port/dmac.h"
 #include "port/iso.h"
 #include "port/retail_data.h"
 #include "port/system.h"
@@ -47,6 +48,13 @@ void* Clock(void*)
     }
     std::fprintf(stderr, "sly1: stopping after %d s\n", g_seconds);
     port::KernelDump();
+    port::DmacDump();
+    {   // the display's and the render frames' semaphores and flags, for the report
+        auto w = [](std::uint32_t a) { return *(const std::int32_t*)port::Native(a); };
+        std::fprintf(stderr, "sly1: semaphores: vblank %d, GS finish %d, frame ready %d, frame done %d; "
+                     "render thread waiting %d, GS finish awaited %d\n", w(0x002BE460), w(0x002BE464),
+                     w(0x002623B0), w(0x002623B4), w(0x002623B8), w(0x002BE468));
+    }
     std::fflush(stderr);
     std::_Exit(0);
 }
