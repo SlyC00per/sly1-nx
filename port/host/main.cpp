@@ -30,6 +30,7 @@ std::atomic<bool> g_started;
 void* GameMain(void*)
 {
     port::SetGameFloatMode();
+    port::KernelStartMainThread();
     g_started = true;
     std::fprintf(stderr, "sly1: RunMainLoop\n");
     func_00185758(0, 0);
@@ -71,7 +72,15 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "sly1: cannot start the game thread\n");
         return 1;
     }
-    std::this_thread::sleep_for(std::chrono::seconds(seconds));
+    // The vertical blank, 60 times a second (NTSC), for the game's handler (cause 2).
+    auto next = std::chrono::steady_clock::now();
+    auto stop = next + std::chrono::seconds(seconds);
+    while (std::chrono::steady_clock::now() < stop) {
+        next += std::chrono::microseconds(16683);
+        std::this_thread::sleep_until(next);
+        if (g_started)
+            port::RaiseInterrupt(2);
+    }
     std::fprintf(stderr, "sly1: stopping after %d s\n", seconds);
     std::fflush(stderr);
     std::_Exit(0);

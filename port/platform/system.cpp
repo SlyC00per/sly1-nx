@@ -20,8 +20,6 @@ std::uint64_t CycleCount()
     return std::uint64_t(ns) * 294912 / 1000000;   // 294.912 MHz
 }
 
-std::int32_t CurrentThreadId() { return 1; }
-
 }  // namespace port
 
 namespace port_vu0 {

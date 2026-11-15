@@ -75,7 +75,7 @@ file(GLOB DECOMP_UNITS CONFIGURE_DEPENDS ${SLY1_DECOMP}/src/main/*.cpp)
 file(GLOB_RECURSE DECOMP_INPUTS CONFIGURE_DEPENDS ${SLY1_DECOMP}/include/*.h ${SLY1_DECOMP}/src/main/*.cpp)
 file(GLOB GEN_TOOLS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tools/gen*.py ${CMAKE_SOURCE_DIR}/tools/patches.py
      ${CMAKE_SOURCE_DIR}/port/include/port/ps2/*.h)
-set(GEN_UNITS ${GEN_DIR}/port_retail_data.cpp)
+set(GEN_UNITS ${GEN_DIR}/port_retail_data.cpp ${GEN_DIR}/src/lib/sort.cpp)
 foreach(unit ${DECOMP_UNITS})
     get_filename_component(name ${unit} NAME)
     list(APPEND GEN_UNITS ${GEN_DIR}/src/main/${name})
@@ -105,7 +105,8 @@ target_include_directories(sly1_game PRIVATE ${GAME_INCLUDES})
 # The platform layer: what replaces sly1-decomp's src/lib and src/libm.
 add_library(port_platform STATIC
     port/platform/lib_runtime.cpp port/platform/lib_kernel.cpp port/platform/lib_devices.cpp
-    port/platform/iop.cpp port/platform/iso.cpp port/platform/float_mode.cpp)
+    port/platform/iop.cpp port/platform/iso.cpp port/platform/float_mode.cpp
+    port/platform/kernel.cpp port/platform/lib_services.cpp)
 target_compile_options(port_platform PRIVATE ${GAME_FLAGS})
 target_include_directories(port_platform PRIVATE ${GAME_INCLUDES})
 add_dependencies(port_platform sly1_gen)

@@ -16,6 +16,10 @@ std::uint64_t CycleCount();
 std::int32_t CurrentThreadId();
 // The EE's float rules on the calling thread: rounding toward zero, denormals flushed.
 void SetGameFloatMode();
+// The kernel model (port/platform/kernel.cpp): the calling host thread becomes the game's main
+// thread, running; and an interrupt cause's handler is called (the clock: 2, vertical blank).
+void KernelStartMainThread();
+void RaiseInterrupt(int cause);
 
 }  // namespace port
 

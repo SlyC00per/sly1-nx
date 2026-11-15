@@ -96,6 +96,12 @@ PATCHES = [
      "        D_00275C34 = 1;",
      "        /* port: the genuine copy's outcome, the flag stays 0 (tools/patches.py) */",
      "the memory checksum covers retail's code and data addresses, which the port does not have"),
+    # The handler of interrupt cause 5 is retail's address 0x15E6A8, written as an offset from a
+    # stripped function's leftover (func_0015E678 + 0x30): the function that begins there.
+    ("src/main/render_frame.cpp",
+     "(void (*)(void))((u8*)func_0015E678 + 0x30)",
+     "(void (*)(void))func_0015E6A8",
+     "the port has no addresses inside code: the handler by the function retail's address names"),
     # The heap's top: retail's is the 32 MB end of the PS2's memory, a fixed address; the port's
     # is the end of its heap arena (port/memory.h), as a game address.
     ("src/main/heap.cpp",

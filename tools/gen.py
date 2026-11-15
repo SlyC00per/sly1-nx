@@ -280,6 +280,10 @@ def strip_asm(text):
 
 PORT_HELPERS = {"include/fpu.h", "include/system.h", "include/mul_wide.h"}
 
+# Library units of sly1-decomp that are portable C and whose exact behaviour the game depends on:
+# compiled like the game's code (the sort's order of equal elements decides draw and update order).
+PORTABLE_LIB_UNITS = ["src/lib/sort.cpp"]
+
 # The helper of vu0.h whose body is a microprogram call in a nested struct: its port name.
 PARTICLE = {"Start", "Next", "Wait", "Results", "Bounds"}
 VU0_FUNCTION = re.compile(
@@ -368,8 +372,12 @@ ASM_FUNC_H = """// SPDX-License-Identifier: AGPL-3.0-or-later
 
 def text_stage(out):
     stats = {"files": 0, "minmax": 0, "named_returns": 0, "broken_strings": 0, "patches": 0}
+    paths = []
     for d in ("include", "src/main"):
-        for path in sorted((DECOMP / d).rglob("*")):
+        paths += sorted((DECOMP / d).rglob("*"))
+    paths += [DECOMP / u for u in PORTABLE_LIB_UNITS]
+    if True:
+        for path in paths:
             if path.is_dir() or path.suffix not in (".h", ".cpp", ".inc"):
                 continue
             rel = str(path.relative_to(DECOMP))
@@ -512,7 +520,7 @@ def main():
         raise SystemExit("gen: %d named patches applied of %d" % (stats["patches"], len(patches.PATCHES)))
     if args.no_pointers:
         return 0
-    units = sorted(str(p.relative_to(DECOMP)) for p in (DECOMP / "src/main").glob("*.cpp")) \
+    units = sorted(str(p.relative_to(DECOMP)) for p in (DECOMP / "src/main").glob("*.cpp")) + PORTABLE_LIB_UNITS \
         if args.all else args.units
     import gen_pointers
     report = {}
