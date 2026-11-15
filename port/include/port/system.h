@@ -14,6 +14,8 @@ std::uint32_t Cop0Status();
 std::uint64_t CycleCount();
 // The id of the game thread that is running.
 std::int32_t CurrentThreadId();
+// The EE's float rules on the calling thread: rounding toward zero, denormals flushed.
+void SetGameFloatMode();
 
 }  // namespace port
 

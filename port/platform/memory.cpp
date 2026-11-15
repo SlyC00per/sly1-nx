@@ -3,6 +3,7 @@
 // of a retail address.
 #include "port/retail_data.h"
 
+#include "port/iso.h"
 #include "port/ptr32.h"
 
 namespace port {
@@ -47,5 +48,16 @@ void* RetailData(std::uint32_t addr)
 }
 
 std::uint32_t HeapEndAddr() { return GameAddr(port_retail_ram + (kRetailRamTop - kRetailRamBase)); }
+
+int FillRetailBytes()
+{
+    int filled = 0;
+    for (int i = 0; i < kRetailBytesCount; i++) {
+        const RetailBytes& r = kRetailBytes[i];
+        if (ReadExecutable(r.addr, kRetailBytesStorage + r.offset, r.size))
+            filled++;
+    }
+    return filled;
+}
 
 }  // namespace port
