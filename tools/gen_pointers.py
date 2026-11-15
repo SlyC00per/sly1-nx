@@ -24,6 +24,7 @@ at one position nest by the depth of their expression, so edits never overwrite 
 """
 
 import collections
+import re
 from pathlib import Path
 
 import clang.cindex as ci
@@ -67,10 +68,24 @@ def canon(t):
     return t
 
 
+def underlying(t):
+    """A typedef's type, or None for any other type."""
+    if t.kind != TK.TYPEDEF:
+        return None
+    d = t.get_declaration()
+    return d.underlying_typedef_type if d is not None and d.kind in (CK.TYPEDEF_DECL, CK.TYPE_ALIAS_DECL) else None
+
+
 def needs(t, storage):
-    """Whether type t, in a storage or register position, changes under the rewrite."""
+    """Whether type t, in a storage or register position, changes under the rewrite. A typedef
+    is kept as written unless a stored pointer hides in it (a typedef of a pointer, stored; a
+    typedef of a pointer to pointers anywhere): typedefs are not rewritten, so `(Fn)x` stays a
+    native cast and a parameter of type Fn a native pointer."""
     t = canon(t)
     k = t.kind
+    u = underlying(t)
+    if u is not None:
+        return needs(u, storage)
     if k == TK.POINTER:
         return True if storage else needs(t.get_pointee(), True)
     if k in REFS:
@@ -101,8 +116,13 @@ def leaf(t):
 
 def pr(t, inner, storage):
     """The declaration of `inner` with type t, under the rewrite."""
+    orig = t
     t = canon(t)
     k = t.kind
+    u = underlying(t)
+    if u is not None and needs(u, storage):
+        s = pr(u, inner, storage)
+        return ("const " if orig.is_const_qualified() and not s.startswith("const ") else "") + s
     if k == TK.POINTER:
         p = t.get_pointee()
         if storage:
@@ -126,11 +146,23 @@ def pr(t, inner, storage):
         if k == TK.FUNCTIONPROTO and t.is_function_variadic():
             args.append("...")
         return pr(t.get_result(), inner + "(" + ", ".join(args) + ")", False)
-    return _join(leaf(t), inner)
+    s = leaf(t)
+    # Qualifiers on the sugar canon() removed (`const u16`, an elaborated typedef) stay.
+    words = s.split()
+    for q in ("volatile", "const"):
+        if getattr(orig, "is_%s_qualified" % q)() and q not in words:
+            s = q + " " + s
+    return _join(s, inner)
 
 
 # ---------------------------------------------------------------------------------------------
 # Edits
+
+
+def _define_ranges(data):
+    """Byte ranges of the #define directives in data, with their continuation lines."""
+    import re
+    return [(m.start(), m.end()) for m in re.finditer(rb"(?m)^[ \t]*#[ \t]*define\b(?:[^\n]*\\\n)*[^\n]*", data)]
 
 
 class Edits:
@@ -138,8 +170,10 @@ class Edits:
 
     def __init__(self):
         self.replace = collections.defaultdict(dict)    # file -> {(start, end): text}
-        self.insert = collections.defaultdict(set)      # file -> {(pos, order, text)}
+        # file -> {(pos, order, text, pair)}: pair is shared by a wrap's opening and closing
+        self.insert = collections.defaultdict(set)
         self.counts = collections.Counter()
+        self.kinds = {}                                 # (file, start, end) or insertion -> kind
         self.unsupported = []
 
     def rep(self, f, start, end, text, kind):
@@ -147,17 +181,21 @@ class Edits:
         if old is not None and old != text:
             self.unsupported.append("%s:%d: two rewrites of one place (%r, %r)" % (f, start, old, text))
             return
-        if old is None:
+        if old is None and kind:
             self.counts[kind] += 1
+            self.kinds[(f, start, end)] = kind
         self.replace[f][(start, end)] = text
 
     def wrap(self, f, start, end, before, after, depth, kind):
         # Opening text: outer expressions first at one position (smaller depth, smaller order);
         # closing text: inner expressions first.
-        if (start, -1000 + depth, before) not in self.insert[f]:
+        pair = (start, end, depth, before, after)
+        opening = (start, -1000 + depth, before, pair)
+        if opening not in self.insert[f]:
             self.counts[kind] += 1
-        self.insert[f].add((start, -1000 + depth, before))
-        self.insert[f].add((end, 1000 - depth, after))
+            self.kinds[(f,) + opening] = kind
+        self.insert[f].add(opening)
+        self.insert[f].add((end, 1000 - depth, after, pair))
 
     def apply(self, root):
         files = set(self.replace) | set(self.insert)
@@ -165,11 +203,25 @@ class Edits:
             path = Path(f)
             text = path.read_bytes().decode("utf-8", "replace")
             data = text.encode()
+            defines = _define_ranges(data)
+
+            def in_define(a, b):
+                return any(a < e and b > s for s, e in defines)
+            def line(a):
+                return data.count(b"\n", 0, a) + 1
+            for (a, b) in [k for k in self.replace[f] if in_define(*k)]:
+                self.unsupported.append("%s:%d: inside a #define, not rewritten" % (f, line(a)))
+                del self.replace[f][(a, b)]
+            # A wrap is dropped whole when either half is inside a #define.
+            dropped = {i[3] for i in self.insert[f] if in_define(i[0], i[0] + 1)}
+            for pair in dropped:
+                self.unsupported.append("%s:%d: inside a #define, not rewritten" % (f, line(pair[0])))
+            self.insert[f] = {i for i in self.insert[f] if i[3] not in dropped}
             ops = []   # (pos, order, kind, end, text)
             spans = sorted(self.replace[f].items())
             for (a, b), t in spans:
                 ops.append((a, 0, "r", b, t))
-            for pos, order, t in self.insert[f]:
+            for pos, order, t, _ in self.insert[f]:
                 ops.append((pos, order, "i", pos, t))
             # Check replacements do not overlap each other or contain an insertion point.
             last = -1
@@ -247,6 +299,18 @@ class Walker:
         self.addressed = set()   # (file, offset) of locals whose address is taken
         self.groups = collections.defaultdict(list)
         self.done = set()        # header declarations already walked in an earlier unit
+        self.texts = {}          # file -> bytes, for char_at
+        self.macro_starts = set()  # (file, offset) where a macro is expanded, in this unit
+        self.rename = {}           # (file, offset) of a parameter -> its name in the signature
+
+    def char_at(self, loc):
+        f = loc.file
+        if f is None:
+            return ""
+        data = self.texts.get(f.name)
+        if data is None:
+            data = self.texts[f.name] = Path(f.name).read_bytes()
+        return chr(data[loc.offset]) if loc.offset < len(data) else ""
 
     def ours(self, c):
         f = c.location.file
@@ -277,6 +341,7 @@ class Walker:
                     _, cname, cend = _decl_regions(c, ctoks)
                     t = c.underlying_typedef_type if c.kind == CK.TYPEDEF_DECL else c.type
                     nm = ctoks[cname].spelling if cname is not None else ""
+                    nm = self.rename.get((f, c.location.offset), nm)
                     # keep what follows the name inside the declarator only through the type
                     text = pr(t, nm, storage)
                     if i == 0:
@@ -348,7 +413,14 @@ class Walker:
         ot = canon(operand.type)
         operand_kind = operand.type.get_canonical().kind
         a, b = toks[0].extent.start.offset, toks[j].extent.end.offset
-        end = c.extent.end.offset
+        otoks = _tokens(operand)
+        end = otoks[-1].extent.end.offset if otoks else c.extent.end.offset
+        if end <= b or end > c.extent.end.offset or toks[-1].extent.end.offset != end:
+            # Not one contiguous run of the file's own tokens: a cast made by a macro.
+            if target_kind == TK.POINTER and operand_kind in INTEGERS or \
+                    target_kind in INTEGERS and operand_kind in {TK.POINTER} | ARRAYS | FUNCS:
+                self.edits.unsupported.append("%s:%d: a pointer/integer cast inside a macro" % (f, c.location.line))
+            return
         if target_kind == TK.POINTER and operand_kind in INTEGERS:
             otoks = [t.spelling for t in _tokens(operand)]
             if otoks in (["0"], ["0", ")"]) or otoks == ["NULL"]:
@@ -373,6 +445,150 @@ class Walker:
             except Unsupported as e:
                 self.edits.unsupported.append("%s:%d: %s" % (f, c.location.line, e))
 
+    # --- initialising stored pointers (Ptr32 has no constructors: port::P32 makes a game word)
+
+    def _own_text(self, e):
+        """The expression's source text when its extent is a plausible piece of the file's own
+        text (short, balanced): read from the file, as tokenizing an extent can cost a whole
+        table's tokens. None when the extent is a macro's or otherwise not trustworthy."""
+        s, t = e.extent.start, e.extent.end
+        if s.file is None or t.file is None or s.file.name != t.file.name:
+            return None
+        a, b = s.offset, t.offset
+        if not 0 <= a < b or b - a > 2000:
+            return None
+        data = self.texts.get(s.file.name)
+        if data is None:
+            data = self.texts[s.file.name] = Path(s.file.name).read_bytes()
+        text = data[a:b].decode("utf-8", "replace")
+        code = re.sub(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'', '""', text)  # literals' contents aside
+        if code.count("(") != code.count(")") or code.count("{") != code.count("}"):
+            return None
+        return text
+
+    def _wrap_pointer_value(self, e, depth, kind):
+        """port::P32(e) around a pointer-valued initialiser of a stored pointer; {} for a null
+        constant (an aggregate's zero)."""
+        f = e.location.file.name if e.location.file else None
+        if f is None:
+            return
+        text = self._own_text(e)
+        if (f, e.extent.start.offset) in self.macro_starts:
+            text = None   # the value comes from a macro's body: a named patch's business
+        if text is None:
+            self.edits.unsupported.append("%s:%d: a stored pointer's initialiser inside a macro"
+                                          % (f, e.location.line))
+            return
+        words = text.split()
+        a, b = e.extent.start.offset, e.extent.end.offset
+        if words in (["0"], ["NULL"], ["nullptr"]):
+            self.edits.rep(f, a, b, "{}", kind)
+            return
+        self.edits.wrap(f, a, b, "port::P32(", ")", depth + 1, kind)
+
+    def initializer(self, c, depth):
+        """A stored pointer variable's initialiser: `Ptr32<T> g = port::P32(&x);`."""
+        if c.type.get_canonical().kind != TK.POINTER:
+            return
+        kids = [k for k in c.get_children() if k.kind not in (CK.TYPE_REF, CK.TEMPLATE_REF,
+                                                              CK.NAMESPACE_REF, CK.PARM_DECL)]
+        if not kids or kids[-1].kind == CK.INIT_LIST_EXPR:
+            return
+        init = kids[-1]
+        toks = _tokens(c)
+        if not any(t.spelling == "=" for t in toks):
+            return
+        self._wrap_pointer_value(init, depth, "stored pointer initialisers")
+
+    def init_list(self, c, depth):
+        """The elements of a braced list that initialise stored pointers (a structure's pointer
+        fields, an array of pointers: every pointer in a list is stored)."""
+        elements = list(c.get_children())
+        lt = c.type.get_canonical()
+        if lt.kind == TK.RECORD:
+            fields = list(lt.get_fields())
+            if len(elements) > len(fields):
+                fields = None    # braces elided: positions are not fields
+            targets = [f.type for f in fields] if fields is not None else None
+        elif lt.kind in ARRAYS:
+            targets = [lt.element_type] * len(elements)
+        else:
+            targets = None
+        for i, e in enumerate(elements):
+            if e.kind == CK.INIT_LIST_EXPR:
+                continue
+            if targets is not None:
+                target = targets[i].get_canonical()
+                # A plain value for an aggregate initialises its first member (a union's, or a
+                # structure's under brace elision), down to a scalar. A whole structure (a call
+                # returning one) initialises the aggregate itself.
+                whole = e.type.get_canonical().kind == TK.RECORD
+                for _ in range(0 if whole else 8):
+                    if target.kind != TK.RECORD:
+                        break
+                    first = next(iter(target.get_fields()), None)
+                    if first is None:
+                        break
+                    target = first.type.get_canonical()
+                pointer = target.kind == TK.POINTER
+            else:
+                # Braces elided, positions unknown: a pointer, a function, or an array that is not
+                # a string literal (an array cannot initialise an array: it decays to a pointer).
+                ek = e.type.get_canonical().kind
+                pointer = ek in {TK.POINTER} | FUNCS or ek in ARRAYS and e.kind != CK.STRING_LITERAL
+            if pointer:
+                self._wrap_pointer_value(e, depth, "stored pointer initialisers")
+
+    def member_initialisers(self, c, depth):
+        """`: a(p)` in a constructor, for a member a that is a stored pointer: `a(port::P32(p))`."""
+        kids = list(c.get_children())
+        for i, k in enumerate(kids[:-1]):
+            if k.kind != CK.MEMBER_REF or k.referenced is None:
+                continue
+            if k.referenced.type.get_canonical().kind != TK.POINTER:
+                continue
+            e = kids[i + 1]
+            text = self._own_text(e)
+            f = e.location.file.name if e.location.file else None
+            if text is None or f is None:
+                if f:
+                    self.edits.unsupported.append("%s:%d: a member initialiser not rewritten" % (f, e.location.line))
+                continue
+            self.edits.wrap(f, e.extent.start.offset, e.extent.end.offset, "port::P32(", ")",
+                            depth + 1, "stored pointer initialisers")
+
+    def addressed_parameters(self, c):
+        """A parameter whose address is taken is stored (its address reaches T** parameters, now
+        Ptr32<T>*): the signature keeps the native pointer, under another name, and the body
+        starts with a Ptr32 of the parameter's own name."""
+        body = next((k for k in c.get_children() if k.kind == CK.COMPOUND_STMT), None)
+        if body is None:
+            return
+        f = c.location.file.name
+        decls = []
+        for p in c.get_children():
+            if p.kind != CK.PARM_DECL or not p.spelling:
+                continue
+            if (p.location.file.name, p.location.offset) not in self.addressed:
+                continue
+            if p.type.get_canonical().kind != TK.POINTER:
+                continue
+            name = p.spelling
+            try:
+                decl = pr(p.type, name, True)
+            except Unsupported as e:
+                self.edits.unsupported.append("%s:%d: %s" % (f, p.location.line, e))
+                continue
+            if needs(p.type, False):
+                self.rename[(f, p.location.offset)] = "port_arg_" + name   # with its new type
+            else:
+                self.edits.rep(f, p.location.offset, p.location.offset + len(name), "port_arg_" + name,
+                               "addressed parameters")
+            decls.append(" %s = port::P32(port_arg_%s);" % (decl, name))
+        if decls:
+            brace = body.extent.start.offset
+            self.edits.wrap(f, brace + 1, brace + 1, "".join(decls), "", 0, "addressed parameters")
+
     def sizeof(self, c):
         toks = _tokens(c)
         if len(toks) < 4 or toks[0].spelling not in ("sizeof", "__alignof__", "alignof") or toks[1].spelling != "(":
@@ -386,7 +602,7 @@ class Walker:
                        "Ptr32<void>", "sizeof of a pointer")
 
     def conditional(self, c, depth):
-        if canon(c.type).kind != TK.POINTER:
+        if c.type.get_canonical().kind != TK.POINTER:
             return
         kids = list(c.get_children())
         if len(kids) != 3:
@@ -395,7 +611,11 @@ class Walker:
         for arm in kids[1:]:
             if [t.spelling for t in _tokens(arm)] in (["0"], ["NULL"], ["nullptr"]):
                 continue  # a null pointer constant: `+(0)` would be the integer 0
-            if canon(arm.type).kind in {TK.POINTER} | ARRAYS | FUNCS:
+            if arm.type.get_canonical().kind in {TK.POINTER} | ARRAYS | FUNCS:
+                atoks = _tokens(arm)
+                if not atoks or atoks[0].extent.start.offset != arm.extent.start.offset or \
+                        atoks[-1].extent.end.offset != arm.extent.end.offset:
+                    continue
                 self.edits.wrap(f, arm.extent.start.offset, arm.extent.end.offset, "+(", ")",
                                 depth + 1, "pointer arms of ?:")
 
@@ -410,7 +630,13 @@ class Walker:
         args = list(c.get_arguments())
         f = c.location.file.name
         for arg in args[fixed:]:
-            if canon(arg.type).kind in {TK.POINTER} | ARRAYS:
+            if arg.type.get_canonical().kind in {TK.POINTER} | ARRAYS:
+                atoks = _tokens(arg)
+                if not atoks or atoks[0].extent.start.offset != arg.extent.start.offset or \
+                        atoks[-1].extent.end.offset != arg.extent.end.offset or \
+                        atoks[0].extent.start.offset < c.extent.start.offset or \
+                        atoks[-1].extent.end.offset > c.extent.end.offset:
+                    continue
                 self.edits.wrap(f, arg.extent.start.offset, arg.extent.end.offset, "+(", ")",
                                 depth + 1, "variadic pointer arguments")
 
@@ -435,8 +661,9 @@ class Walker:
         while stack:
             c = stack.pop()
             if c.kind == CK.UNARY_OPERATOR:
-                toks = _tokens(c)
-                if toks and toks[0].spelling == "&":
+                # Only the operator's first character is needed: read it from the file, as
+                # tokenizing a unary operator's extent can cost a whole table's tokens.
+                if self.char_at(c.extent.start) == "&":
                     kids = list(c.get_children())
                     if kids and kids[0].kind == CK.DECL_REF_EXPR and kids[0].referenced is not None:
                         r = kids[0].referenced
@@ -465,16 +692,20 @@ class Walker:
                 local = in_func and ch.storage_class not in (ci.StorageClass.STATIC, ci.StorageClass.EXTERN)
                 addressed = (ch.location.file.name, ch.location.offset) in self.addressed
                 self.declaration(ch, not local or addressed)
+                if not local or addressed:
+                    self.initializer(ch, depth)
             elif k == CK.PARM_DECL:
                 parent = ch.semantic_parent
                 if parent is not None and parent.kind in (CK.FUNCTION_DECL, CK.CXX_METHOD, CK.CONSTRUCTOR,
                                                           CK.FUNCTION_TEMPLATE):
-                    addressed = (ch.location.file.name, ch.location.offset) in self.addressed
-                    self.declaration(ch, addressed)
-            elif k in (CK.TYPEDEF_DECL, CK.TYPE_ALIAS_DECL):
-                self.declaration(ch, True)
+                    self.declaration(ch, False)
             elif k in (CK.FUNCTION_DECL, CK.CXX_METHOD, CK.FUNCTION_TEMPLATE):
                 self.function_result(ch)
+                self.addressed_parameters(ch)
+            elif k == CK.INIT_LIST_EXPR:
+                self.init_list(ch, depth)
+            elif k == CK.CONSTRUCTOR:
+                self.member_initialisers(ch, depth)
             elif k == CK.CSTYLE_CAST_EXPR:
                 self.cast(ch, depth)
             elif k == CK.CXX_UNARY_EXPR:
@@ -491,23 +722,71 @@ class Walker:
             self.walk(ch, depth + 1, body)
 
 
-def rewrite(units, out, args, report):
-    """Rewrites the pointer declarations of every file the units reach under out."""
+def _collect(job):
+    """A worker: the edits of a share of the units, as plain data."""
+    units, out, args = job
     index = ci.Index.create()
     edits = Edits()
     walker = Walker(edits, out)
     diagnostics = 0
     for unit in units:
-        tu = index.parse(str(out / unit), args=args)
+        tu = index.parse(str(out / unit), args=args,
+                         options=ci.TranslationUnit.PARSE_DETAILED_PROCESSING_RECORD)
+        # Function-like macro calls only (`PROP(id, n)`): an object-like macro that stands for a
+        # name (names.h's readable names) covers just that name and is a plain value.
+        walker.macro_starts = {(c.location.file.name, c.extent.start.offset)
+                               for c in tu.cursor.get_children()
+                               if c.kind == CK.MACRO_INSTANTIATION and c.location.file is not None
+                               and c.extent.end.offset - c.extent.start.offset > len(c.spelling)}
         fatal = [d for d in tu.diagnostics if d.severity >= ci.Diagnostic.Fatal]
         if fatal:
             raise SystemExit("gen: %s does not parse: %s" % (unit, fatal[0]))
-        errors = [d for d in tu.diagnostics if d.severity >= ci.Diagnostic.Error]
-        diagnostics += len(errors)
+        diagnostics += sum(1 for d in tu.diagnostics if d.severity >= ci.Diagnostic.Error)
         cursors = list(walker.top_level(tu, str(out / unit)))
         walker.collect_addressed(cursors)
         walker.walk_cursors(cursors)
         walker.flush_groups()
+    return ({f: dict(r) for f, r in edits.replace.items()}, {f: set(i) for f, i in edits.insert.items()},
+            edits.unsupported, diagnostics, edits.kinds)
+
+
+def rewrite(units, out, args, report, jobs=None):
+    """Rewrites the pointer declarations of every file the units reach under out. The units are
+    shared among worker processes; their edits are merged, and one place rewritten two different
+    ways is reported, never applied."""
+    import multiprocessing
+    import os
+    jobs = jobs or min(len(units), os.cpu_count() or 1) or 1
+    # Large units first, dealt round-robin, so the workers finish together.
+    ordered = sorted(units, key=lambda u: -(out / u).stat().st_size)
+    shares = [ordered[i::jobs] for i in range(jobs)]
+    if jobs == 1:
+        results = [_collect((shares[0], out, args))]
+    else:
+        with multiprocessing.get_context("spawn").Pool(jobs) as pool:
+            results = pool.map(_collect, [(s, out, args) for s in shares])
+    edits = Edits()
+    diagnostics = 0
+    kinds = {}
+    for replace, insert, unsupported, diag, k in results:
+        kinds.update(k)
+        for f, reps in replace.items():
+            for (a, b), text in reps.items():
+                edits.rep(f, a, b, text, None)
+        for f, ins in insert.items():
+            edits.insert[f] |= ins
+        edits.unsupported += [u for u in unsupported if u not in edits.unsupported]
+        diagnostics += diag
+    # The counts, by kind, of the distinct edits after merging.
+    edits.counts = collections.Counter()
+    for f, reps in edits.replace.items():
+        for (a, b) in reps:
+            if (f, a, b) in kinds:
+                edits.counts[kinds[(f, a, b)]] += 1
+    for f, ins in edits.insert.items():
+        for item in ins:
+            if (f,) + item in kinds:
+                edits.counts[kinds[(f,) + item]] += 1
     files = edits.apply(out)
     report["files_changed"] = len(files)
     report["counts"] = dict(edits.counts)

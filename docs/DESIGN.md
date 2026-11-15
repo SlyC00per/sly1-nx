@@ -112,10 +112,11 @@ the places nobody listed.
 32-bit value. **Recommended.** It is the model OpenRAC's port chose (OpenGOAL's offsets),
 adapted to C++:
 
-- `Ptr32<T>`: a 4-byte, trivially copyable class holding a 32-bit offset from one anchor
-  symbol in the program image; 0 is null. It converts to and from `T*`, and has `->`, `*`,
-  `[]`, arithmetic, comparison and call operators, so the game's expressions compile as
-  written.
+- `Ptr32<T>`: a 4-byte game address (an offset from the program image's start; 0 is null).
+  It converts to `T*`, is assigned from `T*`, and has `->`, `*`, `[]`, arithmetic,
+  comparison and call operators, so the game's expressions compile as written. It is plain
+  old data with **no constructors** (the spike showed why, below): a stored pointer's
+  initialiser is wrapped in `port::P32(...)` by the generator.
 - The generation step rewrites **pointer types in declarations** (`T*` becomes
   `Ptr32<T>`: members, globals, parameters, locals, casts, `sizeof`). Expressions are not
   rewritten. `this` and temporaries stay native.
@@ -318,6 +319,53 @@ first code commit.
    `placed_object_model.cpp`, `matrix.cpp`), compiled for the host with the layout
    assertions. I report the error counts and what the rewrite needed, and we confirm (b)
    or fall back before going on.
+   **Result (2026-11-14): (b) holds on the spike.** `tools/gen.py` and
+   `tools/gen_pointers.py` rewrote 1,191 declarations, 44 cast types, 34 pointer-to-integer
+   and 34 integer-to-pointer casts and 3 conditional arms in the 65 files the six units
+   reach. Before the pointer stage clang++ reported 381 errors in the six units (347 failed
+   size checks, 34 pointer casts); after it, all six compile to object code with 0 errors,
+   so every size check they reach holds, and `tools/layout_check.py` compares 2,640 retail
+   field offsets with the host compiler's layout and finds 0 differences. What the rewrite
+   needed along the way: libclang given the system compiler's include directories (it has
+   none of its own); `-fms-extensions` for the analysis only, so the casts a 64-bit compiler
+   rejects stay in the tree; no `nullptr_t` constructor in `Ptr32` (`p = 0` was ambiguous)
+   and an explicit one from other pointer types (casts to typedefs of stored function
+   pointers); null constants left out of the conditional-arm rule.
+
+   **Over all 101 units (2026-11-15): (b) holds; two design changes.** With the Clang host
+   compiler 97 units compile and with the Switch's GCC 100 (strict, no `-fpermissive`); every
+   remaining error is the old compiler's variable-argument builtins (`__builtin_next_arg`,
+   eight functions in four files), which `modern_check.py` already lists as a port's job and
+   which get named patches. 4,860 retail field offsets are asserted in the generated code and
+   hold on both compilers. The rewrite: 3,076 declarations, 551 cast types, 1,152
+   integer-to-pointer and 924 pointer-to-integer casts, 10,926 stored-pointer initialisers,
+   156 conditional arms, 301 variadic arguments, 6 addressed parameters; about 80 seconds.
+   What the full run found:
+   - **Tail padding.** Today's ABI (Clang and GCC) puts a derived class's first members in its
+     base's tail padding when the base is not C++03 POD, which a class with a base of its own
+     never is; g++ 2.95 never does. `tools/gen_layout.py` measures each base's data size with
+     the compiler itself (a probe class derived from it) and gives the one class that needs it
+     an explicit tail member (`LightObject`'s base, 4 bytes).
+   - **`Ptr32` without constructors.** GCC also reuses padding next to members with
+     constructors, and refuses them in anonymous unions and structures (1,384 errors): a
+     `Ptr32` is now plain old data, and the generator writes `port::P32(...)` where a stored
+     pointer is initialised (declarations, braced lists by their target field, constructors'
+     member initialisers, addressed parameters). Typedefs of pointers stay native.
+   - **Offset assertions.** Every commented retail offset becomes a
+     `static_assert(offsetof(...))` after its record, so each compiler checks the layout itself.
+     Records that are views of a larger object (their comments give the outer offsets) are set
+     aside; records that differ are reported, not asserted.
+   - **Virtual functions.** The movie player's `TransferSink` family (three classes, the only
+     ones with virtual functions outside the C++ runtime) has an 8-byte hidden table pointer on
+     64-bit: `MovieStream` and `MoviePlayer` differ from retail. A named patch with an explicit
+     4-byte table pointer, with the video work (milestone 3).
+   - **Named patches** (`tools/patches.py`): exact replacements in the generated copy, each with
+     its reason, failing the generation if one stops matching. One so far (`PROP` in
+     `property_registry.cpp`, whose pointer is in the macro's body). Left for patches: the eight
+     variable-argument functions, `AT` in `player.cpp` (a raw-offset macro that may receive an
+     integer address), one integer-to-pointer cast inside a macro argument
+     (`placed_object.cpp:4878`) and one field declaring its own type (`collider.cpp:1836`).
+   Not yet checked: anything at run time.
 3. All of `src/main` generated and compiling; the helper headers; the 48 assembly
    functions; platform stubs.
 4. `.iso` sector reads; boot to the level loader; `--verify-levels`.

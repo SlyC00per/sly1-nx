@@ -29,12 +29,15 @@ Node g_nodes[3];
 
 UNIT_TEST(ptr32_round_trip_in_image)
 {
-    Ptr32<int> p = &g_array[2];
+    Ptr32<int> p = port::P32(&g_array[2]);
     CHECK(p.get() == &g_array[2]);
     CHECK(p.addr() != 0 && p.addr() < port::kGameMemorySize);
     CHECK(port::FromGameAddr<int>(p.addr()) == &g_array[2]);
-    Ptr32<int> null = nullptr;
+    Ptr32<int> null = {};
     CHECK(null.addr() == 0 && null.get() == nullptr);
+    null = &g_array[0];
+    null = 0;
+    CHECK(null.addr() == 0);
     CHECK(!null);
     CHECK(p);
 }
@@ -47,14 +50,15 @@ UNIT_TEST(ptr32_words_carried_unchanged)
     for (std::uint32_t w : words) {
         void* native = port::Native(w);
         CHECK(port::GameAddr(native) == w);
-        Ptr32<void> stored = native;
+        Ptr32<void> stored;
+        stored = native;
         CHECK(stored.addr() == w);
     }
 }
 
 UNIT_TEST(ptr32_aliases_and_scratchpad)
 {
-    Ptr32<int> p = &g_array[1];
+    Ptr32<int> p = port::P32(&g_array[1]);
     CHECK(port::Native(p.addr() | 0x20000000u) == &g_array[1]);  // uncached alias
     CHECK(port::Native(p.addr() | 0x30000000u) == &g_array[1]);  // uncached accelerated
     CHECK(port::Native(0x70002000u) == port::Scratchpad() + 0x2000);
@@ -62,7 +66,7 @@ UNIT_TEST(ptr32_aliases_and_scratchpad)
 
 UNIT_TEST(ptr32_operators)
 {
-    Ptr32<int> p = &g_array[0];
+    Ptr32<int> p = port::P32(&g_array[0]);
     p++;
     CHECK(p.get() == &g_array[1]);
     p += 3;
@@ -100,15 +104,21 @@ UNIT_TEST(ptr32_struct_links_and_calls)
 UNIT_TEST(ptr32_conversions)
 {
     static Derived d;
-    Ptr32<Derived> pd = &d;
-    Ptr32<Base> pb = pd;
+    Ptr32<Derived> pd = port::P32(&d);
+    Ptr32<Base> pb;
+    pb = pd;
     CHECK(pb.get() == static_cast<Base*>(&d));
-    Ptr32<void> pv = &d;
+    Ptr32<void> pv = port::P32(&d);
     Derived* back = (Derived*)pv;
     CHECK(back == &d);
     volatile bool yes = true;
-    Ptr32<Derived> pick = yes ? pd : Ptr32<Derived>(nullptr);
-    CHECK(pick.get() == &d);
-    Ptr32<Derived> none = !yes ? pd : Ptr32<Derived>(nullptr);
-    CHECK(none.get() == nullptr);
+    Derived* pick = yes ? pd : (Derived*)0;
+    CHECK(pick == &d);
+    Derived* none = !yes ? pd : (Derived*)0;
+    CHECK(none == nullptr);
+    // A table of stored pointers, as the generated code initialises one.
+    static Node table[2] = {{1, port::P32(&g_nodes[0]), port::P32(Bump), port::P32("a")},
+                            {2, {}, 0, 0}};
+    CHECK(table[0].next.get() == &g_nodes[0] && table[1].next.get() == nullptr);
+    CHECK(table[0].name[0] == 'a' && table[1].fn.addr() == 0);
 }

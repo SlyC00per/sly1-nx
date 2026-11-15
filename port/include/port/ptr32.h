@@ -66,22 +66,24 @@ inline std::uint32_t GameAddr(const void* p)
 template <class T> inline std::uint32_t GameAddrOf(T* p) { return GameAddr((const void*)p); }
 template <class T> inline T* FromGameAddr(std::uint32_t addr) { return (T*)Native(addr); }
 
-template <class T> class Ptr32 {
-public:
-    Ptr32() = default;
-    // No nullptr_t constructor: `p = 0` must have one meaning, and 0 and nullptr reach T*.
-    Ptr32(T* p) : addr_(GameAddr((const void*)p)) {}
-    // A cast to a stored pointer type from another pointer type, as a cast to T* would be
-    // ((Fn)func with Fn a typedef of a stored function pointer).
-    template <class U, class = std::enable_if_t<!std::is_convertible<U*, T*>::value>>
-    explicit Ptr32(U* p) : addr_(GameAddr((const void*)p)) {}
-    template <class U, class = std::enable_if_t<!std::is_same<U, T>::value &&
-                                                std::is_convertible<U*, T*>::value>>
-    Ptr32(const Ptr32<U>& p) : Ptr32(static_cast<T*>(p.get())) {}
+// A stored pointer. Plain old data in C++03's sense: no constructors, one public member. That is
+// what keeps retail's layouts on every compiler: a class with constructors would make the game's
+// structures non-POD, and today's ABI (GCC more than Clang) then reuses their tail padding, which
+// g++ 2.95 never did; GCC also refuses a member with constructors in an anonymous union or
+// structure, which the game has by the hundred. So a Ptr32 is assigned (from a T*, a Ptr32 of a
+// convertible type, or 0) and initialised from port::P32(p), which tools/gen.py writes around a
+// stored pointer's initialiser.
+template <class T> struct Ptr32 {
+    std::uint32_t addr_;
 
     T* get() const { return (T*)Native(addr_); }
     std::uint32_t addr() const { return addr_; }
     static Ptr32 FromAddr(std::uint32_t addr) { Ptr32 p; p.addr_ = addr; return p; }
+
+    Ptr32& operator=(T* p) { addr_ = GameAddr((const void*)p); return *this; }
+    template <class U, class = std::enable_if_t<!std::is_same<U, T>::value &&
+                                                std::is_convertible<U*, T*>::value>>
+    Ptr32& operator=(const Ptr32<U>& p) { return *this = static_cast<T*>(p.get()); }
 
     // To T* implicitly, as the game's code uses a pointer; to another pointer type only through
     // a cast, as C++ requires for a native pointer.
@@ -98,10 +100,19 @@ public:
     Ptr32 operator--(int) { Ptr32 old = *this; --*this; return old; }
     Ptr32& operator+=(std::ptrdiff_t n) { return *this = get() + n; }
     Ptr32& operator-=(std::ptrdiff_t n) { return *this = get() - n; }
-
-private:
-    std::uint32_t addr_;
 };
+
+// A game address on its way into a Ptr32 of any type: port::P32's result. It initialises a
+// stored pointer (`Ptr32<T> g = port::P32(&x);`, `{ port::P32(&x), ... }` in a table) through
+// its conversion, as Ptr32 has no constructors.
+struct GameWord {
+    std::uint32_t addr;
+    template <class U> operator Ptr32<U>() const { return Ptr32<U>::FromAddr(addr); }
+};
+
+template <class T> inline GameWord P32(T* p) { return GameWord{GameAddr((const void*)p)}; }
+template <class T> inline GameWord P32(const Ptr32<T>& p) { return GameWord{p.addr_}; }
+inline GameWord P32(std::nullptr_t) { return GameWord{0}; }
 
 // A stored pointer made an integer: its game address, unchanged.
 template <class T> inline std::uint32_t GameAddrOf(const Ptr32<T>& p) { return p.addr(); }
@@ -111,7 +122,8 @@ template <class T> inline std::uint32_t GameAddrOf(const Ptr32<T>& p) { return p
 using port::Ptr32;
 
 static_assert(sizeof(Ptr32<void>) == 4 && alignof(Ptr32<void>) == 4, "a game pointer is 4 bytes");
-static_assert(std::is_trivially_copyable<Ptr32<int>>::value, "game pointers are copied as bytes");
-static_assert(std::is_trivially_default_constructible<Ptr32<int>>::value, "and live in unions");
+static_assert(std::is_trivial<Ptr32<int>>::value && std::is_standard_layout<Ptr32<int>>::value,
+              "a game pointer is plain old data");
+static_assert(std::is_aggregate<Ptr32<int>>::value, "with no constructors");
 
 #endif

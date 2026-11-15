@@ -32,6 +32,8 @@ DECOMP = ROOT / "sly1-decomp"
 PORT_INCLUDE = ROOT / "port" / "include"
 sys.path.insert(0, str(DECOMP / "tools"))
 from modern_check import standard_returns  # noqa: E402  (sly1-decomp's, unchanged)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import patches  # noqa: E402
 
 HELPERS = {"include/vu0.h", "include/fpu.h", "include/system.h", "include/mul_wide.h"}
 
@@ -295,7 +297,7 @@ ASM_FUNC_H = """// SPDX-License-Identifier: AGPL-3.0-or-later
 
 
 def text_stage(out):
-    stats = {"files": 0, "minmax": 0, "named_returns": 0, "broken_strings": 0}
+    stats = {"files": 0, "minmax": 0, "named_returns": 0, "broken_strings": 0, "patches": 0}
     for d in ("include", "src/main"):
         for path in sorted((DECOMP / d).rglob("*")):
             if path.is_dir() or path.suffix not in (".h", ".cpp", ".inc"):
@@ -305,6 +307,8 @@ def text_stage(out):
             if rel == "include/asm_func.h":
                 text = ASM_FUNC_H
             else:
+                text, n = patches.apply(rel, text)
+                stats["patches"] += n
                 fixed = fix_broken_strings(text)
                 stats["broken_strings"] += fixed != text
                 text, found = standard_returns(fixed)
@@ -370,8 +374,10 @@ def main():
     out = args.out.resolve()
     stats = text_stage(out)
     print("gen: text stage: %(files)d files, %(minmax)d min/max operators, "
-          "%(named_returns)d named return values, %(broken_strings)d files with broken strings"
-          % stats)
+          "%(named_returns)d named return values, %(broken_strings)d files with broken strings, "
+          "%(patches)d named patches" % stats)
+    if stats["patches"] != len(patches.PATCHES):
+        raise SystemExit("gen: %d named patches applied of %d" % (stats["patches"], len(patches.PATCHES)))
     if args.no_pointers:
         return 0
     units = sorted(str(p.relative_to(DECOMP)) for p in (DECOMP / "src/main").glob("*.cpp")) \
@@ -383,9 +389,32 @@ def main():
     for k, v in sorted(report["counts"].items()):
         print("  %6d %s" % (v, k))
     if report["unsupported"]:
-        print("gen: %d places not rewritten:" % len(report["unsupported"]))
-        for u in report["unsupported"][:40]:
-            print("  " + u)
+        # Counted by file and reason (the PROP entries of property_registry.cpp alone are
+        # thousands, all handled by its named patch).
+        groups = {}
+        for u in report["unsupported"]:
+            f, _, rest = u.partition(":")
+            line, _, why = rest.partition(": ")
+            key = (str(Path(f).relative_to(out)) if f.startswith(str(out)) else f, why)
+            groups.setdefault(key, []).append(line)
+        print("gen: %d places not rewritten by rule:" % len(report["unsupported"]))
+        for (f, why), lines in sorted(groups.items()):
+            shown = sorted(set(lines), key=lambda x: int(x) if x.isdigit() else 0)
+            print("  %s: %s (%d, lines %s%s)" % (f, why, len(lines), ", ".join(shown[:6]),
+                                                 "..." if len(shown) > 6 else ""))
+    import gen_layout
+    analysis = [a for a in clang_args(out) if a != "-fms-extensions"]
+    gen_layout.pad_tails(units, out, analysis, report)
+    print("gen: tail padding: %d base classes given an explicit tail, in %d rounds"
+          % (report["tails"], report.get("tail_rounds", 0)))
+    for u in report.get("tail_unsupported", []):
+        print("  not padded: " + u)
+    differ = gen_layout.assert_offsets(units, out, analysis, report)
+    print("gen: %d retail offsets asserted; %d views of a larger object set aside; "
+          "%d records differ from retail here" % (report["offset_asserts"], len(report["views"]), len(differ)))
+    for f, q, rows in differ:
+        print("  %s %s: %s" % (Path(f).relative_to(out), q,
+                               ", ".join("%s retail 0x%X here 0x%X" % r for r in rows[:3])))
     return 0
 
 

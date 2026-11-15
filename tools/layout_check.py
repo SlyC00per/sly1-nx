@@ -70,7 +70,19 @@ def check(units, out):
         if (f, line) not in first or col < first[(f, line)][0]:
             first[(f, line)] = (col, v)
     checked = [v for _, v in first.values() if v]
-    bad = [v for v in checked if v[0] != v[1]]
+    # A view of part of a larger object writes the outer object's offsets in its comments: every
+    # field is off by one constant, the view's own start (its first field at 0 here). Not a
+    # layout difference.
+    by_record = {}
+    for v in checked:
+        by_record.setdefault((v[4], v[2]), []).append(v)
+    views = set()
+    for key, rows in by_record.items():
+        shifts = {want - got for want, got, *_ in rows}
+        if len(shifts) == 1 and shifts != {0} and min(got for _, got, *_ in rows) == 0:
+            views.add(key)
+    bad = [v for v in checked if v[0] != v[1] and (v[4], v[2]) not in views]
+    check.views = sorted(views)
     return checked, bad
 
 
@@ -83,7 +95,8 @@ def main():
     out = args.out.resolve()
     units = sorted("src/main/" + p.name for p in (out / "src/main").glob("*.cpp")) if args.all else args.units
     checked, bad = check(units, out)
-    print("layout: %d fields with a retail offset checked, %d differ" % (len(checked), len(bad)))
+    print("layout: %d fields with a retail offset checked, %d differ (%d views of a larger "
+          "object, whose comments give the outer offsets, set aside)" % (len(checked), len(bad), len(check.views)))
     for want, got, rec, field, f, line in bad[:60]:
         print("  %s:%d %s::%s retail 0x%X, here 0x%X" % (f, line, rec, field, want, got))
     return 1 if bad else 0
