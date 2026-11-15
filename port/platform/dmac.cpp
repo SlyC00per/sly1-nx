@@ -16,11 +16,13 @@
 #include <cstdlib>
 #include <map>
 #include <string>
+#include <vector>
 #include <cstdio>
 #include <cstring>
 
 #include "port/ptr32.h"
 #include "port/system.h"
+#include "port/vu0_micro.h"
 
 namespace port {
 
@@ -97,7 +99,8 @@ private:
 // A VIF's stream of 32-bit words: its VIFcodes and their data.
 class Vif {
 public:
-    explicit Vif(int cause) : cause_(cause) {}
+    // VIF0 feeds VU0 (port/vu0_micro.h): its MPG, UNPACK and microprogram starts take effect.
+    Vif(int cause, bool vu0) : cause_(cause), vu0_(vu0) {}
 
     void Word(std::uint32_t w)
     {
@@ -105,6 +108,8 @@ public:
             Code(w);
             return;
         }
+        if (keep_)
+            data_.push_back(w);
         if (direct_) {
             qword_[filled_++] = w;
             if (filled_ == 4) {
@@ -137,6 +142,11 @@ private:
         seen_[(cmd & 0x60) == 0x60 ? 0x60 : cmd]++;
         irq_ = (w >> 31) != 0;
         direct_ = false;
+        cmd_ = cmd;
+        imm_ = imm;
+        num_ = num;
+        data_.clear();
+        keep_ = vu0_ && (cmd == 0x4A || (cmd & 0x60) == 0x60);
         if ((cmd & 0x60) == 0x60) {   // UNPACK: num vectors of vn+1 elements of 32 >> vl bits
             std::uint32_t vn = (cmd >> 2) & 3, vl = cmd & 3, n = num ? num : 256;
             std::uint32_t vectors = n;
@@ -147,8 +157,13 @@ private:
         } else {
             switch (cmd) {
             case 0x00: case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07:
-            case 0x10: case 0x11: case 0x13: case 0x14: case 0x15: case 0x17:
-                left_ = 0;   // NOP, OFFSET .. MARK, the flushes, the microprogram starts
+            case 0x10: case 0x11: case 0x13:
+                left_ = 0;   // NOP, OFFSET .. MARK, the flushes
+                break;
+            case 0x14: case 0x15: case 0x17:   // MSCAL, MSCALF, MSCNT
+                left_ = 0;
+                if (vu0_)
+                    vu0::Run(cmd == 0x17 ? vu0::Vu0().pc * 8 : (imm & 0x1FF) * 8);
                 break;
             case 0x01:   // STCYCL
                 cl_ = imm & 0xFF;
@@ -186,6 +201,13 @@ private:
     void End()
     {
         direct_ = false;
+        if (keep_) {
+            keep_ = false;
+            if (cmd_ == 0x4A)
+                LoadMicrocode();
+            else
+                Unpack();
+        }
         if (irq_) {
             irq_ = false;
             g_counts.vifInterrupts++;
@@ -193,7 +215,70 @@ private:
         }
     }
 
+    // MPG: the instructions to VU0's micro memory at imm (in 64-bit instructions).
+    void LoadMicrocode()
+    {
+        vu0::State& s = vu0::Vu0();
+        for (std::size_t k = 0; k < data_.size(); k++)
+            s.micro[(imm_ * 2 + k) & 1023] = data_[k];
+    }
+
+    // UNPACK to VU0's data memory: num vectors of vn+1 fields of 32 >> vl bits (V4-5: 16-bit
+    // colours) from address imm, cl of every wl quadwords written (STCYCL); fields zero- or
+    // sign-extended (usn), a scalar to all four fields.
+    void Unpack()
+    {
+        std::uint32_t vn = (cmd_ >> 2) & 3, vl = cmd_ & 3, n = num_ ? num_ : 256;
+        if (cmd_ & 0x10) {
+            std::fprintf(stderr, "dmac: a masked UNPACK to VU0 (0x%02X), not done\n", cmd_);
+            return;
+        }
+        if (wl_ > cl_) {
+            std::fprintf(stderr, "dmac: a filling UNPACK to VU0 (cl %u, wl %u), not done\n", cl_, wl_);
+            return;
+        }
+        bool usn = (imm_ >> 14) & 1, v45 = vn == 3 && vl == 3;
+        std::uint32_t bits = v45 ? 16 : 32u >> vl, fields = v45 ? 1 : vn + 1;
+        std::uint64_t pos = 0;   // bit position in the data
+        auto take = [&](std::uint32_t nb) {
+            std::uint32_t v = 0;
+            for (std::uint32_t b = 0; b < nb; b++, pos++) {
+                std::size_t word = pos / 32;
+                if (word < data_.size() && (data_[word] >> (pos % 32)) & 1)
+                    v |= 1u << b;
+            }
+            return v;
+        };
+        vu0::State& s = vu0::Vu0();
+        for (std::uint32_t i = 0; i < n; i++) {
+            std::uint32_t q = ((imm_ & 0x3FF) + (i / wl_) * cl_ + (i % wl_)) & 0xFF;
+            std::uint32_t* out = reinterpret_cast<std::uint32_t*>(s.data + q * 16);
+            std::uint32_t v[4];
+            for (std::uint32_t f = 0; f < fields; f++) {
+                std::uint32_t x = take(bits);
+                if (!usn && bits < 32 && (x >> (bits - 1)) & 1)
+                    x |= ~0u << bits;
+                v[f] = x;
+            }
+            if (v45) {
+                std::uint32_t c = v[0];
+                out[0] = (c & 0x1F) << 3;
+                out[1] = ((c >> 5) & 0x1F) << 3;
+                out[2] = ((c >> 10) & 0x1F) << 3;
+                out[3] = ((c >> 15) & 1) << 7;
+            } else if (fields == 1) {
+                out[0] = out[1] = out[2] = out[3] = v[0];
+            } else {
+                for (std::uint32_t f = 0; f < fields; f++)
+                    out[f] = v[f];
+            }
+        }
+    }
+
     int cause_;
+    bool vu0_ = false, keep_ = false;
+    std::uint32_t cmd_ = 0, imm_ = 0, num_ = 0;
+    std::vector<std::uint32_t> data_;
     std::uint32_t left_ = 0, cl_ = 1, wl_ = 1, filled_ = 0;
     std::uint32_t qword_[4] = {};
     bool irq_ = false, direct_ = false;
@@ -201,7 +286,7 @@ private:
     std::map<std::uint32_t, unsigned> seen_;
 };
 
-Vif g_vif0(kCauseVif0), g_vif1(kCauseVif1);
+Vif g_vif0(kCauseVif0, true), g_vif1(kCauseVif1, false);
 Gif g_gif;
 
 // A quadword of the scratchpad, by SADR's offset (it wraps at 16 KiB).

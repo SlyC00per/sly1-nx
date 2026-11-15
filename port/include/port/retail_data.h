@@ -11,6 +11,8 @@
 #ifndef PORT_RETAIL_DATA_H
 #define PORT_RETAIL_DATA_H
 
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 
@@ -29,6 +31,34 @@ inline void RetailInit(std::uint32_t addr, const void* value, std::size_t size)
 
 // Fills main memory with the executable's loadable segments (port/iso.h); false without one.
 bool LoadRetailImage();
+
+// Preemption points (port/platform/kernel.cpp). tools/gen.py puts Preempt() in every loop test of
+// the game's code: when an interrupt has readied a thread of higher priority, the running thread
+// gives way there, as the PS2 preempts it. Spin() is an empty wait loop's body: the same, and a
+// moment for the host's other threads.
+extern std::atomic<bool> g_preemptPending;
+void PreemptSlow();
+inline void Preempt()
+{
+    if (g_preemptPending.load(std::memory_order_relaxed))
+        PreemptSlow();
+}
+void Spin();
+
+// A local the game views through a larger type (its address cast to a Mat3* and written whole):
+// the local with N bytes of room, its own type and fields as they were (tools/gen_pointers.py,
+// roomy_cast). Retail's frame gave it that room in its neighbours and padding.
+template <class T, std::size_t N> struct alignas(16) Room : T {
+    char port_room[N - sizeof(T)];
+    // Initialised as the local was: from a value of its type, from a braced list of its fields,
+    // or not at all (zeroed here).
+    template <class... A> Room(A... a) : T{a...}, port_room{} {}
+    Room& operator=(const T& v)
+    {
+        static_cast<T&>(*this) = v;
+        return *this;
+    }
+};
 
 }  // namespace port
 

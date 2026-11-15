@@ -40,7 +40,7 @@ if(PLATFORM STREQUAL "HOST_ASAN")
 endif()
 
 # The port's own code: game memory and, later, the platform layer.
-add_library(port_core STATIC port/platform/game_memory.cpp port/platform/varargs.cpp
+add_library(port_core STATIC port/platform/game_memory.cpp port/platform/vu0_micro.cpp port/platform/varargs.cpp
     port/platform/system.cpp
     port/platform/memory.cpp)
 target_include_directories(port_core PUBLIC port/include)
@@ -95,7 +95,8 @@ add_custom_target(sly1_gen DEPENDS ${GEN_UNITS})
 
 # The flags of every unit that sees the game's headers.
 # (SHELL: keeps each -include with its header: CMake removes repeated options otherwise.)
-set(GAME_FLAGS -w -ffp-contract=off "SHELL:-include port/gxx_ext.h" "SHELL:-include port/ptr32.h"
+# -fwrapv: signed arithmetic wraps, as the PS2's does (the game's hashes multiply into overflow).
+set(GAME_FLAGS -w -ffp-contract=off -fwrapv "SHELL:-include port/gxx_ext.h" "SHELL:-include port/ptr32.h"
     "SHELL:-include port/varargs.h" "SHELL:-include port/retail_data.h" -Wno-register)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     list(APPEND GAME_FLAGS -Wno-c++11-narrowing)
@@ -111,8 +112,10 @@ if(PLATFORM STREQUAL "HOST_ASAN")
     # into the next member, inside the same object, in retail's layout): UBSan's declared-bounds
     # check stays on for the port's own code; AddressSanitizer still catches any access outside an
     # object. Its list walks also step a cursor past the last element, null plus the link's offset,
-    # which is never read: the pointer-overflow check is off for game code too.
-    target_compile_options(sly1_game PRIVATE -fno-sanitize=bounds,pointer-overflow)
+    # which is never read: the pointer-overflow check is off for game code too. So is the shift of
+    # a negative value (two's complement, as on the PS2 and in C++20); shifts by too much stay
+    # checked, since MIPS and ARM treat them differently.
+    target_compile_options(sly1_game PRIVATE -fno-sanitize=bounds,pointer-overflow,shift-base)
 endif()
 target_include_directories(sly1_game PRIVATE ${GAME_INCLUDES})
 

@@ -2,6 +2,7 @@
 // The anchor of game addresses (include/port/ptr32.h): the program image's base on each
 // platform, the scratchpad, and the slow paths of the conversions.
 #include "port/ptr32.h"
+#include "port/vu0_micro.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -121,6 +122,36 @@ static unsigned char* Registers(unsigned char*& block, std::uint32_t size)
     return block;
 }
 
+// The vector units' memories as the EE sees them, 0x11000000 to 0x11010000: VU0's micro and data
+// memory are the interpreter's (port/vu0_micro.h); VU1's (micro from 0x11008000, data from
+// 0x1100C000, 16 KiB each) are plain memory until the renderer takes them.
+constexpr std::uint32_t kVuMemory = 0x11000000, kVuMemorySize = 0x10000;
+static unsigned char* g_vu1Memory;   // 0x11008000 to 0x11010000
+
+static void* VuWindow(std::uint32_t off)
+{
+    vu0::State& s = vu0::Vu0();
+    if (off < 0x1000)
+        return reinterpret_cast<unsigned char*>(s.micro) + off;
+    if (off - 0x4000 < 0x1000)
+        return s.data + (off - 0x4000);
+    if (off >= 0x8000)
+        return Registers(g_vu1Memory, 0x8000) + (off - 0x8000);
+    return nullptr;
+}
+
+static bool VuAddr(std::uintptr_t v, std::uint32_t* addr)
+{
+    vu0::State& s = vu0::Vu0();
+    std::uintptr_t micro = reinterpret_cast<std::uintptr_t>(s.micro), data = reinterpret_cast<std::uintptr_t>(s.data);
+    if (v - micro < 0x1000) { *addr = kVuMemory + (std::uint32_t)(v - micro); return true; }
+    if (v - data < 0x1000) { *addr = kVuMemory + 0x4000 + (std::uint32_t)(v - data); return true; }
+    std::uintptr_t vu1 = reinterpret_cast<std::uintptr_t>(g_vu1Memory);
+    if (g_vu1Memory && v - vu1 < 0x8000) { *addr = kVuMemory + 0x8000 + (std::uint32_t)(v - vu1); return true; }
+    return false;
+}
+
+
 void* NativeSlow(std::uint32_t addr)
 {
     if (addr == 0)
@@ -133,6 +164,9 @@ void* NativeSlow(std::uint32_t addr)
         return port_ram + (addr & 0x0FFFFFFFu);   // the uncached alias of main memory
     if (addr - kScratchpadAddr < kScratchpadSize)
         return g_scratchpad + (addr - kScratchpadAddr);
+    if (addr - kVuMemory < kVuMemorySize)
+        if (void* p = VuWindow(addr - kVuMemory))
+            return p;
     return reinterpret_cast<void*>(kWordTag | addr);
 }
 
@@ -152,6 +186,9 @@ std::uint32_t GameAddrSlow(const void* p)
         return kEeRegisters + static_cast<std::uint32_t>(v - reinterpret_cast<std::uintptr_t>(g_eeRegisters));
     if (g_gsRegisters && v - reinterpret_cast<std::uintptr_t>(g_gsRegisters) < kGsRegistersSize)
         return kGsRegisters + static_cast<std::uint32_t>(v - reinterpret_cast<std::uintptr_t>(g_gsRegisters));
+    std::uint32_t vu;
+    if (VuAddr(v, &vu))
+        return vu;
     // A native pointer outside the image cannot be stored in a game structure: memory the game
     // reaches must come from its own arenas (docs/DESIGN.md, section 4).
     std::fprintf(stderr, "port: pointer %p is outside game memory (image base %p, offset 0x%llX)\n", p,

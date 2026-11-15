@@ -150,6 +150,76 @@ PATCHES = [
      "    p = &t;\n    while (arr != p) {",
      "    p = arr + 32;\n    while (arr != p) {",
      "the call's argument array is destroyed from its end, which is &t only in retail's frame"),
+    ("src/main/pose_source.cpp",
+     "        e = rp;\n        while (sc.buf != e) {",
+     "        e = sc.buf + 32;\n        while (sc.buf != e) {",
+     "the setter's argument array is destroyed from its end, which is &ret only in retail's frame"),
+
+    # The one integer-to-pointer cast the generator cannot reach, inside a macro's argument.
+    ("src/main/placed_object.cpp",
+     "F32(((EventObjectPair*)e->a8.i)->f8)",
+     "F32((port::FromGameAddr<EventObjectPair>((u32)e->a8.i))->f8)",
+     "a cast of a stored word to a pointer inside F32's argument: the word is a game address"),
+
+    # A queued call's third argument is a word (QueuedCall's k3, RunQueuedCalls calls fn(arg, k2,
+    # k3)); RunScriptEventHandler, the only queued function that takes a pointer there, is queued
+    # with its parameter list's address in it. It takes the word and makes it the pointer.
+    ("src/main/base_object.cpp",
+     "void RunScriptEventHandler(BaseObject* self, s32 key, R11B008Node* list)\n{\n",
+     "void RunScriptEventHandler(BaseObject* self, s32 key, s32 port_list)\n{\n"
+     "    R11B008Node* list = port::FromGameAddr<R11B008Node>((u32)port_list);\n",
+     "the queued call's third word is the list's game address"),
+    ("include/functions/base_object.h",
+     "void RunScriptEventHandler(BaseObject* self, s32 key, R11B008Node* list);",
+     "void RunScriptEventHandler(BaseObject* self, s32 key, s32 port_list);",
+     "the queued call's third word is the list's game address"),
+    ("src/main/base_object.cpp",
+     "(void*)(void (*)(void*, s32, void*))RunScriptEventHandler",
+     "(void*)(void (*)(void*, s32, s32))RunScriptEventHandler",
+     "the queued call's third word is the list's game address"),
+
+    # The property putter calls each setter with the value's word (fn(p, val->i)); for a vector, a
+    # matrix or an object (types 2, 4, 9, 10, 11 and the 0x1000 and 0x2000 kinds) the word is the
+    # payload's game address and the setter takes the pointer.
+    ("src/main/object_properties.cpp",
+     '        case 2:\n            fn(p, val->i);\n            break;\n        case 4:\n            fn(p, val->i);\n            break;\n        case 9:\n            fn(p, val->i);\n            break;\n        case 10:\n            fn(p, val->i);\n            break;\n        case 11:\n            fn(p, val->i);\n            break;\n        case 13:\n            break;\n        default:\n            if (d->type & 0x1000) {\n                fn(p, val->i);\n            } else if (d->type & 0x2000) {\n                fn(p, val->i);\n            }\n            break;',
+     '        case 2:\n            ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            break;\n        case 4:\n            ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            break;\n        case 9:\n            ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            break;\n        case 10:\n            ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            break;\n        case 11:\n            ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            break;\n        case 13:\n            break;\n        default:\n            if (d->type & 0x1000) {\n                ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            } else if (d->type & 0x2000) {\n                ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            }\n            break;',
+     "a setter of a vector, matrix or object property takes the payload's pointer, not its word"),
+
+    # A camera controller's activation (slot 0 of its method table, called with a pointer: the
+    # table type CameraControllerVt) keeps that pointer in the controller's word at 0x8, which
+    # UpdateValueCameraController reads as its object.
+    ("src/main/camera_controller.cpp",
+     "void ActivateValueCameraController(ValueCameraController* obj, s32 value) { obj->value = value; }",
+     "void ActivateValueCameraController(ValueCameraController* obj, void* value) { obj->ptr = value; }",
+     "the controller is activated with its object's pointer, which a word cannot hold here"),
+    ("include/functions/camera_controller.h",
+     "void ActivateValueCameraController(ValueCameraController* obj, s32 value);",
+     "void ActivateValueCameraController(ValueCameraController* obj, void* value);",
+     "the controller is activated with its object's pointer, which a word cannot hold here"),
+
+    # Slot 23 of a world-listed object (CopyWorldListedObject) takes the object it copies; the
+    # effect spawner calls it with the owner it keeps as a word.
+    ("src/main/effect_spawner.cpp",
+     "                typedef void (*F)(WorldListedObject*, s32);\n                ((F)set->desc->m17)(set, h->ownerArgument);",
+     "                typedef void (*F)(WorldListedObject*, void*);\n"
+     "                ((F)set->desc->m17)(set, port::FromGameAddr<void>((u32)h->ownerArgument));",
+     "the copied object's pointer, from the word that keeps its game address"),
+
+    # Four hand-written functions declared without parameters, only for their addresses in the
+    # method tables; the port defines them in C++ (port/game_asm), so they need their parameters.
+    ("src/main/class_descriptors.cpp", "void SetSwitchedColliderMode();",
+     "void SetSwitchedColliderMode(void* self, s32 mode);",
+     "a hand-written function's parameters, for the port's definition"),
+    ("src/main/class_descriptors.cpp", "void ComputeObjectGathererContactValues();",
+     "s32 ComputeObjectGathererContactValues(void* self, void* contact);",
+     "a hand-written function's parameters, for the port's definition"),
+    ("src/main/class_descriptors.cpp", "void ResolveObjectGathererContact();",
+     "void ResolveObjectGathererContact(void* self, void* contact, s32 side);",
+     "a hand-written function's parameters, for the port's definition"),
+    ("src/main/class_descriptors.cpp", "void ComputePathFollowerContactValue();",
+     "void ComputePathFollowerContactValue(void* self, void* contacts, s32 side);",
+     "a hand-written function's parameters, for the port's definition"),
 
     # AddDmaRefTag takes the block's address as an s32 (the tag's upper word); four callers pass a
     # pointer through a cast of the function, which on 64 bits keeps the pointer's low half. Each

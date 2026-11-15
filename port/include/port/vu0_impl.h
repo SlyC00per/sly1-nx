@@ -22,6 +22,10 @@
 #include <cstdint>
 #include <cstring>
 
+#include <cstring>
+
+#include "port/vu0_micro.h"
+
 namespace port_vu0 {
 
 typedef unsigned int u128 __attribute__((mode(TI)));
@@ -371,20 +375,62 @@ template <class R> inline R Transpose(const R& m)
     return out;
 }
 
-// --- the VU0 microprograms (not decompiled; their two callers get the port's own code)
+// --- the VU0 microprograms: the game's own microcode, run by the port's interpreter
+// (port/vu0_micro.h). These are the register moves around vcallms its two callers make.
 
 [[noreturn]] void Microprogram(const char* what);
 
-template <int N> inline void LoadVf(const void*) { Microprogram("LoadVf"); }
-template <int N> inline void CallMs() { Microprogram("CallMs"); }
-template <int N> inline void MoveToVi(u32) { Microprogram("MoveToVi"); }
-template <int N> inline u32 ReadViWait() { Microprogram("ReadViWait"); }
-inline u32 NextLightGroup(u32, u32) { Microprogram("NextLightGroup"); }
-inline void ParticleStart(u128, u128, u128, u128, u128, u128, u128, u128, u128) { Microprogram("ParticleFilter::Start"); }
-inline void ParticleNext(u128, u128) { Microprogram("ParticleFilter::Next"); }
-inline void ParticleWait() { Microprogram("ParticleFilter::Wait"); }
-inline void ParticleResults(u128&, u128&) { Microprogram("ParticleFilter::Results"); }
-inline void ParticleBounds(u128&, u128&) { Microprogram("ParticleFilter::Bounds"); }
+template <int N> inline void LoadVf(const void* p)
+{
+    if (N != 0)
+        std::memcpy(port::vu0::Vu0().vf[N], p, 16);
+}
+template <int N> inline void CallMs() { port::vu0::Run(N); }
+template <int N> inline void MoveToVi(u32 v)
+{
+    if (N != 0)
+        port::vu0::Vu0().vi[N] = (std::uint16_t)v;
+}
+// The program has ended when the call returns: the wait is only the read.
+template <int N> inline u32 ReadViWait() { return port::vu0::Vu0().vi[N]; }
+// The light test's set-up: the next group's first slot (vi3) and count (vi4), and the mask the
+// previous test left (vi2).
+inline u32 NextLightGroup(u32 firstSlot, u32 count)
+{
+    port::vu0::State& s = port::vu0::Vu0();
+    s.vi[3] = (std::uint16_t)firstSlot;
+    s.vi[4] = (std::uint16_t)count;
+    return s.vi[2];
+}
+inline void ParticleNext(u128 extra, u128 pos)
+{
+    port::vu0::State& s = port::vu0::Vu0();
+    std::memcpy(s.vf[24], &extra, 16);
+    std::memcpy(s.vf[23], &pos, 16);
+    port::vu0::Run(0x10);
+}
+inline void ParticleStart(u128 row0, u128 row1, u128 row2, u128 row3, u128 scale, u128 boundA, u128 boundB,
+                          u128 extra, u128 pos)
+{
+    port::vu0::State& s = port::vu0::Vu0();
+    const u128 in[7] = {row0, row1, row2, row3, scale, boundA, boundB};
+    for (int k = 0; k < 7; k++)
+        std::memcpy(s.vf[31 - k], &in[k], 16);
+    ParticleNext(extra, pos);
+}
+inline void ParticleWait() {}
+inline void ParticleResults(u128& extra, u128& pos)
+{
+    port::vu0::State& s = port::vu0::Vu0();
+    std::memcpy(&extra, s.vf[22], 16);
+    std::memcpy(&pos, s.vf[21], 16);
+}
+inline void ParticleBounds(u128& boundA, u128& boundB)
+{
+    port::vu0::State& s = port::vu0::Vu0();
+    std::memcpy(&boundA, s.vf[26], 16);
+    std::memcpy(&boundB, s.vf[25], 16);
+}
 
 }  // namespace port_vu0
 

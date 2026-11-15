@@ -139,6 +139,7 @@ void InitMpegLibrary() {}
 s32 CreateMpegDecoder(MpegHandle*, u8*, u32) { return 1; }
 s32 DeleteMpegDecoder(MpegHandle*) { return 1; }
 s32 DecodeMpegPicture(MpegHandle*, void*, s32) { return 0; }
-s32 GetMpegDecoderStatus(MpegHandle*) { return 0; }
+// The stream has ended: with no decoder yet, every movie ends at once (PlayMovie's loop stops).
+s32 GetMpegDecoderStatus(MpegHandle*) { return 1; }
 void ResetMpegDecoder(MpegHandle*) {}
 void* SetMpegCallback(MpegHandle*, s32, void*, void*) { return nullptr; }

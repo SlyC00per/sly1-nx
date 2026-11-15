@@ -98,3 +98,39 @@ UNIT_TEST(vu0_plane_signs)
     u32 f = PlaneSigns(r0, r1, r2, V(1, 0, 0, 0), Ones(), FromFloat(0.5f));
     CHECK(f == (0x80u | 0x20u));
 }
+
+// --- the micro-mode interpreter (port/vu0_micro.h): the four-instruction MAC flag latency the
+// game's light tests are scheduled around, and the end bit's one more instruction.
+#include "port/vu0_micro.h"
+
+UNIT_TEST(vu0_micro_flag_latency_and_end)
+{
+    using port::vu0::Vu0;
+    port::vu0::State& s = Vu0();
+    const unsigned kNopUpper = (0x0Bu << 6) | 0x3Fu, kNopLower = 0x8000033Cu, kEnd = 0x40000000u;
+    const unsigned subX = (1u << 24) | (3u << 16) | (2u << 11) | (1u << 6) | 0x2Cu;   // sub.x vf1, vf2, vf3
+    auto fmeq = [](unsigned it, unsigned is) { return (0x18u << 25) | (it << 16) | (is << 11); };
+    const unsigned prog[][2] = {
+        {kNopLower, subX},              // 0: the x result is negative: MAC 0x80 from instruction 4
+        {kNopLower, kNopUpper},
+        {kNopLower, kNopUpper},
+        {fmeq(7, 6), kNopUpper},        // 3: still the old flags
+        {fmeq(5, 6), kNopUpper | kEnd}, // 4: the new ones; the end bit
+        {(0x08u << 25) | (8u << 16) | 9u, kNopUpper},   // 5: iaddiu vi8, vi0, 9 (runs: one more)
+        {(0x08u << 25) | (8u << 16) | 1u, kNopUpper},   // 6: not reached
+    };
+    for (unsigned k = 0; k < 7; k++) {
+        s.micro[k * 2] = prog[k][0];
+        s.micro[k * 2 + 1] = prog[k][1];
+    }
+    s.vf[2][0] = 1.0f;
+    s.vf[3][0] = 2.0f;
+    s.vi[6] = 0x80;
+    s.mac = 0;
+    s.vi[5] = s.vi[7] = s.vi[8] = 0xFFFF;
+    port::vu0::Run(0);
+    CHECK(s.vf[1][0] == -1.0f);
+    CHECK(s.vi[7] == 0);
+    CHECK(s.vi[5] == 1);
+    CHECK(s.vi[8] == 9);
+}

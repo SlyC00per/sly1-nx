@@ -13,10 +13,12 @@
 //
 // A game thread runs on a stack of the port's in game memory (port/ptr32.h: the game links
 // stack frames into its lists), not on the stack the game gives it, which is sized for the PS2.
+#include <atomic>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <thread>
 
 #include <pthread.h>
 
@@ -27,6 +29,8 @@
 #include "port/system.h"
 
 namespace port {
+
+std::atomic<bool> g_preemptPending{false};
 
 namespace {
 
@@ -97,9 +101,21 @@ void MakeReady(std::unique_lock<std::mutex>& lk, int id, bool fromGameThread)
     if (g_current == kIdle) {
         g_current = id;
         g_threads[id].cv.notify_one();
-    } else if (fromGameThread && g_threads[id].priority < g_threads[g_current].priority) {
-        Switch(lk);
+    } else if (g_threads[id].priority < g_threads[g_current].priority) {
+        if (fromGameThread)
+            Switch(lk);
+        else
+            g_preemptPending.store(true, std::memory_order_relaxed);   // at the next preemption point
     }
+}
+
+// Whether a ready thread outranks the running one: what the preemption points look at.
+void UpdatePreemptPending()
+{
+    int best = Pick();
+    bool pending = g_current != kIdle && best != kIdle && best != g_current &&
+                   g_threads[best].priority < g_threads[g_current].priority;
+    g_preemptPending.store(pending, std::memory_order_relaxed);
 }
 
 void* HostEntry(void* p)
@@ -157,6 +173,29 @@ void KernelDump()
 }
 
 // Calls the handlers of an interrupt cause, from the port's clock or a device.
+// A preemption point (port/retail_data.h): on the PS2 an interrupt that readies a thread of higher
+// priority preempts the running one where it is; here the running thread gives way at its next
+// loop test or kernel call. The interrupt handlers (on the clock's host thread) never do.
+void PreemptSlow()
+{
+    std::unique_lock<std::mutex> lk(g_kernel);
+    int self = t_self;
+    if (self != kIdle && g_current == self) {
+        int best = Pick();
+        if (best != self && best != kIdle && g_threads[best].priority < g_threads[self].priority)
+            Switch(lk);
+    }
+    UpdatePreemptPending();
+}
+
+// A game thread's own wait loop (an empty-bodied while, do or for(;;)): a preemption point, then
+// a moment for the host's other threads.
+void Spin()
+{
+    Preempt();
+    std::this_thread::yield();
+}
+
 // One handler at a time, as on the PS2: the clock's and the devices' (a DMA transfer raises its
 // interrupts on the game thread that started it) never overlap; a handler that starts a transfer
 // may raise another inside it.

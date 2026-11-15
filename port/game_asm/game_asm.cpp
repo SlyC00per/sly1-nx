@@ -718,6 +718,74 @@ void InterpolateBlendEntryPosition(void* p, void* e, f32 a, f32 b, s32 i, s32 j,
     PutQ(out, 0, St(AddL(Ld(Q(Ptr(p, 0x6D4))), turned)));
 }
 
+// --- contact values (the object gatherer's and the path follower's, the switched collider's mode)
+
+// Sets the mode word (0x600); entering mode 1 or 3 clears the quadword at 0x5E0 (vsub of vf0).
+void SetSwitchedColliderMode(void* self, s32 mode)
+{
+    if ((s32)W(self, 0x600) == mode)
+        return;
+    PutW(self, 0x600, (u32)mode);
+    if (mode == 1 || mode == 3)
+        PutQ(self, 0x5E0, St(Lanes(0, 0, 0, 0)));
+}
+
+// When the contact's normal (0x80) points up (its dot with +z, as the accumulator forms it, over
+// 0.7): the contact's two values (0x94, 0x98) become 3.0 (mode word 0x550 is 1) or 5.0, and 0.1.
+s32 ComputeObjectGathererContactValues(void* self, void* contact)
+{
+    f32 up = Dot3(Ld(Q(GLOBAL(0x00248D20))), Ld(Q(contact, 0x80)));
+    if (FromBits(0x3F333333) < up) {
+        PutF(contact, 0x94, W(self, 0x550) == 1 ? 3.0f : 5.0f);
+        PutF(contact, 0x98, FromBits(0x3DCCCCCD));
+    }
+    return 1;
+}
+
+// Unless the contact's normal component (0x88), signed for the side (g_contactSideSigns), is under
+// 0.7 or the speed (0x61C) is not over 1e-4: the velocity (0x110) scaled by minus the speed, less
+// its part along the axis (0x130), is added to the side's record (0x30, 64 bytes a side).
+void ResolveObjectGathererContact(void* self, void* contact, s32 side)
+{
+    f32 n = Mul(F(contact, 0x88), F(GLOBAL(0x00274AD0), (u32)side * 4));
+    u8* rec = B(contact) + side * 64;
+    if (n < FromBits(0x3F333333))
+        return;
+    f32 speed = F(self, 0x61C);
+    if (!(kEpsilon < speed))
+        return;
+    L axis = Ld(Q(self, 0x130));
+    L v = Scale(Ld(Q(self, 0x110)), -speed);
+    L along = Scale(axis, Dot3(v, axis));
+    PutQ(rec, 0x30, St(AddL(SubL(v, along), Ld(Q(rec, 0x30)))));
+}
+
+// The path follower's contact values (0x94, 0x98): 0.15 and 0.5 when the other side's object
+// lacks flag bit 56 (0x538); else, when the side's signed normal component is over 0.7 and the
+// speed (the length of 0x150) over the threshold at 0x275618, 1.0 and 0.15; else 0 and 0.
+void ComputePathFollowerContactValue(void* self, void* contacts, s32 side)
+{
+    u8* other = (u8*)port::Native(W(contacts, (u32)(1 - side) * 64));
+    u64 flags;
+    std::memcpy(&flags, other + 0x538, 8);
+    if (!(flags & (1ull << 56))) {
+        PutF(contacts, 0x94, FromBits(0x3E19999A));
+        PutF(contacts, 0x98, 0.5f);
+        return;
+    }
+    f32 n = Mul(F(contacts, 0x88), F(GLOBAL(0x00274AD0), (u32)side * 4));
+    if (FromBits(0x3F333333) < n) {
+        f32 speed = port_vu0::Add(0.0f, Root(Len2(Ld(Q(self, 0x150)))));
+        if (F(GLOBAL(0x00275618), 0) < speed) {
+            PutF(contacts, 0x94, 1.0f);
+            PutF(contacts, 0x98, FromBits(0x3E19999A));
+            return;
+        }
+    }
+    PutF(contacts, 0x94, 0.0f);
+    PutF(contacts, 0x98, 0.0f);
+}
+
 // --- the clock
 
 s64 ReadCycleCounter(void) { return (s64)port::CycleCount(); }
@@ -759,5 +827,17 @@ extern "C" const port::NamedFunction port_game_asm_functions[] = {
     PORT_FUNCTION(ComputeWorld5ModeColliderAnchors),
     PORT_FUNCTION(InterpolateBlendEntryPosition),
     PORT_FUNCTION(ReadCycleCounter),
+    PORT_FUNCTION(ScaleQuadword),
+    PORT_FUNCTION(IsVelocityNegligible),
+    PORT_FUNCTION(IsSpinNegligible),
+    PORT_FUNCTION(IsAccelerationNegligible),
+    PORT_FUNCTION(IsSpinAccelerationNegligible),
+    PORT_FUNCTION(TransformVector4),
+    PORT_FUNCTION(AddColliderForce),
+    PORT_FUNCTION(AddColliderTorque),
+    PORT_FUNCTION(SetSwitchedColliderMode),
+    PORT_FUNCTION(ComputeObjectGathererContactValues),
+    PORT_FUNCTION(ResolveObjectGathererContact),
+    PORT_FUNCTION(ComputePathFollowerContactValue),
     {nullptr, nullptr},
 };

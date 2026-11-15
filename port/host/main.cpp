@@ -35,6 +35,21 @@ alignas(16384) unsigned char g_clockStack[1 << 20];
 std::atomic<bool> g_started;
 int g_seconds = 10;
 
+// The run's report: the kernel's threads, the DMA counts, the frame semaphores, the card.
+void Report()
+{
+    port::KernelDump();
+    port::DmacDump();
+    {   // the display's and the render frames' semaphores and flags, for the report
+        auto w = [](std::uint32_t a) { return *(const std::int32_t*)port::Native(a); };
+        std::fprintf(stderr, "sly1: semaphores: vblank %d, GS finish %d, frame ready %d, frame done %d; "
+                     "render thread waiting %d, GS finish awaited %d\n", w(0x002BE460), w(0x002BE464),
+                     w(0x002623B0), w(0x002623B4), w(0x002623B8), w(0x002BE468));
+        std::fprintf(stderr, "sly1: memory card: state %d, target %d, display mode %d, free %d KB\n",
+                     w(0x00264A40 + 0x0C), w(0x00264A40 + 0x14), w(0x00264A40 + 0x18), w(0x00264A40 + 0x28));
+    }
+}
+
 // The vertical blank, 60 times a second (NTSC), for the game's handler (cause 2); then the end.
 void* Clock(void*)
 {
@@ -48,16 +63,63 @@ void* Clock(void*)
             port::RaiseInterrupt(2);
     }
     std::fprintf(stderr, "sly1: stopping after %d s\n", g_seconds);
-    port::KernelDump();
-    port::DmacDump();
-    {   // the display's and the render frames' semaphores and flags, for the report
-        auto w = [](std::uint32_t a) { return *(const std::int32_t*)port::Native(a); };
-        std::fprintf(stderr, "sly1: semaphores: vblank %d, GS finish %d, frame ready %d, frame done %d; "
-                     "render thread waiting %d, GS finish awaited %d\n", w(0x002BE460), w(0x002BE464),
-                     w(0x002623B0), w(0x002623B4), w(0x002623B8), w(0x002BE468));
-        std::fprintf(stderr, "sly1: memory card: state %d, target %d, display mode %d, free %d KB\n",
-                     w(0x00264A40 + 0x0C), w(0x00264A40 + 0x14), w(0x00264A40 + 0x18), w(0x00264A40 + 0x28));
+    Report();
+    std::fflush(stderr);
+    std::_Exit(0);
+}
+
+// --verify-levels: every level of the level table (0x247AF0, 46 records of 0x2C bytes: the
+// disc record the load reads, the level code at +0x20, the name at +0x24), queued in turn as the
+// warp menu queues a load (the world load request at 0x275AF0); each must load and then run 60
+// frames (the display's frame counter at 0x2626C0). The game thread does the load; this host
+// thread only watches and writes the request between loads.
+int g_verifyFrom = -1;
+
+void VerifyLevels()
+{
+    auto word = [](std::uint32_t a) -> volatile std::int32_t& { return *(volatile std::int32_t*)port::Native(a); };
+    constexpr std::uint32_t kLevels = 0x00247AF0, kRequest = 0x00275AF0, kFrames = 0x002626C0;
+    auto waitFor = [](auto done, int seconds) {
+        auto stop = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+        while (!done()) {
+            if (std::chrono::steady_clock::now() > stop)
+                return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return true;
+    };
+    std::this_thread::sleep_for(std::chrono::seconds(3));   // past start-up and the card check
+    auto fail = [](const char* what, int i) {
+        std::fprintf(stderr, "verify: FAILED at level %d: %s\n", i, what);
+        Report();
+        std::fflush(stderr);
+        std::_Exit(1);
+    };
+    for (int i = g_verifyFrom; i < 46; i++) {
+        std::uint32_t entry = kLevels + i * 0x2C;
+        std::int32_t code = word(entry + 0x20);
+        std::uint32_t name = (std::uint32_t)word(entry + 0x24);
+        std::fprintf(stderr, "verify: level %2d/46, code 0x%03X, %s\n", i + 1, code,
+                     name ? (const char*)port::Native(name) : "(no name)");
+        auto t0 = std::chrono::steady_clock::now();
+        if (!waitFor([&] { return word(kRequest) == 0; }, 120))
+            fail("the previous load never ended", i + 1);
+        word(kRequest + 0x04) = (std::int32_t)entry;   // the key: the level's record
+        word(kRequest + 0x08) = -1;
+        word(kRequest + 0x0C) = -1;
+        word(kRequest + 0x10) = 0;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        word(kRequest) = 1;
+        if (!waitFor([&] { return word(kRequest) == 0; }, 120))
+            fail("the load did not end within 120 s", i + 1);
+        std::int32_t frames = word(kFrames);
+        if (!waitFor([&] { return word(kFrames) - frames >= 60; }, 60))
+            fail("60 frames did not run within 60 s of the load", i + 1);
+        double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        std::fprintf(stderr, "verify: level %2d loaded and ran 60 frames (%.1f s)\n", i + 1, s);
     }
+    std::fprintf(stderr, "verify: all %d levels loaded and ran 60 frames\n", 46 - g_verifyFrom);
+    Report();
     std::fflush(stderr);
     std::_Exit(0);
 }
@@ -77,6 +139,12 @@ void* GameMain(void*)
 
 extern "C" void port_data_init_all();   // written by tools/gen.py (port/retail_data.h)
 
+// The sanitizers' defaults in the host's checking build: a report ends the run with an exit, not
+// an abort, which on macOS leaves the process stuck while the crash reporter reads ASan's huge
+// address space; UBSan reports carry their stack.
+extern "C" const char* __asan_default_options() { return "abort_on_error=0"; }
+extern "C" const char* __ubsan_default_options() { return "print_stacktrace=1:abort_on_error=0"; }
+
 int main(int argc, char** argv)
 {
     std::string iso;
@@ -88,8 +156,12 @@ int main(int argc, char** argv)
             seconds = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--save") && i + 1 < argc)
             port::SetSaveFolder(argv[++i]);
+        else if (!std::strcmp(argv[i], "--verify-levels"))
+            g_verifyFrom = 0;
+        else if (!std::strcmp(argv[i], "--from-level") && i + 1 < argc)
+            g_verifyFrom = std::atoi(argv[++i]) - 1;
         else {
-            std::fprintf(stderr, "usage: %s --iso DISC.iso [--seconds N] [--save FOLDER]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s --iso DISC.iso [--seconds N] [--save FOLDER] [--verify-levels [--from-level N]]\n", argv[0]);
             return 2;
         }
     }
@@ -102,6 +174,12 @@ int main(int argc, char** argv)
         return 1;
     }
     port_data_init_all();
+    if (g_verifyFrom >= 0) {
+        if (g_verifyFrom >= 46)
+            g_verifyFrom = 45;
+        seconds = 24 * 3600;   // the verifier ends the run
+        std::thread(VerifyLevels).detach();
+    }
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);

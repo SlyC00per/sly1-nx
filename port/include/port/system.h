@@ -20,6 +20,8 @@ void SetGameFloatMode();
 // thread, running; and an interrupt cause's handler is called (the clock: 2, vertical blank).
 void KernelStartMainThread();
 void RaiseInterrupt(int cause);
+// A game thread's own wait loop gives way to a thread of higher priority made ready meanwhile.
+void Spin();
 // The kernel's threads and handlers, printed, for a diagnosis.
 void KernelDump();
 

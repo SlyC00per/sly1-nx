@@ -58,7 +58,8 @@ Fill these in as the build takes shape; keep them current. They must work on mac
 
 - Host (ASan/UBSan), the main test loop:
   `cmake -B build-host -DPLATFORM=HOST_ASAN -G Ninja && cmake --build build-host && build-host/sly1_headless --iso <path> --verify-levels`
-- Headless run for N seconds (until `--verify-levels` exists): `build-host/sly1_headless --iso <path> --seconds N`;
+- Every level in turn (load, then 60 frames): `build-host/sly1_headless --iso <path> --verify-levels [--from-level N]`.
+- Headless run for N seconds: `build-host/sly1_headless --iso <path> --seconds N`;
   it ends with the kernel's threads, the DMA counts and the frame semaphores. `SLY1_DMAC_TRACE=1`
   prints every DMA chain; `UBSAN_OPTIONS=print_stacktrace=1` gives UBSan reports a stack.
   Saves go to `--save FOLDER` (default `save/`, gitignored); `SLY1_CARD_TRACE=1` prints every

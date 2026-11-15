@@ -320,6 +320,15 @@ class Walker:
         self.functions = []        # (file, func_XXXXXXXX) per game function the file defines
         self.result_kinds = []     # (func_XXXXXXXX, kind of result, definition?, file, line)
         self.declarations = []     # (func_XXXXXXXX, kind, file, where, adapter details or None)
+        self.fn_adapters = {}      # (file, function, cast type) -> its adapter's name
+        self.address_params = set()          # (function, parameter count, index) used only as addresses
+        self.address_param_cursors = set()   # those parameters' (file, offset) in their definitions
+        self.param_sites = []                # (key, file, start, end) of every declared parameter's type
+        self.call_args = []                  # (key, file, start, end) of direct calls' integer arguments
+        self.rooms = {}            # locals viewed as larger types: (file, offset) -> (cursor, [needs])
+        self.room_plans = {}       # the same as plain data, for the merge (resolve_rooms)
+        self.record_sizes = {}     # every record defined in the files walked: name -> size
+        self.top_cursors = []      # the unit's top-level declarations (function_cast)
         self.global_decls = []     # their declarations: (name, file, start, end, type, shared, line)
 
     def char_at(self, loc):
@@ -440,6 +449,10 @@ class Walker:
                     target_kind in INTEGERS and operand_kind in {TK.POINTER} | ARRAYS | FUNCS:
                 self.edits.unsupported.append("%s:%d: a pointer/integer cast inside a macro" % (f, c.location.line))
             return
+        self.function_cast(c, operand, f)
+        self.roomy_cast(c, operand)
+        if target_kind == TK.POINTER and operand_kind in INTEGERS and self.is_address_parameter(operand):
+            return   # `(T*)a2`, a2 now a void* (address_parameters): a pointer cast as written
         if target_kind == TK.POINTER and operand_kind in INTEGERS:
             otoks = [t.spelling for t in _tokens(operand)]
             if otoks in (["0"], ["0", ")"]) or otoks == ["NULL"]:
@@ -463,6 +476,95 @@ class Walker:
                                pr(c.type, "", False), "cast types")
             except Unsupported as e:
                 self.edits.unsupported.append("%s:%d: %s" % (f, c.location.line, e))
+
+    def function_cast(self, c, operand, f):
+        """A function cast to a function pointer type whose result or a parameter disagrees with
+        the function's own, pointer against integer (`(PropertyTarget)EnsureTimerRecord`): a call
+        through it would pass a 64-bit pointer where the function reads a 32-bit word, or the other
+        way round. The cast takes an adapter of the file's own instead, which converts between
+        game address and pointer and calls the function (written before the declaration that
+        holds the cast)."""
+        pt = c.type.get_canonical()
+        if pt.kind != TK.POINTER or pt.get_pointee().kind != TK.FUNCTIONPROTO:
+            return
+        e = operand
+        while e is not None and e.kind in (CK.UNEXPOSED_EXPR, CK.PAREN_EXPR, CK.UNARY_OPERATOR):
+            kids = list(e.get_children())
+            e = kids[0] if len(kids) == 1 else None
+        if e is None or e.kind != CK.DECL_REF_EXPR or e.referenced is None or \
+                e.referenced.kind != CK.FUNCTION_DECL:
+            return
+        fn = e.referenced
+        want = pt.get_pointee()
+        have = fn.type.get_canonical()
+        if have.kind != TK.FUNCTIONPROTO:
+            return
+
+        def kind(ty):
+            k = ty.get_canonical().kind
+            return ("pointer" if k == TK.POINTER else "integer" if k in INTEGERS else
+                    "float" if k in (TK.FLOAT, TK.DOUBLE) else "void" if k == TK.VOID else "other")
+        cast_args = list(want.argument_types())
+        fn_args = list(have.argument_types())
+        pairs = [(want.get_result(), have.get_result())] + list(zip(cast_args, fn_args))
+        clash = any({kind(a), kind(b)} == {"pointer", "integer"} for a, b in pairs)
+        if not clash:
+            return
+        where = "%s:%d" % (f, c.location.line)
+        # Any other disagreement (a float where the function has a pointer: MIPS passes them in
+        # different registers) is a register pun the adapter cannot follow by position.
+        if any(kind(a) != kind(b) and {kind(a), kind(b)} != {"pointer", "integer"}
+               and not (a is pairs[0][0] and kind(a) == "void") for a, b in pairs):
+            self.edits.unsupported.append("%s: a cast of %s that also mixes floats or other kinds, not "
+                                          "adapted" % (where, fn.spelling))
+            return
+        if want.is_function_variadic() or have.is_function_variadic() or len(cast_args) < len(fn_args):
+            self.edits.unsupported.append("%s: a cast of %s to a function type that disagrees with it, "
+                                          "not adapted (variadic or fewer arguments)" % (where, fn.spelling))
+            return
+        top = next((t for t in self.top_cursors if t.location.file and t.location.file.name == f
+                    and t.extent.start.offset <= c.extent.start.offset < t.extent.end.offset), None)
+        if top is None:
+            self.edits.unsupported.append("%s: a cast of %s that disagrees with it, outside any declaration"
+                                          % (where, fn.spelling))
+            return
+        try:
+            c_args = [pr(a, "", False) for a in cast_args]
+            f_args = [pr(a, "", False) for a in fn_args]
+            c_res = pr(want.get_result(), "", False)
+        except Unsupported as ex:
+            self.edits.unsupported.append("%s: %s" % (where, ex))
+            return
+        key = (f, fn.spelling, want.spelling)
+        name = self.fn_adapters.get(key)
+        if name is None:
+            name = "port_fncast_%s_%d" % (fn.spelling, len(self.fn_adapters))
+            self.fn_adapters[key] = name
+            args = []
+            for i in range(len(fn_args)):
+                ck, fk = kind(cast_args[i]), kind(fn_args[i])
+                if ck == "pointer" and fk == "integer":
+                    args.append("(%s)port::GameAddrOf(a%d)" % (f_args[i], i))
+                elif ck == "integer" and fk == "pointer":
+                    args.append("(%s)port::FromGameAddr<void>((u32)a%d)" % (f_args[i], i))
+                else:
+                    args.append("(%s)a%d" % (f_args[i], i))
+            call = "%s(%s)" % (fn.spelling, ", ".join(args))
+            rk_c, rk_f = kind(want.get_result()), kind(have.get_result())
+            if want.get_result().get_canonical().kind == TK.VOID:
+                body = "%s;" % call
+            elif rk_c == "pointer" and rk_f == "integer":
+                body = "return (%s)port::Native((u32)%s);" % (c_res, call)
+            elif rk_c == "integer" and rk_f == "pointer":
+                body = "return (%s)port::GameAddr((const void*)%s);" % (c_res, call)
+            else:
+                body = "return (%s)%s;" % (c_res, call)
+            params = ", ".join(pr_named(ty, "a%d" % i) for i, ty in enumerate(c_args)) or "void"
+            text = ("// port: %s called through a function type that disagrees with it (tools/gen_pointers.py)\n"
+                    "static %s %s(%s)\n{\n    %s\n}\n\n" % (fn.spelling, c_res, name, params, body))
+            s = top.extent.start.offset
+            self.edits.wrap(f, s, s, text, "", 0, "function casts adapted")
+        self.edits.rep(f, e.extent.start.offset, e.extent.end.offset, name, "function casts adapted")
 
     # --- initialising stored pointers (Ptr32 has no constructors: port::P32 makes a game word)
 
@@ -588,6 +690,221 @@ class Walker:
             type_text = None
         self.global_decls.append((name, f, start, j, type_text, shared, c.location.line))
 
+    def roomy_cast(self, c, operand):
+        """`(Mat3*)&a` with `a` a smaller local (or `(ScaledTransform*)tmp`, an array): the game
+        hands the local's address on as the larger type and has it written whole, which retail's
+        frame (its neighbours, its padding) took. The local is noted with the size it needs, or
+        the record's name when this file only declares it; the merge (resolve_rooms) gives it the
+        room of the largest view, knowing every record's size."""
+        pt = c.type.get_canonical()
+        if pt.kind != TK.POINTER:
+            return
+        pointee = pt.get_pointee()
+        size = pointee.get_size()
+        need = size if size > 0 else (pointee.get_declaration().spelling
+                                      if pointee.kind == TK.RECORD and pointee.get_declaration().spelling else None)
+        if need is None:
+            return
+        e = operand
+        while e is not None and e.kind in (CK.UNEXPOSED_EXPR, CK.PAREN_EXPR):
+            kids = list(e.get_children())
+            e = kids[0] if len(kids) == 1 else None
+        if e is None:
+            return
+        if e.kind == CK.DECL_REF_EXPR:
+            ref = e   # an array, decaying to its first element's address
+        elif e.kind == CK.UNARY_OPERATOR:
+            toks = _tokens(e)
+            if not toks or toks[0].spelling != "&":
+                return
+            kids = list(e.get_children())
+            ref = kids[0] if len(kids) == 1 else None
+        else:
+            return
+        while ref is not None and ref.kind in (CK.UNEXPOSED_EXPR, CK.PAREN_EXPR):
+            k2 = list(ref.get_children())
+            ref = k2[0] if len(k2) == 1 else None
+        if ref is None or ref.kind != CK.DECL_REF_EXPR or ref.referenced is None:
+            return
+        var = ref.referenced
+        if var.kind != CK.VAR_DECL or var.storage_class in (ci.StorageClass.STATIC, ci.StorageClass.EXTERN):
+            return
+        parent = var.semantic_parent
+        if parent is None or parent.kind not in (CK.FUNCTION_DECL, CK.CXX_METHOD, CK.CONSTRUCTOR,
+                                                 CK.DESTRUCTOR, CK.FUNCTION_TEMPLATE):
+            return
+        vt = var.type.get_canonical()
+        if vt.kind not in (TK.RECORD, TK.CONSTANTARRAY) or vt.get_size() <= 0:
+            return
+        if isinstance(need, int) and need <= vt.get_size():
+            # A record or array local whose address goes out through any cast may be read or
+            # stored as quadwords (`(f32*)&v` written as a Vec4, `(u32*)hdr` copied as one): it
+            # gets its 16-byte slot, as in retail.
+            if vt.get_size() % 16 == 0:
+                return
+            need = (vt.get_size() + 15) // 16 * 16
+        if e.kind == CK.DECL_REF_EXPR and vt.kind != TK.CONSTANTARRAY:
+            return
+        key = (var.location.file.name, var.location.offset)
+        if key not in self.rooms:
+            self.rooms[key] = (var, [])
+        self.rooms[key][1].append(need)
+
+    def flush_rooms(self):
+        """The noted locals as plain data for the merge: how to give each more room."""
+        for (f, off), (var, needs) in self.rooms.items():
+            toks = _tokens(var)
+            vt = var.type.get_canonical()
+            line = var.location.line
+            plan = {"file": f, "line": line, "size": vt.get_size(), "needs": needs}
+            if vt.kind == TK.RECORD and vt.get_declaration().kind == CK.UNION_DECL:
+                plan["error"] = "a union local viewed as a larger type; not given room"
+            elif vt.kind == TK.CONSTANTARRAY:
+                spell = [tk.spelling for tk in toks]
+                i = spell.index("[") if "[" in spell else -1
+                try:
+                    ok = i >= 0 and i + 2 < len(toks) and spell[i + 2] == "]" and \
+                        int(spell[i + 1].rstrip("uUlL"), 0) >= 0
+                except ValueError:
+                    ok = False
+                if not ok:
+                    plan["error"] = "an array local viewed as a larger type, its bound not a number; not given room"
+                else:
+                    plan.update(kind="array", elem=vt.get_array_element_type().get_size(),
+                                at=(toks[i + 1].extent.start.offset, toks[i + 1].extent.end.offset))
+            elif len(toks) < 2 or toks[1].extent.start.offset != var.location.offset or \
+                    (f, toks[0].extent.start.offset) in self.macro_starts:
+                plan["error"] = "a local viewed as a larger type, its type not one word; not given room"
+            else:
+                plan.update(kind="record", type=toks[0].spelling,
+                            at=(toks[0].extent.start.offset, toks[0].extent.end.offset))
+            self.room_plans[(f, off)] = plan
+        self.rooms = {}
+
+    def preemption_point(self, c, kids, body):
+        """Every loop tests port::Preempt() with its condition (`while ((port::Preempt(), x))`),
+        or, a for loop, first thing in its body: where the PS2 would preempt a thread that loops
+        while an interrupt readies one of higher priority."""
+        if c.kind in (CK.WHILE_STMT, CK.DO_STMT):
+            cond = kids[0] if c.kind == CK.WHILE_STMT else kids[-1]
+            if cond.kind == CK.VAR_DECL or cond.location.file is None:
+                return
+            f = cond.location.file.name
+            if (f, cond.extent.start.offset) in self.macro_starts:
+                return
+            self.edits.wrap(f, cond.extent.start.offset, cond.extent.end.offset, "(port::Preempt(), ", ")",
+                            0, "preemption points")
+        elif body.kind == CK.COMPOUND_STMT and body.location.file is not None:
+            f = body.location.file.name
+            if (f, body.extent.start.offset) in self.macro_starts or not list(body.get_children()):
+                return
+            a = body.extent.start.offset + 1
+            self.edits.wrap(f, a, a, " port::Preempt();", "", 0, "preemption points")
+
+    def wait_loop(self, c):
+        """A loop with an empty body waits for another thread or an interrupt handler: it calls
+        port::Spin() each turn (port/retail_data.h), where the PS2 would have preempted it."""
+        kids = list(c.get_children())
+        if not kids:
+            return
+        body = kids[0] if c.kind == CK.DO_STMT else kids[-1]
+        self.preemption_point(c, kids, body)
+        if c.kind == CK.FOR_STMT:
+            # only for (;;): a counted empty for is a delay or computes its counter
+            toks = [tk.spelling for tk in _tokens(c)[:5]]
+            if toks[:5] != ["for", "(", ";", ";", ")"]:
+                return
+        f = body.location.file.name if body.location.file else None
+        if f is None or (f, body.extent.start.offset) in self.macro_starts:
+            return
+        a, b = body.extent.start.offset, body.extent.end.offset
+        if body.kind == CK.NULL_STMT:
+            self.edits.rep(f, a, b, "{ port::Spin(); }", "wait loops")
+        elif body.kind == CK.COMPOUND_STMT and not list(body.get_children()):
+            self.edits.rep(f, a, b, "{ port::Spin(); }", "wait loops")
+
+    @staticmethod
+    def address_param_key(fn, index):
+        return (fn.spelling, len(list(fn.get_arguments())), index)
+
+    def address_parameters(self, c):
+        """A parameter of integer type whose every use is a cast to a pointer (`(BodyContact*)a2`)
+        carries an address: the game calls such functions through method tables with pointers,
+        which a 32-bit word cannot hold here. Noted by (function, parameter count, index), from the
+        definition; the merge retypes it void* in every declaration (retype_address_parameters),
+        and its casts stay pointer casts (cast). Each declaration's parameter types are recorded
+        for that."""
+        if c.kind != CK.FUNCTION_DECL or c.location.file is None:
+            return
+        args = list(c.get_arguments())
+        f = c.location.file.name
+        for i, a in enumerate(args):
+            toks = _tokens(a)
+            name_at = [k for k, tk in enumerate(toks) if tk.extent.start.offset == a.location.offset]
+            end = name_at[0] if name_at and a.spelling else len(toks)
+            if end > 0 and toks and (f, toks[0].extent.start.offset) not in self.macro_starts:
+                self.param_sites.append((self.address_param_key(c, i), f, toks[0].extent.start.offset,
+                                         toks[end - 1].extent.end.offset))
+        if not c.is_definition():
+            return
+        body = next((k for k in c.get_children() if k.kind == CK.COMPOUND_STMT), None)
+        if body is None:
+            return
+        for i, a in enumerate(args):
+            if a.type.get_canonical().kind not in INTEGERS or a.type.get_canonical().get_size() != 4:
+                continue
+            uses = []
+
+            def visit(n, chain):
+                if n.kind == CK.DECL_REF_EXPR and n.referenced is not None and n.referenced == a:
+                    uses.append(chain)
+                    return
+                for k in n.get_children():
+                    visit(k, chain + [n])
+            visit(body, [])
+            if not uses:
+                continue
+            ok = True
+            for chain in uses:
+                up = [n for n in chain if n.kind not in (CK.UNEXPOSED_EXPR, CK.PAREN_EXPR)]
+                cast = up[-1] if up else None
+                if cast is None or cast.kind != CK.CSTYLE_CAST_EXPR or \
+                        cast.type.get_canonical().kind != TK.POINTER:
+                    ok = False
+                    break
+            if ok:
+                self.address_params.add(self.address_param_key(c, i))
+                self.address_param_cursors.add((a.location.file.name, a.location.offset))
+
+    def record_call_arguments(self, c):
+        """A direct call's integer arguments (not a literal 0), for the merge: where the callee's
+        parameter turns out to be an address (address_parameters), the argument, a game address
+        held as a word, becomes the pointer."""
+        fn = c.referenced
+        if fn is None or fn.kind != CK.FUNCTION_DECL:
+            return
+        args = list(c.get_arguments())
+        n = len(list(fn.get_arguments()))
+        for i, a in enumerate(args[:n]):
+            if a.type.get_canonical().kind not in INTEGERS or a.location.file is None:
+                continue
+            text = self._own_text(a)
+            if text is None or text.strip() in ("0", "0U", "0u"):
+                continue
+            f = a.location.file.name
+            if (f, a.extent.start.offset) in self.macro_starts:
+                continue
+            self.call_args.append(((fn.spelling, n, i), f, a.extent.start.offset, a.extent.end.offset))
+
+    def is_address_parameter(self, operand):
+        e = operand
+        while e is not None and e.kind in (CK.UNEXPOSED_EXPR, CK.PAREN_EXPR):
+            kids = list(e.get_children())
+            e = kids[0] if len(kids) == 1 else None
+        if e is None or e.kind != CK.DECL_REF_EXPR or e.referenced is None or e.referenced.location.file is None:
+            return False
+        return (e.referenced.location.file.name, e.referenced.location.offset) in self.address_param_cursors
+
     def record_function(self, c):
         """A game function's definition (func_XXXXXXXX, at namespace scope, in a source file): an
         entry of the function table by retail address (port/ptr32.h). Every declaration's kind of
@@ -611,7 +928,8 @@ class Walker:
             # The definition's own type picks it where the file also declares other overloads.
             # Its type under the rewrite: parameters and result in register positions.
             try:
-                params = [pr(a.type, "", False) for a in c.get_arguments()]
+                params = ["void *" if self.address_param_key(c, i) in self.address_params else pr(a.type, "", False)
+                          for i, a in enumerate(c.get_arguments())]
                 if c.type.is_function_variadic():
                     params.append("...")
                 spelling = "%s (%s)" % (pr(c.result_type, "", False), ", ".join(params))
@@ -708,8 +1026,7 @@ class Walker:
         # The macro comes first, on its own lines: an initialiser may take the global's own address
         # (a registry pointing into itself), which is then its retail one. One insertion, with the
         # `static` the definition needs, as both go at the line's start.
-        prefix = "#undef %s\n#define %s (port::RetailRef< %s >(0x%08XU))\n" % (
-            name, name, type_text, int(name[2:], 16))
+        prefix = "#undef %s\n#define %s %s\n" % (name, name, retail_macro(type_text, int(name[2:], 16)))
         if words[:1] != ["extern"] and "static" not in words:
             start = c.extent.start.offset
             if start == line:
@@ -866,6 +1183,10 @@ class Walker:
                 if k in (CK.NAMESPACE, CK.LINKAGE_SPEC, CK.UNEXPOSED_DECL):
                     self.walk(ch, depth, in_func)
                 return
+            if k in (CK.STRUCT_DECL, CK.CLASS_DECL) and ch.is_definition() and ch.spelling:
+                sz = ch.type.get_size()
+                if sz > 0:
+                    self.record_sizes[ch.spelling] = sz
             if k == CK.FIELD_DECL:
                 self.declaration(ch, True)
             elif k == CK.VAR_DECL:
@@ -882,6 +1203,7 @@ class Walker:
                                                           CK.FUNCTION_TEMPLATE):
                     self.declaration(ch, False)
             elif k in (CK.FUNCTION_DECL, CK.CXX_METHOD, CK.FUNCTION_TEMPLATE):
+                self.address_parameters(ch)
                 self.record_function(ch)
                 self.function_result(ch)
                 self.addressed_parameters(ch)
@@ -897,6 +1219,9 @@ class Walker:
                 self.conditional(ch, depth)
             elif k == CK.CALL_EXPR:
                 self.call(ch, depth)
+                self.record_call_arguments(ch)
+            elif k in (CK.WHILE_STMT, CK.DO_STMT, CK.FOR_STMT):
+                self.wait_loop(ch)
             if k in (CK.PARM_DECL,) and ch.semantic_parent is not None and \
                     ch.semantic_parent.kind not in (CK.FUNCTION_DECL, CK.CXX_METHOD, CK.CONSTRUCTOR):
                 return  # a function-pointer type's parameters belong to its declaration
@@ -926,13 +1251,16 @@ def _collect(job):
             raise SystemExit("gen: %s does not parse: %s" % (unit, fatal[0]))
         diagnostics += sum(1 for d in tu.diagnostics if d.severity >= ci.Diagnostic.Error)
         cursors = list(walker.top_level(tu, str(out / unit)))
+        walker.top_cursors = cursors
         walker.collect_addressed(cursors)
         walker.walk_cursors(cursors)
         walker.flush_groups()
+        walker.flush_rooms()
     return ({f: dict(r) for f, r in edits.replace.items()}, {f: set(i) for f, i in edits.insert.items()},
             edits.unsupported, diagnostics, edits.kinds, walker.global_defs, walker.global_decls,
             walker.global_inits, walker.global_kept, walker.functions, walker.result_kinds,
-            walker.declarations)
+            walker.declarations, walker.room_plans, walker.record_sizes, walker.address_params,
+            walker.param_sites, walker.call_args)
 
 
 def adapt_results(edits, result_kinds, declarations):
@@ -976,6 +1304,38 @@ def adapt_results(edits, result_kinds, declarations):
     return adapters, unadapted
 
 
+def resolve_rooms(edits, plans, record_sizes):
+    """Gives each local viewed as a larger type (Walker.roomy_cast) the room of its largest view,
+    every record's size known now: a record local becomes port::Room<T, N>, an array gets more
+    elements."""
+    for plan in plans.values():
+        sizes = [n if isinstance(n, int) else record_sizes.get(n, 0) for n in plan["needs"]]
+        size = max(sizes) if sizes else 0
+        if size <= plan["size"]:
+            continue
+        f = plan["file"]
+        if "error" in plan:
+            edits.unsupported.append("%s:%d: %s" % (f, plan["line"], plan["error"]))
+            continue
+        a, b = plan["at"]
+        if plan["kind"] == "array":
+            count = -(-size // plan["elem"])
+            edits.rep(f, a, b, "%d /* port: room for a larger view */" % count, "locals given a larger view's room")
+        else:
+            n = (size + 15) // 16 * 16
+            edits.rep(f, a, b, "port::Room<%s, %d>" % (plan["type"], n), "locals given a larger view's room")
+
+
+def retail_macro(type_text, addr):
+    """A game global's macro (port/retail_data.h): the object at its retail address. Below the
+    program (0x100000) an unsized array is a label whose address is a number, a VU1
+    microprogram's for an MSCAL: a pointer to that address, which address 0 may be."""
+    m = re.fullmatch(r"(.+?)\s*\[\s*\]", type_text.strip())
+    if addr < 0x100000 and m:
+        return "(port::FromGameAddr< %s >(0x%08XU))" % (m.group(1), addr)
+    return "(port::RetailRef< %s >(0x%08XU))" % (type_text, addr)
+
+
 def rewrite(units, out, args, report, jobs=None):
     """Rewrites the pointer declarations of every file the units reach under out. The units are
     shared among worker processes; their edits are merged, and one place rewritten two different
@@ -998,8 +1358,20 @@ def rewrite(units, out, args, report, jobs=None):
     functions = collections.defaultdict(set)
     result_kinds = collections.defaultdict(set)
     declarations = []
-    for replace, insert, unsupported, diag, k, gdefs, gdecls, ginits, gkept, funcs, rkinds, fdecls in results:
+    room_plans, record_sizes = {}, {}
+    address_params, param_sites, call_args = set(), [], []
+    for replace, insert, unsupported, diag, k, gdefs, gdecls, ginits, gkept, funcs, rkinds, fdecls, rplans, rsizes, \
+            aparams, psites, cargs in results:
+        address_params |= aparams
+        param_sites += psites
+        call_args += cargs
         declarations += fdecls
+        record_sizes.update(rsizes)
+        for key, plan in rplans.items():
+            if key in room_plans:
+                room_plans[key]["needs"] += plan["needs"]
+            else:
+                room_plans[key] = plan
         for name, kind, is_def, f, line in rkinds:
             result_kinds[name].add((kind, is_def, f, line))
         for f, name, spelling in funcs:
@@ -1054,8 +1426,7 @@ def rewrite(units, out, args, report, jobs=None):
             else:
                 if name not in global_defs:
                     undefined.setdefault(name, []).append((f, line))
-                text += "\n#undef %s\n#define %s (port::RetailRef< %s >(0x%08XU))" % (
-                    name, name, type_text, int(name[2:], 16))
+                text += "\n#undef %s\n#define %s %s" % (name, name, retail_macro(type_text, int(name[2:], 16)))
         text += "\n"
         reps = edits.replace.get(f, {})
         for key in [k for k in reps if start <= k[0] < end]:
@@ -1103,6 +1474,14 @@ def rewrite(units, out, args, report, jobs=None):
             clashes[name] = sorted(decls, key=lambda d: (not d[1], d[2], d[3]))
     report["result_clashes"] = clashes
     report["result_adapters"], report["result_unadapted"] = adapt_results(edits, result_kinds, declarations)
+    resolve_rooms(edits, room_plans, record_sizes)
+    # Parameters used only as addresses: void* in every declaration, so the link names agree.
+    for key, f, a, b in set(param_sites):
+        if key in address_params:
+            edits.rep(f, a, b, "void*", "integer parameters used only as addresses")
+    for key, f, a, b in set(call_args):
+        if key in address_params:
+            edits.wrap(f, a, b, "port::FromGameAddr<void>((u32)(", "))", 0, "address arguments made pointers")
     files = edits.apply(out)
     report["files_changed"] = len(files)
     report["counts"] = dict(edits.counts)
