@@ -327,7 +327,8 @@ def text_stage(out):
 
 # The flags the game code is compiled with, for libclang and for the build (CMakeLists.txt).
 COMPILE_FLAGS = ["-x", "c++", "-std=gnu++17", "-Wno-register", "-Wno-c++11-narrowing",
-                 "-include", "port/gxx_ext.h", "-include", "port/ptr32.h"]
+                 "-include", "port/gxx_ext.h", "-include", "port/ptr32.h",
+                 "-include", "port/varargs.h"]
 
 
 def system_includes():

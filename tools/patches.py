@@ -15,6 +15,89 @@ PATCHES = [
      "#define PROP(id, n) { id, port::P32(&g_objectPropertyDescriptors[n]) }",
      "the entry's pointer is written in the macro's body, so its stored-pointer initialiser "
      "(port::P32, ptr32.h) goes there, once for every entry"),
+
+    # The variadic functions that read the PS2's saved argument registers as 8-byte slots
+    # (port/varargs.h). Each fills such a run from its arguments, by the types its callers pass,
+    # and reads it as before.
+    ("src/main/curve_segment.cpp",
+     "    char* ap = (char*)__builtin_next_arg(n) - 56;",
+     "    port::Slot port_slots[2 * 32 + 1];\n"
+     "    char* ap = (char*)port_slots;\n"
+     "    { std::va_list va; va_start(va, n); s32 k = 0;\n"
+     "      for (s32 q = 0; q < n && q < 32; q++) { port_slots[k++] = port::SlotPtr(va_arg(va, void*));"
+     " port_slots[k++] = port::SlotDouble(va_arg(va, double)); }\n"
+     "      port_slots[k++] = port::SlotPtr(va_arg(va, void*)); va_end(va); }",
+     "variadic arguments: n pairs of (curve coefficients, limit as a double) and the result's "
+     "address (object_cycler.cpp's call)"),
+    ("src/main/object_properties.cpp",
+     "    void* ap = (char*)__builtin_next_arg(kinds) - 32;",
+     "    port::Slot port_slots[32];\n"
+     "    void* ap = (char*)port_slots;\n"
+     "    { std::va_list va; va_start(va, kinds);\n"
+     "      for (s32 q = 0; q < count && q < 32; q++) port_slots[q] = port::SlotPtr(va_arg(va, void*));\n"
+     "      va_end(va); }",
+     "variadic arguments: count out-parameter addresses (object_host_functions.cpp's calls)"),
+    ("src/main/object_properties.cpp",
+     "    ap = (char*)__builtin_next_arg(size) - (8 - __builtin_args_info(0)) * 8;",
+     "    port::Slot port_slots[2 * 16 + 2];\n"
+     "    ap = (char*)port_slots;\n"
+     "    { std::va_list va; va_start(va, size); s32 k = 0;\n"
+     "      port_slots[k++] = port::SlotPtr(va_arg(va, void*));\n"
+     "      while (k < 2 * 16) { s32 s = va_arg(va, s32); port_slots[k++] = port::SlotInt(s);"
+     " port_slots[k++] = port::SlotPtr(va_arg(va, void*)); if (s == 0) break; }\n"
+     "      va_end(va); }",
+     "variadic arguments: the first buffer's address, then (size, address) pairs, a zero size "
+     "and a null address last (world_listed_object.cpp's calls)"),
+    ("src/main/object_properties.cpp",
+     "    void* ap = (char*)__builtin_next_arg(first) - 56;",
+     "    port::Slot port_slots[16];\n"
+     "    void* ap = (char*)port_slots;\n"
+     "    { std::va_list va; va_start(va, first);\n"
+     "      for (s32 q = 0; q < 16; q++) { void* a = va_arg(va, void*); port_slots[q] = port::SlotPtr(a);"
+     " if (a == 0) break; }\n"
+     "      va_end(va); }",
+     "variadic arguments: buffer addresses, a null one last (world_listed_object.cpp's call)"),
+    ("src/main/player_request.cpp",
+     "    u64* ap = (u64*)((char*)__builtin_next_arg(out) - 32);",
+     "    port::Slot port_slots[32];\n"
+     "    u64* ap = (u64*)port_slots;\n"
+     "    { std::va_list va; va_start(va, out);\n"
+     "      for (s32 q = 0; q < (n - 1) + (m - 1) && q < 32; q++) port_slots[q] = port::SlotDouble(va_arg(va, double));\n"
+     "      va_end(va); }",
+     "variadic arguments: n - 1 then m - 1 weights as doubles (FillOuterProductTable's caller)"),
+    ("src/main/text_format.cpp",
+     "    void* ap = (char*)__builtin_next_arg(fmt) - 56;",
+     "    port::Slot port_slots[64];\n"
+     "    void* ap = (char*)port_slots;\n"
+     "    { std::va_list va; va_start(va, fmt); port::FormatSlots(fmt, va, port_slots, 64); va_end(va); }",
+     "variadic arguments of PrintFormatted: as the format consumes them (port::FormatSlots)"),
+    ("src/main/text_format.cpp",
+     "    void* ap = (char*)__builtin_next_arg(fmt) - 48;",
+     "    port::Slot port_slots[64];\n"
+     "    void* ap = (char*)port_slots;\n"
+     "    { std::va_list va; va_start(va, fmt); port::FormatSlots(fmt, va, port_slots, 64); va_end(va); }",
+     "variadic arguments of FormatToString: as the format consumes them (port::FormatSlots)"),
+    ("src/main/text_format.cpp",
+     "    void* ap = (char*)__builtin_next_arg(fmt) - 40;",
+     "    port::Slot port_slots[64];\n"
+     "    void* ap = (char*)port_slots;\n"
+     "    { std::va_list va; va_start(va, fmt); port::FormatSlots(fmt, va, port_slots, 64); va_end(va); }",
+     "variadic arguments of FormatToStringBounded: as the format consumes them (port::FormatSlots)"),
+    # Their callers end a list of addresses with a bare 0: an int, which a 64-bit ABI need not
+    # widen into a pointer's slot (Apple's arm64 passes variadic ints in 8-byte stack slots with
+    # undefined upper halves). A null pointer there instead.
+    ("src/main/world_listed_object.cpp",
+     "StartToSprChain(node->count * 16, p, node->count * 16, p + 0x2C, node->count * 16, p + 0x58, 0, 0);",
+     "StartToSprChain(node->count * 16, p, node->count * 16, p + 0x2C, node->count * 16, p + 0x58, 0, (void*)0);",
+     "a null address, not an int 0, as the last variadic argument"),
+    ("src/main/world_listed_object.cpp",
+     "StartToSprChain(next->count * 16, p, next->count * 16, p + 0x2C, next->count * 16, p + 0x58, 0, 0);",
+     "StartToSprChain(next->count * 16, p, next->count * 16, p + 0x2C, next->count * 16, p + 0x58, 0, (void*)0);",
+     "a null address, not an int 0, as the last variadic argument"),
+    ("src/main/world_listed_object.cpp",
+     "StartFromSprChain(p, p + 0x2C, p + 0x58, 0);",
+     "StartFromSprChain(p, p + 0x2C, p + 0x58, (void*)0);",
+     "a null address, not an int 0, as the last variadic argument"),
 ]
 
 
