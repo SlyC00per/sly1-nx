@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# What CI can check without a disc: the repository check, the host build and its unit tests on
+# macOS, Linux and Windows, and the Switch build (devkitPro's container).
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  repository:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tests/check_repository.py
+
+  host:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: HOST_ASAN
+          - os: macos-latest
+            platform: HOST_ASAN
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: tools
+        if: runner.os == 'macOS'
+        run: brew install ninja
+      - run: cmake -B build-host -G Ninja -DPLATFORM=${{ matrix.platform }}
+      - run: cmake --build build-host
+      - run: ctest --test-dir build-host --output-on-failure
+
+  host-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+      # Sanitizers are not assumed on MSYS2's Clang yet: a plain host build there.
+      - run: cmake -B build-host -G Ninja -DPLATFORM=HOST
+      - run: cmake --build build-host
+      - run: ctest --test-dir build-host --output-on-failure
+
+  switch:
+    runs-on: ubuntu-latest
+    container: devkitpro/devkita64:latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - run: apt-get update && apt-get install -y ninja-build
+      - run: cmake -B build-switch -G Ninja -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake
+      - run: cmake --build build-switch
+      - run: cmake -S tests/switch_smoke -B build-smoke -G Ninja -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake
+      - run: cmake --build build-smoke
