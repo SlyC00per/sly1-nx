@@ -1,0 +1,43 @@
+# Disc images and executables: never committed
+*.iso
+*.ISO
+*.bin
+*.img
+*.cue
+*.ccd
+*.sub
+*.mdf
+*.mds
+*.chd
+*.elf
+*.nro
+*.nso
+*.nacp
+SCUS_*
+SCES_*
+baserom/
+
+# Build folders
+build/
+build-*/
+out/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+compile_commands.json
+
+# Extracted assets and user-supplied HD textures
+assets/
+extracted/
+dump/
+hd_textures/
+*.dds
+*.dksh
+
+# Tools and editors
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+.idea/

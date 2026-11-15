@@ -1,0 +1,65 @@
+# Sly Cooper port — Nintendo Switch (AArch64, libnx, deko3d)
+
+This file is the port repository's root `CLAUDE.md`. The decompilation is the submodule
+`sly1-decomp/`, which has its own `CLAUDE.md` and `AGENTS.md` for its own rules.
+
+## What this is
+
+A native Switch homebrew port of *Sly Cooper and the Thievius Raccoonus* (PS2, NTSC-U
+`SCUS_971.98`), built from the finished matching decompilation in the submodule `sly1-decomp/`
+(pinned; update it only by a deliberate submodule bump). Targets: locked 60 FPS, true 16:9 (Hor+), low power use, optional PS3 HD
+textures toggled at run time.
+
+## Rules
+
+1. **The decompilation is read-only.** Never edit `sly1-decomp/`. Its sources are compiled
+   as they are; the port supplies replacement headers, a library layer and a source rewrite
+   step. If the decomp needs a fix, stop and tell the user.
+2. **No proprietary material in git:** no disc images, executables, extracted assets, HD
+   textures, compilers or SDK files. Assets are read from the user's `.iso` at run time.
+3. **Derive from the decomp and its docs** (`sly1-decomp/docs/PORTING.md`, `DISC.md`,
+   `OBJECTS.md`). Nothing from Sony's SDK, the game's prototype, or other Sly projects. OpenRAC
+   code may be reused, credited (OpenThievius's `docs/policy/SOURCING.md`).
+4. **One milestone at a time:** build, run its verification, commit, summarise, then continue.
+   Report what was actually run; say plainly what could not be run.
+5. **A behaviour difference from retail is a port bug.** The decompiled code is byte-exact;
+   do not "tidy" game logic, `goto`s or statement order.
+
+## Facts that are easy to get wrong
+
+- No `.WAD` files, no file names: data is found by sector through records in the executable.
+  Levels are LZSS streams read field by field by the game's own loaders.
+- No Sony header or function names in the source: the library layer is `src/lib/` under the
+  project's own names.
+- LP64: pointers are 8 bytes here, 4 on the PS2. Integers that hold addresses are `sptr`/`uptr`.
+  Never cast a pointer to `int`/`u32`/`long`. Structure `check_` assertions, class sizes in the
+  descriptors and `count * 4` allocations assume 4-byte pointers. Script values hold handles in
+  32 bits.
+- g++ 2.95 extensions remain in the decomp by design: named return values (nine functions),
+  `<?` `>?` `>?=`, and the old compiler's varargs and exception internals. `tools/modern_check.py`
+  there lists and rewrites them.
+- Vector math is the `include/vu0.h` seam; each helper's "Computes:" line is its specification.
+  Keep the PS2 float conventions it documents where gameplay depends on them.
+- Colour and alpha: 0x80 is 1.0. Textures are 4/8-bit indices with CLUTs in CSM1 order, or
+  32-bit. Read depth, alpha-test and blend behaviour from the GS state the game sets, not from
+  assumptions.
+- Sound is commands to a driver the port must impersonate (bank load, start by bank and record,
+  adjust, stop); the game waits on replies. Videos are MPEG program streams.
+
+## Commands
+
+Fill these in as the build takes shape; keep them current. They must work on macOS, Windows
+(MSYS2 or Visual Studio) and Linux: devkitPro tools through `$DEVKITPRO`, never a hard-coded path.
+
+- Host (ASan/UBSan), the main test loop:
+  `cmake -B build-host -DPLATFORM=HOST_ASAN -G Ninja && cmake --build build-host && build-host/sly1_headless --iso <path> --verify-levels`
+- Switch: `cmake -B build-switch -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake -G Ninja && cmake --build build-switch`
+- Shaders: `$DEVKITPRO/tools/bin/uam -s <vert|frag> <in> -o <out.dksh>` (run by the build)
+- Run in the emulator (Ryujinx): open `build-switch/sly1.nro`; output at 1280x720 and, in
+  docked mode, 1920x1080.
+- Run on the Switch Lite (handheld only): `$DEVKITPRO/tools/bin/nxlink -s build-switch/sly1.nro`
+  with hbmenu's netloader open.
+- Symbolicate a crash: `$DEVKITPRO/devkitA64/bin/aarch64-none-elf-addr2line -e build-switch/sly1.elf -f -C -p <offset>`
+- The decomp's own checks (must stay green, run in `sly1-decomp/`): `python3 tools/build.py` prints
+  `MATCH: build/us/SCUS_971.98 sha1 57dc305d…`; `python3 tools/modern_check.py --check`.
+- After any rendering change, dump a frame (`--frames N --dump-fb out/frame.png`) and look at it.

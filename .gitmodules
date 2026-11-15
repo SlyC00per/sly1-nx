@@ -1,0 +1,3 @@
+[submodule "sly1-decomp"]
+	path = sly1-decomp
+	url = https://github.com/OpenThievius/sly1-decomp.git
