@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// The platform layer's system state (port/system.h) and the VU0 microprogram stand-in.
+#include "port/system.h"
+
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+
+#include "port/vu0_impl.h"
+
+namespace port {
+
+std::uint32_t Cop0Status() { return 0x10001; }
+
+std::uint64_t CycleCount()
+{
+    using namespace std::chrono;
+    static const steady_clock::time_point start = steady_clock::now();
+    auto ns = duration_cast<nanoseconds>(steady_clock::now() - start).count();
+    return std::uint64_t(ns) * 294912 / 1000000;   // 294.912 MHz
+}
+
+std::int32_t CurrentThreadId() { return 1; }
+
+}  // namespace port
+
+namespace port_vu0 {
+
+// The VU0 microprograms are not decompiled: their two callers (CollectLightsForSphere,
+// FilterParticleVerticesVu0) get the port's own code. Until then, reaching one stops the game
+// with its name.
+void Microprogram(const char* what)
+{
+    std::fprintf(stderr, "port: VU0 microprogram interface %s reached; its caller is not ported yet\n", what);
+    std::abort();
+}
+
+}  // namespace port_vu0

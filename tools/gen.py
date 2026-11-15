@@ -278,6 +278,76 @@ def strip_asm(text):
     return text
 
 
+PORT_HELPERS = {"include/fpu.h", "include/system.h", "include/mul_wide.h"}
+
+# The helper of vu0.h whose body is a microprogram call in a nested struct: its port name.
+PARTICLE = {"Start", "Next", "Wait", "Results", "Bounds"}
+VU0_FUNCTION = re.compile(
+    r"\n(?P<indent>[ \t]*)(?P<sig>(?P<tmpl>template <[^>]*> )?(?:static |inline )*"
+    r"(?P<ret>[\w:<>,\s&*]+?)\b(?P<name>\w+)\s*\((?P<params>[^;{]*?)\)\s*(?:const)?)\s*\n?\s*\{", re.S)
+
+
+def _param_names(params):
+    names, depth, cur = [], 0, ""
+    for ch in params + ",":
+        if ch in "(<[":
+            depth += 1
+        elif ch in ")>]":
+            depth -= 1
+        if ch == "," and depth == 0:
+            p = cur.split("=")[0].strip()
+            if p and p != "void":
+                names.append(re.findall(r"\w+", p)[-1])
+            cur = ""
+        else:
+            cur += ch
+    return names
+
+
+def forward_vu0(text):
+    """vu0.h with each helper body that was VU0 assembly replaced by a call of the port's function
+    of the same name (port/vu0_impl.h): the header's names, signatures and wrappers stay."""
+    text = text.replace('#include "common.h"', '#include "common.h"\n#include "port/vu0_impl.h"', 1)
+    # Scalar's g++ 2.95 extension, the address of a cast (an lvalue there): the value itself.
+    text = re.sub(r"\*\(u128\s*\*\)\s*&\s*\(s128\)\s*(\w+)", r"\1", text)
+    out, pos = [], 0
+    while True:
+        m = VU0_FUNCTION.search(text, pos)
+        if not m:
+            break
+        i, depth = m.end(), 1
+        while depth:
+            c = text[i]
+            depth += c == "{"
+            depth -= c == "}"
+            i += 1
+        body = text[m.end():i - 1]
+        if "__asm__" not in body:
+            out.append(text[pos:i])
+            pos = i
+            continue
+        name = m.group("name")
+        target = "Particle" + name if name in PARTICLE else name
+        tmpl = m.group("tmpl") or ""
+        explicit = "<N>" if "int N" in tmpl else ""
+        args = ", ".join(_param_names(m.group("params")))
+        ret = m.group("ret").split()
+        call = "::port_vu0::%s%s(%s)" % (target, explicit, args)
+        if name == "Transpose":
+            new_body = " return ::port_vu0::Transpose(m); "
+        elif ret and ret[-1] == "void":
+            new_body = " %s; " % call
+        else:
+            new_body = " return %s; " % call
+        out.append(text[pos:m.end()] + new_body + "}")
+        pos = i
+    out.append(text[pos:])
+    text = "".join(out)
+    if "__asm__(" in text or "__asm__ volatile" in text:
+        raise SystemExit("gen: vu0.h still has assembly after forwarding: a helper the port lacks")
+    return text
+
+
 ASM_FUNC_H = """// SPDX-License-Identifier: AGPL-3.0-or-later
 // Written by tools/gen.py: the port has no assembly to include. The hand-written functions get
 // C++ of the port's own (docs/DESIGN.md, section 3); linker leftovers have no role.
@@ -315,8 +385,10 @@ def text_stage(out):
                 stats["named_returns"] += len(found)
                 text, n = rewrite_minmax(text)
                 stats["minmax"] += n
-                if rel in HELPERS:
-                    text = strip_asm(text)
+                if rel == "include/vu0.h":
+                    text = forward_vu0(text)
+                elif rel in PORT_HELPERS:
+                    text = (PORT_INCLUDE / "port" / "ps2" / Path(rel).name).read_text()
             dst = out / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             if not dst.exists() or dst.read_text() != text:

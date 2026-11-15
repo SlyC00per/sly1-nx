@@ -28,13 +28,14 @@ if(PLATFORM STREQUAL "HOST_ASAN")
 endif()
 
 # The port's own code: game memory and, later, the platform layer.
-add_library(port_core STATIC port/platform/game_memory.cpp)
+add_library(port_core STATIC port/platform/game_memory.cpp port/platform/varargs.cpp
+    port/platform/system.cpp)
 target_include_directories(port_core PUBLIC port/include)
 target_compile_options(port_core PRIVATE -Wall -Wextra)
 
 # Unit tests that need no disc: on the host through ctest, on the Switch as an .nro that
 # tools/run_ryujinx.py runs.
-set(UNIT_SOURCES tests/unit/unit.cpp tests/unit/test_ptr32.cpp)
+set(UNIT_SOURCES tests/unit/unit.cpp tests/unit/test_ptr32.cpp tests/unit/test_vu0.cpp)
 if(PLATFORM STREQUAL "SWITCH")
     add_executable(sly1_unit ${UNIT_SOURCES} tests/unit/main_switch.cpp)
     target_link_libraries(sly1_unit PRIVATE port_core)
