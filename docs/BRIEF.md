@@ -1,3 +1,8 @@
+> **Added 2026-11-14 by the maintainer:** the port matches the PlayStation 3 release as
+> closely as possible: widescreen, HD textures (part of the target, not optional), no memory
+> cards, and the other differences in `docs/PS3_PARITY.md`. Where this brief says a
+> difference from retail is a bug, the differences listed there are the exceptions.
+
 I want a native Nintendo Switch homebrew port (AArch64, libnx, deko3d) of *Sly Cooper and the Thievius Raccoonus* (PS2, NTSC-U `SCUS_971.98`), built from our finished matching decompilation. Goals: the whole game playable at a locked 60 FPS, true 16:9 widescreen, low power use in handheld mode, and optionally the PS3 collection's HD textures in place of the PS2 ones.
 
 You are starting with no context from the sessions that produced the decompilation, so this brief tells you what exists, what is known, and where the hard parts are. Read it fully, then the documents listed under "Read first", before writing code.

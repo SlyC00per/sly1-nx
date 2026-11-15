@@ -5,6 +5,9 @@ A native Nintendo Switch homebrew port of *Sly Cooper and the Thievius Raccoonus
 [sly1-decomp](https://github.com/OpenThievius/sly1-decomp), which this repository takes as a git
 submodule at `sly1-decomp/`, pinned to a commit.
 
+The port aims to match the game's PlayStation 3 release as closely as possible: widescreen,
+HD textures and saves without memory cards (`docs/PS3_PARITY.md`).
+
 ## The game's data is not here
 
 This repository holds only the port's own code, build files and documentation. The game's data

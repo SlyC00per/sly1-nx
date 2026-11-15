@@ -179,7 +179,7 @@ found by role in `config/names/lib/`:
 | CD sector read (0x203B18) and its status calls | reads of the `.iso` at sector × 2048; on a worker thread on Switch |
 | DMA and graphics helpers, the packet submit | the renderer's intake (section 7) |
 | pad | libnx pad and vibration; scripted or idle input on the host |
-| memory-card client | files in a save folder, behind the same asynchronous calls the save code polls |
+| memory-card client | save data, behind the same asynchronous calls the save code polls; as on the PS3 release, no memory card: the card checks, slot selection and card prompts are bypassed by patches (`docs/PS3_PARITY.md`) |
 | IOP clients and the command channel | the sound engine's command queue; every call answered (section 8) |
 | MPEG library, IPU | the video decoder (section 8) |
 | exception and unwind runtime, `tlb`, patch installers, IOP reset and module loading | the compiler's own runtime; no-ops that report success |
@@ -258,7 +258,8 @@ ends: **deko3d** on Switch (GLSL 450 through `uam`, 1280×720 and 1920×1080), a
 exists because I cannot see a Switch screen: it makes `--dump-fb` work on the host and in
 CI. It does not prove the deko3d shaders; those need you or an emulator.
 
-Widescreen and HD textures hang off this design as the brief describes them (the
+Widescreen and HD textures are part of the target, since the port matches the PS3 release
+(`docs/PS3_PARITY.md`); they hang off this design as the brief describes them (the
 projection and culls in game code through patches; an override lookup where a texture is
 identified).
 

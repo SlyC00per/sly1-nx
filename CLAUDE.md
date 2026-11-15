@@ -7,8 +7,9 @@ This file is the port repository's root `CLAUDE.md`. The decompilation is the su
 
 A native Switch homebrew port of *Sly Cooper and the Thievius Raccoonus* (PS2, NTSC-U
 `SCUS_971.98`), built from the finished matching decompilation in the submodule `sly1-decomp/`
-(pinned; update it only by a deliberate submodule bump). Targets: locked 60 FPS, true 16:9 (Hor+), low power use, optional PS3 HD
-textures toggled at run time.
+(pinned; update it only by a deliberate submodule bump). **It matches the PS3 release as
+closely as possible** (`docs/PS3_PARITY.md`): 16:9 widescreen (Hor+), HD textures, no memory
+card, HD output at a locked 60 FPS; plus low power use.
 
 ## Rules
 
@@ -22,8 +23,12 @@ textures toggled at run time.
    code may be reused, credited (OpenThievius's `docs/policy/SOURCING.md`).
 4. **One milestone at a time:** build, run its verification, commit, summarise, then continue.
    Report what was actually run; say plainly what could not be run.
-5. **A behaviour difference from retail is a port bug.** The decompiled code is byte-exact;
-   do not "tidy" game logic, `goto`s or statement order.
+5. **A behaviour difference from retail is a port bug,** unless `docs/PS3_PARITY.md` lists it.
+   The decompiled code is byte-exact; do not "tidy" game logic, `goto`s or statement order.
+6. **Match the PS3 version as closely as possible** (maintainer, 2026-11-14): widescreen, HD
+   textures, no memory cards, and every other difference `docs/PS3_PARITY.md` lists. The PS3
+   release is a reference for behaviour, observed on the maintainer's own copy: never copy its
+   code, and never implement a PS3 behaviour from memory; record what was observed first.
 
 ## Facts that are easy to get wrong
 
