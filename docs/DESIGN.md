@@ -285,7 +285,9 @@ decode, and the choice has a dependency in it, so it is yours:
 - (ii) decode with FFmpeg's `libavcodec` (LGPL/GPL, AGPL-compatible, already in devkitPro's
   portlibs). Less code; a large dependency on four build environments.
 
-I recommend (i), decided for good after measuring one stream's format in milestone 3.
+**Decided (maintainer, 2026-11-14): (i) for the PS2 videos.** If the PS3 release's videos are
+better than the PS2's and are wanted (`docs/PS3_PARITY.md`), they are decoded with FFmpeg as
+optional replacements found on the SD card, as the HD textures are; FFmpeg is added only then.
 
 ## 9. Test strategy
 
@@ -326,7 +328,7 @@ first code commit.
    (a), growing structures as the brief's checklist assumes.
 2. A host reference rasteriser as a second back end (recommended), or deko3d only,
    verified by you on the Switch Lite or in an emulator you install.
-3. Video decoding: (i) own code behind the IPU's role (recommended), or (ii) FFmpeg.
+3. ~~Video decoding~~: decided, (i) for the PS2 videos; FFmpeg only for PS3 replacements, if wanted (section 8).
 4. Whether you can supply retail references (memory dumps, audio recordings) for the
    comparisons in sections 8 and 9.
 5. `libclang` (Apache-2.0 with the LLVM exception) as a build-time tool dependency.
