@@ -8,19 +8,24 @@
 //
 // A game address is a 32-bit word with the PS2's meaning:
 //   0                                    null
-//   0x00000000 + x, x < kGameMemorySize  the program image at offset x (code, data, the
-//                                        game's heap and stacks all live in the image)
-//   0x20000000 + x                       the same memory: the PS2's uncached alias of RAM (the game
+//   0x00000000 + x, x < 0x02000000       the PS2's main memory, mirrored by the port (port_ram):
+//                                        the game's globals at their retail addresses, its heap
+//   0x08000000 + x, x < ImageSize()      the port's program image at offset x (code, the game's
+//                                        thread stacks, the port's own statics)
+//   0x20000000 + x, x < 0x02000000       main memory again: the PS2's uncached alias (the game
 //                                        writes its deferred requests through it; 0x30000000, the
 //                                        accelerated alias, it never uses, so those words are kept)
 //   0x70000000 + x, x < 0x4000           the scratchpad (a 16 KiB buffer of the port's)
 //   0x10000000 + x, x < 0x10000;         the hardware registers the game uses: plain memory of the
 //   0x12000000 + x, x < 0x2000           port's (port/platform/game_memory.cpp)
 //   anything else                        not memory here: a word carried in a pointer (the
-//                                        game passes float bits as void*, 0x3F800000 is 1.0f),
-//                                        or a hardware register's address
+//                                        game passes float bits as void*, 0x3F800000 is 1.0f)
 // Words that are not memory become tagged native pointers that give the same word back and fault
 // when dereferenced, so a pointer can carry any 32-bit word and return it unchanged.
+//
+// With the game's data at its retail addresses, a pointer stored in data has its retail value,
+// objects the decompilation defines in pieces are whole again, and the port's memory compares
+// directly with a PS2's (docs/DESIGN.md, section 4).
 #ifndef PORT_PTR32_H
 #define PORT_PTR32_H
 
@@ -30,10 +35,12 @@
 
 namespace port {
 
-// The most the program image may span: game addresses below this are image offsets. The image's
-// real extent (ImageSize(), measured at start-up) decides what is game memory: a pointer is an
+// The PS2's main memory, mirrored, and where the program image's addresses start. The image's
+// real extent (ImageSize(), measured at start-up) decides what is image memory: a pointer is an
 // image pointer only inside it, and a word only becomes one when it is within it.
-constexpr std::uint32_t kGameMemorySize = 0x08000000;
+constexpr std::uint32_t kRamSize = 0x02000000;
+constexpr std::uint32_t kImageAddr = 0x08000000;
+constexpr std::uint32_t kGameMemorySize = 0x08000000;   // the most the image may span
 constexpr std::uint32_t kScratchpadAddr = 0x70000000;
 constexpr std::uint32_t kScratchpadSize = 0x4000;
 // The tag that marks a native pointer holding a word that is not memory. Not a valid address on
@@ -54,18 +61,58 @@ unsigned char* Scratchpad();
 void* NativeSlow(std::uint32_t addr);
 std::uint32_t GameAddrSlow(const void* p);
 
+// The game's functions by their retail addresses (tools/gen.py writes the table from every
+// func_XXXXXXXX the C defines): a function pointer is stored as its retail address, as the
+// executable's own data holds them (class descriptors, callback tables), and a stored one is
+// called through the native function at that address.
+// The tables are constant data, one per source file, listed by port_function_tables (written
+// by tools/gen.py; empty without the game), and merged on the first lookup: a stored function
+// pointer's initial value is worked out during static initialisation, before main.
+struct FunctionEntry {
+    std::uint32_t addr;
+    void* fn;
+};
+// The port's own definitions of game functions (port/game_asm): a name as names.h spells it,
+// expanded to func_XXXXXXXX, which gives the address; the table ends with a null entry.
+struct NamedFunction {
+    const char* name;
+    void* fn;
+};
+#define PORT_FUNCTION_ENTRY(f) {#f, (void*)&f}
+#define PORT_FUNCTION(f) PORT_FUNCTION_ENTRY(f)
+struct FunctionTable {
+    const FunctionEntry* entries;
+    std::size_t count;
+    const NamedFunction* named;   // or a table of the port's own, by name
+};
+void* NativeFunction(std::uint32_t addr);       // the function at a retail address, else Native(addr)
+std::uint32_t FunctionAddr(const void* fn);     // a game function's retail address, else GameAddr(fn)
+
+}  // namespace port
+// The mirrored main memory (port/platform/game_memory.cpp). Outside the namespace and unmangled,
+// so that a global's address, port_ram + its retail address, is a link-time constant.
+extern "C" unsigned char port_ram[];
+extern "C" const port::FunctionTable port_function_tables[];
+extern "C" const std::size_t port_function_table_count;
+namespace port {
+
 inline void* Native(std::uint32_t addr)
 {
-    if (addr - 1u < ImageSize() - 1u)
-        return reinterpret_cast<void*>(ImageBase() + addr);
+    if (addr - 1u < kRamSize)   // 1 to the end itself: the heap's top is one past main memory
+        return port_ram + addr;
+    if (addr - kImageAddr < ImageSize())
+        return reinterpret_cast<void*>(ImageBase() + (addr - kImageAddr));
     return NativeSlow(addr);
 }
 
 inline std::uint32_t GameAddr(const void* p)
 {
+    std::uintptr_t r = reinterpret_cast<std::uintptr_t>(p) - reinterpret_cast<std::uintptr_t>(port_ram);
+    if (r - 1u < std::uintptr_t(kRamSize))
+        return static_cast<std::uint32_t>(r);
     std::uintptr_t d = reinterpret_cast<std::uintptr_t>(p) - ImageBase();
-    if (d - 1u < ImageSize() - 1u)
-        return static_cast<std::uint32_t>(d);
+    if (d < ImageSize())
+        return kImageAddr + static_cast<std::uint32_t>(d);
     return GameAddrSlow(p);
 }
 
@@ -79,8 +126,25 @@ inline std::uint32_t WordArg(const void* p)
 }
 
 // The overloads tools/gen.py writes for a cast between a pointer and an integer.
-template <class T> inline std::uint32_t GameAddrOf(T* p) { return GameAddr((const void*)p); }
-template <class T> inline T* FromGameAddr(std::uint32_t addr) { return (T*)Native(addr); }
+// A pointer's game address, and the pointer at one: a function's by the function table.
+template <class T> inline std::uint32_t AddrOf(T* p)
+{
+    if constexpr (std::is_function<T>::value)
+        return FunctionAddr((const void*)p);
+    else
+        return GameAddr((const void*)p);
+}
+template <class T> inline T* AtAddr(std::uint32_t addr)
+{
+    if constexpr (std::is_function<T>::value)
+        return (T*)NativeFunction(addr);
+    else
+        return (T*)Native(addr);
+}
+
+// The overloads tools/gen.py writes for a cast between a pointer and an integer.
+template <class T> inline std::uint32_t GameAddrOf(T* p) { return AddrOf(p); }
+template <class T> inline T* FromGameAddr(std::uint32_t addr) { return AtAddr<T>(addr); }
 
 // A stored pointer. Plain old data in C++03's sense: no constructors, one public member. That is
 // what keeps retail's layouts on every compiler: a class with constructors would make the game's
@@ -92,11 +156,11 @@ template <class T> inline T* FromGameAddr(std::uint32_t addr) { return (T*)Nativ
 template <class T> struct Ptr32 {
     std::uint32_t addr_;
 
-    T* get() const { return (T*)Native(addr_); }
+    T* get() const { return AtAddr<T>(addr_); }
     std::uint32_t addr() const { return addr_; }
     static Ptr32 FromAddr(std::uint32_t addr) { Ptr32 p; p.addr_ = addr; return p; }
 
-    Ptr32& operator=(T* p) { addr_ = GameAddr((const void*)p); return *this; }
+    Ptr32& operator=(T* p) { addr_ = AddrOf(p); return *this; }
     template <class U, class = std::enable_if_t<!std::is_same<U, T>::value &&
                                                 std::is_convertible<U*, T*>::value>>
     Ptr32& operator=(const Ptr32<U>& p) { return *this = static_cast<T*>(p.get()); }
@@ -126,7 +190,7 @@ struct GameWord {
     template <class U> operator Ptr32<U>() const { return Ptr32<U>::FromAddr(addr); }
 };
 
-template <class T> inline GameWord P32(T* p) { return GameWord{GameAddr((const void*)p)}; }
+template <class T> inline GameWord P32(T* p) { return GameWord{AddrOf(p)}; }
 template <class T> inline GameWord P32(const Ptr32<T>& p) { return GameWord{p.addr_}; }
 inline GameWord P32(std::nullptr_t) { return GameWord{0}; }
 

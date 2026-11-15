@@ -18,6 +18,7 @@
 #include <pthread.h>
 
 #include "port/iso.h"
+#include "port/retail_data.h"
 #include "port/system.h"
 
 extern "C" void func_00185758(int argc, int argv);   // RunMainLoop
@@ -63,9 +64,7 @@ void* GameMain(void*)
 
 }  // namespace
 
-namespace port {
-int FillRetailBytes();
-}
+extern "C" void port_data_init_all();   // written by tools/gen.py (port/retail_data.h)
 
 int main(int argc, char** argv)
 {
@@ -85,7 +84,11 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "sly1: needs the NTSC-U disc image (--iso)\n");
         return 2;
     }
-    std::fprintf(stderr, "sly1: %d labels of retail bytes filled from the executable\n", port::FillRetailBytes());
+    if (!port::LoadRetailImage()) {
+        std::fprintf(stderr, "sly1: the executable does not fit in main memory\n");
+        return 1;
+    }
+    port_data_init_all();
 
     pthread_attr_t attr;
     pthread_attr_init(&attr);

@@ -43,12 +43,10 @@ struct ImpulseRow;
 struct FacePoint;
 struct PlacedObject;
 
-// The game's constants and globals these functions read (defined by the game's C).
-extern "C" const unsigned char D_00248D00[], D_00248D10[], D_00248D20[], D_00248D30[], D_00248D40[];
-extern "C" const unsigned char D_00248D50[], D_00248D60[], D_00249DD0[], D_0024E600[], D_002483D0[];
-extern "C" unsigned char D_00263C00[], D_00263C10[], D_0026B530[];
-extern "C" u32 D_00261990;   // g_camera
-extern "C" u32 D_00262E10;   // g_player
+// The game's constants and globals these functions read, at their retail addresses in main memory
+// (port/retail_data.h): unit vectors, the identity matrix, the largest-float constants, the
+// quadratics of world 5's collider, the effect curve, the camera and player pointers.
+#define GLOBAL(addr) ((u8*)port::Native(addr))
 
 namespace {
 
@@ -273,7 +271,7 @@ void StorePlacedObjectLocalSpin(void* self, void* in)
 
 void ComputeChainedWorldFrame(void* a, void* pos, void* rot)
 {
-    PutQ(pos, 0, Q(D_00248D30));
+    PutQ(pos, 0, Q(GLOBAL(0x00248D30)));
     PutQ(rot, 0x00, Q(a, 0x50));
     PutQ(rot, 0x10, Q(a, 0x60));
     PutQ(rot, 0x20, Q(a, 0x70));
@@ -360,7 +358,7 @@ void LookupValueTreeLeaf(void* a, void* b, void* c)
 
 s32 FindNearestStoredPoint(TriggerZone* self, f32* out)
 {
-    f32 best = F(D_00249DD0, 0);
+    f32 best = F(GLOBAL(0x00249DD0), 0);
     s32 n = (s32)W(self, 0x7B4);
     if (n == 0)
         return 0;
@@ -380,7 +378,7 @@ s32 FindNearestStoredPoint(TriggerZone* self, f32* out)
 
 PlacedObject* FindNearestAgentKey(void* a, void* b)
 {
-    f32 best = F(D_0024E600, 0);
+    f32 best = F(GLOBAL(0x0024E600), 0);
     L p = Ld(Q(b));
     u8* result = nullptr;
     for (u32 i = 0; i < 6; i++) {
@@ -397,7 +395,7 @@ PlacedObject* FindNearestAgentKey(void* a, void* b)
 
 s32 CompareDistanceFromPlayer(TargetCandidate* a, TargetCandidate* b)
 {
-    L player = Ld(Q(port::Native(D_00262E10), 0x140));
+    L player = Ld(Q(port::Native(W(GLOBAL(0x00262E10), 0)), 0x140));
     f32 da = Root(Len2(SubL(Ld(Q(a, 0x10)), player)));
     f32 db = Root(Len2(SubL(Ld(Q(b, 0x10)), player)));
     return da < db ? -1 : 1;
@@ -418,8 +416,8 @@ void BuildCameraGroundFrame(void* self)
 {
     L flat = Lanes(-F(self, 0x80), -F(self, 0x84), 0, 0);
     f32 len = Root(Len2(flat));
-    L forward = len < kEpsilon ? Ld(Q(D_00248D00)) : Scale(flat, Reciprocal(len));
-    L up = Ld(Q(D_00248D20));
+    L forward = len < kEpsilon ? Ld(Q(GLOBAL(0x00248D00))) : Scale(flat, Reciprocal(len));
+    L up = Ld(Q(GLOBAL(0x00248D20)));
     L side = Cross(up, forward);
     u128 keep = Q(self, 0xA0);
     L back80 = Scale(Ld(Q(self, 0x80)), -1.0f);
@@ -453,7 +451,7 @@ void FillLookDirectionBlock(void* out, LookSource* src)
     PutF(out, 0x20, F(src, 0xC4));
     L dir = Ld(Q(src, 0xD0));
     f32 len = Root(Len2(dir));
-    PutQ(out, 0x30, len < kEpsilon ? Q(D_00248D20) : St(Scale(dir, Reciprocal(len))));
+    PutQ(out, 0x30, len < kEpsilon ? Q(GLOBAL(0x00248D20)) : St(Scale(dir, Reciprocal(len))));
     PutW(out, 0x40, W(src, 0xE0));
     PutW(out, 0x44, W(src, 0x7C));
 }
@@ -463,16 +461,16 @@ void FillLookDirectionBlock(void* out, LookSource* src)
 void InitEffect(Effect* self, void* pos, f32 scale, s32 flags)
 {
     PutW(self, 0x24, (u32)flags);
-    PutF(self, 0x18, port::RetailRef<f32>(0x0026185C));   // the game clock's time
+    PutF(self, 0x18, F(GLOBAL(0x0026185C), 0));   // the game clock's time
     PutF(self, 0x1C, 1.0f);
     PutF(self, 0x30, scale);
-    PutQ(self, 0x40, Q(D_0026B530));
+    PutQ(self, 0x40, Q(GLOBAL(0x0026B530)));
     u128 p = Q(pos);
     PutQ(self, 0x80, p);
     PutQ(self, 0x90, p);
-    PutQ(self, 0x50, Q(D_002483D0, 0x00));
-    PutQ(self, 0x60, Q(D_002483D0, 0x10));
-    PutQ(self, 0x70, Q(D_002483D0, 0x20));
+    PutQ(self, 0x50, Q(GLOBAL(0x002483D0), 0x00));
+    PutQ(self, 0x60, Q(GLOBAL(0x002483D0), 0x10));
+    PutQ(self, 0x70, Q(GLOBAL(0x002483D0), 0x20));
     u8* owner = Ptr(self, 0xC);
     f32 d = Root(Len2(SubL(Ld(Q(self, 0x80)), Ld(Q(owner, 0x140)))));
     if (F(owner, 0x2A4) < d) {
@@ -490,8 +488,8 @@ void InitRangeRecord(void* p)
     PutF(p, 0x40, 100.0f);
     PutF(p, 0x44, 400.0f);
     PutW(p, 0xB0, 0xFFFFFFFFu);
-    PutQ(p, 0x30, Q(D_00248D10));
-    PutQ(p, 0x20, St(Scale(Ld(Q(D_00248D20)), -1.0f)));
+    PutQ(p, 0x30, Q(GLOBAL(0x00248D10)));
+    PutQ(p, 0x20, St(Scale(Ld(Q(GLOBAL(0x00248D20))), -1.0f)));
 }
 
 s32 RangeRecordReachesSphere(RangeRecord* node, void* sphere, f32 radius)
@@ -500,7 +498,7 @@ s32 RangeRecordReachesSphere(RangeRecord* node, void* sphere, f32 radius)
     if (!owner)
         return 0;
     u32 mask = W(owner, 0xC);
-    u32 cameraMask = W(port::Native(D_00261990), 0x21C);
+    u32 cameraMask = W(port::Native(W(GLOBAL(0x00261990), 0)), 0x21C);
     if (!(mask & 0x10000000u) && (cameraMask & mask) != cameraMask)
         return 0;
     f32 r = port_vu0::Add(radius, F(node, 0x60));
@@ -560,7 +558,7 @@ void ExpandColliderBoundsBySphere(void* self, void* p, f32 f)
 {
     L point = Ld(Q(p));
     f32 dist = Root(Len2(SubL(point, Ld(Q(self, 0x140)))));
-    L unit = Ld(Q(D_00248D40));
+    L unit = Ld(Q(GLOBAL(0x00248D40)));
     L lo = Ld(Q(self, 0x420));
     MinXyz(lo, Corner(point, unit, -f));
     PutQ(self, 0x420, St(lo));
@@ -585,9 +583,9 @@ void UpdateColliderBounds(Collider* self)
 {
     const u64 kSphere = u64(1) << 40;     // the part is a sphere: its box is its radius
     const u64 kNoPoint = u64(1) << 44;    // the part has no extra point at +0x370
-    L lo = Ld(Q(D_00248D50)), hi = Ld(Q(D_00248D60));
+    L lo = Ld(Q(GLOBAL(0x00248D50))), hi = Ld(Q(GLOBAL(0x00248D60)));
     L pos = Ld(Q(self, 0x140));
-    L unit = Ld(Q(D_00248D40));
+    L unit = Ld(Q(GLOBAL(0x00248D40)));
     f32 maxR = 0.0f;
     for (u8* part = Ptr(self, 0x2D8); part; part = Ptr(part, 0x2E4)) {
         u64 flags;
@@ -690,8 +688,8 @@ void TransformMeshToWorld(CollisionMesh* a, CollisionMesh* b, Qword128 q, Mat3* 
 void ComputeWorld5ModeColliderAnchors(World5ModeCollider* self, Vec4* a, Vec4* b)
 {
     f32 t = F(self, 0x6FC), u = F(self, 0x700);
-    f32 c0 = F(D_00263C00, 0), c1 = F(D_00263C00, 4), c2 = F(D_00263C00, 8);
-    f32 d0 = F(D_00263C10, 0), d1 = F(D_00263C10, 4), d2 = F(D_00263C10, 8);
+    f32 c0 = F(GLOBAL(0x00263C00), 0), c1 = F(GLOBAL(0x00263C00), 4), c2 = F(GLOBAL(0x00263C00), 8);
+    f32 d0 = F(GLOBAL(0x00263C10), 0), d1 = F(GLOBAL(0x00263C10), 4), d2 = F(GLOBAL(0x00263C10), 8);
     f32 A = port_vu0::Add(c0, Mul(t, port_vu0::Add(c1, Mul(t, c2))));
     f32 Bv = port_vu0::Add(d0, Mul(u, port_vu0::Add(d1, Mul(u, d2))));
     PutQ(a, 0, Shuffled(0.0f, A, Bv));
@@ -723,3 +721,43 @@ void InterpolateBlendEntryPosition(void* p, void* e, f32 a, f32 b, s32 i, s32 j,
 // --- the clock
 
 s64 ReadCycleCounter(void) { return (s64)port::CycleCount(); }
+
+// --- the table by retail address (port/ptr32.h): these functions' pointers are in the game's
+// data too (class descriptors), as their retail addresses.
+
+extern "C" const port::NamedFunction port_game_asm_functions[] = {
+    PORT_FUNCTION(AddWeightedVectors),
+    PORT_FUNCTION(MeasureListenerDistance),
+    PORT_FUNCTION(SplitVectorAlongAxis),
+    PORT_FUNCTION(BuildPerpendicularPair),
+    PORT_FUNCTION(ScaleMatrix),
+    PORT_FUNCTION(MultiplyByTransposedMatrix3x3),
+    PORT_FUNCTION(OrthonormalizeMatrix),
+    PORT_FUNCTION(GetPlacedObjectLocalVelocity),
+    PORT_FUNCTION(StorePlacedObjectLocalVelocity),
+    PORT_FUNCTION(StorePlacedObjectLocalSpin),
+    PORT_FUNCTION(ComputeChainedWorldFrame),
+    PORT_FUNCTION(FindPlaneTreeNodeForPoint),
+    PORT_FUNCTION(IsPointInsideFaceTree),
+    PORT_FUNCTION(LookupValueTreeLeaf),
+    PORT_FUNCTION(FindNearestStoredPoint),
+    PORT_FUNCTION(FindNearestAgentKey),
+    PORT_FUNCTION(CompareDistanceFromPlayer),
+    PORT_FUNCTION(MeasurePointGraphEdges),
+    PORT_FUNCTION(BuildCameraGroundFrame),
+    PORT_FUNCTION(ComputeCameraDistanceFade),
+    PORT_FUNCTION(FillLookDirectionBlock),
+    PORT_FUNCTION(InitEffect),
+    PORT_FUNCTION(InitRangeRecord),
+    PORT_FUNCTION(RangeRecordReachesSphere),
+    PORT_FUNCTION(ConvertRgbToHsv),
+    PORT_FUNCTION(ComputeColliderPointVelocity),
+    PORT_FUNCTION(ApplyColliderInverseInertia),
+    PORT_FUNCTION(ExpandColliderBoundsBySphere),
+    PORT_FUNCTION(UpdateColliderBounds),
+    PORT_FUNCTION(TransformMeshToWorld),
+    PORT_FUNCTION(ComputeWorld5ModeColliderAnchors),
+    PORT_FUNCTION(InterpolateBlendEntryPosition),
+    PORT_FUNCTION(ReadCycleCounter),
+    {nullptr, nullptr},
+};

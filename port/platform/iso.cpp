@@ -3,6 +3,8 @@
 // its loadable segments as an ELF file. Written from the public ISO 9660 and ELF formats.
 #include "port/iso.h"
 
+#include "port/ptr32.h"
+
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -91,6 +93,16 @@ bool ReadSectors(std::uint32_t lsn, std::uint32_t count, void* dst)
     if (std::fseek(g_iso, (long)((std::uint64_t)lsn * kSectorSize), SEEK_SET) != 0)
         return false;
     return std::fread(dst, kSectorSize, count, g_iso) == count;
+}
+
+bool LoadExecutableSegments()
+{
+    for (const Segment& s : g_segments) {
+        if (s.vaddr + s.filesz > kRamSize)
+            return false;
+        std::memcpy(port_ram + s.vaddr, &g_exe[s.offset], s.filesz);
+    }
+    return !g_segments.empty();
 }
 
 bool ReadExecutable(std::uint32_t addr, void* dst, std::uint32_t size)

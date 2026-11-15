@@ -7,9 +7,9 @@
 #include "port/ptr32.h"
 
 // The sound client's armed reply buffer and its word count (iop_commands.cpp's g_iopReplyBuffer,
-// a game pointer, and g_iopReplyWordCount).
-extern "C" std::uint32_t D_0025C340;
-extern "C" std::int32_t D_0025C344;
+// a game pointer, and g_iopReplyWordCount), at their retail addresses.
+static std::uint32_t ReplyBuffer() { return *static_cast<std::uint32_t*>(port::Native(0x0025C340)); }
+static std::int32_t ReplyWordCount() { return *static_cast<std::int32_t*>(port::Native(0x0025C344)); }
 
 #include <cstdio>
 #include <map>
@@ -45,9 +45,9 @@ void CallIopService(RemoteCallClient* client, std::int32_t cmd, const void*, std
     // The sound driver's command channel: the driver writes its reply straight into the buffer the
     // game armed, between two marker words 0xFFFFFFFF (IsIopReplyReady waits for both). Until the
     // sound engine answers (milestone 3), the reply words are zero.
-    if (service == kSoundCommands && D_0025C340 != 0) {
-        std::uint32_t* reply = static_cast<std::uint32_t*>(Native(D_0025C340));
-        std::int32_t n = D_0025C344;
+    if (service == kSoundCommands && ReplyBuffer() != 0) {
+        std::uint32_t* reply = static_cast<std::uint32_t*>(Native(ReplyBuffer()));
+        std::int32_t n = ReplyWordCount();
         std::memset(reply + 1, 0, sizeof(std::uint32_t) * (std::size_t)(n > 0 ? n : 0));
         reply[0] = 0xFFFFFFFFu;
         reply[n + 1] = 0xFFFFFFFFu;

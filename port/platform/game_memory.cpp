@@ -3,7 +3,10 @@
 // platform, the scratchpad, and the slow paths of the conversions.
 #include "port/ptr32.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <functional>
+#include <vector>
 #include <cstdlib>
 
 #if defined(__APPLE__) || defined(__linux__)
@@ -79,7 +82,7 @@ std::uintptr_t FindImageBase()
     g_imageBase = reinterpret_cast<std::uintptr_t>(__executable_start);
     size = reinterpret_cast<std::uintptr_t>(_end) - g_imageBase;
 #endif
-    if (size == 0 || size > kGameMemorySize) {
+    if (size == 0 || size >= kGameMemorySize) {
         std::fprintf(stderr, "port: the program image spans 0x%llX bytes; game addresses reach 0x%X\n",
                      (unsigned long long)size, (unsigned)kGameMemorySize);
         std::_Exit(70);
@@ -89,6 +92,14 @@ std::uintptr_t FindImageBase()
 }
 
 alignas(64) static unsigned char g_scratchpad[kScratchpadSize];
+
+}  // namespace port
+
+// The PS2's main memory, mirrored: the game's globals at their retail addresses, filled from the
+// player's executable and the decompilation's initialisers (port/retail_data.h), and its heap.
+alignas(4096) unsigned char port_ram[port::kRamSize];
+
+namespace port {
 
 unsigned char* Scratchpad() { return g_scratchpad; }
 
@@ -117,10 +128,8 @@ void* NativeSlow(std::uint32_t addr)
         return Registers(g_eeRegisters, kEeRegistersSize) + (addr - kEeRegisters);
     if (addr - kGsRegisters < kGsRegistersSize)
         return Registers(g_gsRegisters, kGsRegistersSize) + (addr - kGsRegisters);
-    std::uint32_t seg = addr >> 28;
-    std::uint32_t off = addr & 0x0FFFFFFFu;
-    if ((seg == 0 || seg == 2) && off != 0 && off < kGameMemorySize)
-        return reinterpret_cast<void*>(ImageBase() + off);
+    if ((addr >> 28) == 2 && (addr & 0x0FFFFFFFu) < kRamSize)
+        return port_ram + (addr & 0x0FFFFFFFu);   // the uncached alias of main memory
     if (addr - kScratchpadAddr < kScratchpadSize)
         return g_scratchpad + (addr - kScratchpadAddr);
     return reinterpret_cast<void*>(kWordTag | addr);
@@ -153,6 +162,69 @@ std::uint32_t GameAddrSlow(const void* p)
 #endif
     std::fflush(stderr);
     std::_Exit(70);
+}
+
+// --- the game's functions by retail address (port/ptr32.h)
+
+namespace {
+
+// Built on first use, which may be during static initialisation (a stored function pointer's
+// initial value): a function-local static is constructed then, where a global might be constructed
+// again afterwards.
+struct FunctionIndex {
+    std::vector<FunctionEntry> byAddr, byFn;
+
+    FunctionIndex()
+    {
+        for (std::size_t i = 0; i < port_function_table_count; i++) {
+            const FunctionTable& table = port_function_tables[i];
+            if (table.entries)
+                byAddr.insert(byAddr.end(), table.entries, table.entries + table.count);
+            for (const NamedFunction* n = table.named; n && n->name; n++) {
+                unsigned addr;
+                if (std::sscanf(n->name, "func_%8X", &addr) != 1) {
+                    std::fprintf(stderr, "port: %s is not a game function's name\n", n->name);
+                    std::abort();
+                }
+                byAddr.push_back({addr, n->fn});
+            }
+        }
+        byFn = byAddr;
+        std::sort(byAddr.begin(), byAddr.end(),
+                  [](const FunctionEntry& a, const FunctionEntry& b) { return a.addr < b.addr; });
+        std::sort(byFn.begin(), byFn.end(), [](const FunctionEntry& a, const FunctionEntry& b) {
+            return std::less<const void*>()(a.fn, b.fn);
+        });
+    }
+};
+
+const FunctionIndex& Functions()
+{
+    static const FunctionIndex index;
+    return index;
+}
+
+}  // namespace
+
+void* NativeFunction(std::uint32_t addr)
+{
+    const FunctionIndex& index = Functions();
+    auto it = std::lower_bound(index.byAddr.begin(), index.byAddr.end(), addr,
+                               [](const FunctionEntry& e, std::uint32_t a) { return e.addr < a; });
+    if (it != index.byAddr.end() && it->addr == addr)
+        return it->fn;
+    return Native(addr);
+}
+
+std::uint32_t FunctionAddr(const void* fn)
+{
+    const FunctionIndex& index = Functions();
+    auto it = std::lower_bound(index.byFn.begin(), index.byFn.end(), fn, [](const FunctionEntry& e, const void* f) {
+        return std::less<const void*>()(e.fn, f);
+    });
+    if (it != index.byFn.end() && it->fn == fn)
+        return it->addr;
+    return GameAddr(fn);
 }
 
 }  // namespace port

@@ -18,8 +18,6 @@
 
 namespace {
 
-// Ten channels of 0x100 bytes, the register blocks' spacing.
-alignas(256) unsigned char g_dmaChannels[10][0x100];
 std::uint32_t g_discReadCount;
 
 }  // namespace
@@ -85,7 +83,14 @@ s32 GetGsInterruptMask(void) { return 0; }
 
 // --- DMA: channels in game memory, transfers accepted
 
-u32 GetDmaChannel(u32 index) { return index < 10 ? port::GameAddr(g_dmaChannels[index]) : 0; }
+// The EE's ten DMA channels' register blocks (VIF0, VIF1, GIF, IPU from/to, SIF0-2, SPR from/to), at
+// their hardware addresses (port/ptr32.h maps the register window to plain memory).
+u32 GetDmaChannel(u32 index)
+{
+    static const u32 kChannels[10] = {0x10008000, 0x10009000, 0x1000A000, 0x1000B000, 0x1000B400,
+                                      0x1000C000, 0x1000C400, 0x1000C800, 0x1000D000, 0x1000D400};
+    return index < 10 ? kChannels[index] : 0;
+}
 s32 ResetDmaController(s32) { return 0; }
 void StartDmaChain(void*, void*) {}
 void StartDmaChainToMemory(void*) {}

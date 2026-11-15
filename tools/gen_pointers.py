@@ -315,6 +315,11 @@ class Walker:
         self.macro_starts = set()  # (file, offset) where a macro is expanded, in this unit
         self.rename = {}           # (file, offset) of a parameter -> its name in the signature
         self.global_defs = {}      # D_XXXXXXXX globals the C defines -> their size in bytes
+        self.global_inits = []     # (file, name, its initial value's name), per definition moved
+        self.global_kept = set()   # globals left as objects of their own (see define_global)
+        self.functions = []        # (file, func_XXXXXXXX) per game function the file defines
+        self.result_kinds = []     # (func_XXXXXXXX, kind of result, definition?, file, line)
+        self.declarations = []     # (func_XXXXXXXX, kind, file, where, adapter details or None)
         self.global_decls = []     # their declarations: (name, file, start, end, type, shared, line)
 
     def char_at(self, loc):
@@ -561,6 +566,7 @@ class Walker:
         if c.is_definition():
             size = c.type.get_size()
             self.global_defs[name] = max(self.global_defs.get(name, 0), size if size > 0 else 0)
+            self.define_global(c, name)
             return
         f = c.location.file.name
         start, end = c.extent.start.offset, c.extent.end.offset
@@ -578,6 +584,137 @@ class Walker:
         except Unsupported:
             type_text = None
         self.global_decls.append((name, f, start, j, type_text, shared, c.location.line))
+
+    def record_function(self, c):
+        """A game function's definition (func_XXXXXXXX, at namespace scope, in a source file): an
+        entry of the function table by retail address (port/ptr32.h). Every declaration's kind of
+        result too: the return type is not in a C++ function's link name, so one file's `s32 f()`
+        and another's `T* f()` meet at link time, which the PS2's 32-bit registers absorbed."""
+        if c.kind != CK.FUNCTION_DECL or not re.fullmatch(r"func_[0-9A-F]{8}", c.spelling):
+            return
+        rk = c.result_type.get_canonical().kind
+        kind = ("pointer" if rk == TK.POINTER else "void" if rk == TK.VOID else
+                "integer" if rk in (TK.INT, TK.UINT, TK.LONG, TK.ULONG, TK.SHORT, TK.USHORT, TK.CHAR_S,
+                                    TK.SCHAR, TK.UCHAR, TK.CHAR_U, TK.BOOL, TK.ENUM) else "other")
+        self.result_kinds.append((c.spelling, kind, c.is_definition(), c.location.file.name, c.location.line))
+        if not c.is_definition():
+            self.record_declaration(c, kind)
+            return
+        parent = c.semantic_parent
+        if parent is None or parent.kind not in (CK.TRANSLATION_UNIT, CK.LINKAGE_SPEC, CK.UNEXPOSED_DECL):
+            return
+        f = c.location.file.name
+        if f.endswith(".cpp"):
+            # The definition's own type picks it where the file also declares other overloads.
+            # Its type under the rewrite: parameters and result in register positions.
+            try:
+                params = [pr(a.type, "", False) for a in c.get_arguments()]
+                if c.type.is_function_variadic():
+                    params.append("...")
+                spelling = "%s (%s)" % (pr(c.result_type, "", False), ", ".join(params))
+            except Unsupported:
+                spelling = None
+            if spelling and ("(unnamed" in spelling or "(anonymous" in spelling or "(lambda" in spelling):
+                spelling = None
+            self.functions.append((f, c.spelling, spelling))
+
+    def record_declaration(self, c, kind):
+        """What an adapter needs, should this declaration's result disagree with the definition's
+        (see adapt_results): where its name and end are, and its types under the rewrite."""
+        if kind not in ("pointer", "integer"):
+            return
+        f = c.location.file.name
+        parent = c.semantic_parent
+        where = "%s:%d" % (f, c.location.line)
+        if not f.endswith(".cpp") or parent is None or parent.kind not in (
+                CK.TRANSLATION_UNIT, CK.LINKAGE_SPEC, CK.UNEXPOSED_DECL):
+            self.declarations.append((c.spelling, kind, f, where, None))
+            return
+        data = self.texts.get(f)
+        if data is None:
+            data = self.texts[f] = Path(f).read_bytes()
+        j = c.extent.end.offset
+        while j < len(data) and data[j:j + 1] in b" \t\r\n":
+            j += 1
+        loc = c.location.offset
+        m = re.match(rb"[A-Za-z_]\w*", data[loc:])
+        if data[j:j + 1] != b";" or m is None or c.type.is_function_variadic():
+            self.declarations.append((c.spelling, kind, f, where, None))
+            return
+        try:
+            params = [pr(a.type, "a%d" % i, False) for i, a in enumerate(c.get_arguments())]
+            result = pr(c.result_type, "", False)
+        except Unsupported:
+            self.declarations.append((c.spelling, kind, f, where, None))
+            return
+        self.declarations.append((c.spelling, kind, f, where,
+                                  (loc, len(m.group(0)), j + 1, result, params)))
+
+    def define_global(self, c, name):
+        """A definition of a game global at namespace scope: its value becomes port_init_<name>
+        (static, the same type and initialiser), copied to the global's retail address at start-up,
+        and the name a macro over that address (port/retail_data.h)."""
+        parent = c.semantic_parent
+        if parent is None or parent.kind not in (CK.TRANSLATION_UNIT, CK.NAMESPACE, CK.LINKAGE_SPEC,
+                                                 CK.UNEXPOSED_DECL):
+            return                          # a function's static: a real object of its own
+        f = c.location.file.name
+        if not f.endswith(".cpp"):
+            self.global_kept.add(name)
+            self.edits.unsupported.append("%s:%d: %s is defined in a header; kept as a global of its own"
+                                          % (f, c.location.line, name))
+            return
+        data = self.texts.get(f)
+        if data is None:
+            data = self.texts[f] = Path(f).read_bytes()
+        end = c.extent.end.offset
+        j = end
+        while j < len(data) and data[j:j + 1] in b" \t\r\n":
+            j += 1
+        if data[j:j + 1] != b";":
+            self.global_kept.add(name)  # `T A = 1, B = 2;`: one statement, several globals
+            self.edits.unsupported.append("%s:%d: %s is defined in a statement that defines others; kept "
+                                          "as a global of its own" % (f, c.location.line, name))
+            return
+        line = data.rfind(b"\n", 0, c.extent.start.offset) + 1
+        if data[line:c.extent.start.offset].strip():
+            self.global_kept.add(name)
+            self.edits.unsupported.append("%s:%d: %s's definition shares its line; kept as a global of its own"
+                                          % (f, c.location.line, name))
+            return
+        try:
+            type_text = pr(c.type, "", True)
+        except Unsupported as e:
+            self.global_kept.add(name)
+            self.edits.unsupported.append("%s:%d: %s: %s" % (f, c.location.line, name, e))
+            return
+        new_name = "port_init_" + name
+        loc = c.location.offset
+        m = re.match(rb"[A-Za-z_]\w*", data[loc:])
+        spelled = m.group(0).decode() if m else name
+        if needs(c.type, True):
+            self.rename[(f, loc)] = new_name            # the declaration's rewrite writes the name
+        else:
+            self.edits.rep(f, loc, loc + len(spelled), new_name, "globals at retail addresses")
+        toks = _tokens(c)
+        words = [tk.spelling for tk in toks[:3]]
+        if words[:1] == ["extern"]:
+            stop = 2 if len(words) > 1 and words[1].startswith('"') else 1
+            self.edits.rep(f, toks[0].extent.start.offset, toks[stop - 1].extent.end.offset, "static",
+                           "globals at retail addresses")
+        # The macro comes first, on its own lines: an initialiser may take the global's own address
+        # (a registry pointing into itself), which is then its retail one. One insertion, with the
+        # `static` the definition needs, as both go at the line's start.
+        prefix = "#undef %s\n#define %s (port::RetailRef< %s >(0x%08XU))\n" % (
+            name, name, type_text, int(name[2:], 16))
+        if words[:1] != ["extern"] and "static" not in words:
+            start = c.extent.start.offset
+            if start == line:
+                prefix += "static "
+            else:
+                self.edits.wrap(f, start, start, "static ", "", 0, "globals at retail addresses")
+        self.edits.wrap(f, line, line, prefix, "", 0, "globals at retail addresses")
+        self.global_inits.append((f, name, new_name))
 
     def member_initialisers(self, c, depth):
         """`: a(p)` in a constructor, for a member a that is a stored pointer: `a(port::P32(p))`."""
@@ -742,6 +879,7 @@ class Walker:
                                                           CK.FUNCTION_TEMPLATE):
                     self.declaration(ch, False)
             elif k in (CK.FUNCTION_DECL, CK.CXX_METHOD, CK.FUNCTION_TEMPLATE):
+                self.record_function(ch)
                 self.function_result(ch)
                 self.addressed_parameters(ch)
             elif k == CK.INIT_LIST_EXPR:
@@ -789,7 +927,50 @@ def _collect(job):
         walker.walk_cursors(cursors)
         walker.flush_groups()
     return ({f: dict(r) for f, r in edits.replace.items()}, {f: set(i) for f, i in edits.insert.items()},
-            edits.unsupported, diagnostics, edits.kinds, walker.global_defs, walker.global_decls)
+            edits.unsupported, diagnostics, edits.kinds, walker.global_defs, walker.global_decls,
+            walker.global_inits, walker.global_kept, walker.functions, walker.result_kinds,
+            walker.declarations)
+
+
+def adapt_results(edits, result_kinds, declarations):
+    """A declaration whose result is a pointer where the definition's is an integer, or the other
+    way round. The two meet at link time (a C++ function's link name leaves its result out); the
+    PS2 kept both in one 32-bit register, where here a pointer is 64 bits and a game address 32.
+    The declaration is renamed to an adapter of this file's own, defined right after it: it calls
+    the definition through a declaration of its kind of result, converting between game address
+    and pointer, and a macro sends the file's uses of the name to it."""
+    defined = {}
+    for name, decls in result_kinds.items():
+        for kind, is_def, _, _ in decls:
+            if is_def:
+                defined[name] = kind
+    adapters, unadapted, seen = 0, [], set()
+    # In file order: a file's first disagreeing declaration gets the adapter, and its macro renames
+    # any later one.
+    order = lambda d: (d[2], d[4][0] if d[4] else int(d[3].rsplit(":", 1)[1]) * 1000)
+    for name, kind, f, where, details in sorted(declarations, key=order):
+        want = defined.get(name)
+        if want not in ("pointer", "integer") or want == kind or (f, name) in seen:
+            continue
+        seen.add((f, name))
+        if details is None:
+            unadapted.append("%s: %s declared %s, defined %s" % (where, name, kind, want))
+            continue
+        loc, length, after, result, params = details
+        adapter = "port_as_%s_%s" % (name, re.sub(r"\W", "_", Path(f).stem))
+        args = ", ".join("a%d" % i for i in range(len(params)))
+        plist = ", ".join(params) or "void"
+        if want == "integer":       # declared a pointer: the definition's word is a game address
+            text = ("\nint %s(%s);\ninline %s %s(%s)\n{\n    return (%s)port::Native((std::uint32_t)%s(%s));\n}\n"
+                    % (name, plist, result, adapter, plist, result, name, args))
+        else:                       # declared an integer: the definition's pointer, as its game address
+            text = ("\nvoid* %s(%s);\ninline %s %s(%s)\n{\n    return (%s)port::GameAddr(%s(%s));\n}\n"
+                    % (name, plist, result, adapter, plist, result, name, args))
+        text += "#define %s %s\n" % (name, adapter)
+        edits.rep(f, loc, loc + length, adapter, "results that disagree")
+        edits.wrap(f, after, after, text, "", 0, "results that disagree")
+        adapters += 1
+    return adapters, unadapted
 
 
 def rewrite(units, out, args, report, jobs=None):
@@ -810,8 +991,18 @@ def rewrite(units, out, args, report, jobs=None):
     edits = Edits()
     diagnostics = 0
     kinds = {}
-    global_defs, global_decls = {}, []
-    for replace, insert, unsupported, diag, k, gdefs, gdecls in results:
+    global_defs, global_decls, global_inits, global_kept = {}, [], [], set()
+    functions = collections.defaultdict(set)
+    result_kinds = collections.defaultdict(set)
+    declarations = []
+    for replace, insert, unsupported, diag, k, gdefs, gdecls, ginits, gkept, funcs, rkinds, fdecls in results:
+        declarations += fdecls
+        for name, kind, is_def, f, line in rkinds:
+            result_kinds[name].add((kind, is_def, f, line))
+        for f, name, spelling in funcs:
+            functions[f].add((name, spelling))
+        global_inits += [g for g in ginits if g not in global_inits]
+        global_kept |= gkept
         kinds.update(k)
         for name, size in gdefs.items():
             global_defs[name] = max(global_defs.get(name, 0), size)
@@ -842,7 +1033,7 @@ def rewrite(units, out, args, report, jobs=None):
     for name, f, start, end, type_text, shared, line in global_decls:
         statements[(f, start)][name] = (end, type_text, line)
     for (f, start), members in statements.items():
-        if all(n in global_defs for n in members):
+        if all(n in global_kept for n in members):
             continue
         data = Path(f).read_bytes()
         end = max(e for e, _, _ in members.values())
@@ -855,10 +1046,11 @@ def rewrite(units, out, args, report, jobs=None):
             continue
         text = ""
         for name, (_, type_text, line) in sorted(members.items(), key=lambda m: m[1][0]):
-            if name in global_defs:
+            if name in global_kept:
                 text += "\nextern %s;" % pr_named(type_text, name)
             else:
-                undefined.setdefault(name, []).append((f, line))
+                if name not in global_defs:
+                    undefined.setdefault(name, []).append((f, line))
                 text += "\n#undef %s\n#define %s (port::RetailRef< %s >(0x%08XU))" % (
                     name, name, type_text, int(name[2:], 16))
         text += "\n"
@@ -869,6 +1061,45 @@ def rewrite(units, out, args, report, jobs=None):
         edits.rep(f, start, end, text, "globals nothing defines")
     report["undefined_globals"] = undefined
     report["global_defs"] = global_defs
+    # Each file's definitions moved to retail addresses: a function that copies their initial values.
+    by_file = collections.defaultdict(list)
+    for f, name, new_name in global_inits:
+        if name not in global_kept:
+            by_file[f].append((name, new_name))
+    report["global_init_files"] = []
+    for f, items in sorted(by_file.items()):
+        func = "port_data_init_" + re.sub(r"\W", "_", Path(f).stem)
+        body = "".join("    port::RetailInit(0x%08XU, (const void*)&%s, sizeof(%s));\n" % (int(n[2:], 16), v, v)
+                       for n, v in sorted(set(items)))
+        size = Path(f).stat().st_size
+        edits.wrap(f, size, size, "\n// Written by tools/gen.py: this file's globals to their retail "
+                   "addresses (port/retail_data.h).\nvoid %s()\n{\n%s}\n" % (func, body), "", 0,
+                   "globals at retail addresses")
+        report["global_init_files"].append(func)
+    report["global_kept"] = sorted(global_kept)
+    # Each file's game functions: the table by retail address (port/ptr32.h).
+    report["function_files"] = []
+    count = 0
+    for f, names in sorted(functions.items()):
+        func = "port_functions_" + re.sub(r"\W", "_", Path(f).stem)
+        body = "".join("    {0x%sU, (void*)%s},\n" % (
+            n[5:], ("static_cast<std::add_pointer_t<%s>>(&%s)" % (s, n)) if s else "&" + n)
+            for n, s in sorted(names, key=lambda x: (x[0], x[1] or "")))
+        size = Path(f).stat().st_size
+        edits.wrap(f, size, size, "\n// Written by tools/gen.py: this file's functions by retail address "
+                   "(port/ptr32.h).\nextern const port::FunctionEntry %s[] = {\n%s};\n" % (func, body),
+                   "", 0, "functions by retail address")
+        report["function_files"].append((func, len(names)))
+        count += len(names)
+    report["function_count"] = count
+    # Results that disagree between pointer and integer: a 64-bit pointer meets a 32-bit word.
+    clashes = {}
+    for name, decls in sorted(result_kinds.items()):
+        kinds = {k for k, _, _, _ in decls}
+        if "pointer" in kinds and "integer" in kinds:
+            clashes[name] = sorted(decls, key=lambda d: (not d[1], d[2], d[3]))
+    report["result_clashes"] = clashes
+    report["result_adapters"], report["result_unadapted"] = adapt_results(edits, result_kinds, declarations)
     files = edits.apply(out)
     report["files_changed"] = len(files)
     report["counts"] = dict(edits.counts)

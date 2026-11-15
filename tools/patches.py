@@ -117,12 +117,6 @@ PATCHES = [
      "void StorePlacedObjectLocalSpin();",
      "void StorePlacedObjectLocalSpin(void* self, void* in);",
      "the setter's real parameters, for the port's C++ version of the assembly"),
-    # The heap's top: retail's is the 32 MB end of the PS2's memory, a fixed address; the port's
-    # is the end of its heap arena (port/memory.h), as a game address.
-    ("src/main/heap.cpp",
-     "    g_heapEnd = 0x2000000;",
-     "    g_heapEnd = port::HeapEndAddr();   /* port: the heap arena's end, not the PS2's 32 MB */",
-     "game addresses are offsets in the port's image, so the heap ends where its arena does"),
     # Their callers end a list of addresses with a bare 0: an int, which a 64-bit ABI need not
     # widen into a pointer's slot (Apple's arm64 passes variadic ints in 8-byte stack slots with
     # undefined upper halves). A null pointer there instead.
@@ -138,6 +132,17 @@ PATCHES = [
      "StartFromSprChain(p, p + 0x2C, p + 0x58, 0);",
      "StartFromSprChain(p, p + 0x2C, p + 0x58, (void*)0);",
      "a null address, not an int 0, as the last variadic argument"),
+
+    # 64-bit hazards: 32-bit unsigned arithmetic added to a pointer, which wraps on the PS2's
+    # 32-bit addresses and lands 4 GB away here. Reported to the decompilation (byte-neutral there).
+    ("src/main/placed_object_model.cpp",
+     "strip->unpack = (StripUnpack*)((u8*)strip->unpack + (strip->addr[0] - starts[0]));",
+     "strip->unpack = (StripUnpack*)((u8*)strip->unpack + (s32)(strip->addr[0] - starts[0]));",
+     "the unpack block moves by the difference of two u32 addresses, which may be negative"),
+    ("src/main/placed_object_model.cpp",
+     "m->p = (u16*)((u8*)m->p + (m->addr - start));",
+     "m->p = (u16*)((u8*)m->p + (s32)(m->addr - start));",
+     "the morph target's words move by the difference of two u32 addresses, which may be negative"),
 ]
 
 

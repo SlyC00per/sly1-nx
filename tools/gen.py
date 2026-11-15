@@ -23,6 +23,7 @@ AST stage (libclang), see rewrite_pointers().
 """
 
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -34,6 +35,31 @@ sys.path.insert(0, str(DECOMP / "tools"))
 from modern_check import standard_returns  # noqa: E402  (sly1-decomp's, unchanged)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import patches  # noqa: E402
+
+def named_returns(text):
+    """g++'s named return values (`T f(...) return out { ... }`) as standard C++: sly1-decomp's
+    standard_returns declares the name at the top of the body, for its compile check; the port
+    also returns it, at every bare `return;` and at the body's end, as g++ did."""
+    text, found = standard_returns(text)
+    if not found:
+        return text, found
+    lines = text.split("\n")
+    for line, name in found:
+        # standard_returns puts the head on line `line` and `{ T name;` on the next one.
+        i = line   # index of the `{ T name;` line (0-based)
+        assert lines[i].startswith("{ ") and lines[i].rstrip().endswith(" %s;" % name), lines[i]
+        depth, j = 0, i
+        while True:
+            depth += lines[j].count("{") - lines[j].count("}")
+            if depth == 0:
+                break
+            j += 1
+        for k in range(i + 1, j + 1):
+            lines[k] = re.sub(r"\breturn\s*;", "return %s;" % name, lines[k])
+        end = lines[j].rindex("}")
+        lines[j] = lines[j][:end] + "return %s; " % name + lines[j][end:]
+    return "\n".join(lines), found
+
 
 HELPERS = {"include/vu0.h", "include/fpu.h", "include/system.h", "include/mul_wide.h"}
 
@@ -389,7 +415,7 @@ def text_stage(out):
                 stats["patches"] += n
                 fixed = fix_broken_strings(text)
                 stats["broken_strings"] += fixed != text
-                text, found = standard_returns(fixed)
+                text, found = named_returns(fixed)
                 stats["named_returns"] += len(found)
                 text, n = rewrite_minmax(text)
                 stats["minmax"] += n
@@ -445,65 +471,26 @@ def clang_args(out):
         ["-I" + str(PORT_INCLUDE), "-I" + str(out / "include"), "-I" + str(out / "src")]
 
 
-def write_retail_aliases(out, undefined, defined):
-    """port_retail_data.cpp, the table behind port::RetailData for the globals the C declares and
-    nothing defines (port/retail_data.h):
-      - a label inside a global the C defines (by that global's address and the size of its C type:
-        config/us/c_data.tsv's entries can be a whole file's data section, several globals): that
-        global plus the offset;
-      - a label in the executable's data that is the decompilation's retail bytes (INCLUDE_DATA,
-        INCLUDE_RODATA, a constant the C reads but does not write): storage of its own, sized to
-        the next known label, which the port fills from the executable on the player's disc at
-        start-up (zero until then);
-      - the others fall in RetailData's fixed ranges."""
-    import csv
-    cdata = []
-    with open(DECOMP / "config/us/c_data.tsv") as f:
-        for row in csv.reader(f, delimiter="\t"):
-            if row and row[0] != "name":
-                cdata.append((int(row[1], 16), int(row[2]), row[0]))
-    labels = {a for a, _, _ in cdata}
-    with open(DECOMP / "config/names/data.tsv") as f:
-        for row in csv.reader(f, delimiter="\t"):
-            if row and re.match(r"D_[0-9A-F]{8}$", row[0]):
-                labels.add(int(row[0][2:], 16))
-    labels |= {int(n[2:], 16) for n in undefined} | {int(n[2:], 16) for n in defined}
-    labels = sorted(labels)
-    aliases, bases, own = [], set(), []
-    sized = sorted((int(n[2:], 16), s, n) for n, s in defined.items() if s > 0)
-    for name in sorted(undefined):
-        a = int(name[2:], 16)
-        g = next(((ga, gs, gn) for ga, gs, gn in sized if ga <= a < ga + gs), None)
-        if g:
-            aliases.append((a, g[2], a - g[0]))
-            bases.add(g[2])
-        elif 0x217380 <= a < 0x27B300:          # .rodata to the end of the file's data
-            nxt = next((l for l in labels if l > a), a + 16)
-            own.append((a, min(nxt - a, 0x400)))
-    lines = ["// Written by tools/gen.py: the table behind port::RetailData (port/retail_data.h).",
-             '#include "port/retail_data.h"', "", "namespace port {",
-             "struct RetailAlias { unsigned addr; unsigned char* base; unsigned offset; };",
-             "struct RetailBytes { unsigned addr; unsigned offset; unsigned size; };", "}", ""]
-    lines += ['extern "C" unsigned char %s[];' % b for b in sorted(bases)]
-    total = sum((s + 15) & ~15 for _, s in own)
-    lines += ["", "namespace port {",
-              "alignas(16) unsigned char kRetailBytesStorage[%d];" % max(total, 16),
-              "extern const RetailAlias kRetailAliases[] = {"]
-    lines += ["    {0x%08XU, %s, 0x%X}," % (a, b, o) for a, b, o in aliases] or ["    {0, nullptr, 0},"]
-    lines += ["};", "extern const int kRetailAliasCount = %d;" % len(aliases),
-              "// Labels whose bytes only the player's executable has: filled at start-up.",
-              "extern const RetailBytes kRetailBytes[] = {"]
-    off = 0
-    for a, s in own:
-        lines.append("    {0x%08XU, 0x%X, 0x%X}," % (a, off, s))
-        off += (s + 15) & ~15
-    if not own:
-        lines.append("    {0, 0, 0},")
-    lines += ["};", "extern const int kRetailBytesCount = %d;" % len(own), "}  // namespace port", ""]
-    (out / "port_retail_data.cpp").write_text("\n".join(lines))
-    print("gen: %d globals nothing defines: %d labels inside C globals, %d labels of retail bytes "
-          "(%d bytes, read from the player's executable at start-up), the rest in fixed ranges"
-          % (len(undefined), len(aliases), len(own), sum(s for _, s in own)))
+# The port's own definitions of game functions, by name (port/ptr32.h, NamedFunction).
+PORT_FUNCTION_TABLES = ["port_game_asm_functions"]
+
+
+def write_data_init(out, funcs, function_tables=()):
+    """port_data_init.cpp: port_data_init_all(), which start-up calls after filling main memory from
+    the executable: every file's globals get their initial values at their retail addresses."""
+    lines = ["// Written by tools/gen.py: the game's globals to their retail addresses (port/retail_data.h).", ""]
+    lines += ["#include <cstddef>", ""]
+    lines += ["extern const port::FunctionEntry %s[];" % f for f, _ in function_tables]
+    lines += ['extern "C" const port::NamedFunction %s[];' % f for f in PORT_FUNCTION_TABLES]
+    lines += ["", 'extern "C" const port::FunctionTable port_function_tables[] = {']
+    lines += ["    {%s, %d, nullptr}," % (f, n) for f, n in function_tables]
+    lines += ["    {nullptr, 0, %s}," % f for f in PORT_FUNCTION_TABLES] + ["};"]
+    lines += ['extern "C" const std::size_t port_function_table_count = %d;'
+              % (len(function_tables) + len(PORT_FUNCTION_TABLES)), ""]
+    lines += ["void %s();" % f for f in funcs]
+    lines += ["", 'extern "C" void port_data_init_all()', "{"]
+    lines += ["    %s();" % f for f in funcs] + ["}", ""]
+    (out / "port_data_init.cpp").write_text("\n".join(lines))
 
 
 def add_missing_returns(units, out):
@@ -589,7 +576,25 @@ def main():
             shown = sorted(set(lines), key=lambda x: int(x) if x.isdigit() else 0)
             print("  %s: %s (%d, lines %s%s)" % (f, why, len(lines), ", ".join(shown[:6]),
                                                  "..." if len(shown) > 6 else ""))
-    write_retail_aliases(out, report.get("undefined_globals", {}), report.get("global_defs", set()))
+    write_data_init(out, report.get("global_init_files", []), report.get("function_files", []))
+    clashes = report.get("result_clashes", {})
+    print("gen: %d functions declared returning a pointer in one place and an integer in another"
+          % len(clashes))
+    with open(out / "result_clashes.txt", "w") as fh:
+        for name, decls in clashes.items():
+            fh.write("%s\n" % name)
+            for kind, is_def, f, line in decls:
+                fh.write("    %-8s %s %s:%d\n" % (kind, "definition " if is_def else "declaration",
+                                                   os.path.relpath(f, out), line))
+    unadapted = report.get("result_unadapted", [])
+    print("gen: %d declarations adapted to their definition's result; %d left as they are"
+          % (report.get("result_adapters", 0), len(unadapted)))
+    for line in unadapted:
+        print("  " + line)
+    print("gen: functions by retail address: %d, in %d files"
+          % (report.get("function_count", 0), len(report.get("function_files", []))))
+    print("gen: globals at retail addresses: %d files of definitions, %d kept as objects of their own"
+          % (len(report.get("global_init_files", [])), len(report.get("global_kept", []))))
     import gen_layout
     analysis = [a for a in clang_args(out) if a != "-fms-extensions"]
     gen_layout.pad_tails(units, out, analysis, report)

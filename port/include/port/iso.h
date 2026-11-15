@@ -19,8 +19,9 @@ bool IsoOpen();
 bool ReadSectors(std::uint32_t lsn, std::uint32_t count, void* dst);
 // Copies size bytes of the executable at retail address addr; false outside its loaded segments.
 bool ReadExecutable(std::uint32_t addr, void* dst, std::uint32_t size);
-// Fills every label of retail bytes (port/retail_data.h) from the executable; the count filled.
-int FillRetailBytes();
+// Copies the executable's loadable segments to their addresses in main memory (port_ram); false
+// when there is no executable.
+bool LoadExecutableSegments();
 
 }  // namespace port
 

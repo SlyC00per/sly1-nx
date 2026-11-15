@@ -22,16 +22,41 @@ struct Derived : Base { int b; };
 int g_counter;
 void Bump(int* p) { ++*p; }
 
+void Retail(int* p) { *p += 10; }   // stands for a game function, at retail address 0x00123450
+
 alignas(16) int g_array[8];
 Node g_nodes[3];
 
+const port::FunctionEntry g_functions[] = {{0x00123450u, (void*)&Retail}};
+
 }  // namespace
+
+// The function table tools/gen.py writes for the game; here, one function.
+extern "C" const port::FunctionTable port_function_tables[] = {{g_functions, 1, nullptr}};
+extern "C" const std::size_t port_function_table_count = 1;
+
+UNIT_TEST(ptr32_functions_by_retail_address)
+{
+    // Stored as its retail address, as the executable's data holds functions; called natively.
+    Ptr32<void (int*)> fn = port::P32(Retail);
+    CHECK(fn.addr() == 0x00123450u);
+    int x = 1;
+    fn(&x);
+    CHECK(x == 11);
+    Ptr32<void (int*)> from_data = Ptr32<void (int*)>::FromAddr(0x00123450u);
+    CHECK(from_data.get() == &Retail);
+    CHECK(port::FromGameAddr<void (int*)>(0x00123450u) == &Retail);
+    CHECK(port::GameAddrOf(&Retail) == 0x00123450u);
+    // A function outside the table: an image address, still a round trip.
+    Ptr32<void (int*)> other = port::P32(Bump);
+    CHECK(other.addr() >= port::kImageAddr && other.get() == &Bump);
+}
 
 UNIT_TEST(ptr32_round_trip_in_image)
 {
     Ptr32<int> p = port::P32(&g_array[2]);
     CHECK(p.get() == &g_array[2]);
-    CHECK(p.addr() != 0 && p.addr() < port::kGameMemorySize);
+    CHECK(p.addr() >= port::kImageAddr && p.addr() < port::kImageAddr + port::kGameMemorySize);
     CHECK(port::FromGameAddr<int>(p.addr()) == &g_array[2]);
     Ptr32<int> null = {};
     CHECK(null.addr() == 0 && null.get() == nullptr);
@@ -58,9 +83,13 @@ UNIT_TEST(ptr32_words_carried_unchanged)
 
 UNIT_TEST(ptr32_aliases_and_scratchpad)
 {
-    Ptr32<int> p = port::P32(&g_array[1]);
-    CHECK(port::Native(p.addr() | 0x20000000u) == &g_array[1]);  // uncached alias
-    CHECK(port::GameAddr(port::Native(p.addr() | 0x30000000u)) == (p.addr() | 0x30000000u));  // a word, kept
+    // Main memory: a game address is its offset in port_ram, also through the uncached alias.
+    Ptr32<unsigned char> p = port::P32(port_ram + 0x00275BEC);
+    CHECK(p.addr() == 0x00275BECu);
+    CHECK(port::Native(port::kRamSize) == port_ram + port::kRamSize);   // the end, as the heap's top
+    CHECK(port::GameAddr(port_ram + port::kRamSize) == port::kRamSize);
+    CHECK(port::Native(0x20275BECu) == port_ram + 0x00275BEC);  // uncached alias
+    CHECK(port::GameAddr(port::Native(0x30275BECu)) == 0x30275BECu);  // a word, kept
     CHECK(port::Native(0x70002000u) == port::Scratchpad() + 0x2000);
     // A hardware register: memory that keeps what is written, and its address back.
     std::uint32_t* csr = (std::uint32_t*)port::Native(0x12001000u);

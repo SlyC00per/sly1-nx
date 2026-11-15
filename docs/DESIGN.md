@@ -120,11 +120,23 @@ adapted to C++:
 - The generation step rewrites **pointer types in declarations** (`T*` becomes
   `Ptr32<T>`: members, globals, parameters, locals, casts, `sizeof`). Expressions are not
   rewritten. `this` and temporaries stay native.
-- Everything a game pointer can point at is inside the image, so within 2 GiB of the
-  anchor on every platform: globals and functions already are; the game's heap is a static
-  array (the PS2's 32 MiB, configurable); the game's threads run on static stacks. So one
-  offset works for data, functions and stack objects alike, with no table of functions and
-  no fixed load address (which neither macOS on Apple Silicon nor the Switch allows).
+- Main memory is mirrored: a static 32 MiB block, `port_ram`, holds what the PS2's main memory
+  held at the same addresses. Start-up copies the executable's segments from the player's disc
+  into it, then each file's initial values (the generator renames every C definition of a
+  `D_XXXXXXXX` global to `port_init_D_XXXXXXXX` and writes the copy). Every global is a macro
+  over its retail address, so neighbouring globals that the C splits from one object (a
+  decompilation leftover) still sit together as in retail, and the heap ends at 0x02000000 as
+  retail's does. Addresses 0x0 to 0x02000000 are `port_ram`; 0x08000000 and up are the
+  port's program image (functions, string literals, statics); the scratchpad, the hardware
+  registers and the uncached alias have their PS2 addresses. No fixed load address is needed
+  (neither macOS on Apple Silicon nor the Switch allows one).
+- Functions are stored as their **retail addresses**, as the executable's data holds them
+  (class descriptors, callback tables): the generator writes a table of every `func_XXXXXXXX`
+  the C defines (and the port's own definitions of the assembly functions), and a call through
+  a stored pointer looks the native function up there.
+- Declarations whose result disagrees with the definition's, pointer against integer (they link
+  because a C++ link name leaves out the return type), get a per-file adapter that converts
+  between game address and pointer. The list goes to `build-host/gen/result_clashes.txt`.
 
 What that buys, compared with (a):
 

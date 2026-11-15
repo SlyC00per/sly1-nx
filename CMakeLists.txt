@@ -81,7 +81,7 @@ file(GLOB DECOMP_UNITS CONFIGURE_DEPENDS ${SLY1_DECOMP}/src/main/*.cpp)
 file(GLOB_RECURSE DECOMP_INPUTS CONFIGURE_DEPENDS ${SLY1_DECOMP}/include/*.h ${SLY1_DECOMP}/src/main/*.cpp)
 file(GLOB GEN_TOOLS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tools/gen*.py ${CMAKE_SOURCE_DIR}/tools/patches.py
      ${CMAKE_SOURCE_DIR}/port/include/port/ps2/*.h)
-set(GEN_UNITS ${GEN_DIR}/port_retail_data.cpp ${GEN_DIR}/src/lib/sort.cpp)
+set(GEN_UNITS ${GEN_DIR}/port_data_init.cpp ${GEN_DIR}/src/lib/sort.cpp)
 foreach(unit ${DECOMP_UNITS})
     get_filename_component(name ${unit} NAME)
     list(APPEND GEN_UNITS ${GEN_DIR}/src/main/${name})
@@ -110,8 +110,9 @@ if(PLATFORM STREQUAL "HOST_ASAN")
     # The game indexes past a member array on purpose (views that start before an array or run on
     # into the next member, inside the same object, in retail's layout): UBSan's declared-bounds
     # check stays on for the port's own code; AddressSanitizer still catches any access outside an
-    # object.
-    target_compile_options(sly1_game PRIVATE -fno-sanitize=bounds)
+    # object. Its list walks also step a cursor past the last element, null plus the link's offset,
+    # which is never read: the pointer-overflow check is off for game code too.
+    target_compile_options(sly1_game PRIVATE -fno-sanitize=bounds,pointer-overflow)
 endif()
 target_include_directories(sly1_game PRIVATE ${GAME_INCLUDES})
 

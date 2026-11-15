@@ -1,34 +1,34 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// The game's globals that its C declares but does not define (tools/gen_pointers.py turns each
-// such declaration into a macro of the same name over RetailRef), and the memory they live in.
+// The game's globals, at their retail addresses in the mirrored main memory (port/ptr32.h).
 //
-// RetailData(address) is the port's storage of a retail address:
-//   0x27B300 to 0x2000000   the end of retail's image and its heap: one block (port_retail_ram)
-//                           with every label at its retail offset; g_imageEnd (0x64C70F) and the
-//                           heap's top (HeapEndAddr) fall where retail's do
-//   0x211E10 to 0x217360    the VU microcode block: a placeholder, the port runs no microcode
-//   inside a global the C   that global plus the offset (port_retail_data.cpp, written by
-//   defines                 tools/gen.py from sly1-decomp's config/us/c_data.tsv)
-//   anything else           an address used only as a number (the VU programs' addresses, the
-//                           checksum ranges): the native pointer of that very game address, so
-//                           that converting it back gives the number again
+// tools/gen.py turns every declaration of a game global (D_XXXXXXXX, whatever readable name it is
+// spelled with) into a macro of the same name over RetailRef, with that declaration's own type,
+// and every definition into its initial value (port_init_D_XXXXXXXX), which start-up copies to
+// the global's place. Start-up first fills main memory from the player's executable
+// (LoadRetailImage), so every byte the decompilation does not write in C has its retail value.
+// An address used only as a number (a VU program's, a checksum range's end) is simply that
+// address.
 #ifndef PORT_RETAIL_DATA_H
 #define PORT_RETAIL_DATA_H
 
 #include <cstdint>
+#include <cstring>
+
+#include "port/ptr32.h"
 
 namespace port {
 
-constexpr std::uint32_t kRetailRamBase = 0x0027B300;
-constexpr std::uint32_t kRetailRamTop = 0x02000000;
-constexpr std::uint32_t kVutextBase = 0x00211E10;
-constexpr std::uint32_t kVutextSize = 0x5550;
+template <class T> inline T& RetailRef(std::uint32_t addr) { return *reinterpret_cast<T*>(Native(addr)); }
 
-void* RetailData(std::uint32_t addr);
-template <class T> inline T& RetailRef(std::uint32_t addr) { return *reinterpret_cast<T*>(RetailData(addr)); }
+// Copies a global's initial value to its retail address (written by tools/gen.py, for each
+// definition).
+inline void RetailInit(std::uint32_t addr, const void* value, std::size_t size)
+{
+    std::memcpy(Native(addr), value, size);
+}
 
-// The heap's top as a game address: the end of port_retail_ram, where retail's 32 MB end is.
-std::uint32_t HeapEndAddr();
+// Fills main memory with the executable's loadable segments (port/iso.h); false without one.
+bool LoadRetailImage();
 
 }  // namespace port
 
