@@ -74,6 +74,7 @@ void* Clock(void*)
 // frames (the display's frame counter at 0x2626C0). The game thread does the load; this host
 // thread only watches and writes the request between loads.
 int g_verifyFrom = -1;
+int g_verifyTo = 46;   // --level N: that level alone
 
 void VerifyLevels()
 {
@@ -95,7 +96,7 @@ void VerifyLevels()
         std::fflush(stderr);
         std::_Exit(1);
     };
-    for (int i = g_verifyFrom; i < 46; i++) {
+    for (int i = g_verifyFrom; i < g_verifyTo; i++) {
         std::uint32_t entry = kLevels + i * 0x2C;
         std::int32_t code = word(entry + 0x20);
         std::uint32_t name = (std::uint32_t)word(entry + 0x24);
@@ -118,7 +119,7 @@ void VerifyLevels()
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "verify: level %2d loaded and ran 60 frames (%.1f s)\n", i + 1, s);
     }
-    std::fprintf(stderr, "verify: all %d levels loaded and ran 60 frames\n", 46 - g_verifyFrom);
+    std::fprintf(stderr, "verify: all %d levels loaded and ran 60 frames\n", g_verifyTo - g_verifyFrom);
     Report();
     std::fflush(stderr);
     std::_Exit(0);
@@ -160,8 +161,12 @@ int main(int argc, char** argv)
             g_verifyFrom = 0;
         else if (!std::strcmp(argv[i], "--from-level") && i + 1 < argc)
             g_verifyFrom = std::atoi(argv[++i]) - 1;
+        else if (!std::strcmp(argv[i], "--level") && i + 1 < argc) {
+            g_verifyFrom = std::atoi(argv[++i]) - 1;
+            g_verifyTo = g_verifyFrom + 1;
+        }
         else {
-            std::fprintf(stderr, "usage: %s --iso DISC.iso [--seconds N] [--save FOLDER] [--verify-levels [--from-level N]]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s --iso DISC.iso [--seconds N] [--save FOLDER] [--verify-levels [--from-level N] | --level N]\n", argv[0]);
             return 2;
         }
     }
@@ -177,6 +182,8 @@ int main(int argc, char** argv)
     if (g_verifyFrom >= 0) {
         if (g_verifyFrom >= 46)
             g_verifyFrom = 45;
+        if (g_verifyTo > 46 || g_verifyTo <= g_verifyFrom)
+            g_verifyTo = 46;
         seconds = 24 * 3600;   // the verifier ends the run
         std::thread(VerifyLevels).detach();
     }

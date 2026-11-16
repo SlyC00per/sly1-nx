@@ -154,6 +154,111 @@ PATCHES = [
      "        e = rp;\n        while (sc.buf != e) {",
      "        e = sc.buf + 32;\n        while (sc.buf != e) {",
      "the setter's argument array is destroyed from its end, which is &ret only in retail's frame"),
+    ("src/main/script_machine.cpp",
+     "    q = &D;",
+     "    q = C + 2;",
+     "the pair is destroyed from its end, which is &D only in retail's frame"),
+    ("src/main/script_machine.cpp",
+     "    ScriptValue* p2 = &c;",
+     "    ScriptValue* p2 = b + 2;",
+     "the pair is destroyed from its end, which is &c only in retail's frame"),
+
+    # A spline path's slot 2 (SampleSplinePathAtLength) is called with the position and tangent
+    # outputs (path_follower.cpp); the first is declared s32 and handed on as one.
+    ("src/main/path_curve.cpp",
+     "typedef void (*CurveSampleAtFn)(void* self, f32 t, s32 a1, void* a2);",
+     "typedef void (*CurveSampleAtFn)(void* self, f32 t, void* a1, void* a2);",
+     "the spline's sample position is a pointer the slot's callers pass, which an s32 cannot hold here"),
+    ("src/main/path_curve.cpp",
+     "void SampleSplinePathAtLength(SplinePathCurve* self, s32 a1, void* a2)",
+     "void SampleSplinePathAtLength(SplinePathCurve* self, void* a1, void* a2)",
+     "the spline's sample position is a pointer the slot's callers pass, which an s32 cannot hold here"),
+    ("include/functions/path_curve.h",
+     "void SampleSplinePathAtLength(SplinePathCurve* self, s32 a1, void* a2);",
+     "void SampleSplinePathAtLength(SplinePathCurve* self, void* a1, void* a2);",
+     "the spline's sample position is a pointer the slot's callers pass, which an s32 cannot hold here"),
+
+    # The one stored pointer declared together with its type (`struct Tri {...} *tris;`), which the
+    # pointer rewrite does not reach: the type on its own, so the field becomes a game pointer and
+    # the record keeps retail's 12 bytes (it is allocated as 0xC and read as VertexBlend03).
+    ("src/main/collider.cpp",
+     "    struct Tri { s32 i[3]; } *tris;",
+     "    struct Tri { s32 i[3]; };\n    Tri* tris;",
+     "the mesh motion record's face triples are a stored pointer, 4 bytes as in retail"),
+
+    # Slot 27 of the switched colliders shows the typed-text caption box for an object it is
+    # handed (a pointer, through the method table); the value was declared u32 and stored as a word.
+    ("src/main/switched_collider.cpp",
+     "void ShowTypedTextCaptionBox(SwitchedCollider* self, u32 value)\n{\n    CaptionBox* block = &g_typedTextCaptionBox;\n    ((T217D_Word*)&block->child)->v = value;",
+     "void ShowTypedTextCaptionBox(SwitchedCollider* self, void* value)\n{\n    CaptionBox* block = &g_typedTextCaptionBox;\n    block->child = value;",
+     "the caption's object comes through a method slot as a pointer, which a u32 cannot hold here"),
+    ("include/functions/switched_collider.h",
+     "void ShowTypedTextCaptionBox(SwitchedCollider* self, u32 value);",
+     "void ShowTypedTextCaptionBox(SwitchedCollider* self, void* value);",
+     "the caption's object comes through a method slot as a pointer, which a u32 cannot hold here"),
+
+    # The spline path's nearest-point functions hand their point and output pointers on through
+    # the curve's method slots (slot 11, slot 1) as s32 words.
+    ('src/main/path_curve.cpp',
+     'FindSplinePathNearestTime(self, (s32)pos, (s32)anchor, a3, a4, a5, a6, self->times[best]);',
+     'FindSplinePathNearestTime(self, pos, anchor, a3, a4, a5, a6, self->times[best]);',
+     "a spline path's point and outputs are pointers its callers pass through the method slots"),
+    ('include/functions/path_curve.h',
+     'void FindSplinePathNearestPoint(SplinePathCurve* self, Vec4* pos, void* anchor, s32 a3, s32 a4, f32* a5, f32* a6);',
+     'void FindSplinePathNearestPoint(SplinePathCurve* self, Vec4* pos, void* anchor, void* a3, void* a4, f32* a5, f32* a6);',
+     "a spline path's point and outputs are pointers its callers pass through the method slots"),
+    ('include/functions/path_curve.h',
+     'void FindSplinePathNearestTime(SplinePathCurve* self, s32 a1, s32 a2, s32 a3, s32 a4, f32* a5, f32* a6, f32 f12);',
+     'void FindSplinePathNearestTime(SplinePathCurve* self, void* a1, void* a2, void* a3, void* a4, f32* a5, f32* a6, f32 f12);',
+     "a spline path's point and outputs are pointers its callers pass through the method slots"),
+    ('include/functions/path_curve.h',
+     'void ProjectOntoSplinePathNearLength(SplinePathCurve* self, s32 p1, s32 p2, s32 p3, s32 p4, s32 p5, s32 p6);',
+     'void ProjectOntoSplinePathNearLength(SplinePathCurve* self, void* p1, void* p2, void* p3, void* p4, void* p5, void* p6);',
+     "a spline path's point and outputs are pointers its callers pass through the method slots"),
+    ('src/main/path_curve.cpp',
+     'typedef void (*SplineSlot11Fn)(void* self, s32 p1, f32 x, s32 p2, s32 p3, s32 p4, s32 p5, s32 p6);',
+     'typedef void (*SplineSlot11Fn)(void* self, void* p1, f32 x, void* p2, void* p3, void* p4, void* p5, void* p6);',
+     "a spline path's point and outputs are pointers its callers pass through the method slots"),
+    ('src/main/path_curve.cpp',
+     'void FindSplinePathNearestPoint(SplinePathCurve* self, Vec4* pos, void* anchor, s32 a3, s32 a4, f32* a5, f32* a6)\n',
+     'void FindSplinePathNearestPoint(SplinePathCurve* self, Vec4* pos, void* anchor, void* a3, void* a4, f32* a5, f32* a6)\n',
+     "a spline path's point and outputs are pointers its callers pass through the method slots"),
+    ('src/main/path_curve.cpp',
+     'void FindSplinePathNearestTime(SplinePathCurve* self, s32 a1, s32 a2, s32 a3, s32 a4, f32* a5, f32* a6, f32 f12)\n',
+     'void FindSplinePathNearestTime(SplinePathCurve* self, void* a1, void* a2, void* a3, void* a4, f32* a5, f32* a6, f32 f12)\n',
+     "a spline path's point and outputs are pointers its callers pass through the method slots"),
+    ('src/main/path_curve.cpp',
+     '((void (*)(PathCurve*, s32, s32, f32))fn)(self, a3, a4, out.time);',
+     '((void (*)(PathCurve*, void*, void*, f32))fn)(self, a3, a4, out.time);',
+     "a spline path's point and outputs are pointers its callers pass through the method slots"),
+    ('src/main/path_curve.cpp',
+     'void ProjectOntoSplinePathNearLength(SplinePathCurve* self, s32 p1, s32 p2, s32 p3, s32 p4, s32 p5, s32 p6)\n',
+     'void ProjectOntoSplinePathNearLength(SplinePathCurve* self, void* p1, void* p2, void* p3, void* p4, void* p5, void* p6)\n',
+     "a spline path's point and outputs are pointers its callers pass through the method slots"),
+    ('src/main/path_curve.cpp',
+     '    s32 q1 = p1;',
+     '    void* q1 = p1;',
+     "a spline path's point and outputs are pointers its callers pass through the method slots"),
+    ('src/main/path_curve.cpp',
+     '    s32 q2 = p2;',
+     '    void* q2 = p2;',
+     "a spline path's point and outputs are pointers its callers pass through the method slots"),
+    ('src/main/path_curve.cpp',
+     '    s32 q3 = p3;',
+     '    void* q3 = p3;',
+     "a spline path's point and outputs are pointers its callers pass through the method slots"),
+    ('src/main/path_curve.cpp',
+     '    s32 q4 = p4;',
+     '    void* q4 = p4;',
+     "a spline path's point and outputs are pointers its callers pass through the method slots"),
+    ('src/main/path_curve.cpp',
+     '    s32 q5 = p5;',
+     '    void* q5 = p5;',
+     "a spline path's point and outputs are pointers its callers pass through the method slots"),
+    ('src/main/path_curve.cpp',
+     '    s32 q6 = p6;',
+     '    void* q6 = p6;',
+     "a spline path's point and outputs are pointers its callers pass through the method slots"),
 
     # The one integer-to-pointer cast the generator cannot reach, inside a macro's argument.
     ("src/main/placed_object.cpp",
@@ -179,11 +284,12 @@ PATCHES = [
      "the queued call's third word is the list's game address"),
 
     # The property putter calls each setter with the value's word (fn(p, val->i)); for a vector, a
-    # matrix or an object (types 2, 4, 9, 10, 11 and the 0x1000 and 0x2000 kinds) the word is the
-    # payload's game address and the setter takes the pointer.
+    # matrix or an object (types 2, 4, 9, 10, 11 and the 0x2000 kinds, object classes) the word is
+    # the payload's game address and the setter takes the pointer. The 0x1000 kinds are
+    # enumerations (4096 the anchor presets, 4110 modes): an integer, as it was.
     ("src/main/object_properties.cpp",
      '        case 2:\n            fn(p, val->i);\n            break;\n        case 4:\n            fn(p, val->i);\n            break;\n        case 9:\n            fn(p, val->i);\n            break;\n        case 10:\n            fn(p, val->i);\n            break;\n        case 11:\n            fn(p, val->i);\n            break;\n        case 13:\n            break;\n        default:\n            if (d->type & 0x1000) {\n                fn(p, val->i);\n            } else if (d->type & 0x2000) {\n                fn(p, val->i);\n            }\n            break;',
-     '        case 2:\n            ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            break;\n        case 4:\n            ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            break;\n        case 9:\n            ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            break;\n        case 10:\n            ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            break;\n        case 11:\n            ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            break;\n        case 13:\n            break;\n        default:\n            if (d->type & 0x1000) {\n                ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            } else if (d->type & 0x2000) {\n                ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            }\n            break;',
+     '        case 2:\n            ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            break;\n        case 4:\n            ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            break;\n        case 9:\n            ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            break;\n        case 10:\n            ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            break;\n        case 11:\n            ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            break;\n        case 13:\n            break;\n        default:\n            if (d->type & 0x1000) {\n                fn(p, val->i);\n            } else if (d->type & 0x2000) {\n                ((void (*)(void*, void*))fn)(p, port::FromGameAddr<void>((u32)val->i));\n            }\n            break;',
      "a setter of a vector, matrix or object property takes the payload's pointer, not its word"),
 
     # A camera controller's activation (slot 0 of its method table, called with a pointer: the
@@ -205,6 +311,30 @@ PATCHES = [
      "                typedef void (*F)(WorldListedObject*, void*);\n"
      "                ((F)set->desc->m17)(set, port::FromGameAddr<void>((u32)h->ownerArgument));",
      "the copied object's pointer, from the word that keeps its game address"),
+
+    # ConvertDoubleToFloat takes a double; two variadic functions declare it on the double's bits
+    # (u64), the same 64-bit register on the PS2, a general register here where the function reads
+    # a floating-point one. They convert through the bits.
+    ('src/main/curve_segment.cpp',
+     'extern "C" f32 ConvertDoubleToFloat(u64 bits);',
+     'extern "C" f32 ConvertDoubleToFloat(double a);\nstatic inline f32 port_DoubleBitsToFloat(u64 bits)\n{\n    double d;\n    __builtin_memcpy(&d, &bits, 8);\n    return ConvertDoubleToFloat(d);\n}',
+     "a double's bits, as a word slot holds them, made the double the conversion takes in its FP register"),
+    ('src/main/curve_segment.cpp',
+     'ConvertDoubleToFloat(*(u64*)((ap += 8) - 8))',
+     'port_DoubleBitsToFloat(*(u64*)((ap += 8) - 8))',
+     "a double's bits, as a word slot holds them, made the double the conversion takes in its FP register"),
+    ('src/main/player_request.cpp',
+     'extern "C" f32 ConvertDoubleToFloat(u64 bits);',
+     'extern "C" f32 ConvertDoubleToFloat(double a);\nstatic inline f32 port_DoubleBitsToFloat(u64 bits)\n{\n    double d;\n    __builtin_memcpy(&d, &bits, 8);\n    return ConvertDoubleToFloat(d);\n}',
+     "a double's bits, as a word slot holds them, made the double the conversion takes in its FP register"),
+    ('src/main/player_request.cpp',
+     'rows[i] = ConvertDoubleToFloat(ap[-1]);',
+     'rows[i] = port_DoubleBitsToFloat(ap[-1]);',
+     "a double's bits, as a word slot holds them, made the double the conversion takes in its FP register"),
+    ('src/main/player_request.cpp',
+     'cols[j] = ConvertDoubleToFloat(ap[-1]);',
+     'cols[j] = port_DoubleBitsToFloat(ap[-1]);',
+     "a double's bits, as a word slot holds them, made the double the conversion takes in its FP register"),
 
     # Four hand-written functions declared without parameters, only for their addresses in the
     # method tables; the port defines them in C++ (port/game_asm), so they need their parameters.

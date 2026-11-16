@@ -499,6 +499,10 @@ class Walker:
         have = fn.type.get_canonical()
         if have.kind != TK.FUNCTIONPROTO:
             return
+        if returned_in_place(have.get_result()) and len(list(want.argument_types())) == \
+                len(list(have.argument_types())) + 1:
+            self.in_place_cast(c, e, fn, have, f)
+            return
 
         def kind(ty):
             k = ty.get_canonical().kind
@@ -507,7 +511,12 @@ class Walker:
         cast_args = list(want.argument_types())
         fn_args = list(have.argument_types())
         pairs = [(want.get_result(), have.get_result())] + list(zip(cast_args, fn_args))
-        clash = any({kind(a), kind(b)} == {"pointer", "integer"} for a, b in pairs)
+        # A result that disagrees either way, or a pointer the cast passes where the function reads
+        # a word, needs converting. A word the cast's type passes where the function takes a
+        # pointer does not: the method tables' types are placeholders (PathM02's s32 slots, called
+        # through each caller's own cast with pointers), and converting there would cut the pointers.
+        clash = {kind(pairs[0][0]), kind(pairs[0][1])} == {"pointer", "integer"} or \
+            any(kind(a) == "pointer" and kind(b) == "integer" for a, b in pairs[1:])
         if not clash:
             return
         where = "%s:%d" % (f, c.location.line)
@@ -546,7 +555,7 @@ class Walker:
                 if ck == "pointer" and fk == "integer":
                     args.append("(%s)port::GameAddrOf(a%d)" % (f_args[i], i))
                 elif ck == "integer" and fk == "pointer":
-                    args.append("(%s)port::FromGameAddr<void>((u32)a%d)" % (f_args[i], i))
+                    args.append("(%s)(uptr)a%d" % (f_args[i], i))   # passed on as it came
                 else:
                     args.append("(%s)a%d" % (f_args[i], i))
             call = "%s(%s)" % (fn.spelling, ", ".join(args))
@@ -690,6 +699,35 @@ class Walker:
             type_text = None
         self.global_decls.append((name, f, start, j, type_text, shared, c.location.line))
 
+    def in_place_cast(self, c, e, fn, have, f):
+        """`((ScriptValue* (*)(ScriptValue*, ...))EvalScriptAnd)(&u, ...)`: a function returning a
+        class by value, called with the result's place first as on the PS2. The cast takes an
+        adapter of the file's own that constructs the result there (in_place_adapter)."""
+        top = next((t for t in self.top_cursors if t.location.file and t.location.file.name == f
+                    and t.extent.start.offset <= c.extent.start.offset < t.extent.end.offset), None)
+        if top is None:
+            return
+        try:
+            params = [pr(a, "", False) for a in have.argument_types()]
+            result = pr(have.get_result(), "", False)
+        except Unsupported:
+            return
+        name = "port_inplace_cast_" + fn.spelling
+        if (f, name) not in self.fn_adapters:
+            self.fn_adapters[(f, name)] = name
+            # declared before the use, defined at the end, where the class is complete
+            s = top.extent.start.offset
+            decl = ", ".join(["void*"] + params)
+            self.edits.wrap(f, s, s, "// port: %s's result in the place its caller passes (tools/gen_pointers.py)\n"
+                            "static void* %s(%s);\n" % (fn.spelling, name, decl), "", 0, "results in place adapted")
+            data = self.texts.get(f)
+            if data is None:
+                data = self.texts[f] = Path(f).read_bytes()
+            end = len(data)
+            self.edits.wrap(f, end, end, "\n" + in_place_adapter(fn.spelling, name, result, params), "", 0,
+                            "results in place adapted")
+        self.edits.rep(f, e.extent.start.offset, e.extent.end.offset, name, "results in place adapted")
+
     def roomy_cast(self, c, operand):
         """`(Mat3*)&a` with `a` a smaller local (or `(ScaledTransform*)tmp`, an array): the game
         hands the local's address on as the larger type and has it written whole, which retail's
@@ -749,6 +787,42 @@ class Walker:
         if key not in self.rooms:
             self.rooms[key] = (var, [])
         self.rooms[key][1].append(need)
+
+    def roomy_address(self, e):
+        """`&local` of a record whose size is not a multiple of 16, anywhere: the address may reach
+        code that copies or stores it as a larger, quadword-aligned record (a 72-byte draw record
+        copied as an 80-byte ScaledTransform through a method slot), which retail's 16-byte stack
+        slots allowed. The local gets its slot's room."""
+        # The operator from the file's own byte (tokenising a whole operand is costly).
+        f = e.location.file.name if e.location.file else None
+        if f is None:
+            return
+        data = self.texts.get(f)
+        if data is None:
+            data = self.texts[f] = Path(f).read_bytes()
+        if data[e.extent.start.offset:e.extent.start.offset + 1] != b"&":
+            return
+        kids = list(e.get_children())
+        ref = kids[0] if len(kids) == 1 else None
+        while ref is not None and ref.kind in (CK.UNEXPOSED_EXPR, CK.PAREN_EXPR):
+            k2 = list(ref.get_children())
+            ref = k2[0] if len(k2) == 1 else None
+        if ref is None or ref.kind != CK.DECL_REF_EXPR or ref.referenced is None:
+            return
+        var = ref.referenced
+        if var.kind != CK.VAR_DECL or var.storage_class in (ci.StorageClass.STATIC, ci.StorageClass.EXTERN):
+            return
+        parent = var.semantic_parent
+        if parent is None or parent.kind not in (CK.FUNCTION_DECL, CK.CXX_METHOD, CK.CONSTRUCTOR,
+                                                 CK.DESTRUCTOR, CK.FUNCTION_TEMPLATE):
+            return
+        vt = var.type.get_canonical()
+        if vt.kind != TK.RECORD or vt.get_size() <= 0 or vt.get_size() % 16 == 0:
+            return
+        key = (var.location.file.name, var.location.offset)
+        if key not in self.rooms:
+            self.rooms[key] = (var, [])
+        self.rooms[key][1].append((vt.get_size() + 15) // 16 * 16)
 
     def flush_rooms(self):
         """The noted locals as plain data for the merge: how to give each more room."""
@@ -937,7 +1011,11 @@ class Walker:
                 spelling = None
             if spelling and ("(unnamed" in spelling or "(anonymous" in spelling or "(lambda" in spelling):
                 spelling = None
-            self.functions.append((f, c.spelling, spelling))
+            adapter = None
+            if spelling and returned_in_place(c.result_type) and not c.type.is_function_variadic():
+                adapter = in_place_adapter(c.spelling, "port_inplace_" + c.spelling, pr(c.result_type, "", False),
+                                           params)
+            self.functions.append((f, c.spelling, spelling, adapter))
 
     def record_declaration(self, c, kind):
         """What an adapter needs, should this declaration's result disagree with the definition's
@@ -1215,6 +1293,8 @@ class Walker:
                 self.cast(ch, depth)
             elif k == CK.CXX_UNARY_EXPR:
                 self.sizeof(ch)
+            elif k == CK.UNARY_OPERATOR:
+                self.roomy_address(ch)
             elif k == CK.CONDITIONAL_OPERATOR:
                 self.conditional(ch, depth)
             elif k == CK.CALL_EXPR:
@@ -1326,6 +1406,34 @@ def resolve_rooms(edits, plans, record_sizes):
             edits.rep(f, a, b, "port::Room<%s, %d>" % (plan["type"], n), "locals given a larger view's room")
 
 
+def returned_in_place(t):
+    """A class with its own destructor or copy constructor, returned by value: on the PS2 g++ 2.95
+    passes the result's place as the hidden first argument, which callers through casts and the
+    game's tables pass explicitly; here it goes in a register of its own (x8 on ARM64)."""
+    t = t.get_canonical()
+    if t.kind != TK.RECORD:
+        return False
+    d = t.get_declaration()
+    for k in d.get_children():
+        if k.kind == CK.DESTRUCTOR:
+            return True
+        if k.kind == CK.CONSTRUCTOR:
+            args = list(k.get_arguments())
+            if len(args) == 1 and args[0].type.get_canonical().kind == TK.LVALUEREFERENCE and \
+                    args[0].type.get_canonical().get_pointee().get_canonical() == t:
+                return True
+    return False
+
+
+def in_place_adapter(name, adapter, result, params, static=True):
+    """`void* adapter(void* ret, params...)`: the function's result constructed in ret, ret given
+    back, as the PS2's convention for a class returned by value has it."""
+    decl = ", ".join(["void* port_ret"] + ["%s" % pr_named(p, "a%d" % i) for i, p in enumerate(params)])
+    args = ", ".join("a%d" % i for i in range(len(params)))
+    return ("%svoid* %s(%s)\n{\n    ::new (port_ret) %s(%s(%s));\n    return port_ret;\n}\n"
+            % ("static " if static else "", adapter, decl, result, name, args))
+
+
 def retail_macro(type_text, addr):
     """A game global's macro (port/retail_data.h): the object at its retail address. Below the
     program (0x100000) an unsized array is a label whose address is a number, a VU1
@@ -1374,8 +1482,8 @@ def rewrite(units, out, args, report, jobs=None):
                 room_plans[key] = plan
         for name, kind, is_def, f, line in rkinds:
             result_kinds[name].add((kind, is_def, f, line))
-        for f, name, spelling in funcs:
-            functions[f].add((name, spelling))
+        for f, name, spelling, adapter in funcs:
+            functions[f].add((name, spelling, adapter))
         global_inits += [g for g in ginits if g not in global_inits]
         global_kept |= gkept
         kinds.update(k)
@@ -1456,12 +1564,16 @@ def rewrite(units, out, args, report, jobs=None):
     count = 0
     for f, names in sorted(functions.items()):
         func = "port_functions_" + re.sub(r"\W", "_", Path(f).stem)
+        # A function returning a class in place is entered by its adapter, which takes the result's
+        # place first, as retail's tables call it (returned_in_place).
+        adapters = "".join(a for _, _, a in sorted(names, key=lambda x: (x[0], x[1] or "")) if a)
         body = "".join("    {0x%sU, (void*)%s},\n" % (
-            n[5:], ("static_cast<std::add_pointer_t<%s>>(&%s)" % (s, n)) if s else "&" + n)
-            for n, s in sorted(names, key=lambda x: (x[0], x[1] or "")))
+            n[5:], ("&port_inplace_" + n) if a else
+            ("static_cast<std::add_pointer_t<%s>>(&%s)" % (s, n)) if s else "&" + n)
+            for n, s, a in sorted(names, key=lambda x: (x[0], x[1] or "")))
         size = Path(f).stat().st_size
         edits.wrap(f, size, size, "\n// Written by tools/gen.py: this file's functions by retail address "
-                   "(port/ptr32.h).\nextern const port::FunctionEntry %s[] = {\n%s};\n" % (func, body),
+                   "(port/ptr32.h).\n%sextern const port::FunctionEntry %s[] = {\n%s};\n" % (adapters, func, body),
                    "", 0, "functions by retail address")
         report["function_files"].append((func, len(names)))
         count += len(names)

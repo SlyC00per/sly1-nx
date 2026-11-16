@@ -13,6 +13,7 @@
 #include <cstring>
 
 #include "common.h"
+#include "port/ptr32.h"
 
 extern "C" {
 
@@ -100,8 +101,15 @@ f32 Cosine(f32 x) { return std::cos(x); }
 f32 RoundDown(f32 x) { return std::floor(x); }
 f32 Sine(f32 x) { return std::sin(x); }
 f32 Tangent(f32 x) { return std::tan(x); }
-f32 Arccosine(f32 x) { return std::acos(x); }
-f32 Arcsine(f32 x) { return std::asin(x); }
+// Outside [-1, 1] the library reports a domain error and gives the error record's result, 0
+// (sly1-decomp src/libm/arccosine.c, arcsine.c), unless its error mode (0x24FF78) is -1, when the
+// kernel's 0 / 0 stands: the largest float on the PS2's FPU, which has no NaN.
+static f32 DomainResult()
+{
+    return *(const s32*)port::Native(0x0024FF78u) == -1 ? 3.4028235e38f : 0.0f;
+}
+f32 Arccosine(f32 x) { return std::fabs(x) > 1.0f ? DomainResult() : std::acos(x); }
+f32 Arcsine(f32 x) { return std::fabs(x) > 1.0f ? DomainResult() : std::asin(x); }
 f32 ArctangentOfRatio(f32 y, f32 x) { return std::atan2(y, x); }
 f32 FloatRemainder(f32 x, f32 y) { return std::fmod(x, y); }
 f32 Logarithm(f32 x) { return std::log(x); }

@@ -96,7 +96,9 @@ add_custom_target(sly1_gen DEPENDS ${GEN_UNITS})
 # The flags of every unit that sees the game's headers.
 # (SHELL: keeps each -include with its header: CMake removes repeated options otherwise.)
 # -fwrapv: signed arithmetic wraps, as the PS2's does (the game's hashes multiply into overflow).
-set(GAME_FLAGS -w -ffp-contract=off -fwrapv "SHELL:-include port/gxx_ext.h" "SHELL:-include port/ptr32.h"
+# -fno-delete-null-pointer-checks: two methods test `this == 0` and are called on null pointers,
+# which g++ 2.95 compiled as written.
+set(GAME_FLAGS -w -ffp-contract=off -fwrapv -fno-delete-null-pointer-checks "SHELL:-include port/gxx_ext.h" "SHELL:-include port/ptr32.h"
     "SHELL:-include port/varargs.h" "SHELL:-include port/retail_data.h" -Wno-register)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     list(APPEND GAME_FLAGS -Wno-c++11-narrowing)
@@ -115,7 +117,11 @@ if(PLATFORM STREQUAL "HOST_ASAN")
     # which is never read: the pointer-overflow check is off for game code too. So is the shift of
     # a negative value (two's complement, as on the PS2 and in C++20); shifts by too much stay
     # checked, since MIPS and ARM treat them differently.
-    target_compile_options(sly1_game PRIVATE -fno-sanitize=bounds,pointer-overflow,shift-base)
+    # And the null check: those methods are called on null on purpose; a real null dereference
+    # still faults, which AddressSanitizer reports. And alignment: the game views retail's data
+    # through types of its own (an object's descriptor read as a PlacedObject, 16-byte aligned),
+    # plain loads that ARM64 and x86-64 do at any alignment.
+    target_compile_options(sly1_game PRIVATE -fno-sanitize=bounds,pointer-overflow,shift-base,null,alignment)
 endif()
 target_include_directories(sly1_game PRIVATE ${GAME_INCLUDES})
 
