@@ -2725,6 +2725,153 @@ bool Quads(Runner& r)
     return true;
 }
 
+// --- 0x45C of chunk 2DDC9AA2 (from 0x477 with vi05 = 13.x - 1, and 0x47B with 0): a morph
+// target added. The weight is 11.w + 22.x's x; when it is 0 (the Z flag, read four instructions
+// on) nothing is added, though the first delta is still loaded in the branch's delay slot. Each
+// vertex's quadword at vi05 (stride 13.x, from 11.x to 11.y) gains the delta at 12.w times it.
+bool Morph(Runner& r, std::uint16_t offset, std::uint32_t endPc)
+{
+    State& st = r.s;
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    V h11 = Load(r, top + 11);
+    std::uint16_t step = Half(Load(r, top + 13).x);
+    std::uint16_t base = (std::uint16_t)(top + offset);
+    std::uint16_t first = (std::uint16_t)(base + Half(h11.x)), end = (std::uint16_t)(base + Half(h11.y));
+    std::uint16_t deltas = (std::uint16_t)(top + Half(Load(r, top + 12).w));
+    std::uint16_t weightAt = (std::uint16_t)(top + Half(h11.w) + Half(Load(r, top + 22).x));
+    V w = Load(r, weightAt);
+    const bool zero = Add(w.x, 0.0f) == 0.0f;
+    int n = Count(first, end, step);
+    if (!zero && (n == 0 || step > 64))
+        return false;
+    std::memcpy(st.vf[3], &w, 12);
+    SetVf(st, 4, Load(r, deltas));
+    if (!zero) {
+        V v02;
+        std::memcpy(&v02, st.vf[2], 16);
+        V d;
+        for (int k = 0; k < n; k++) {
+            d = Load(r, (std::uint16_t)(deltas + k));
+            std::uint16_t at = (std::uint16_t)(first + step * k);
+            V p = Load(r, at);
+            for (int c = 0; c < 3; c++)
+                d[c] = Mul(d[c], w.x);
+            for (int c = 0; c < 3; c++)
+                v02[c] = Add(p[c], d[c]);
+            std::memcpy(r.Qword(at), &v02, 12);
+        }
+        SetVf(st, 4, d);
+        SetVf(st, 2, v02);
+    }
+    st.pc = endPc;
+    return true;
+}
+
+bool MorphFromStride(Runner& r)
+{
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    return Morph(r, (std::uint16_t)(Half(Load(r, top + 13).x) - 1), 0x477);
+}
+bool MorphFromStart(Runner& r) { return Morph(r, 0, 0x477); }
+
+// --- 0x47E of chunk 2DDC9AA2: a batch's normals made unit length and laid out four at a time,
+// as 0x411 without the matrices: the loop pipelined two deep, MFP reading the ERLENG of two
+// passes back (each ERLENG waits for the one before), the first two passes on what an earlier
+// program left in vf29, vf30 and P.
+bool UnitNormals(Runner& r)
+{
+    State& st = r.s;
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    V hdr = Load(r, top + 11);
+    std::uint16_t vi05 = (std::uint16_t)(top + Half(hdr.x)), vi06 = (std::uint16_t)(top + Half(hdr.y) + 8);
+    std::uint16_t span = (std::uint16_t)(vi06 - vi05);
+    if (span == 0 || (span & 3) || span > 0x400)
+        return false;
+    float (*vf)[4] = st.vf;
+    auto g = [&](int k) { V x; std::memcpy(&x, vf[k], 16); return x; };
+    auto set = [&](int k, const V& x) { std::memcpy(vf[k], &x, 16); };
+    std::memcpy(vf[2], r.Qword(vi05), 12);
+    V zero;
+    zero.v = F4{Sub(0.0f, 0.0f), Sub(0.0f, 0.0f), Sub(0.0f, 0.0f), Sub(1.0f, 1.0f)};
+    set(28, zero);
+    int vi07 = 6;
+    float visible = st.p, pending = 0.0f;
+    bool havePending = false;
+    auto mr32 = [&](int k) {
+        V x = g(k), y;
+        for (int c = 0; c < 4; c++)
+            y[c] = x[(c + 1) & 3];
+        set(k, y);
+    };
+    do {
+        mr32(25);
+        mr32(26);
+        mr32(27);
+        vf[24][3] = visible;
+        vi07--;
+        vf[25][3] = Mul(vf[24][3], vf[30][0]);
+        vf[26][3] = Mul(vf[24][3], vf[30][1]);
+        vf[27][3] = Mul(vf[24][3], vf[30][2]);
+        vi05 = (std::uint16_t)(vi05 + 4);
+        if (vi07 == 0) {
+            Store(r, (std::uint16_t)(vi05 - 12), g(28));
+            Store(r, (std::uint16_t)(vi05 - 24), g(25));
+            Store(r, (std::uint16_t)(vi05 - 20), g(26));
+            Store(r, (std::uint16_t)(vi05 - 16), g(27));
+            vi07 = 4;
+        }
+        set(30, g(29));
+        set(29, g(2));
+        std::memcpy(vf[2], r.Qword(vi05), 12);
+        if (havePending)
+            visible = pending;   // done while this ERLENG waits for it
+        pending = Erleng(g(29));
+        havePending = true;
+    } while (vi05 != vi06);
+    st.p = pending;
+    if (vi07 - 4 < 0) {
+        do {
+            mr32(25);
+            mr32(26);
+            mr32(27);
+            vi07--;
+            vi05 = (std::uint16_t)(vi05 + 4);
+        } while (vi07 != 0);
+        Store(r, (std::uint16_t)(vi05 - 24), g(25));
+        Store(r, (std::uint16_t)(vi05 - 20), g(26));
+        Store(r, (std::uint16_t)(vi05 - 16), g(27));
+        Store(r, (std::uint16_t)(vi05 - 12), g(28));
+    }
+    st.pc = 0x4A9;
+    return true;
+}
+
+// --- 0x4F8 of chunk 2DDC9AA2: 22.xy added to each vertex's first quadword (stride 13.x).
+bool OffsetXy(Runner& r)
+{
+    State& st = r.s;
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    V h11 = Load(r, top + 11);
+    std::uint16_t step = Half(Load(r, top + 13).x);
+    std::uint16_t first = (std::uint16_t)(top + Half(h11.x)), end = (std::uint16_t)(top + Half(h11.y));
+    std::uint16_t last = (std::uint16_t)(end - step), span = (std::uint16_t)(last - first);
+    if (step == 0 || step > 64 || span % step || span / step > 1024)
+        return false;
+    int n = span / step + 1;
+    V off = Load(r, top + 22);
+    st.vf[3][0] = off.x;
+    st.vf[3][1] = off.y;
+    for (int k = 0; k < n; k++) {
+        float* q = r.Qword((std::uint16_t)(first + step * k));
+        st.vf[4][0] = Add(q[0], off.x);
+        st.vf[4][1] = Add(q[1], off.y);
+        q[0] = st.vf[4][0];
+        q[1] = st.vf[4][1];
+    }
+    st.pc = 0x507;
+    return true;
+}
+
 }  // namespace
 
 // Every VF register but vf00 and vf01, and P: what the lights' handlers are compared on.
@@ -2767,6 +2914,10 @@ const HandlerEntry kHandlers[] = {
     {0xE1624411, 0x051, BatchSetup, "batch setup", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I"},
     {0x6744EAB9, 0x1DE, SpotLight, "spot light", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q P I clip"},
     {0x19FE9C91, 0x000, Quads, "particle quads", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q clip"},
+    {0x2DDC9AA2, 0x477, MorphFromStride, "morph (from the stride)", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31},
+    {0x2DDC9AA2, 0x47B, MorphFromStart, "morph (from the start)", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31},
+    {0x2DDC9AA2, 0x47E, UnitNormals, "unit normals", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "P"},
+    {0x2DDC9AA2, 0x4F8, OffsetXy, "xy offset", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31},
     {0xE1624411, 0x01E, BatchSecond, "lit batch second pass", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I clip"},
 };
 const std::size_t kHandlerCount = sizeof kHandlers / sizeof kHandlers[0];
