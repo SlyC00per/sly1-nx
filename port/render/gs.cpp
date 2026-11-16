@@ -7,6 +7,7 @@
 // from 0 to 640 covers pixels 0 to 639); triangles follow the top-left rule. Colours are 0 to 255
 // with 0x80 as 1.0 in texture modulation and blending.
 #include "port/gs.h"
+#include "port/gs_backend.h"
 
 #include <algorithm>
 #include <atomic>
@@ -616,6 +617,133 @@ void Line(const Draw& d, const Vertex& v0, const Vertex& v1)
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// A GPU renderer (port/gs_backend.h): the primitives gathered into runs drawn by the same
+// registers, handed over when a register that matters changes, before an upload and at a swap.
+
+std::uint32_t BitsPerPixel(std::uint32_t psm);
+
+Backend* g_backend;
+std::vector<DrawVertex> g_run;
+DrawState g_runState;
+bool g_stateChanged = true;
+
+// Uploads by page of local memory (8,192 bytes): the count of uploads when each last changed.
+std::uint32_t g_uploads = 1;
+std::uint32_t g_pageUpload[kLocalBytes / 8192];
+
+void FlushRun()
+{
+    if (g_backend && !g_run.empty())
+        g_backend->Draw(g_runState, g_run.data(), g_run.size());
+    g_run.clear();
+}
+
+DrawState StateOf(const Draw& d, std::uint32_t kind)
+{
+    DrawState s;
+    std::memset(&s, 0, sizeof s);   // compared as bytes
+    s.kind = kind;
+    s.tme = d.tme;
+    s.fge = d.fge;
+    s.abe = d.abe;
+    s.fba = d.fba;
+    if (d.tme) {
+        s.tex0 = d.c->tex0;
+        s.tex1 = d.c->tex1;
+        s.clamp = d.c->clamp;
+        s.texa = g_regs.texa;
+    }
+    if (d.abe)
+        s.alpha = d.c->alpha;
+    s.test = d.c->test;
+    s.frame = d.c->frame;
+    s.zbuf = d.c->zbuf;
+    s.scissor = d.c->scissor;
+    if (d.fge)
+        s.fogcol = g_regs.fogcol;
+    return s;
+}
+
+// The primitive in the vertex queue added to the run.
+void Gather(std::uint64_t prim, std::uint32_t type)
+{
+    static const std::uint32_t kKind[8] = {0, 1, 1, 2, 2, 2, 2, 0};
+    static Draw d;
+    if (g_stateChanged) {
+        d = DrawOf(prim);
+        DrawState s = StateOf(d, kKind[type]);
+        if (std::memcmp(&s, &g_runState, sizeof s) != 0) {
+            FlushRun();
+            g_runState = s;
+        }
+        g_stateChanged = false;
+    }
+    int ofx = d.ofx, ofy = d.ofy & ~15;   // the odd field's half line dropped
+    float sw = 1.0f / (16.0f * d.tex.tw), sh = 1.0f / (16.0f * d.tex.th);
+    auto vertex = [&](const Vertex& v, const Vertex& flat) {
+        DrawVertex o;
+        o.x = (v.x - ofx) * (1.0f / 16);
+        o.y = (v.y - ofy) * (1.0f / 16);
+        o.z = v.z;
+        const Vertex& c = d.iip ? v : flat;
+        o.r = c.r; o.g = c.g; o.b = c.b; o.a = c.a;
+        if (d.fst) {
+            o.s = v.u * sw; o.t = v.v * sh; o.q = 1.0f;
+        } else {
+            o.s = v.s; o.t = v.t; o.q = v.q;
+        }
+        o.fog = v.f;
+        return o;
+    };
+    switch (type) {
+    case 0: g_run.push_back(vertex(g_queue[0], g_queue[0])); break;
+    case 1: case 2:
+        g_run.push_back(vertex(g_queue[0], g_queue[1]));
+        g_run.push_back(vertex(g_queue[1], g_queue[1]));
+        break;
+    case 3: case 4: case 5:
+        for (int k = 0; k < 3; k++)
+            g_run.push_back(vertex(g_queue[k], g_queue[2]));
+        break;
+    case 6: {   // a sprite: the rectangle of its two corners, the second's colour, depth and fog
+        DrawVertex a = vertex(g_queue[0], g_queue[1]), b = vertex(g_queue[1], g_queue[1]);
+        a.r = b.r; a.g = b.g; a.b = b.b; a.a = b.a;
+        a.z = b.z;
+        a.fog = b.fog;
+        if (!d.fst) {   // S and T at the second vertex's Q
+            a.s = g_queue[0].s; a.t = g_queue[0].t; a.q = b.q;
+        }
+        DrawVertex ab = a, ba = a;
+        ab.x = b.x; ab.s = b.s;
+        ba.y = b.y; ba.t = b.t;
+        g_run.push_back(a); g_run.push_back(ab); g_run.push_back(ba);
+        g_run.push_back(ab); g_run.push_back(b); g_run.push_back(ba);
+        break;
+    }
+    default: break;
+    }
+    g_drawn++;
+}
+
+// The pages of local memory a buffer's rectangle lies in, each given to f.
+template <typename F>
+void PagesOf(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, std::uint32_t x0, std::uint32_t y0, std::uint32_t w,
+             std::uint32_t h, F f)
+{
+    std::uint32_t bpp = BitsPerPixel(psm);
+    std::uint32_t pw = bpp >= 16 ? 64 : 128, ph = bpp == 32 || bpp == 24 ? 32 : bpp == 4 ? 128 : 64;
+    if (psm == PSMT8H || psm == PSMT4HL || psm == PSMT4HH)
+        pw = 64, ph = 32;
+    if (bw == 0)
+        bw = 1;
+    if (w == 0 || h == 0)
+        return;
+    for (std::uint32_t py = y0 / ph; py <= (y0 + h - 1) / ph; py++)
+        for (std::uint32_t px = x0 / pw; px <= (x0 + w - 1) / pw; px++)
+            f((bp / 32 + py * bw + px) % (kLocalBytes / 8192));
+}
+
 // SLY1_GS_SURVEY: the drawing states the game uses, for the GPU renderer (docs/RENDERER.md):
 // each distinct combination counted by its primitives, printed by SurveyReport.
 bool Surveying()
@@ -680,6 +808,8 @@ void Kick(bool draw)
         return;
     if (draw && Surveying())
         SurveyDraw(prim);
+    if (draw && g_backend)
+        Gather(prim, type);
     if (draw && g_rasterise) {
         Draw d = DrawOf(prim);
         g_drawn++;
@@ -746,6 +876,13 @@ void StartTransfer()
     std::uint64_t bb = g_regs.bitbltbuf, pos = g_regs.trxpos, reg = g_regs.trxreg;
     std::uint32_t dir = (std::uint32_t)Bits(g_regs.trxdir, 0, 2);
     g_trx = Transfer();
+    if (g_backend && dir != 1) {   // what is gathered is drawn by the textures as they were
+        FlushRun();
+        g_uploads++;
+        PagesOf((std::uint32_t)Bits(bb, 32, 14), (std::uint32_t)Bits(bb, 48, 6), (std::uint32_t)Bits(bb, 56, 6),
+                (std::uint32_t)Bits(pos, 32, 11), (std::uint32_t)Bits(pos, 48, 11), (std::uint32_t)Bits(reg, 0, 12),
+                (std::uint32_t)Bits(reg, 32, 12), [](std::uint32_t page) { g_pageUpload[page] = g_uploads; });
+    }
     if (dir == 0) {   // host to local
         g_trx.active = true;
         g_trx.dbp = (std::uint32_t)Bits(bb, 32, 14);
@@ -809,8 +946,12 @@ void Write(std::uint32_t reg, std::uint64_t value)
 {
     // the caller holds the GS (gs::Hold)
     Regs& r = g_regs;
+    if (reg > 0x05 && reg != 0x0A && reg != 0x0C && reg != 0x0D)
+        g_stateChanged = true;
     switch (reg) {
     case 0x00:   // PRIM: a new primitive empties the vertex queue
+        if (r.prim != value)
+            g_stateChanged = true;
         r.prim = value;
         g_queued = 0;
         break;
@@ -929,7 +1070,7 @@ void PackedRun(std::uint64_t regs, std::uint32_t nreg, const std::uint32_t* q, s
     // as long as the vertices before them left it. A fan keeps its first vertex, and PRIM or a
     // context register in the loop is left to the plain way.
     std::uint32_t type = (std::uint32_t)(g_regs.prim & 7);
-    if (!g_rasterise && !Surveying() && loops > 3 && type != 5) {
+    if (!g_rasterise && !g_backend && !Surveying() && loops > 3 && type != 5) {
         std::uint32_t vertices = 0;
         bool only = true;
         for (std::uint32_t k = 0; k < nreg; k++) {
@@ -1129,8 +1270,48 @@ void SurveyReport()
         std::fprintf(stderr, "gs survey: %10llu  %s\n", (unsigned long long)kv.second, kv.first.c_str());
 }
 
+void SetBackend(Backend* backend)
+{
+    Guard lk;
+    g_backend = backend;
+    g_stateChanged = true;
+}
+
+void DecodeTexture(const DrawState& state, std::vector<std::uint32_t>& rgba, int& width, int& height)
+{
+    Context c;
+    c.tex0 = state.tex0;
+    c.clamp = 0;   // the whole texture: wrapping is the sampler's
+    c.tex1 = 0;
+    Tex t = TexOf(c);
+    width = (int)t.tw;
+    height = (int)t.th;
+    rgba.resize((std::size_t)t.tw * t.th);
+    for (std::uint32_t y = 0; y < t.th; y++)
+        for (std::uint32_t x = 0; x < t.tw; x++)
+            rgba[(std::size_t)y * t.tw + x] = Texel(t, (int)x, (int)y);
+}
+
+std::uint32_t TextureGeneration(const DrawState& state)
+{
+    Context c;
+    c.tex0 = state.tex0;
+    Tex t = TexOf(c);
+    std::uint32_t latest = 0;
+    auto page = [&](std::uint32_t p) { latest = std::max(latest, g_pageUpload[p]); };
+    PagesOf(t.tbp, t.tbw, t.psm, 0, 0, t.tw, t.th, page);
+    if (t.psm == PSMT8 || t.psm == PSMT4 || t.psm == PSMT8H || t.psm == PSMT4HL || t.psm == PSMT4HH)
+        PagesOf((std::uint32_t)Bits(state.tex0, 37, 14), 1, PSMCT32, 0, 0, 16, 16, page);
+    return latest;
+}
+
 void FrameShown()
 {
+    if (g_backend) {
+        Guard lk;
+        FlushRun();
+        g_backend->Present(g_dispfb, g_display);
+    }
     std::uint64_t n = ++g_framesShown;
     if (g_dumpDir.empty() || n % (std::uint64_t)g_dumpEvery)
         return;

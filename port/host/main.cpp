@@ -37,6 +37,7 @@
 #endif
 
 #include "port/dmac.h"
+#include "port/gpu.h"
 #include "port/gs.h"
 #include "port/iso.h"
 #include "port/memory_card.h"
@@ -90,6 +91,7 @@ void Report()
     }
     port::KernelDump();
     port::DmacDump();
+    port::gpu::Report();
     if (std::getenv("SLY1_GS_SURVEY"))
         port::gs::SurveyReport();
     {   // the display's and the render frames' semaphores and flags, for the report
@@ -452,6 +454,9 @@ int main(int argc, char** argv)
     }
 
     pthread_t game, clock, render, gsThread;
+    // The Switch's GPU renderer, before any thread draws (SLY1_NO_GPU: without it, nothing shown).
+    if (!std::getenv("SLY1_NO_GPU"))
+        port::gpu::Start();
     // SLY1_GS_THREAD: the GS on a thread of its own (measured slower on the Switch: the hand-over
     // costs more than the GS's work there, and in batches the GS no longer overlaps VU1)
     if (std::getenv("SLY1_GS_THREAD") &&
