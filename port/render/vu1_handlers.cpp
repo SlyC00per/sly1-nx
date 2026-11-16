@@ -842,6 +842,61 @@ bool DirectionalLight(Runner& r)
     return true;
 }
 
+// --- 0x401 of chunk 2DDC9AA2 (through 0x3D4): a batch skinned by four matrices.
+//
+// From TOP: 11.x and 11.y the vertices (stride 13.x, the position in each one's last quadword),
+// 11.z the four matrices (16 quadwords), 11.w the weights (one quadword a vertex). Each position:
+// through each matrix (rows x, y, z and the translation), the four results blended by the weights.
+bool Skin(Runner& r)
+{
+    State& st = r.s;
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    V hdr = Load(r, top + 11);
+    std::uint16_t step = Half(Load(r, top + 13).x);
+    std::uint16_t back = (std::uint16_t)(step - 1);
+    std::uint16_t first = (std::uint16_t)(top + Half(hdr.x) + back);
+    std::uint16_t end = (std::uint16_t)(top + Half(hdr.y) + back);
+    int n = Count(first, end, step);
+    if (n == 0 || step > 64)
+        return false;
+    std::uint16_t mats = (std::uint16_t)(top + Half(hdr.z)), weights = (std::uint16_t)(top + Half(hdr.w));
+    V m[16];
+    for (int k = 0; k < 16; k++)
+        m[k] = Load(r, (std::uint16_t)(mats + k));
+    V pos = {}, w = {}, t[4];
+    for (int k = 0; k < n; k++) {
+        std::uint16_t at = (std::uint16_t)(first + step * k);
+        V p = Load(r, at);
+        pos.x = p.x;
+        pos.y = p.y;
+        pos.z = p.z;
+        w = Load(r, (std::uint16_t)(weights + k));
+        for (int j = 0; j < 4; j++) {
+            F4 acc = Mul4(m[4 * j].v, Splat(p.x));
+            acc = Add4(acc, Mul4(m[4 * j + 1].v, Splat(p.y)));
+            acc = Add4(acc, Mul4(m[4 * j + 2].v, Splat(p.z)));
+            t[j].v = Add4(acc, Mul4(m[4 * j + 3].v, Splat(1.0f)));
+        }
+        F4 acc = Mul4(t[0].v, Splat(w.x));
+        acc = Add4(acc, Mul4(t[1].v, Splat(w.y)));
+        acc = Add4(acc, Mul4(t[2].v, Splat(w.z)));
+        V out;
+        out.v = Add4(acc, Mul4(t[3].v, Splat(w.w)));
+        pos.x = out.x;
+        pos.y = out.y;
+        pos.z = out.z;
+        std::memcpy(r.Qword(at), &out, 12);
+    }
+    SetXyz(st, 2, pos);
+    SetVf(st, 3, w);
+    for (int k = 0; k < 16; k++)
+        SetVf(st, 4 + k, m[k]);
+    for (int j = 0; j < 4; j++)
+        SetXyz(st, 20 + j, t[j]);
+    st.pc = 0x411;
+    return true;
+}
+
 }  // namespace
 
 const HandlerEntry kHandlers[] = {
@@ -859,6 +914,10 @@ const HandlerEntry kHandlers[] = {
     {0xB90790F3, 0x242, LitColours, "lit colours",
      "vf02.xyzw vf03.xyzw vf04.xyzw vf05.xyzw vf06.xyzw vf07.xyzw vf08.xyzw vf09.xyzw vf10.xyzw vf11.xyzw "
      "vf12.xyzw vf13.xyzw vf14.xyzw vf15.xyzw vf16.xyzw I"},
+    {0x2DDC9AA2, 0x401, Skin, "skinning",
+     "vf02.xyz vf03.xyzw vf04.xyzw vf05.xyzw vf06.xyzw vf07.xyzw vf08.xyzw vf09.xyzw vf10.xyzw vf11.xyzw "
+     "vf12.xyzw vf13.xyzw vf14.xyzw vf15.xyzw vf16.xyzw vf17.xyzw vf18.xyzw vf19.xyzw vf20.xyz vf21.xyz "
+     "vf22.xyz vf23.xyz"},
     {0xE1624411, 0x01E, BatchSecond, "lit batch second pass", "vf03.xyzw vf11.w vf12.xyz vf13.w"},
 };
 const std::size_t kHandlerCount = sizeof kHandlers / sizeof kHandlers[0];
