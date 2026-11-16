@@ -33,6 +33,13 @@ inline void RetailInit(std::uint32_t addr, const void* value, std::size_t size)
 // Fills main memory with the executable's loadable segments (port/iso.h); false without one.
 bool LoadRetailImage();
 
+// A base address as the game's raw-offset macros take it (player.cpp's AT): a pointer as it is, a
+// stored pointer, or a word holding a game address.
+template <class T> inline void* AsAddress(T* p) { return (void*)p; }
+template <class T> inline void* AsAddress(const Ptr32<T>& p) { return (void*)p.get(); }
+template <class T, class = std::enable_if_t<std::is_integral<T>::value>>
+inline void* AsAddress(T word) { return Native((std::uint32_t)word); }
+
 // Preemption points (port/platform/kernel.cpp). tools/gen.py puts Preempt() in every loop test of
 // the game's code: when an interrupt has readied a thread of higher priority, the running thread
 // gives way there, as the PS2 preempts it. Spin() is an empty wait loop's body: the same, and a

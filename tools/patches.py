@@ -185,6 +185,23 @@ PATCHES = [
      "    struct Tri { s32 i[3]; } *tris;",
      "    struct Tri { s32 i[3]; };\n    Tri* tris;",
      "the mesh motion record's face triples are a stored pointer, 4 bytes as in retail"),
+    ('src/main/gauge_collider.cpp',
+     '                Vec4 pair[2];\n                Vec4 in = dir;\n',
+     "                // port: retail's frame put `in` right after pair, and ComputeOscillatorDisplacement\n                // reads three deltas from pair: the third is `in`.\n                Vec4 pair[3];\n                pair[2] = dir;\n                Vec4& in = pair[2];\n",
+     "the oscillator reads three deltas from a two-vector pair; retail's frame made the third the vector after it"),
+    ('src/main/gauge_collider.cpp',
+     '        Vec4 pair[2];\n        Vec4 n;\n        n = normal;\n',
+     "        // port: retail's frame put `n` right after pair, and ComputeOscillatorDisplacement reads\n        // three deltas from pair: the third is `n`.\n        Vec4 pair[3];\n        Vec4& n = pair[2];\n        n = normal;\n",
+     "the oscillator reads three deltas from a two-vector pair; retail's frame made the third the vector after it"),
+    ('src/main/collider.cpp',
+     '        Vec4 axes[2];\n        Vec4 dir = normal;\n',
+     "        // port: retail's frame put `dir` right after axes, and ComputeOscillatorDisplacement reads\n        // three deltas from axes: the third is `dir`.\n        Vec4 axes[3];\n        axes[2] = normal;\n        Vec4& dir = axes[2];\n",
+     "the oscillator reads three deltas from a two-vector pair; retail's frame made the third the vector after it"),
+    ("src/main/player.cpp",
+     "#define AT(T, p, o) (*(T*)((u8*)(p) + (o)))",
+     "#define AT(T, p, o) (*(T*)((u8*)port::AsAddress(p) + (o)))",
+     "the raw-offset macro is given words holding game addresses as well as pointers; a cast in a "
+     "macro's body is not rewritten"),
 
     # Slot 27 of the switched colliders shows the typed-text caption box for an object it is
     # handed (a pointer, through the method table); the value was declared u32 and stored as a word.
@@ -310,6 +327,11 @@ PATCHES = [
      "                typedef void (*F)(WorldListedObject*, s32);\n                ((F)set->desc->m17)(set, h->ownerArgument);",
      "                typedef void (*F)(WorldListedObject*, void*);\n"
      "                ((F)set->desc->m17)(set, port::FromGameAddr<void>((u32)h->ownerArgument));",
+     "the copied object's pointer, from the word that keeps its game address"),
+    ("src/main/effect_spawner.cpp",
+     "                typedef void (*F)(EffectOwner*, s32);\n                ((F)node->desc->m17)(node, h->ownerArgument);",
+     "                typedef void (*F)(EffectOwner*, void*);\n"
+     "                ((F)node->desc->m17)(node, port::FromGameAddr<void>((u32)h->ownerArgument));",
      "the copied object's pointer, from the word that keeps its game address"),
 
     # ConvertDoubleToFloat takes a double; two variadic functions declare it on the double's bits

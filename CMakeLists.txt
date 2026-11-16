@@ -120,12 +120,21 @@ if(PLATFORM STREQUAL "HOST_ASAN")
     # And the null check: those methods are called on null on purpose; a real null dereference
     # still faults, which AddressSanitizer reports. And alignment: the game views retail's data
     # through types of its own (an object's descriptor read as a PlacedObject, 16-byte aligned),
-    # plain loads that ARM64 and x86-64 do at any alignment.
-    target_compile_options(sly1_game PRIVATE -fno-sanitize=bounds,pointer-overflow,shift-base,null,alignment)
+    # plain loads that ARM64 and x86-64 do at any alignment. And float-cast-overflow: a float too
+    # large for an int saturates on the PS2 (cvt.w.s) as on ARM64 (fcvtzs), the Switch's.
+    target_compile_options(sly1_game PRIVATE
+        -fno-sanitize=bounds,pointer-overflow,shift-base,null,alignment,float-cast-overflow)
 endif()
 target_include_directories(sly1_game PRIVATE ${GAME_INCLUDES})
 
 # The platform layer: what replaces sly1-decomp's src/lib and src/libm.
+# The game's math library: sly1-decomp's own C (src/libm, matched to retail), compiled as it is, so
+# the game's results are retail's to the bit rather than the host library's.
+file(GLOB LIBM_SOURCES CONFIGURE_DEPENDS ${SLY1_DECOMP}/src/libm/*.c)
+add_library(port_libm STATIC ${LIBM_SOURCES})
+target_include_directories(port_libm PRIVATE ${SLY1_DECOMP}/include)
+target_compile_options(port_libm PRIVATE -w -ffp-contract=off -fwrapv)
+
 add_library(port_platform STATIC
     port/platform/lib_runtime.cpp port/platform/lib_kernel.cpp port/platform/lib_devices.cpp
     port/platform/iop.cpp port/platform/iso.cpp port/platform/float_mode.cpp
@@ -145,6 +154,6 @@ if(NOT PLATFORM STREQUAL "SWITCH")
     find_package(Threads REQUIRED)
     add_executable(sly1_headless port/host/main.cpp $<TARGET_OBJECTS:sly1_game>)
     target_include_directories(sly1_headless PRIVATE port/include)
-    target_link_libraries(sly1_headless PRIVATE port_game_asm port_platform port_core Threads::Threads)
+    target_link_libraries(sly1_headless PRIVATE port_game_asm port_platform port_libm port_core Threads::Threads)
 endif()
 endif()  # SLY1_BUILD_GAME

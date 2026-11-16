@@ -170,9 +170,16 @@ template <class T> struct Ptr32 {
     // a cast, as C++ requires for a native pointer.
     operator T*() const { return get(); }
     // A cast to a function pointer reads the word as a function's address, whatever the stored
-    // pointer's own type (the game calls table slots typed void*).
+    // pointer's own type (the game calls table slots typed void*); so does any cast of a function
+    // slot (`fn = (void*)vt->m01`, then called through a cast of fn).
     template <class U, class = std::enable_if_t<!std::is_same<U, T>::value>>
-    explicit operator U*() const { return AtAddr<U>(addr_); }
+    explicit operator U*() const
+    {
+        if constexpr (std::is_function<T>::value)
+            return (U*)NativeFunction(addr_);
+        else
+            return AtAddr<U>(addr_);
+    }
 
     T* operator->() const { return get(); }
 
