@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// sly1_headless: the game on the host, without a window or sound, for the tests.
+// The game's entry: sly1_headless on the host (no window or sound, for the tests) and sly1.nro
+// on the Switch.
 //
 //   sly1_headless --iso DISC.iso [--seconds N]
+//
+// On the Switch the disc image and the saves default to sdmc:/switch/sly1/ (sly1.iso, save/);
+// arguments come from nxlink, or else from sdmc:/switch/sly1/args.txt when it exists (for runs
+// in the emulator, which passes none). The output goes to nxlink when it is listening, and to
+// the debug-output channel (svcOutputDebugString) otherwise. A run that ends prints
+// "sly1: done, status N" (tools/run_ryujinx.py waits for it).
 //
 // As retail's entry does (EnterProgram), it starts the game's main loop, RunMainLoop. The game
 // runs on a thread of its own whose stack lies in game memory, as every game thread's must: the
@@ -18,23 +25,46 @@
 
 #include <pthread.h>
 
+#if defined(__SWITCH__)
+#include <arpa/inet.h>
+#include <switch.h>
+#endif
+
 #include "port/dmac.h"
 #include "port/iso.h"
 #include "port/memory_card.h"
 #include "port/retail_data.h"
 #include "port/system.h"
+#include "port/thread.h"
 
 extern "C" void func_00185758(int argc, int argv);   // RunMainLoop
 
 namespace {
 
-// Page-aligned (16 KiB pages on Apple Silicon): pthread_attr_setstack refuses anything less.
+// Page-aligned (16 KiB pages on Apple Silicon): port::StartThread needs whole pages.
 alignas(16384) unsigned char g_mainStack[4 << 20];
 // The interrupt handlers are game code too (they link stack frames into game structures), so
 // the clock that calls them runs on a stack in game memory as well.
 alignas(16384) unsigned char g_clockStack[1 << 20];
 std::atomic<bool> g_started;
+#if defined(__SWITCH__)
+int g_seconds = 0;   // until the program is closed
+#else
 int g_seconds = 10;
+#endif
+
+// The end of a run: its status, in the line tools/run_ryujinx.py waits for.
+[[noreturn]] void Finish(int status)
+{
+    char line[64];
+    std::snprintf(line, sizeof line, "sly1: done, status %d", status);
+    std::fprintf(stderr, "%s\n", line);
+    std::fflush(stderr);
+#if defined(__SWITCH__)
+    svcOutputDebugString(line, std::strlen(line));
+#endif
+    std::_Exit(status);
+}
 
 // The run's report: the kernel's threads, the DMA counts, the frame semaphores, the card.
 void Report()
@@ -54,10 +84,11 @@ void Report()
 // The vertical blank, 60 times a second (NTSC), for the game's handler (cause 2); then the end.
 void* Clock(void*)
 {
+    port::PlaceThread(port::ThreadRole::Clock);
     port::SetGameFloatMode();
     auto next = std::chrono::steady_clock::now();
     auto stop = next + std::chrono::seconds(g_seconds);
-    while (std::chrono::steady_clock::now() < stop) {
+    while (g_seconds == 0 || std::chrono::steady_clock::now() < stop) {
         next += std::chrono::microseconds(16683);
         std::this_thread::sleep_until(next);
         if (g_started)
@@ -65,8 +96,7 @@ void* Clock(void*)
     }
     std::fprintf(stderr, "sly1: stopping after %d s\n", g_seconds);
     Report();
-    std::fflush(stderr);
-    std::_Exit(0);
+    Finish(0);
 }
 
 // --verify-levels: every level of the level table (0x247AF0, 46 records of 0x2C bytes: the
@@ -91,12 +121,12 @@ void VerifyLevels()
         }
         return true;
     };
+    port::PlaceThread(port::ThreadRole::Watch);
     std::this_thread::sleep_for(std::chrono::seconds(3));   // past start-up and the card check
     auto fail = [](const char* what, int i) {
         std::fprintf(stderr, "verify: FAILED at level %d: %s\n", i, what);
         Report();
-        std::fflush(stderr);
-        std::_Exit(1);
+        Finish(1);
     };
     std::vector<int> order = g_verifyList;
     if (order.empty())
@@ -137,12 +167,12 @@ void VerifyLevels()
     }
     std::fprintf(stderr, "verify: all %d levels loaded and ran 60 frames\n", (int)order.size());
     Report();
-    std::fflush(stderr);
-    std::_Exit(0);
+    Finish(0);
 }
 
 void* GameMain(void*)
 {
+    port::PlaceThread(port::ThreadRole::Game);
     port::SetGameFloatMode();
     port::KernelStartMainThread();
     g_started = true;
@@ -162,15 +192,81 @@ extern "C" void port_data_init_all();   // written by tools/gen.py (port/retail_
 extern "C" const char* __asan_default_options() { return "abort_on_error=0"; }
 extern "C" const char* __ubsan_default_options() { return "print_stacktrace=1:abort_on_error=0"; }
 
+#if defined(__SWITCH__)
+// A fault on any thread: where, relative to the program's image (addr2line on sly1.elf), then
+// the end of the run.
+extern "C" {
+alignas(16) u8 __nx_exception_stack[0x8000];
+u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
+void __libnx_exception_handler(ThreadExceptionDump* ctx)
+{
+    char line[256];
+    std::uintptr_t base = port::g_imageBase;
+    std::snprintf(line, sizeof line, "sly1: fault 0x%X at pc +0x%llX, lr +0x%llX, address 0x%llX, sp 0x%llX",
+                  ctx->error_desc, (unsigned long long)(ctx->pc.x - base), (unsigned long long)(ctx->lr.x - base),
+                  (unsigned long long)ctx->far.x, (unsigned long long)ctx->sp.x);
+    svcOutputDebugString(line, std::strlen(line));
+    for (int i = 0; i < 29; i += 4) {
+        std::snprintf(line, sizeof line, "sly1:   x%d %llX x%d %llX x%d %llX x%d %llX", i,
+                      (unsigned long long)ctx->cpu_gprs[i].x, i + 1, (unsigned long long)ctx->cpu_gprs[i + 1].x,
+                      i + 2, (unsigned long long)ctx->cpu_gprs[i + 2].x, i + 3, (unsigned long long)ctx->cpu_gprs[i + 3].x);
+        svcOutputDebugString(line, std::strlen(line));
+    }
+    Finish(3);
+}
+}
+
+namespace {
+
+std::vector<std::string> g_fileArgs;
+std::vector<char*> g_fileArgv;
+
+// The arguments in sdmc:/switch/sly1/args.txt, split at white space, after the program's name.
+void ArgsFromFile(int& argc, char**& argv)
+{
+    std::FILE* f = std::fopen("sdmc:/switch/sly1/args.txt", "r");
+    if (!f)
+        return;
+    g_fileArgs.push_back(argc > 0 ? argv[0] : "sly1");
+    char word[512];
+    while (std::fscanf(f, "%511s", word) == 1)
+        g_fileArgs.push_back(word);
+    std::fclose(f);
+    for (std::string& a : g_fileArgs)
+        g_fileArgv.push_back(&a[0]);
+    g_fileArgv.push_back(nullptr);
+    argc = (int)g_fileArgs.size();
+    argv = g_fileArgv.data();
+}
+
+}  // namespace
+#endif
+
 int main(int argc, char** argv)
 {
+#if defined(__SWITCH__)
+    consoleDebugInit(debugDevice_SVC);
+    if (__nxlink_host.s_addr != 0 && R_SUCCEEDED(socketInitializeDefault()))
+        nxlinkStdio();
+    if (argc <= 1)
+        ArgsFromFile(argc, argv);
+    std::string iso = "sdmc:/switch/sly1/sly1.iso";
+    port::SetSaveFolder("sdmc:/switch/sly1/save");
+#else
     std::string iso;
+#endif
     int& seconds = g_seconds;
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--iso") && i + 1 < argc)
             iso = argv[++i];
         else if (!std::strcmp(argv[i], "--seconds") && i + 1 < argc)
             seconds = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--env") && i + 1 < argc) {
+            // NAME=VALUE: the port's trace switches (SLY1_CD_TRACE, ...), for the Switch's runs
+            std::string kv = argv[++i];
+            std::size_t eq = kv.find('=');
+            setenv(kv.substr(0, eq).c_str(), eq == std::string::npos ? "1" : kv.substr(eq + 1).c_str(), 1);
+        }
         else if (!std::strcmp(argv[i], "--save") && i + 1 < argc)
             port::SetSaveFolder(argv[++i]);
         else if (!std::strcmp(argv[i], "--verify-levels"))
@@ -213,28 +309,21 @@ int main(int argc, char** argv)
         if (g_verifyTo > 46 || g_verifyTo <= g_verifyFrom)
             g_verifyTo = 46;
         seconds = 24 * 3600;   // the verifier ends the run
-        std::thread(VerifyLevels).detach();
+        // (a pthread: std::thread's start stalled the starting thread under libnx)
+        pthread_t verify;
+        pthread_create(&verify, nullptr, [](void*) -> void* { VerifyLevels(); return nullptr; }, nullptr);
+        pthread_detach(verify);
     }
 
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    if (pthread_attr_setstack(&attr, g_mainStack, sizeof g_mainStack) != 0) {
-        std::fprintf(stderr, "sly1: the game thread's stack in game memory was refused\n");
+    pthread_t game, clock;
+    if (port::StartThread(&game, g_mainStack, sizeof g_mainStack, GameMain, nullptr, true) != 0) {
+        std::fprintf(stderr, "sly1: cannot start the game thread on its stack in game memory\n");
         return 1;
     }
-    pthread_t game;
-    if (pthread_create(&game, &attr, GameMain, nullptr) != 0) {
-        std::fprintf(stderr, "sly1: cannot start the game thread\n");
+    if (port::StartThread(&clock, g_clockStack, sizeof g_clockStack, Clock, nullptr, false) != 0) {
+        std::fprintf(stderr, "sly1: cannot start the clock thread on its stack in game memory\n");
         return 1;
     }
-    pthread_attr_t clockAttr;
-    pthread_attr_init(&clockAttr);
-    if (pthread_attr_setstack(&clockAttr, g_clockStack, sizeof g_clockStack) != 0) {
-        std::fprintf(stderr, "sly1: the clock thread's stack in game memory was refused\n");
-        return 1;
-    }
-    pthread_t clock;
-    pthread_create(&clock, &clockAttr, Clock, nullptr);
     pthread_join(clock, nullptr);
     return 0;
 }

@@ -86,6 +86,8 @@ struct LevelStreamEnd {
 extern LevelStreamEnd g_levelStreamEnds[16];
 extern std::atomic<int> g_levelStreamCloses;
 void NoteLevelStreamEnd(int remaining, int bytesToRead, int nextCount, int carry);
+// Under SLY1_STREAM_TRACE: the bytes of a game structure, as words, to compare platforms.
+void TraceBytes(const char* what, const void* p, int n);
 
 // A base address as the game's raw-offset macros take it (player.cpp's AT): a pointer as it is, a
 // stored pointer, or a word holding a game address.

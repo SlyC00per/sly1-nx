@@ -40,6 +40,17 @@ namespace port {
 LevelStreamEnd g_levelStreamEnds[16];
 std::atomic<int> g_levelStreamCloses{0};
 
+void TraceBytes(const char* what, const void* p, int n)
+{
+    static const bool trace = std::getenv("SLY1_STREAM_TRACE") != nullptr;
+    if (!trace)
+        return;
+    std::fprintf(stderr, "trace: %s at 0x%08X:", what, GameAddr(p));
+    for (int i = 0; i + 4 <= n; i += 4)
+        std::fprintf(stderr, " %08X", *reinterpret_cast<const std::uint32_t*>(static_cast<const char*>(p) + i));
+    std::fprintf(stderr, "\n");
+}
+
 void NoteLevelStreamEnd(int remaining, int bytesToRead, int nextCount, int carry)
 {
     int n = g_levelStreamCloses.load() + 1;

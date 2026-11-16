@@ -23,6 +23,8 @@
 
 #include <pthread.h>
 
+#include "port/thread.h"
+
 #include "common.h"
 #include "thread_params.h"
 #include "semaphore_params.h"
@@ -71,7 +73,7 @@ Thread g_threads[kThreads];
 Sema g_semas[kSemaphores];
 int g_current = kIdle;        // the game thread that runs, or none
 
-alignas(16384) unsigned char g_stacks[8][kStackSize];   // page-aligned for pthread_attr_setstack
+alignas(16384) unsigned char g_stacks[8][kStackSize];   // page-aligned (port/thread.h)
 bool g_stackUsed[8];
 
 void (*g_handlers[16])(void);
@@ -131,6 +133,7 @@ void* HostEntry(void* p)
 {
     int id = (int)(std::intptr_t)p;
     t_self = id;
+    PlaceThread(ThreadRole::Game);
     SetGameFloatMode();
     {
         std::unique_lock<std::mutex> lk(g_kernel);
@@ -306,15 +309,11 @@ void RunThread(s32 id, void* arg)
     g_stackUsed[s] = true;
     g_threads[id].stack = s;
     g_threads[id].arg = arg;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    if (pthread_attr_setstack(&attr, g_stacks[s], kStackSize) != 0) {
-        std::fprintf(stderr, "port: a game thread's stack in game memory was refused\n");
+    pthread_t h;
+    if (StartThread(&h, g_stacks[s], kStackSize, HostEntry, (void*)(std::intptr_t)id, true) != 0) {
+        std::fprintf(stderr, "port: a game thread on its stack in game memory could not start\n");
         std::abort();
     }
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    pthread_t h;
-    pthread_create(&h, &attr, HostEntry, (void*)(std::intptr_t)id);
     MakeReady(lk, id, true);
 }
 

@@ -419,6 +419,18 @@ def text_stage(out):
                 stats["named_returns"] += len(found)
                 text, n = rewrite_minmax(text)
                 stats["minmax"] += n
+                # g++ 2.95's #pragma interface / implementation chose the one file that emits a
+                # class's inline functions, to place them as retail did; a newer g++ emits them
+                # there only where that file uses them, and Clang ignores the pair. Plain inline
+                # functions, emitted wherever they are used, are the same code.
+                # The inline definitions such a file wrote out for the others lose `inline`, so
+                # they are emitted there once, as before.
+                m = re.search(r'(?m)^#pragma implementation\s+"([^"]+)"', text)
+                if m:
+                    header = (DECOMP / "include" / m.group(1)).read_text(errors="replace")
+                    for cls in re.findall(r"(?m)^(?:struct|class)\s+(\w+)\s*(?::[^{;]*)?\{", header):
+                        text = re.sub(r"(?m)^inline\s+(?=[^\n(;]*\b%s::)" % cls, "", text)
+                text = re.sub(r"(?m)^#pragma (interface|implementation)\b.*$", r"// port: (#pragma \1)", text)
                 if rel == "include/vu0.h":
                     text = forward_vu0(text)
                 elif rel in PORT_HELPERS:

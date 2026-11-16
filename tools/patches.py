@@ -194,6 +194,14 @@ PATCHES = [
      "            port::NoteLevelStreamEnd(sub.remaining, sub.bytesToRead, sub.nextCount, sub.unpackCarry);\n"
      "            CloseBufferedStream(&sub);",
      "records where the level's load left its stream (instrumentation only)"),
+    # Instrumentation, no change to the game: the level stream before its first read, under
+    # SLY1_STREAM_TRACE, to compare platforms.
+    ("src/main/on_off_object.cpp",
+     "            g_currentWorld = 0;\n            ReadBufferedBlockHeader(ne, &sub);",
+     "            g_currentWorld = 0;\n"
+     "            port::TraceBytes(\"level stream\", &sub, 0x60);\n"
+     "            ReadBufferedBlockHeader(ne, &sub);",
+     "shows the level stream before its first read (instrumentation only)"),
     ('src/main/gauge_collider.cpp',
      '                Vec4 pair[2];\n                Vec4 in = dir;\n',
      "                // port: retail's frame put `in` right after pair, and ComputeOscillatorDisplacement\n                // reads three deltas from pair: the third is `in`.\n                Vec4 pair[3];\n                pair[2] = dir;\n                Vec4& in = pair[2];\n",

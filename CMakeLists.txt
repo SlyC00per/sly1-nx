@@ -23,6 +23,8 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if(NINTENDO_SWITCH)
     set(PLATFORM SWITCH)
+    # frame records for the port's reports of where a fault came from
+    add_compile_options(-fno-omit-frame-pointer)
 else()
     set(PLATFORM HOST_ASAN CACHE STRING "Host build: HOST_ASAN (sanitizers) or HOST (plain)")
     set_property(CACHE PLATFORM PROPERTY STRINGS HOST_ASAN HOST)
@@ -42,7 +44,7 @@ endif()
 # The port's own code: game memory and, later, the platform layer.
 add_library(port_core STATIC port/platform/game_memory.cpp port/platform/vu0_micro.cpp port/platform/varargs.cpp
     port/platform/system.cpp
-    port/platform/memory.cpp)
+    port/platform/memory.cpp port/platform/thread.cpp)
 target_include_directories(port_core PUBLIC port/include)
 target_compile_options(port_core PRIVATE -Wall -Wextra)
 
@@ -98,7 +100,12 @@ add_custom_target(sly1_gen DEPENDS ${GEN_UNITS})
 # -fwrapv: signed arithmetic wraps, as the PS2's does (the game's hashes multiply into overflow).
 # -fno-delete-null-pointer-checks: two methods test `this == 0` and are called on null pointers,
 # which g++ 2.95 compiled as written.
-set(GAME_FLAGS -w -ffp-contract=off -fwrapv -fno-delete-null-pointer-checks "SHELL:-include port/gxx_ext.h" "SHELL:-include port/ptr32.h"
+# -fno-strict-aliasing: the game reads one object through pointers of other types throughout (a
+# word as a float, a record as bytes), which g++ 2.95 compiled as written; newer compilers (GCC most
+# of all, the Switch's) would reorder or drop such accesses.
+# -fsigned-char: plain char is signed, as the PS2's g++ had it; AArch64's ABI (the Switch's)
+# makes it unsigned, where Apple's and x86-64's keep it signed.
+set(GAME_FLAGS -w -ffp-contract=off -fwrapv -fno-strict-aliasing -fsigned-char -fno-delete-null-pointer-checks "SHELL:-include port/gxx_ext.h" "SHELL:-include port/ptr32.h"
     "SHELL:-include port/varargs.h" "SHELL:-include port/retail_data.h" -Wno-register)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     list(APPEND GAME_FLAGS -Wno-c++11-narrowing)
@@ -140,7 +147,7 @@ target_include_directories(sly1_game PRIVATE ${GAME_INCLUDES})
 file(GLOB LIBM_SOURCES CONFIGURE_DEPENDS ${SLY1_DECOMP}/src/libm/*.c)
 add_library(port_libm STATIC ${LIBM_SOURCES})
 target_include_directories(port_libm PRIVATE ${SLY1_DECOMP}/include)
-target_compile_options(port_libm PRIVATE -w -ffp-contract=off -fwrapv)
+target_compile_options(port_libm PRIVATE -w -ffp-contract=off -fwrapv -fno-strict-aliasing -fsigned-char)
 
 add_library(port_platform STATIC
     port/platform/lib_runtime.cpp port/platform/lib_kernel.cpp port/platform/lib_devices.cpp
@@ -157,7 +164,13 @@ target_compile_options(port_game_asm PRIVATE ${GAME_FLAGS})
 target_include_directories(port_game_asm PRIVATE ${GAME_INCLUDES})
 add_dependencies(port_game_asm sly1_gen)
 
-if(NOT PLATFORM STREQUAL "SWITCH")
+if(PLATFORM STREQUAL "SWITCH")
+    add_executable(sly1 port/host/main.cpp $<TARGET_OBJECTS:sly1_game>)
+    target_include_directories(sly1 PRIVATE port/include)
+    target_link_libraries(sly1 PRIVATE port_game_asm port_platform port_libm port_core)
+    nx_generate_nacp(sly1.nacp NAME "Sly Cooper" AUTHOR "sly1-nx" VERSION "0.0.1")
+    nx_create_nro(sly1 NACP sly1.nacp)
+else()
     find_package(Threads REQUIRED)
     add_executable(sly1_headless port/host/main.cpp $<TARGET_OBJECTS:sly1_game>)
     target_include_directories(sly1_headless PRIVATE port/include)

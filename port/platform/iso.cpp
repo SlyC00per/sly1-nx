@@ -6,6 +6,7 @@
 #include "port/ptr32.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -90,9 +91,20 @@ bool ReadSectors(std::uint32_t lsn, std::uint32_t count, void* dst)
     std::lock_guard<std::mutex> lock(g_isoLock);
     if (!g_iso)
         return false;
-    if (std::fseek(g_iso, (long)((std::uint64_t)lsn * kSectorSize), SEEK_SET) != 0)
+    static const bool trace = std::getenv("SLY1_CD_TRACE") != nullptr;
+    if (std::fseek(g_iso, (long)((std::uint64_t)lsn * kSectorSize), SEEK_SET) != 0) {
+        if (trace)
+            std::fprintf(stderr, "cd: seek to sector %u failed\n", lsn);
         return false;
-    return std::fread(dst, kSectorSize, count, g_iso) == count;
+    }
+    std::size_t got = std::fread(dst, kSectorSize, count, g_iso);
+    if (trace) {   // each read with a checksum of its bytes, to compare runs
+        std::uint32_t sum = 2166136261u;
+        for (std::size_t i = 0; i < got * kSectorSize; i++)
+            sum = (sum ^ static_cast<const unsigned char*>(dst)[i]) * 16777619u;
+        std::fprintf(stderr, "cd: sectors %u+%u read %zu, sum %08X\n", lsn, count, got, sum);
+    }
+    return got == count;
 }
 
 bool LoadExecutableSegments()

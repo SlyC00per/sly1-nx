@@ -10,6 +10,7 @@
 #include <mutex>
 #include <vector>
 #include <cstdlib>
+#include <cstring>
 
 #if defined(__APPLE__) || defined(__linux__)
 #include <execinfo.h>
@@ -99,7 +100,10 @@ alignas(64) static unsigned char g_scratchpad[kScratchpadSize];
 
 // The PS2's main memory, mirrored: the game's globals at their retail addresses, filled from the
 // player's executable and the decompilation's initialisers (port/retail_data.h), and its heap.
-alignas(4096) unsigned char port_ram[port::kRamSize];
+// With a guard after it: main memory's end address is a game address too (the heap's top), so
+// GameAddr takes a pointer one past port_ram as 0x02000000; no other object may start there (the
+// Switch's linker put the scratchpad there, which then came back as 0x02000000).
+alignas(4096) unsigned char port_ram[port::kRamSize + 4096];
 
 namespace port {
 
@@ -167,6 +171,32 @@ void* NativeSlow(std::uint32_t addr)
     if (addr - kVuMemory < kVuMemorySize)
         if (void* p = VuWindow(addr - kVuMemory))
             return p;
+    // An address of nothing (a plain word the game keeps where a declaration says pointer comes
+    // here too, and is never read): the first above main memory's end is reported with its caller,
+    // which a read would fault in.
+    static bool reported;
+    if (!reported && addr - kRamSize < 0x00100000u) {
+        reported = true;
+        std::fprintf(stderr, "port: game address 0x%08X maps to nothing; from image +0x%llX\n", addr,
+                     (unsigned long long)(reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)) - ImageBase()));
+#if defined(__SWITCH__)
+        // the callers, by the frame records (the Switch build keeps frame pointers)
+        auto* fp = static_cast<std::uintptr_t*>(__builtin_frame_address(0));
+        for (int i = 0; i < 12 && fp && reinterpret_cast<std::uintptr_t>(fp) % 8 == 0; i++) {
+            std::uintptr_t lr = fp[1];
+            if (lr - ImageBase() >= ImageSize())
+                break;
+            std::fprintf(stderr, "port:   called from image +0x%llX\n", (unsigned long long)(lr - ImageBase()));
+            fp = reinterpret_cast<std::uintptr_t*>(fp[0]);
+        }
+        // Reading it would fault, and a fault in the emulator leaves Ryujinx unable to exit: the run
+        // ends here instead, its report made.
+        std::fflush(stderr);
+        static const char line[] = "sly1: done, status 4";
+        svcOutputDebugString(line, sizeof line - 1);
+        std::_Exit(4);
+#endif
+    }
     return reinterpret_cast<void*>(kWordTag | addr);
 }
 

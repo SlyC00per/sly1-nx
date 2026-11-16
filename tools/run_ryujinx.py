@@ -3,6 +3,7 @@
 
     python3 tools/run_ryujinx.py build-smoke/sly1_smoke.nro
     python3 tools/run_ryujinx.py build-switch/sly1.nro --timeout 300 --out out/run1
+    python3 tools/run_ryujinx.py build-switch/sly1.nro --iso DISC.iso --args "--level 3"
 
 Ryujinx runs headless (--no-gui) with a data folder of its own (default: build-ryujinx/, so a
 run never touches the user's own Ryujinx setup). The program reports through the debug-output
@@ -11,6 +12,10 @@ follows that log, prints the program's lines, and stops the emulator when one re
 "<name>: done, status N" (Ryujinx keeps running after a homebrew program exits). It then copies
 the emulated SD card's sly1/ folder into --out and converts every .ppm frame there to .png.
 The exit status is the program's status, 124 on a timeout, 125 if Ryujinx could not be run.
+
+--iso links the player's disc image to the emulated SD card's switch/sly1/sly1.iso, where the
+game looks for it; --args writes switch/sly1/args.txt, the arguments the game reads when it is
+given none (an emulated run is given none), and without --args that file is removed.
 
 Ryujinx is found by --ryujinx, then $SLY1_RYUJINX, then the usual install places. Homebrew
 needs no firmware and no keys.
@@ -130,6 +135,8 @@ def main():
     ap.add_argument("--timeout", type=float, default=120.0, help="seconds (default 120)")
     ap.add_argument("--docked", action="store_true", help="docked mode (default: handheld)")
     ap.add_argument("--quiet", action="store_true", help="print only the program's lines")
+    ap.add_argument("--iso", type=Path, help="the disc image, linked to the SD card's switch/sly1/sly1.iso")
+    ap.add_argument("--args", help="the game's arguments, written to the SD card's switch/sly1/args.txt")
     args = ap.parse_args()
 
     exe = find_ryujinx(args.ryujinx)
@@ -146,8 +153,36 @@ def main():
     if sd_out.exists():
         shutil.rmtree(sd_out)
     data_dir.mkdir(parents=True, exist_ok=True)
+    game_dir = data_dir / "sdcard" / "switch" / "sly1"
+    game_dir.mkdir(parents=True, exist_ok=True)
+    if args.iso:
+        link = game_dir / "sly1.iso"
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        try:
+            os.link(args.iso.resolve(), link)
+        except OSError:
+            link.symlink_to(args.iso.resolve())
+    args_file = game_dir / "args.txt"
+    if args.args is not None:
+        args_file.write_text(args.args + "\n")
+    elif args_file.exists():
+        args_file.unlink()
 
-    cmd = [str(exe), "--no-gui", "--root-data-dir", str(data_dir),
+    # Ryujinx's own JIT rather than Apple's Hypervisor: a guest fault under the hypervisor ends
+    # Ryujinx in a process macOS cannot remove until a restart.
+    config = data_dir / "Config.json"
+    if config.is_file():
+        text = config.read_text()
+        fixed = re.sub(r'"use_hypervisor":\s*true', '"use_hypervisor": false', text)
+        if fixed != text:
+            config.write_text(fixed)
+    cmd = []
+    if sys.platform == "darwin" and subprocess.run(["sysctl", "-n", "hw.optional.arm64"], capture_output=True,
+                                                   text=True).stdout.strip() == "1":
+        # natively on Apple Silicon: a Python built for Intel would start it under Rosetta
+        cmd = ["arch", "-arm64"]
+    cmd += [str(exe), "--no-gui", "--root-data-dir", str(data_dir),
            "--skip-user-profiles-manager", "--ignore-controller-applet"]
     if not args.docked:
         cmd.append("--disable-docked-mode")
@@ -185,12 +220,19 @@ def main():
                 break
             time.sleep(0.25)
     finally:
+        # Ryujinx can ignore a terminate request (a guest that hangs it), so it is killed when
+        # it has not gone within a few seconds; never left running.
         if proc.poll() is None:
             proc.terminate()
             try:
-                proc.wait(timeout=10)
+                proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    print(f"run_ryujinx: Ryujinx (pid {proc.pid}) did not end when killed; it is stuck "
+                          "exiting and goes only with a restart", file=sys.stderr)
         console.close()
 
     out = (args.out or nro.parent / "run").resolve()

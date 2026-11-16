@@ -716,11 +716,12 @@ class Walker:
         name = "port_inplace_cast_" + fn.spelling
         if (f, name) not in self.fn_adapters:
             self.fn_adapters[(f, name)] = name
-            # declared before the use, defined at the end, where the class is complete
+            # declared before the use (and before any `static` the definition is given: depth -1
+            # puts it first), defined at the end, where the class is complete
             s = top.extent.start.offset
             decl = ", ".join(["void*"] + params)
             self.edits.wrap(f, s, s, "// port: %s's result in the place its caller passes (tools/gen_pointers.py)\n"
-                            "static void* %s(%s);\n" % (fn.spelling, name, decl), "", 0, "results in place adapted")
+                            "static void* %s(%s);\n" % (fn.spelling, name, decl), "", -1, "results in place adapted")
             data = self.texts.get(f)
             if data is None:
                 data = self.texts[f] = Path(f).read_bytes()
