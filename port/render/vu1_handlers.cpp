@@ -1314,6 +1314,144 @@ bool Outlines(Runner& r)
     return true;
 }
 
+// --- 0x076 of chunk E1624411: sprites.
+//
+// From TOP: 22-25 a matrix (multiplied first by the one at 8-11 of data memory, 0x22B, in place),
+// 8.xy the w of the viewport's offset and scale, 26 the sprites' colour, 27 the size's limits
+// (x, y) and where it fades (w), 11.x and 11.y the sprites (stride 13.x: quadword 0 the centre's
+// w, the last the centre), 28 a packet kicked first. Each sprite: its centre less the viewport's
+// offset, over its scale, times its w, through the matrix; its size (w) kept within the limits,
+// and when kept, the centre moved by half the change and the colour's w 0 past the fade; then
+// divided by the sprite's w into quadword 0; the colour into quadwords 1 and stride - 2. The
+// batch is kicked; one with a sprite to clip (13.z) is left to the microcode.
+
+// 0x22B: rows 0-3 at out = the rows at in times the matrix at global (each result row k is the
+// in rows weighted by global row k), vf20-vf31 as it leaves them.
+void MatrixProduct(Runner& r, float (*vf)[4], std::uint16_t in, std::uint16_t global, std::uint16_t out)
+{
+    V g[4], a[4], res[4];
+    for (int k = 0; k < 4; k++) {
+        g[k] = Load(r, (std::uint16_t)(global + k));
+        a[k] = Load(r, (std::uint16_t)(in + k));
+    }
+    for (int k = 0; k < 4; k++) {
+        F4 acc = Mul4(a[0].v, Splat(g[k].x));
+        acc = Add4(acc, Mul4(a[1].v, Splat(g[k].y)));
+        acc = Add4(acc, Mul4(a[2].v, Splat(g[k].z)));
+        res[k].v = Add4(acc, Mul4(a[3].v, Splat(g[k].w)));
+    }
+    for (int k = 0; k < 4; k++)
+        Store(r, (std::uint16_t)(out + k), res[k]);
+    for (int k = 0; k < 4; k++) {
+        std::memcpy(vf[20 + k], &a[k], 16);
+        std::memcpy(vf[24 + k], &g[k], 16);
+        std::memcpy(vf[28 + k], &res[k], 16);
+    }
+}
+
+bool Sprites(Runner& r)
+{
+    State& st = r.s;
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    if (Half(Load(r, top + 13).z) != 0)
+        return false;
+    V hdr = Load(r, top + 11);
+    std::uint16_t step = Half(Load(r, top + 13).x);
+    std::uint16_t first = (std::uint16_t)(top + Half(hdr.x)), end = (std::uint16_t)(top + Half(hdr.y));
+    std::uint16_t last = (std::uint16_t)(end - step);
+    std::uint16_t span = (std::uint16_t)(last - first);
+    if (step == 0 || step > 64 || span % step || span / step > 1024)
+        return false;
+    const int n = span / step + 1;
+    float vf[32][4];
+    std::memcpy(vf, st.vf, sizeof vf);
+    auto get = [&](int k) { V x; std::memcpy(&x, vf[k], 16); return x; };
+    auto set = [&](int k, const V& x) { std::memcpy(vf[k], &x, 16); };
+    MatrixProduct(r, vf, (std::uint16_t)(top + 22), 8, (std::uint16_t)(top + 22));
+    V m[4] = {Load(r, top + 22), Load(r, top + 23), Load(r, top + 24), Load(r, top + 25)};
+    for (int k = 0; k < 4; k++)
+        set(2 + k, m[k]);
+    V colour = Load(r, top + 26), limits = Load(r, top + 27), v09 = Load(r, top + 8);
+    V v06 = Load(r, 1), v07 = Load(r, 0);
+    v06.w = Mul(1.0f, v09.x);
+    v07.w = Mul(1.0f, v09.y);
+    V v08 = get(8);
+    v08.x = Add(0.0f, Reciprocal(r, v07.x));
+    v08.y = Add(0.0f, Reciprocal(r, v07.y));
+    v08.z = Add(0.0f, Reciprocal(r, v07.z));
+    float q = 0.0f;
+    Kick(r, (std::uint16_t)(top + 28));
+    V v10 = get(10), v12 = get(12), v13 = get(13), v14 = get(14), v11 = limits;
+    float i = st.i;
+    const std::uint16_t back1 = (std::uint16_t)(step - 1), back2 = (std::uint16_t)(step - 2);
+    for (int k = 0; k < n; k++) {
+        std::uint16_t at = (std::uint16_t)(first + step * k);
+        v13.w = Load(r, at).w;
+        V c = Load(r, (std::uint16_t)(at + back1));
+        v12.x = c.x;
+        v12.y = c.y;
+        v12.z = c.z;
+        V d;
+        d.v = Fix4(Fix4(v12.v) - Fix4(v06.v));
+        v12.x = d.x;
+        v12.y = d.y;
+        v12.z = d.z;
+        q = Reciprocal(r, v13.w);
+        v12.w = v13.w;
+        for (int j = 0; j < 3; j++)
+            v12[j] = Mul(v12[j], v08[j]);
+        for (int j = 0; j < 3; j++)
+            v12[j] = Mul(v12[j], v12.w);
+        F4 acc = Mul4(m[0].v, Splat(v12.x));
+        acc = Add4(acc, Mul4(m[1].v, Splat(v12.y)));
+        acc = Add4(acc, Mul4(m[2].v, Splat(v12.z)));
+        v13.v = Add4(acc, Mul4(m[3].v, Splat(v12.w)));
+        float below = Sub(v13.w, v11.x), above = Sub(v13.w, v11.y);
+        v10 = colour;
+        v13.z = Add(0.0f, v13.w);
+        bool small = std::signbit(below) && below != 0.0f;
+        bool withinTop = std::signbit(above) && above != 0.0f;
+        v11.z = Add(0.0f, v11.x);
+        bool kept = small;
+        if (!small) {
+            v11.z = Add(0.0f, v11.y);
+            kept = !withinTop;
+        }
+        if (kept) {   // 0x0C5
+            v14.z = Sub(v11.z, v13.w);
+            i = 0.5f;
+            v14.z = Mul(v14.z, i);
+            v13.z = v11.z;
+            v13.x = Add(v13.x, v14.z);
+            v13.y = Add(v13.y, v14.z);
+            float fade = Sub(v13.w, v11.w);
+            if (std::signbit(fade) && fade != 0.0f)
+                v10.w = Sub(1.0f, 1.0f);
+        }
+        for (int j = 0; j < 3; j++)
+            v13[j] = Mul(v13[j], q);
+        Store(r, (std::uint16_t)(at + 1), v10);
+        Store(r, (std::uint16_t)(at + back2), v10);
+        std::memcpy(r.Qword(at), &v13, 12);
+    }
+    Kick(r, (std::uint16_t)(first - 1));
+    set(6, v06);
+    set(7, v07);
+    set(8, v08);
+    set(9, v09);
+    set(10, v10);
+    set(11, v11);
+    set(12, v12);
+    set(13, v13);
+    set(14, v14);
+    set(15, colour);
+    std::memcpy(st.vf, vf, sizeof vf);
+    st.q = q;
+    st.i = i;
+    st.pc = 0x0C5;
+    return true;
+}
+
 }  // namespace
 
 // Every VF register but vf00 and vf01, and P: what the lights' handlers are compared on.
@@ -1347,6 +1485,7 @@ const HandlerEntry kHandlers[] = {
      "vf12.xyzw vf13.xyzw vf14.xyzw vf15.xyzw vf16.xyzw vf17.xyzw vf18.xyzw vf19.xyzw vf20.xyz vf21.xyz "
      "vf22.xyz vf23.xyz"},
     {0x7B92AF0F, 0x26D, Outlines, "outlines", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "P clip"},
+    {0xE1624411, 0x076, Sprites, "sprites", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I"},
     {0xE1624411, 0x01E, BatchSecond, "lit batch second pass", "vf03.xyzw vf11.w vf12.xyz vf13.w"},
 };
 const std::size_t kHandlerCount = sizeof kHandlers / sizeof kHandlers[0];
