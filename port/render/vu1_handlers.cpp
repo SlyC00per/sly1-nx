@@ -296,6 +296,199 @@ bool LitBatchTransform(Runner& r)
     return true;
 }
 
+// --- The batch's colours and kicks (chunk E1624411): 0x002 after the transform, 0x01E for a
+// batch's second pass.
+
+// ITOF0 and FTOI0, field by field as the runner does them.
+inline float Itof0(float x) { return (float)(std::int32_t)Bits(x) / 1.0f; }
+inline float Ftoi0(float x)
+{
+    double v = (double)In(x) * 1.0f;
+    std::int32_t n = v >= 2147483647.0 ? 0x7FFFFFFF : v <= -2147483648.0 ? (std::int32_t)0x80000000 : (std::int32_t)v;
+    return FromBits((std::uint32_t)n);
+}
+
+void SetVf(State& st, int reg, const V& x) { std::memcpy(st.vf[reg], &x, 16); }
+
+// Whether x - 1 is zero (SUBw with vf00w; the Z flag FSAND reads four instructions later).
+bool IsOne(float x) { return Sub(x, 1.0f) == 0.0f; }
+
+// A loop that runs from first, step by step, while its pointer has not met end after the step
+// (IBNE after the increment): the count, or 0 when it would run on past the end (wrapping).
+int Count(std::uint16_t first, std::uint16_t end, int step)
+{
+    std::uint16_t span = (std::uint16_t)(end - first);
+    if (span == 0 || step <= 0 || span % step)
+        return 0;
+    return span / step;
+}
+
+void Kick(Runner& r, std::uint32_t qaddr)
+{
+    if (r.ctx.kick)
+        r.ctx.kick(qaddr & 0x3FF, r.ctx.user);
+}
+
+// 0x4C1: each vertex's colour (quadword 2) scaled by 10.w, or not when that is 1; quadword 1's w
+// copied into its w. vf11.w, vf12 and vf13.w as the loop leaves them.
+void Colours4C1(Runner& r, std::uint16_t top, int n)
+{
+    State& st = r.s;
+    std::uint16_t first = (std::uint16_t)(top + Half(Load(r, top + 11).x));
+    float scale = Load(r, top + 10).w;
+    st.vf[11][3] = scale;
+    bool one = IsOne(scale);
+    for (int k = 0; k < n; k++) {
+        std::uint16_t at = (std::uint16_t)(first + 4 * k);
+        float* c = r.Qword(at + 2);
+        float w = r.Qword(at + 1)[3];
+        if (!one) {
+            V x = Load(r, at + 2);
+            for (int j = 0; j < 3; j++)
+                x[j] = Ftoi0(Mul(Itof0(x[j]), scale));
+            c[0] = x[0];
+            c[1] = x[1];
+            c[2] = x[2];
+            if (k == n - 1)
+                std::memcpy(st.vf[12], c, 12);
+        }
+        c[3] = w;
+        if (k == n - 1)
+            st.vf[13][3] = w;
+    }
+}
+
+// 0x4DD: each vertex's quadword 1 xyz from the array at 12.w, scaled by 10.w unless that is 1.
+void Colours4DD(Runner& r, std::uint16_t top, int n)
+{
+    State& st = r.s;
+    std::uint16_t first = (std::uint16_t)(top + Half(Load(r, top + 11).x));
+    std::uint16_t from = (std::uint16_t)(top + Half(Load(r, top + 12).w));
+    float scale = Load(r, top + 10).w;
+    st.vf[11][3] = scale;
+    bool one = IsOne(scale);
+    for (int k = 0; k < n; k++) {
+        float x[3];
+        std::memcpy(x, r.Qword(from + k), 12);
+        if (!one)
+            for (int j = 0; j < 3; j++)
+                x[j] = Ftoi0(Mul(Itof0(x[j]), scale));
+        std::memcpy(r.Qword(first + 4 * k + 1), x, 12);
+        if (k == n - 1)
+            std::memcpy(st.vf[12], x, 12);
+    }
+}
+
+// The kick of a batch: the GIF tag at `tag` copied before the vertices (11.x), the packet after
+// the tag kicked, then the vertices.
+void KickBatch(Runner& r, std::uint16_t top, std::uint16_t tag)
+{
+    std::uint16_t at = (std::uint16_t)(top + tag);
+    V t = Load(r, at);
+    SetVf(r.s, 3, t);
+    Kick(r, at + 1);
+    std::uint16_t verts = (std::uint16_t)(top + Half(Load(r, top + 11).x));
+    Store(r, verts - 1, t);
+    Kick(r, verts - 1);
+}
+
+// Whether a batch can be done here: whole vertices, and no triangle flagged for the clipper.
+bool Plain(Runner& r, std::uint16_t top, int& n)
+{
+    V hdr = Load(r, top + 11);
+    n = Count((std::uint16_t)(top + Half(hdr.x)), (std::uint16_t)(top + Half(hdr.y)), 4);
+    return n > 0 && Half(Load(r, top + 13).z) == 0;
+}
+
+// 0x01E's body from 0x020: the colours (0x4C1), the kick of the packet at 12.y, and when 9.w is
+// not 1 the second colours (0x4DD) and the packet at 12.z.
+void SecondPass(Runner& r, std::uint16_t top, int n)
+{
+    Colours4C1(r, top, n);
+    KickBatch(r, top, Half(Load(r, top + 12).y));
+    if (Half(Load(r, top + 9).w) == 1)
+        return;
+    Colours4DD(r, top, n);
+    KickBatch(r, top, Half(Load(r, top + 12).z));
+}
+
+bool BatchSecond(Runner& r)
+{
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    V nine = Load(r, top + 9);
+    r.s.pc = 0x051;
+    if (Half(nine.y) != 0 || Half(nine.w) == 0)
+        return true;
+    int n;
+    if (!Plain(r, top, n))
+        return false;
+    SecondPass(r, top, n);
+    return true;
+}
+
+// 0x4A9: quadword 1 of each vertex (stride 13.x) scaled, xyz by 10.w and w by 9.x, unless both
+// are 1.
+bool Scale4A9(Runner& r, std::uint16_t top)
+{
+    State& st = r.s;
+    float sw = Load(r, top + 9).x, sxyz = Load(r, top + 10).w;
+    std::uint16_t first = (std::uint16_t)(top + Half(Load(r, top + 11).x));
+    std::uint16_t end = (std::uint16_t)(top + Half(Load(r, top + 11).y));
+    std::uint16_t step = Half(Load(r, top + 13).x);
+    V factor;
+    factor.v = F4{Add(0.0f, sxyz), Add(0.0f, sxyz), Add(0.0f, sxyz), Add(0.0f, sw)};
+    st.vf[2][0] = factor.x;   // vf02: x from 9.x first, then all four
+    SetVf(st, 2, factor);
+    st.vf[3][3] = sxyz;
+    std::memset(st.vf[5], 0, 16);
+    if (IsOne(sw) && IsOne(sxyz))
+        return true;
+    // the loop stops when its pointer, before the step, is end - step
+    std::uint16_t last = (std::uint16_t)(end - step);
+    std::uint16_t span = (std::uint16_t)(last - first);
+    if (step == 0 || span % step || span / step > 1024)
+        return false;
+    int count = span / step + 1;
+    V x;
+    for (int k = 0; k < count; k++) {
+        std::uint16_t at = (std::uint16_t)(first + step * k + 1);
+        x = Load(r, at);
+        for (int j = 0; j < 4; j++)
+            x[j] = Itof0(x[j]);
+        x.v = Mul4(x.v, factor.v);
+        for (int j = 0; j < 4; j++)
+            x[j] = Ftoi0(x[j]);
+        Store(r, at, x);
+    }
+    SetVf(st, 4, x);
+    return true;
+}
+
+bool BatchFinish(Runner& r)
+{
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    int n;
+    if (!Plain(r, top, n))
+        return false;
+    V nine = Load(r, top + 9);
+    bool second = Half(nine.y) != 0 && Half(nine.w) != 0;
+    // a quadword-1 scaling the handler leaves to the microcode is decided before anything changes
+    State saved = r.s;
+    if (!Scale4A9(r, top)) {
+        r.s = saved;
+        return false;
+    }
+    KickBatch(r, top, Half(Load(r, top + 12).x));
+    if (Half(nine.y) == 0) {
+        r.s.pc = 0x01E;
+        return true;
+    }
+    r.s.pc = 0x051;
+    if (second)
+        SecondPass(r, top, n);
+    return true;
+}
+
 }  // namespace
 
 const HandlerEntry kHandlers[] = {
@@ -303,6 +496,8 @@ const HandlerEntry kHandlers[] = {
      "vf02.xyzw vf03.xyzw vf04.xyzw vf05.xyzw vf06.xyzw vf07.xyzw vf08.xyzw vf09.xyzw vf10.xyzw vf11.xyzw "
      "vf12.xyzw vf14.xy vf15.xyzw vf16.xyzw vf17.xyzw vf19.xyzw vf20.xyzw vf21.xyzw vf22.xyzw vf24.xy "
      "vf25.xyzw vf26.xyzw vf27.xyzw vf29.xy clip"},
+    {0xE1624411, 0x002, BatchFinish, "lit batch finish", "vf02.xyzw vf03.xyzw vf04.xyzw vf05.xyzw vf11.w vf12.xyz vf13.w"},
+    {0xE1624411, 0x01E, BatchSecond, "lit batch second pass", "vf03.xyzw vf11.w vf12.xyz vf13.w"},
 };
 const std::size_t kHandlerCount = sizeof kHandlers / sizeof kHandlers[0];
 

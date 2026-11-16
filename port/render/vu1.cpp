@@ -56,7 +56,9 @@ core::ChunkFn g_table[2048];
 int g_owner[2048];   // the index of the chunk installed there, or -1
 bool g_tableReady;
 std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> g_profile;   // SLY1_VU1_PROFILE
-std::uint64_t g_handlerNs[64], g_handlerCalls[64];
+std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> g_profileCalls;
+std::uint64_t g_handlerNs[64], g_handlerCalls[64], g_fallbacks[64];
+std::map<std::uint32_t, std::uint64_t> g_stretch;
 std::uint64_t g_translatedRun;
 
 std::uint32_t HashWords(const std::uint32_t* w, std::size_t n)
@@ -115,12 +117,16 @@ std::uint64_t Interpret(std::uint32_t start, const Context& ctx)
     Runner r(ctx);
     std::uint32_t pc = start & 0x7FF;
     static const bool tracking = live::Enabled();
-    static const bool interpretOnly = tracking || std::getenv("SLY1_VU1_INTERPRET") != nullptr;
+    static const char* profileEnv = std::getenv("SLY1_VU1_PROFILE");
+    static const bool stretches = profileEnv && profileEnv[0] == '2';   // per 16 instructions
+    static const bool interpretOnly = tracking || stretches || std::getenv("SLY1_VU1_INTERPRET") != nullptr;
     if (tracking) {
         int o = g_owner[pc];
         live::Begin(pc, o < 0 ? 0 : core::kTranslated[o].hash);
     }
     while (!r.done) {
+        if (stretches)
+            g_stretch[pc & ~15u]++;
         if (tracking)
             live::Instruction(pc, Micro()[pc * 2 + 1], Micro()[pc * 2], r.cycle);
         if (!interpretOnly && r.branch < 0 && !r.ending && g_table[pc]) {
@@ -139,6 +145,9 @@ std::uint64_t Interpret(std::uint32_t start, const Context& ctx)
     if (profile) {
         int o = g_owner[start & 0x7FF];
         g_profile[{o < 0 ? 0u : core::kTranslated[o].hash, start & 0x7FF}] += r.executed;
+        g_profileCalls[{o < 0 ? 0u : core::kTranslated[o].hash, start & 0x7FF}]++;
+        // the instructions run in each 16-instruction stretch of micro memory
+
     }
     s.pc = pc;
     r.cycle += 64;   // the program's last results settle
@@ -276,6 +285,8 @@ std::uint64_t Run(std::uint32_t start, const Context& ctx)
             return h->fn(r) ? 0 : Interpret(start, ctx);
         auto t0 = std::chrono::steady_clock::now();
         bool done = h->fn(r);
+        if (!done)
+            g_fallbacks[h - kHandlers]++;
         g_handlerNs[h - kHandlers] += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                           std::chrono::steady_clock::now() - t0).count();
         g_handlerCalls[h - kHandlers]++;
@@ -291,6 +302,7 @@ std::uint64_t Run(std::uint32_t start, const Context& ctx)
     {
         Runner r(hctx);
         if (!h->fn(r)) {   // a case the handler leaves to the microcode
+            g_fallbacks[h - kHandlers]++;
             before.Restore();
             return Interpret(start, ctx);
         }
@@ -337,11 +349,16 @@ void ReportLive()
     std::sort(rows.rbegin(), rows.rend());
     for (std::size_t k = 0; k < kHandlerCount && k < 64; k++)
         if (g_handlerCalls[k])
-            std::fprintf(stderr, "vu1 profile: handler %s: %llu calls, %.3f s\n", kHandlers[k].name,
-                         (unsigned long long)g_handlerCalls[k], g_handlerNs[k] / 1e9);
+            std::fprintf(stderr, "vu1 profile: handler %s: %llu calls (%llu left to the microcode), %.3f s\n",
+                         kHandlers[k].name, (unsigned long long)g_handlerCalls[k], (unsigned long long)g_fallbacks[k],
+                         g_handlerNs[k] / 1e9);
     for (const auto& row : rows)
-        std::fprintf(stderr, "vu1 profile: chunk %08X entry 0x%03X: %llu instructions (%.1f%%)\n", row.second.first,
-                     row.second.second, (unsigned long long)row.first, total ? row.first * 100.0 / total : 0.0);
+        std::fprintf(stderr, "vu1 profile: chunk %08X entry 0x%03X: %llu instructions (%.1f%%) in %llu calls\n",
+                     row.second.first, row.second.second, (unsigned long long)row.first,
+                     total ? row.first * 100.0 / total : 0.0, (unsigned long long)g_profileCalls[row.second]);
+    for (const auto& e : g_stretch)
+        if (e.second * 200 > total)
+            std::fprintf(stderr, "vu1 profile: 0x%03X-0x%03X: %.1f%%\n", e.first, e.first + 15, e.second * 100.0 / total);
 }
 
 std::uint64_t TranslatedInstructions() { return g_translatedRun; }
