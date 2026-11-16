@@ -327,6 +327,7 @@ class Walker:
         self.call_args = []                  # (key, file, start, end) of direct calls' integer arguments
         self.rooms = {}            # locals viewed as larger types: (file, offset) -> (cursor, [needs])
         self.room_plans = {}       # the same as plain data, for the merge (resolve_rooms)
+        self.sizeof_locals = []    # (local's key, file, start, end, its size) of each sizeof(local)
         self.record_sizes = {}     # every record defined in the files walked: name -> size
         self.top_cursors = []      # the unit's top-level declarations (function_cast)
         self.global_decls = []     # their declarations: (name, file, start, end, type, shared, line)
@@ -728,6 +729,30 @@ class Walker:
                             "results in place adapted")
         self.edits.rep(f, e.extent.start.offset, e.extent.end.offset, name, "results in place adapted")
 
+    def record_sizeof_local(self, c):
+        """`sizeof(local)` or `sizeof local`: if the merge gives that local room (resolve_rooms), the
+        expression keeps the local's own size, as retail's code computed it."""
+        kids = list(c.get_children())
+        if len(kids) != 1 or c.location.file is None:
+            return
+        e = kids[0]
+        while e is not None and e.kind in (CK.UNEXPOSED_EXPR, CK.PAREN_EXPR):
+            k2 = list(e.get_children())
+            e = k2[0] if len(k2) == 1 else None
+        if e is None or e.kind != CK.DECL_REF_EXPR or e.referenced is None or e.referenced.kind != CK.VAR_DECL:
+            return
+        var = e.referenced
+        if var.location.file is None:
+            return
+        f = c.location.file.name
+        data = self.texts.get(f)
+        if data is None:
+            data = self.texts[f] = Path(f).read_bytes()
+        if not data[c.extent.start.offset:c.extent.start.offset + 6] == b"sizeof":
+            return
+        self.sizeof_locals.append(((var.location.file.name, var.location.offset), f, c.extent.start.offset,
+                                   c.extent.end.offset, var.type.get_canonical().get_size()))
+
     def roomy_cast(self, c, operand):
         """`(Mat3*)&a` with `a` a smaller local (or `(ScaledTransform*)tmp`, an array): the game
         hands the local's address on as the larger type and has it written whole, which retail's
@@ -830,7 +855,16 @@ class Walker:
             toks = _tokens(var)
             vt = var.type.get_canonical()
             line = var.location.line
-            plan = {"file": f, "line": line, "size": vt.get_size(), "needs": needs}
+            plan = {"file": f, "line": line, "size": vt.get_size(), "needs": needs, "name": var.spelling}
+            # Where the declaration ends, for the audit build's guard (PORT_ROOM_AUDIT): after its
+            # semicolon, unless that is not a plain statement's (a for's first clause).
+            data = self.texts.get(f)
+            if data is None:
+                data = self.texts[f] = Path(f).read_bytes()
+            j = data.find(b";", var.extent.end.offset)
+            between = data[var.extent.end.offset:j] if j >= 0 else b")"
+            if b")" not in between and b"{" not in between:
+                plan["after"] = j + 1
             if vt.kind == TK.RECORD and vt.get_declaration().kind == CK.UNION_DECL:
                 plan["error"] = "a union local viewed as a larger type; not given room"
             elif vt.kind == TK.CONSTANTARRAY:
@@ -874,6 +908,39 @@ class Walker:
                 return
             a = body.extent.start.offset + 1
             self.edits.wrap(f, a, a, " port::Preempt();", "", 0, "preemption points")
+
+    def float_division(self, c, depth):
+        """`a / b` and `a /= b` in floats: the PS2's FPU divides by zero to the largest float with
+        the quotient's sign (0 / 0 too), where IEEE gives infinity or NaN. port::FDiv divides as
+        it does (port/retail_data.h); an overflow already saturates, as game threads round toward
+        zero."""
+        if c.type.get_canonical().kind != TK.FLOAT or c.location.file is None:
+            return
+        kids = list(c.get_children())
+        if len(kids) != 2:
+            return
+        lhs, rhs = kids
+        f = c.location.file.name
+        if lhs.location.file is None or rhs.location.file is None or lhs.location.file.name != f or \
+                rhs.location.file.name != f:
+            return
+        data = self.texts.get(f)
+        if data is None:
+            data = self.texts[f] = Path(f).read_bytes()
+        a, b = lhs.extent.end.offset, rhs.extent.start.offset
+        between = data[a:b]
+        op = between.strip()
+        if op not in (b"/", b"/="):
+            return
+        if (f, c.extent.start.offset) in self.macro_starts or c.extent.start.offset >= c.extent.end.offset:
+            self.edits.unsupported.append("%s:%d: a float division inside a macro" % (f, c.location.line))
+            return
+        if c.kind == CK.COMPOUND_ASSIGNMENT_OPERATOR and lhs.type.get_canonical().kind != TK.FLOAT:
+            return
+        i = a + between.index(op)
+        self.edits.rep(f, i, i + len(op), ",", "float divisions as the PS2 divides")
+        helper = "port::FDivAssign(" if op == b"/=" else "port::FDiv("
+        self.edits.wrap(f, c.extent.start.offset, c.extent.end.offset, helper, ")", depth, "float divisions as the PS2 divides")
 
     def wait_loop(self, c):
         """A loop with an empty body waits for another thread or an interrupt handler: it calls
@@ -1165,6 +1232,7 @@ class Walker:
             self.edits.wrap(f, brace + 1, brace + 1, "".join(decls), "", 0, "addressed parameters")
 
     def sizeof(self, c):
+        self.record_sizeof_local(c)
         toks = _tokens(c)
         if len(toks) < 4 or toks[0].spelling not in ("sizeof", "__alignof__", "alignof") or toks[1].spelling != "(":
             return
@@ -1295,6 +1363,8 @@ class Walker:
                 self.sizeof(ch)
             elif k == CK.UNARY_OPERATOR:
                 self.roomy_address(ch)
+            elif k in (CK.BINARY_OPERATOR, CK.COMPOUND_ASSIGNMENT_OPERATOR):
+                self.float_division(ch, depth)
             elif k == CK.CONDITIONAL_OPERATOR:
                 self.conditional(ch, depth)
             elif k == CK.CALL_EXPR:
@@ -1340,7 +1410,7 @@ def _collect(job):
             edits.unsupported, diagnostics, edits.kinds, walker.global_defs, walker.global_decls,
             walker.global_inits, walker.global_kept, walker.functions, walker.result_kinds,
             walker.declarations, walker.room_plans, walker.record_sizes, walker.address_params,
-            walker.param_sites, walker.call_args)
+            walker.param_sites, walker.call_args, walker.sizeof_locals)
 
 
 def adapt_results(edits, result_kinds, declarations):
@@ -1387,8 +1457,9 @@ def adapt_results(edits, result_kinds, declarations):
 def resolve_rooms(edits, plans, record_sizes):
     """Gives each local viewed as a larger type (Walker.roomy_cast) the room of its largest view,
     every record's size known now: a record local becomes port::Room<T, N>, an array gets more
-    elements."""
-    for plan in plans.values():
+    elements. Gives back the keys of the locals given room."""
+    widened = set()
+    for key, plan in plans.items():
         sizes = [n if isinstance(n, int) else record_sizes.get(n, 0) for n in plan["needs"]]
         size = max(sizes) if sizes else 0
         if size <= plan["size"]:
@@ -1398,12 +1469,17 @@ def resolve_rooms(edits, plans, record_sizes):
             edits.unsupported.append("%s:%d: %s" % (f, plan["line"], plan["error"]))
             continue
         a, b = plan["at"]
+        widened.add(key)
+        if "after" in plan:   # the audit build marks the added bytes (port/retail_data.h)
+            edits.wrap(f, plan["after"], plan["after"], " PORT_ROOM_AUDIT(%s, %d);" % (plan["name"], plan["size"]),
+                       "", 0, "room audit guards")
         if plan["kind"] == "array":
             count = -(-size // plan["elem"])
             edits.rep(f, a, b, "%d /* port: room for a larger view */" % count, "locals given a larger view's room")
         else:
             n = (size + 15) // 16 * 16
             edits.rep(f, a, b, "port::Room<%s, %d>" % (plan["type"], n), "locals given a larger view's room")
+    return widened
 
 
 def returned_in_place(t):
@@ -1467,9 +1543,10 @@ def rewrite(units, out, args, report, jobs=None):
     result_kinds = collections.defaultdict(set)
     declarations = []
     room_plans, record_sizes = {}, {}
-    address_params, param_sites, call_args = set(), [], []
+    address_params, param_sites, call_args, sizeof_locals = set(), [], [], []
     for replace, insert, unsupported, diag, k, gdefs, gdecls, ginits, gkept, funcs, rkinds, fdecls, rplans, rsizes, \
-            aparams, psites, cargs in results:
+            aparams, psites, cargs, slocals in results:
+        sizeof_locals += slocals
         address_params |= aparams
         param_sites += psites
         call_args += cargs
@@ -1586,7 +1663,10 @@ def rewrite(units, out, args, report, jobs=None):
             clashes[name] = sorted(decls, key=lambda d: (not d[1], d[2], d[3]))
     report["result_clashes"] = clashes
     report["result_adapters"], report["result_unadapted"] = adapt_results(edits, result_kinds, declarations)
-    resolve_rooms(edits, room_plans, record_sizes)
+    widened = resolve_rooms(edits, room_plans, record_sizes)
+    for key, f, a, b, size in set(sizeof_locals):
+        if key in widened:
+            edits.rep(f, a, b, "((size_t)%d)" % size, "sizeof of a local given room")
     # Parameters used only as addresses: void* in every declaration, so the link names agree.
     for key, f, a, b in set(param_sites):
         if key in address_params:

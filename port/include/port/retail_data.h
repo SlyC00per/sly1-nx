@@ -12,6 +12,7 @@
 #define PORT_RETAIL_DATA_H
 
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -32,6 +33,48 @@ inline void RetailInit(std::uint32_t addr, const void* value, std::size_t size)
 
 // Fills main memory with the executable's loadable segments (port/iso.h); false without one.
 bool LoadRetailImage();
+
+// The audit of that room (a build with PORT_ROOM_AUDIT and ASan's recover mode): the bytes added
+// past the local's own size are poisoned while it lives, so any code that reaches them, which
+// retail's frame let reach a neighbour, is reported with its function and the variable.
+#ifdef PORT_ROOM_AUDIT
+}  // namespace port
+#include <sanitizer/asan_interface.h>
+namespace port {
+struct RoomAudit {
+    char* at;
+    std::size_t size;
+    RoomAudit(void* v, std::size_t own, std::size_t whole) : at((char*)v + own), size(whole - own)
+    {
+        // ASan poisons to the end of an 8-byte granule: up to the last granule end in the room
+        std::uintptr_t end = ((std::uintptr_t)at + size) & ~std::uintptr_t(7);
+        size = end > (std::uintptr_t)at ? end - (std::uintptr_t)at : 0;
+        if (size)
+            __asan_poison_memory_region(at, size);
+    }
+    ~RoomAudit()
+    {
+        if (size)
+            __asan_unpoison_memory_region(at, size);
+    }
+};
+#define PORT_ROOM_AUDIT_NAME2(l) port_room_audit_##l
+#define PORT_ROOM_AUDIT_NAME(l) PORT_ROOM_AUDIT_NAME2(l)
+#define PORT_ROOM_AUDIT(v, own) port::RoomAudit PORT_ROOM_AUDIT_NAME(__LINE__)((void*)&(v), own, sizeof(v))
+#else
+#define PORT_ROOM_AUDIT(v, own) ((void)0)
+#endif
+
+// The PS2 FPU's division (div.s): by zero, the largest float with the quotient's sign (0 / 0
+// too), where IEEE gives infinity or NaN; tools/gen.py writes it for every float division of the
+// game's code. An overflowing quotient already saturates (game threads round toward zero).
+inline float FDiv(float a, float b)
+{
+    if (b == 0.0f)
+        return std::signbit(a) != std::signbit(b) ? -3.4028235e38f : 3.4028235e38f;
+    return a / b;
+}
+inline float& FDivAssign(float& a, float b) { return a = FDiv(a, b); }
 
 // A base address as the game's raw-offset macros take it (player.cpp's AT): a pointer as it is, a
 // stored pointer, or a word holding a game address.

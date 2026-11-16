@@ -124,6 +124,13 @@ if(PLATFORM STREQUAL "HOST_ASAN")
     # large for an int saturates on the PS2 (cvt.w.s) as on ARM64 (fcvtzs), the Switch's.
     target_compile_options(sly1_game PRIVATE
         -fno-sanitize=bounds,pointer-overflow,shift-base,null,alignment,float-cast-overflow)
+    # The room audit (tools/gen_pointers.py, port/retail_data.h): reports every access to the bytes
+    # given to locals past their own size, and goes on.
+    option(SLY1_ROOM_AUDIT "Report accesses to the room given to game locals" OFF)
+    if(SLY1_ROOM_AUDIT)
+        target_compile_definitions(sly1_game PRIVATE PORT_ROOM_AUDIT)
+        target_compile_options(sly1_game PRIVATE -fsanitize-recover=address)
+    endif()
 endif()
 target_include_directories(sly1_game PRIVATE ${GAME_INCLUDES})
 

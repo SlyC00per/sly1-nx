@@ -418,6 +418,25 @@ first code commit.
 4. **Retail references** (memory dumps, recordings) when the maintainer can supply them.
 5. **`libclang`** (Apache-2.0 with the LLVM exception) as a build-time tool dependency.
 
+## 12. Retail fidelity (maintainer's rule, 2026-11-15)
+
+Behaviour and gameplay stay identical to PS2 retail; a fix reproduces what retail computed, never
+only avoids a fault. What the port does for it, and what is left:
+
+| Area | How the port matches retail |
+| --- | --- |
+| Memory | globals at their retail addresses in a mirrored 32 MB main memory; 32-bit stored pointers; functions stored as their retail addresses |
+| Frames | code that relied on g++ 2.95's frame (an array's end written as the next local's address, a third delta read past a pair) is patched to the value retail read |
+| Locals given room | 291 locals viewed through larger types get room; the audit build (`-DSLY1_ROOM_AUDIT=ON`, `tools/room_audit.py`) shows only two are reached past their size in any level's first 60 frames: one lands in retail's frame padding as here, one reads two stack bytes retail never wrote either; `sizeof` of such a local keeps its own size |
+| Floats | game threads round toward zero and flush denormals as the PS2's FPU does, so overflow saturates; float division by zero gives the largest float with the quotient's sign (`port::FDiv`, 1,062 divisions); no FMA contraction |
+| Doubles | the soft-float routines (AddDoubles and the rest) round to nearest, as the PS2's software doubles do |
+| Math library | sly1-decomp's own src/libm, matched C (`port_libm`) |
+| VU0 | the vector helpers follow VU0's float rules; the game's microcode runs in an interpreter (`port/vu0_micro.h`) |
+| Threads | one game thread runs at a time, by priority; a thread readied by an interrupt preempts at the next loop test or kernel call, a point where retail's interrupts can fall too; clock interrupts run on the stopped game thread, never beside it |
+
+Left: movies end at once until the decoder (milestone 3); the room audit covers each level's first
+60 frames without input; libm's own divisions by zero (log(0) and the like) still give infinity.
+
 ## Credits
 
 The pointer model and the float handling follow OpenRAC's port design (its

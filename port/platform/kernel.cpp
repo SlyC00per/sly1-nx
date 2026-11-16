@@ -14,6 +14,7 @@
 // A game thread runs on a stack of the port's in game memory (port/ptr32.h: the game links
 // stack frames into its lists), not on the stack the game gives it, which is sized for the PS2.
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -31,6 +32,14 @@
 namespace port {
 
 std::atomic<bool> g_preemptPending{false};
+
+// Interrupts raised by the clock while a game thread runs: serviced by that thread at its next
+// preemption point or kernel call, with it stopped there, as the PS2 runs a handler between the
+// interrupted thread's instructions, never beside them.
+std::atomic<unsigned> g_pendingCauses{0};
+std::mutex g_serviceLock;
+std::condition_variable g_serviced;
+void ServiceInterrupts();
 
 namespace {
 
@@ -113,8 +122,8 @@ void MakeReady(std::unique_lock<std::mutex>& lk, int id, bool fromGameThread)
 void UpdatePreemptPending()
 {
     int best = Pick();
-    bool pending = g_current != kIdle && best != kIdle && best != g_current &&
-                   g_threads[best].priority < g_threads[g_current].priority;
+    bool pending = g_pendingCauses.load() != 0 || (g_current != kIdle && best != kIdle && best != g_current &&
+                   g_threads[best].priority < g_threads[g_current].priority);
     g_preemptPending.store(pending, std::memory_order_relaxed);
 }
 
@@ -178,6 +187,7 @@ void KernelDump()
 // loop test or kernel call. The interrupt handlers (on the clock's host thread) never do.
 void PreemptSlow()
 {
+    ServiceInterrupts();
     std::unique_lock<std::mutex> lk(g_kernel);
     int self = t_self;
     if (self != kIdle && g_current == self) {
@@ -196,15 +206,65 @@ void Spin()
     std::this_thread::yield();
 }
 
-// One handler at a time, as on the PS2: the clock's and the devices' (a DMA transfer raises its
-// interrupts on the game thread that started it) never overlap; a handler that starts a transfer
-// may raise another inside it.
-void RaiseInterrupt(int cause)
+namespace {
+
+// One handler at a time, as on the PS2; a handler that starts a transfer may raise another
+// inside it.
+void Dispatch(int cause)
 {
     static std::recursive_mutex interrupts;
     std::lock_guard<std::recursive_mutex> lk(interrupts);
     if (cause >= 0 && cause < 16 && g_enabled[cause] && g_handlers[cause])
         g_handlers[cause]();
+}
+
+}  // namespace
+
+// The running game thread runs the interrupts the clock left pending (at a preemption point or a
+// kernel call), stopped there while they run.
+void ServiceInterrupts()
+{
+    if (t_self == kIdle || g_pendingCauses.load(std::memory_order_relaxed) == 0)
+        return;
+    unsigned causes = g_pendingCauses.exchange(0);
+    for (int c = 0; c < 16; c++)
+        if (causes & (1u << c))
+            Dispatch(c);
+    std::lock_guard<std::mutex> lk(g_serviceLock);
+    g_serviced.notify_all();
+}
+
+// A device on a game thread (a DMA transfer's VIF or GS interrupt) runs the handler at once, the
+// thread stopped in it. The clock, a host thread of its own, leaves it pending for the running
+// game thread and waits until it has run; with no game thread running it runs it itself.
+void RaiseInterrupt(int cause)
+{
+    if (t_self != kIdle) {
+        Dispatch(cause);
+        return;
+    }
+    g_pendingCauses.fetch_or(1u << cause);
+    g_preemptPending.store(true);
+    std::unique_lock<std::mutex> lk(g_serviceLock);
+    for (;;) {
+        if ((g_pendingCauses.load() & (1u << cause)) == 0)
+            return;
+        bool running;
+        {
+            std::lock_guard<std::mutex> k(g_kernel);
+            running = g_current != kIdle;
+        }
+        if (!running) {
+            // every game thread waits: nothing to interrupt
+            unsigned mine = g_pendingCauses.fetch_and(~(1u << cause));
+            if (mine & (1u << cause)) {
+                lk.unlock();
+                Dispatch(cause);
+            }
+            return;
+        }
+        g_serviced.wait_for(lk, std::chrono::milliseconds(1));
+    }
 }
 
 }  // namespace port
@@ -337,11 +397,16 @@ static s32 Signal(s32 id, bool fromGameThread)
     return id;
 }
 
-s32 PostSemaphore(void* a) { return Signal((s32)port::WordArg(a), t_self != kIdle); }
+s32 PostSemaphore(void* a)
+{
+    ServiceInterrupts();
+    return Signal((s32)port::WordArg(a), t_self != kIdle);
+}
 void PostSemaphoreFromInterrupt(s32 sema) { Signal(sema, false); }
 
 s32 AwaitSemaphore(void* a)
 {
+    ServiceInterrupts();
     s32 id = (s32)port::WordArg(a);
     std::unique_lock<std::mutex> lk(g_kernel);
     if (id < 1 || id >= kSemaphores || !g_semas[id].used)

@@ -64,6 +64,9 @@ Fill these in as the build takes shape; keep them current. They must work on mac
   prints every DMA chain; `UBSAN_OPTIONS=print_stacktrace=1` gives UBSan reports a stack.
   Saves go to `--save FOLDER` (default `save/`, gitignored); `SLY1_CARD_TRACE=1` prints every
   memory card request.
+- Every level on its own, in parallel, failures grouped: `python3 tools/verify_parallel.py --iso <path> [--jobs 8]`.
+- The room audit (which widened locals are reached past their size): build `build-audit` with
+  `-DSLY1_ROOM_AUDIT=ON`, then `python3 tools/room_audit.py --iso <path>`.
 - Switch: `cmake -B build-switch -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake -G Ninja && cmake --build build-switch`
 - Shaders: `$DEVKITPRO/tools/bin/uam -s <vert|frag> <in> -o <out.dksh>` (run by the build)
 - Run in the emulator (Ryujinx), unattended: `python3 tools/run_ryujinx.py build-switch/sly1.nro`

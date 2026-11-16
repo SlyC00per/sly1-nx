@@ -2,10 +2,13 @@
 // The platform layer: the toolchain's runtime and the C library functions the game calls
 // (sly1-decomp src/lib, src/libm; their roles in config/names/lib and libm), on the host's own.
 //
-// The soft-float routines of the PS2's runtime implement IEEE double arithmetic, which the host's
-// doubles are; the conversions follow the roles the name tables give. The math library's
-// functions are the host's single-precision ones: their last bits may differ from retail's
-// (newlib's kernels), which is listed in docs/DESIGN.md as a measured-later difference.
+// The soft-float routines of the PS2's runtime implement IEEE double arithmetic, rounding to
+// nearest, which the host's doubles are; but game threads run with the FPU rounding toward zero,
+// as the PS2's single-precision FPU does (port/platform/float_mode.cpp), and the host's rounding
+// mode applies to doubles too. So each double routine, and each conversion that rounds, works in
+// round-to-nearest and gives the game's mode back. The math library is sly1-decomp's own
+// (port_libm).
+#include <cfenv>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -15,16 +18,45 @@
 #include "common.h"
 #include "port/ptr32.h"
 
+#pragma STDC FENV_ACCESS ON
+
+namespace {
+
+// The soft-float routines' rounding, to nearest, for the one operation.
+struct Nearest {
+    int saved = std::fegetround();
+    Nearest() { std::fesetround(FE_TONEAREST); }
+    ~Nearest() { std::fesetround(saved); }
+};
+
+}  // namespace
+
 extern "C" {
 
 // --- 64-bit integer and double helpers (libgcc and soft-float, called by name)
 
-f32 ConvertS64ToFloat(s64 x) { return (f32)x; }
+f32 ConvertS64ToFloat(s64 x)
+{
+    Nearest n;
+    return (f32)x;
+}
 u64 DivideUnsigned64(u64 num, u64 den) { return den ? num / den : 0; }
 s64 RemainderUnsigned64(u64 num, u64 den) { return (s64)(den ? num % den : num); }
-double AddDoubles(double a, double b) { return a + b; }
-double SubtractDoubles(double a, double b) { return a - b; }
-double MultiplyDoubles(double a, double b) { return a * b; }
+double AddDoubles(double a, double b)
+{
+    Nearest n;
+    return a + b;
+}
+double SubtractDoubles(double a, double b)
+{
+    Nearest n;
+    return a - b;
+}
+double MultiplyDoubles(double a, double b)
+{
+    Nearest n;
+    return a * b;
+}
 
 // The order of a and b: negative, zero or positive; an unordered pair (a NaN) compares greater,
 // as libgcc's __cmpdf2 does.
@@ -51,7 +83,11 @@ s32 ConvertDoubleToS32(double a)
     return (s32)a;
 }
 
-f32 ConvertDoubleToFloat(double x) { return (f32)x; }
+f32 ConvertDoubleToFloat(double x)
+{
+    Nearest n;
+    return (f32)x;
+}
 
 // A float to an unsigned 32-bit integer, as libgcc's __fixunssfsi: from 2^31 up through the
 // signed conversion of the value less 2^31.
