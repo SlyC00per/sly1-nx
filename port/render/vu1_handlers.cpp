@@ -1817,6 +1817,238 @@ bool Sprites(Runner& r)
     return true;
 }
 
+// --- 0x110 of chunk 1AE4A8D6 (set B): particles, as rotated quads.
+//
+// From TOP: 0.x and 0.y the particles (ten quadwords each), 0.z the count for the GIF tag before
+// them, 1-4 and 6 quadratics in the particle's distance (size, alpha, size again, frame, blend),
+// 5 the distance's origin (w) and the quads' xy scale, 7-10 a matrix, 11.x the alpha's scale,
+// 15 on the frames' texture registers, 47 on the colours. Each particle: its angle folded into
+// [-pi/2, pi/2) by a quarter turn either way (the corners' order turned to match; the tests read
+// the MAC flags four instructions on), its sine (ESIN) and cosine (ESQRT of 1 - sin^2); its
+// frame (a quadratic in distance, plus 2.y, wrapped by 6.z), its colour (blended along the
+// gradient by another when 6.x's bit 0 asks), its alpha (a third, clamped, times 11.x), the size
+// (a fourth) rotating and scaling the four corners about the centre (through 7-10 and the matrix
+// at 4-7 of data memory); a quad with a corner outside is skipped, its first two vertices marked
+// (ADC); else the corners to the screen with fixed STQs. The packet at 48 is kicked.
+bool Particles(Runner& r)
+{
+    State& st = r.s;
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    V h0 = Load(r, top);
+    std::uint16_t vi06 = (std::uint16_t)(Half(h0.x) + top), vi07 = (std::uint16_t)(Half(h0.y) + top);
+    std::uint16_t span = (std::uint16_t)(vi07 - vi06);
+    if (span == 0 || span % 10 || span > 0x400)
+        return false;
+    float (*vf)[4] = st.vf;
+    auto g = [&](int k) { V x; std::memcpy(&x, vf[k], 16); return x; };
+    auto p = [&](int k, const V& x, int mask) {
+        for (int c = 0; c < 4; c++)
+            if (mask & (8 >> c))
+                vf[k][c] = x[c];
+    };
+    auto lq = [&](int k, std::uint16_t a, int mask) { p(k, Load(r, a), mask); };
+    const int X = 8, Y = 4, Z = 2, W = 1, XY = 12, XYZ = 14, XYZW = 15;
+    const std::uint16_t vi05 = 32768;
+    lq(2, 0, XYZW);
+    lq(3, 1, XYZW);
+    lq(4, (std::uint16_t)(top + 5), XYZW);
+    std::uint16_t vi09 = (std::uint16_t)(Half(Load(r, (std::uint16_t)(top + 6)).z) - 1);
+    std::uint16_t vi08 = Half(Load(r, (std::uint16_t)(top + 6)).x);
+    for (int k = 11; k <= 14; k++)
+        for (int c = 0; c < 3; c++)
+            vf[k][c] = Add(0.0f, 0.0f);
+    for (int k = 0; k < 4; k++)
+        lq(5 + k, (std::uint16_t)(top + 1 + k), XYZW);
+    r.Qword((std::uint16_t)(vi06 - 1))[0] = FromBits((std::uint16_t)(Half(h0.z) + vi05));
+    vf[9][0] = Add(0.0f, 1.0f);
+    vf[10][3] = Add(1.0f, 0.0f);
+    for (int k = 0; k < 4; k++)
+        lq(16 + k, (std::uint16_t)(4 + k), XYZW);
+    const float one = vf[1][0];
+    const float halfPi = FromBits(0x3FC90FDBu);
+    auto corners = [&](const float (*xy)[2]) {
+        for (int k = 0; k < 4; k++) {
+            vf[11 + k][0] = xy[k][0];
+            vf[11 + k][1] = xy[k][1];
+        }
+    };
+    const float m1 = Sub(0.0f, 1.0f), p1 = Add(0.0f, 1.0f);
+    auto quadratic = [&](int coeff) {   // MUL.xyz vf21 = coeff * vf09, ADDAy.x, MADDz.x with vf01.x
+        V c = g(coeff), d = g(9);
+        V t = g(21);
+        for (int k = 0; k < 3; k++)
+            t[k] = Mul(c[k], d[k]);
+        p(21, t, XYZ);
+        float acc = Add(vf[21][0], vf[21][1]);
+        vf[21][0] = Add(acc, Mul(one, vf[21][2]));
+    };
+    auto clamp01 = [&]() { vf[21][0] = Max(Mini(vf[21][0], 1.0f), 0.0f); };
+    do {
+        lq(21, (std::uint16_t)(vi06 + 2), W);
+        float a = Add(0.0f, vf[21][3]);
+        st.i = halfPi;
+        if (std::signbit(a) && a != 0.0f) {
+            vf[22][3] = Add(vf[21][3], st.i);
+            if (std::signbit(vf[22][3]) && vf[22][3] != 0.0f) {
+                const float c[4][2] = {{m1, p1}, {m1, m1}, {p1, p1}, {p1, m1}};
+                corners(c);
+                vf[21][3] = vf[22][3];
+            } else {
+                const float c[4][2] = {{m1, m1}, {p1, m1}, {m1, p1}, {p1, p1}};
+                corners(c);
+            }
+        } else {
+            vf[22][3] = Sub(vf[21][3], st.i);
+            if (!(std::signbit(vf[22][3]) && vf[22][3] != 0.0f)) {
+                const float c[4][2] = {{p1, m1}, {p1, p1}, {m1, m1}, {m1, p1}};
+                corners(c);
+                vf[21][3] = vf[22][3];
+            } else {
+                const float c[4][2] = {{m1, m1}, {p1, m1}, {m1, p1}, {p1, p1}};
+                corners(c);
+            }
+        }
+        float sine = core::Fix(std::sin(In(vf[21][3])));   // ESIN
+        lq(20, (std::uint16_t)(vi06 + 3), XYZW);
+        std::uint16_t vi11 = Half(Load(r, (std::uint16_t)(vi06 + 2)).x);
+        vf[9][3] = Sub(vf[4][3], vf[20][3]);
+        vf[9][1] = Add(0.0f, vf[9][3]);
+        vf[9][2] = Add(0.0f, vf[9][3]);
+        vf[9][2] = Mul(vf[9][2], vf[9][2]);
+        quadratic(7);
+        vf[21][0] = Ftoi0(vf[21][0]);
+        std::uint16_t vi01 = Half(Load(r, (std::uint16_t)(vi06 + 2)).y);
+        std::uint16_t vi10 = (std::uint16_t)((vi01 + Half(vf[21][0])) & vi09);
+        vi01 = (std::uint16_t)(top - vi11);
+        lq(24, (std::uint16_t)(vi01 + 47), XYZW);
+        if (vi08 & 1) {
+            V c24 = g(24);
+            for (int k = 0; k < 4; k++)
+                c24[k] = Itof0(c24[k]);
+            p(24, c24, XYZW);
+            quadratic(8);
+            clamp01();
+            vf[22][0] = Sub(one, vf[21][0]);
+            vi01 = (std::uint16_t)(vi01 - 1);
+            F4 acc = Mul4(g(24).v, Splat(vf[22][0]));
+            lq(24, (std::uint16_t)(vi01 + 47), XYZW);
+            V n = g(24);
+            for (int k = 0; k < 4; k++)
+                n[k] = Itof0(n[k]);
+            n.v = Add4(acc, Mul4(n.v, Splat(vf[21][0])));
+            for (int k = 0; k < 4; k++)
+                n[k] = Ftoi0(n[k]);
+            p(24, n, XYZW);
+        }
+        quadratic(5);
+        vi10 = (std::uint16_t)(vi10 + top);
+        lq(23, (std::uint16_t)(vi10 + 15), XYZW);
+        Store(r, vi06, g(23));
+        clamp01();
+        vf[24][3] = Itof0(vf[24][3]);
+        lq(22, (std::uint16_t)(top + 11), X);
+        vf[24][3] = Mul(vf[24][3], vf[21][0]);
+        vf[24][3] = Mul(vf[24][3], vf[22][0]);
+        vf[24][3] = Ftoi0(vf[24][3]);
+        p(10, g(20), XYZ);
+        {
+            V v10 = g(10);
+            F4 acc = Mul4(Load(r, (std::uint16_t)(top + 7)).v, Splat(v10.x));
+            acc = Add4(acc, Mul4(Load(r, (std::uint16_t)(top + 8)).v, Splat(v10.y)));
+            acc = Add4(acc, Mul4(Load(r, (std::uint16_t)(top + 9)).v, Splat(v10.z)));
+            V last = Load(r, (std::uint16_t)(top + 10));
+            p(22, last, XYZW);
+            V o;
+            o.v = Add4(acc, Mul4(last.v, Splat(v10.w)));
+            p(10, o, XYZW);
+        }
+        quadratic(6);
+        Store(r, (std::uint16_t)(vi06 + 2), g(24));
+        for (int k = 11; k <= 14; k++) {
+            vf[k][0] = Mul(vf[k][0], vf[21][0]);
+            vf[k][1] = Mul(vf[k][1], vf[21][0]);
+        }
+        vf[21][1] = sine;
+        vf[22][1] = vf[21][1];
+        vf[22][1] = Mul(vf[22][1], vf[22][1]);
+        vf[22][1] = Sub(vf[1][1], vf[22][1]);
+        vf[22][0] = Sub(0.0f, vf[21][1]);
+        float cosine = core::Fix(std::sqrt(std::fabs(In(vf[22][1]))));   // ESQRT
+        {
+            V v10 = g(10);
+            F4 acc = Mul4(g(16).v, Splat(v10.x));
+            acc = Add4(acc, Mul4(g(17).v, Splat(v10.y)));
+            acc = Add4(acc, Mul4(g(18).v, Splat(v10.z)));
+            V o;
+            o.v = Add4(acc, Mul4(g(19).v, Splat(v10.w)));
+            p(25, o, XYZW);
+        }
+        vf[22][1] = cosine;
+        st.p = cosine;
+        vf[21][0] = Add(0.0f, vf[22][1]);
+        for (int k = 11; k <= 14; k++) {
+            float x = vf[k][0], y = vf[k][1];
+            vf[31][0] = Add(Mul(vf[21][0], x), Mul(vf[22][0], y));
+            vf[31][1] = Add(Mul(vf[21][1], x), Mul(vf[22][1], y));
+            vf[k][0] = Mul(vf[31][0], vf[4][0]);
+            vf[k][1] = Mul(vf[31][1], vf[4][1]);
+        }
+        float q = Reciprocal(r, vf[25][3]);
+        st.q = q;
+        std::uint32_t clip = st.clip;
+        for (int k = 0; k < 4; k++) {
+            V c = g(27 + k);
+            for (int j = 0; j < 3; j++)
+                c[j] = Add(vf[25][j], vf[11 + k][j]);
+            p(27 + k, c, XYZ);
+        }
+        for (int k = 0; k < 4; k++) {
+            V c = g(27 + k);
+            c.w = vf[25][3];
+            clip = ((clip << 6) | ClipCode(c)) & 0xFFFFFF;
+        }
+        st.clip = clip;
+        if (clip) {
+            for (int k = 0; k < 4; k++)
+                r.Qword((std::uint16_t)(vi06 + 3 + 2 * k))[3] = FromBits(vi05);
+        } else {
+            for (int j = 0; j < 3; j++)
+                vf[26][j] = Mul(vf[2][j], q);
+            const std::uint32_t wbits[4] = {0xFFFF8000u, 0xFFFF8000u, 0u, 0u};
+            for (int k = 0; k < 4; k++) {
+                for (int j = 0; j < 3; j++)
+                    vf[15][j] = Add(Mul(vf[26][j], vf[27 + k][j]), Mul(vf[1][j], vf[3][j]));
+                vf[15][3] = FromBits(wbits[k]);
+                Store(r, (std::uint16_t)(vi06 + 3 + 2 * k), g(15));
+            }
+            const float zero = Add(0.0f, 0.0f), unit = Add(0.0f, 1.0f);
+            vf[21][0] = zero;
+            vf[21][1] = unit;
+            vf[21][2] = unit;
+            Store(r, (std::uint16_t)(vi06 + 1), g(21));
+            vf[21][0] = unit;
+            vf[21][1] = unit;
+            vf[21][2] = unit;
+            Store(r, (std::uint16_t)(vi06 + 4), g(21));
+            vf[21][0] = zero;
+            vf[21][1] = zero;
+            vf[21][2] = unit;
+            Store(r, (std::uint16_t)(vi06 + 6), g(21));
+            vf[21][1] = zero;
+            vf[21][0] = unit;
+            vf[21][2] = unit;
+            Store(r, (std::uint16_t)(vi06 + 8), g(21));
+        }
+        vi06 = (std::uint16_t)(vi06 + 10);
+    } while (vi06 != vi07);
+    Kick(r, (std::uint16_t)(top + 48));
+    st.pc = 0x1DB;
+    (void)Y;
+    (void)Z;
+    (void)XY;
+    return true;
+}
+
 }  // namespace
 
 // Every VF register but vf00 and vf01, and P: what the lights' handlers are compared on.
@@ -1851,6 +2083,7 @@ const HandlerEntry kHandlers[] = {
      "vf22.xyz vf23.xyz"},
     {0x7B92AF0F, 0x26D, Outlines, "outlines", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "P clip"},
     {0xE1624411, 0x076, Sprites, "sprites", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I"},
+    {0x1AE4A8D6, 0x110, Particles, "particles", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q P I clip"},
     {0xE1624411, 0x01E, BatchSecond, "lit batch second pass", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I clip"},
 };
 const std::size_t kHandlerCount = sizeof kHandlers / sizeof kHandlers[0];
