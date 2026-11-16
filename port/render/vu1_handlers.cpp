@@ -606,6 +606,164 @@ bool PointLight(Runner& r)
     return true;
 }
 
+// --- 0x242 of chunk B90790F3: a lit batch's colours made final.
+//
+// From TOP: 11.x and 11.y the vertices, 12.w the lit colours (floats, one quadword a vertex),
+// 13.w whether the batch was set up (0 the first time: each vertex's quadword 2 set from 3 of
+// data memory with 13.y / 32768 added to y, the colours cleared, 13.w set, then the rest). Each
+// vertex: m the brightest of its lit colour; t = min(quadword 2's xy, (vf01.x - m - vf01.x *
+// quadword 2's y, vf01.y - m)), at least 0; the average of its base colour (quadword 1, integers)
+// a; quadword 1 becomes a * t.x, quadword 2 the base colour and 255 times t.y, the colour the
+// lit colour (at most vf01) times a and 255 times t.x, as integers. The loop is pipelined one
+// vertex deep (a vertex is stored in the next one's pass; the first pass stores back what its
+// prologue read before the buffers), so it is followed here on the registers themselves.
+struct Regs {
+    float vf[32][4];
+    V get(int r) const { V x; std::memcpy(&x, vf[r], 16); return x; }
+    void put(int r, const V& x, int mask) { for (int k = 0; k < 4; k++) if (mask & (8 >> k)) vf[r][k] = x[k]; }
+};
+
+bool LitColours(Runner& r)
+{
+    State& st = r.s;
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    V hdr = Load(r, top + 11);
+    std::uint16_t first = (std::uint16_t)(top + Half(hdr.x));
+    int n = Count(first, (std::uint16_t)(top + Half(hdr.y)), 4);
+    if (n == 0)
+        return false;
+    std::uint16_t colours = (std::uint16_t)(top + Half(Load(r, top + 12).w));
+    Regs R;
+    std::memcpy(R.vf, st.vf, sizeof R.vf);
+    const int X = 8, Y = 4, Z = 2, W = 1, XY = 12, XYZ = 14, XYZW = 15;
+    V zero = {};
+    zero.v = Fix4(Fix4(Splat(0.0f)) - Fix4(F4{0.0f, 0.0f, 0.0f, 1.0f}));   // SUB vf00 - vf00
+    zero.w = Sub(1.0f, 1.0f);
+    zero.x = Sub(0.0f, 0.0f);
+    zero.y = zero.x;
+    zero.z = zero.x;
+    R.put(15, zero, XYZW);
+    auto ftoi = [](V x) { for (int k = 0; k < 4; k++) x[k] = Ftoi0(x[k]); return x; };
+    auto itof = [](V x) { for (int k = 0; k < 4; k++) x[k] = Itof0(x[k]); return x; };
+
+    if (Half(Load(r, top + 13).w) == 0) {   // the first time: the setup at 0x26B
+        V v16 = R.get(16);
+        v16.y = (float)(std::int32_t)Bits(r.Qword(top + 13)[1]) / 32768.0f;   // LQ.y, ITOF15.y
+        R.put(16, v16, Y);
+        V v09 = R.get(9);
+        V g = Load(r, 3);
+        v09.x = g.x;
+        v09.y = Add(g.y, v16.y);
+        R.put(9, v09, XY);
+        // 0x24C ran in the branch's delay slot: vf08.w = 255
+        V v08 = R.get(8);
+        v08.w = Add(zero.w, 255.0f);
+        R.put(8, v08, W);
+        for (int k = 0; k < n; k++) {
+            Store(r, (std::uint16_t)(first + 4 * k + 2), R.get(9));
+            Store(r, (std::uint16_t)(colours + k), zero);
+        }
+        r.Qword(top + 13)[3] = FromBits(1);
+    }
+    V c255;
+    c255.v = Add4(zero.v, Splat(255.0f));
+    R.put(3, c255, XYZW);
+    V v08 = R.get(8);
+    v08.w = Add(zero.w, 255.0f);
+    R.put(8, v08, W);
+    const float third = FromBits(0x3EAAAA9Fu);
+    V c3;
+    c3.v = Add4(zero.v, Splat(third));
+    R.put(4, c3, XYZW);
+    st.i = third;
+
+    // the prologue
+    std::uint16_t at = first, col = colours;
+    R.put(5, Load(r, at + 1), XYZ);
+    R.put(6, Load(r, at + 2), XY);
+    R.put(7, Load(r, col), XYZ);
+    V t = R.get(8);
+    V v05 = R.get(5);
+    for (int k = 0; k < 3; k++)
+        t[k] = Itof0(v05[k]);
+    R.put(8, t, XYZ);
+    R.put(11, Load(r, (std::uint16_t)(at - 2)), XYZW);
+    R.put(10, Load(r, (std::uint16_t)(at - 3)), XYZ);
+    R.put(12, Load(r, (std::uint16_t)(col - 1)), XYZW);
+    V v14 = R.get(14);
+    v14.x = Max(R.vf[7][0], R.vf[7][1]);
+    v14.x = Max(v14.x, R.vf[7][2]);
+    R.put(14, v14, X);
+    const float* one = st.vf[1];
+    for (int k = 0; k < n; k++) {
+        // 0x253-0x256: the vertex before stored
+        V v02 = R.get(2);
+        v02.y = Sub(one[1], R.vf[14][0]);
+        float acc = Sub(one[0], R.vf[14][0]);
+        v02.x = Sub(acc, Mul(one[0], R.vf[6][1]));
+        R.put(2, v02, XY);
+        Store(r, (std::uint16_t)(at - 2), R.get(11));
+        { V old = Load(r, (std::uint16_t)(at - 3)); V x = R.get(10); old.x = x.x; old.y = x.y; old.z = x.z;
+          Store(r, (std::uint16_t)(at - 3), old); }
+        Store(r, (std::uint16_t)(col - 1), R.get(12));
+        V v12 = R.get(12), v07 = R.get(7);
+        for (int c = 0; c < 3; c++)
+            v12[c] = Mini(v07[c], one[c]);
+        R.put(12, v12, XYZ);
+        // 0x257-0x25A: the average of the base colour; the next vertex read
+        V v08n = R.get(8);
+        F4 a4 = Mul4(c3.v, Splat(v08n.x));
+        a4 = Add4(a4, Mul4(c3.v, Splat(v08n.y)));
+        R.put(7, Load(r, (std::uint16_t)(col + 1)), XYZ);
+        V v09 = R.get(9), v06 = R.get(6);
+        v09.x = Mini(v06.x, v02.x);
+        v09.y = Mini(v06.y, v02.y);
+        R.put(5, Load(r, (std::uint16_t)(at + 5)), XYZ);
+        V v13;
+        v13.v = Add4(a4, Mul4(c3.v, Splat(v08n.z)));
+        R.put(13, v13, XYZ);
+        R.put(6, Load(r, (std::uint16_t)(at + 6)), XY);
+        // 0x25B-0x265
+        V nx = R.get(14);
+        nx.x = Max(R.vf[7][0], R.vf[7][1]);
+        v09.x = Max(v09.x, 0.0f);
+        v09.y = Max(v09.y, 0.0f);
+        R.put(9, v09, XY);
+        v12 = R.get(12);
+        V prod;
+        prod.v = Mul4(v12.v, R.get(13).v);
+        v12.x = prod.x;
+        v12.y = prod.y;
+        v12.z = prod.z;
+        nx.x = Max(nx.x, R.vf[7][2]);
+        R.put(14, nx, X);
+        V v11;
+        v11.v = Mul4(R.get(8).v, Splat(v09.y));
+        V v10;
+        v10.v = Mul4(R.get(13).v, Splat(v09.x));
+        v12.w = Mul(R.vf[3][3], v09.x);
+        V n08 = R.get(8);
+        V n05 = R.get(5);
+        for (int c = 0; c < 3; c++)
+            n08[c] = Itof0(n05[c]);
+        R.put(8, n08, XYZ);
+        at = (std::uint16_t)(at + 4);
+        col = (std::uint16_t)(col + 1);
+        R.put(11, ftoi(v11), XYZW);
+        R.put(10, ftoi(v10), XYZ);
+        R.put(12, ftoi(v12), XYZW);
+    }
+    // 0x266-0x268: the last vertex stored
+    Store(r, (std::uint16_t)(at - 2), R.get(11));
+    { V old = Load(r, (std::uint16_t)(at - 3)); V x = R.get(10); old.x = x.x; old.y = x.y; old.z = x.z;
+      Store(r, (std::uint16_t)(at - 3), old); }
+    Store(r, (std::uint16_t)(col - 1), R.get(12));
+    (void)itof;
+    std::memcpy(st.vf, R.vf, sizeof R.vf);
+    st.pc = 0x26B;
+    return true;
+}
+
 }  // namespace
 
 const HandlerEntry kHandlers[] = {
@@ -617,6 +775,9 @@ const HandlerEntry kHandlers[] = {
     {0x6744EAB9, 0x1A6, PointLight, "point light",
      "vf02.xyz vf03.xyz vf04.xyz vf05.xyz vf06.xy vf07.xyzw vf08.xyzw vf09.xyzw vf10.xyzw vf11.xyz vf12.xyzw "
      "vf13.xyz vf14.xyz vf15.xyz vf16.xyz vf17.x vf18.x vf19.x vf20.xyz P"},
+    {0xB90790F3, 0x242, LitColours, "lit colours",
+     "vf02.xyzw vf03.xyzw vf04.xyzw vf05.xyzw vf06.xyzw vf07.xyzw vf08.xyzw vf09.xyzw vf10.xyzw vf11.xyzw "
+     "vf12.xyzw vf13.xyzw vf14.xyzw vf15.xyzw vf16.xyzw I"},
     {0xE1624411, 0x01E, BatchSecond, "lit batch second pass", "vf03.xyzw vf11.w vf12.xyz vf13.w"},
 };
 const std::size_t kHandlerCount = sizeof kHandlers / sizeof kHandlers[0];
