@@ -715,6 +715,54 @@ struct Clipper {
             vi07 = vi06;
     }
 
+    // 0x671 (vi03 = 0): the same for vertices of three quadwords (STQ, colour, position), with
+    // 15 noted at 34.x and 13.z left alone; 0x627, called last, returns at once, zeroing vf04 in
+    // its delay slot.
+    void Run3()
+    {
+        V hdr = Load(r, (std::uint16_t)(top + 11));
+        std::uint16_t vi08 = (std::uint16_t)(top + Half(hdr.x) + 6), vi09 = (std::uint16_t)(top + Half(hdr.y));
+        r.Qword((std::uint16_t)(top + 34))[0] = FromBits((std::uint16_t)(top + 15));
+        std::uint16_t vi05 = 2;
+        do {
+            std::uint16_t control = Half(Load(r, (std::uint16_t)(vi08 + 2)).w);
+            if ((std::uint16_t)(control + 4096) & 8192) {
+                vi06 = 13;
+                vi07 = 22;
+                std::uint16_t vi11 = vi06, a = (std::uint16_t)(vi08 - 9);
+                do {
+                    a = (std::uint16_t)(a + 3);
+                    lq(2, a);
+                    lq(3, (std::uint16_t)(a + 1));
+                    lq(4, (std::uint16_t)(a + 2));
+                    sq(2, vi11);
+                    sq(3, (std::uint16_t)(vi11 + 1));
+                    sq(4, (std::uint16_t)(vi11 + 2));
+                    vi11 = (std::uint16_t)(vi11 + 3);
+                } while (vi11 != vi07);
+                Polygon();
+                if (vi06 != vi07) {
+                    Cull(vi05);
+                    if (vi06 != vi07) {
+                        r.Qword(12)[0] = FromBits((std::uint16_t)(32768 + vi10));
+                        Kick(r, 12);
+                        float* nop = r.Qword(2);
+                        nop[1] = 0.0f;
+                        nop[2] = 0.0f;
+                        nop[3] = 1.0f;
+                        nop[0] = FromBits(32768);
+                        Kick(r, 2);
+                    }
+                }
+            }
+            vi08 = (std::uint16_t)(vi08 + 3);
+            vi05 = (std::uint16_t)(vi05 + 2);
+        } while (vi08 != vi09);
+        V zero;
+        zero.v = F4{Sub(0.0f, 0.0f), Sub(0.0f, 0.0f), Sub(0.0f, 0.0f), Sub(1.0f, 1.0f)};
+        p(4, zero);
+    }
+
     // 0x5EF with the colour at quadword colour of each vertex.
     void Run(std::uint16_t colour)
     {
@@ -760,6 +808,14 @@ struct Clipper {
         } while (vi08 != vi09);
     }
 };
+
+// Whether a batch of vertices of stride quadwords has at least three, whole.
+bool Clippable(Runner& r, std::uint16_t top, int stride)
+{
+    V hdr = Load(r, top + 11);
+    std::uint16_t span = (std::uint16_t)(Half(hdr.y) - Half(hdr.x));
+    return span % stride == 0 && span / stride >= 3 && span <= 0x400;
+}
 
 void ClipIfMarked(Runner& r, std::uint16_t top, std::uint16_t colour)
 {
@@ -1714,14 +1770,18 @@ void MatrixProduct(Runner& r, float (*vf)[4], std::uint16_t in, std::uint16_t gl
     }
 }
 
+bool Clippable(Runner& r, std::uint16_t top, int stride);
+
 bool Sprites(Runner& r)
 {
     State& st = r.s;
     std::uint16_t top = (std::uint16_t)r.ctx.top;
-    if (Half(Load(r, top + 13).z) != 0)
-        return false;
     V hdr = Load(r, top + 11);
     std::uint16_t step = Half(Load(r, top + 13).x);
+    const bool clips = Half(Load(r, top + 13).z) != 0;
+    // the clipper after: 0x671 for three quadwords, else 0x5EF (which steps by four)
+    if (clips && !((step == 3 && Clippable(r, top, 3)) || (step == 4 && Clippable(r, top, 4))))
+        return false;
     std::uint16_t first = (std::uint16_t)(top + Half(hdr.x)), end = (std::uint16_t)(top + Half(hdr.y));
     std::uint16_t last = (std::uint16_t)(end - step);
     std::uint16_t span = (std::uint16_t)(last - first);
@@ -1813,6 +1873,13 @@ bool Sprites(Runner& r)
     std::memcpy(st.vf, vf, sizeof vf);
     st.q = q;
     st.i = i;
+    if (clips) {
+        Clipper c(r);
+        if (step == 3)
+            c.Run3();
+        else
+            c.Run(1);
+    }
     st.pc = 0x0C5;
     return true;
 }
@@ -2205,7 +2272,8 @@ bool CopyFromOtherBuffer(Runner& r)
 bool UnlitFinish(Runner& r)
 {
     std::uint16_t top = (std::uint16_t)r.ctx.top;
-    if (Half(Load(r, top + 13).z) != 0)
+    const bool clips = Half(Load(r, top + 13).z) != 0;
+    if (clips && !Clippable(r, top, 3))
         return false;
     State saved = r.s;
     if (!Scale4A9(r, top)) {
@@ -2213,6 +2281,10 @@ bool UnlitFinish(Runner& r)
         return false;
     }
     KickBatch(r, top, Half(Load(r, top + 12).x));
+    if (clips) {
+        Clipper c(r);
+        c.Run3();
+    }
     r.s.pc = 0x076;
     return true;
 }
@@ -2250,12 +2322,12 @@ const HandlerEntry kHandlers[] = {
      "vf12.xyzw vf13.xyzw vf14.xyzw vf15.xyzw vf16.xyzw vf17.xyzw vf18.xyzw vf19.xyzw vf20.xyz vf21.xyz "
      "vf22.xyz vf23.xyz"},
     {0x7B92AF0F, 0x26D, Outlines, "outlines", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "P clip"},
-    {0xE1624411, 0x076, Sprites, "sprites", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I"},
+    {0xE1624411, 0x076, Sprites, "sprites", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I clip"},
     {0x1AE4A8D6, 0x110, Particles, "particles", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q P I clip"},
     {0x2DDC9AA2, 0x411, SkinNormals, "skinned normals", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "P"},
     {0x79A6F5FB, 0x318, MatrixAt14, "matrix at 14", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31},
     {0x79A6F5FB, 0x31F, CopyFromOtherBuffer, "copy from the other buffer", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31},
-    {0xE1624411, 0x05F, UnlitFinish, "unlit batch finish", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31},
+    {0xE1624411, 0x05F, UnlitFinish, "unlit batch finish", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I clip"},
     {0xE1624411, 0x01E, BatchSecond, "lit batch second pass", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I clip"},
 };
 const std::size_t kHandlerCount = sizeof kHandlers / sizeof kHandlers[0];
