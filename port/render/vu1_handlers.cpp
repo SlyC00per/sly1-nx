@@ -2558,6 +2558,173 @@ bool SpotLight(Runner& r)
     return true;
 }
 
+// --- 0x000 of chunk 19FE9C91 (set B): particles as upright quads.
+//
+// As 0x110 without the rotation: each particle's size, frame, alpha and colour blend from
+// quadratics in its distance (here each weighted through vf01's fields), its centre through 7-10
+// and the matrix at 4-7 of data memory, the corners the centre plus and minus 5's xy times the
+// size; a quad with a corner outside the guard band marks its first two vertices (ADC), else its
+// corners go to the screen; the STQs are vf01's fields and zeros. The packet at 48 is kicked.
+bool Quads(Runner& r)
+{
+    State& st = r.s;
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    V h0 = Load(r, top);
+    std::uint16_t vi06 = (std::uint16_t)(Half(h0.x) + top), vi07 = (std::uint16_t)(Half(h0.y) + top);
+    std::uint16_t span = (std::uint16_t)(vi07 - vi06);
+    if (span == 0 || span % 10 || span > 0x400)
+        return false;
+    float (*vf)[4] = st.vf;
+    auto g = [&](int k) { V x; std::memcpy(&x, vf[k], 16); return x; };
+    auto set = [&](int k, const V& x) { std::memcpy(vf[k], &x, 16); };
+    const std::uint16_t vi05 = 32768;
+    set(2, Load(r, 0));
+    set(3, Load(r, 1));
+    set(4, Load(r, (std::uint16_t)(top + 5)));
+    std::uint16_t vi09 = (std::uint16_t)(Half(Load(r, (std::uint16_t)(top + 6)).z) - 1);
+    std::uint16_t vi08 = Half(Load(r, (std::uint16_t)(top + 6)).x);
+    for (int k = 0; k < 4; k++)
+        set(5 + k, Load(r, (std::uint16_t)(top + 1 + k)));
+    r.Qword((std::uint16_t)(vi06 - 1))[0] = FromBits((std::uint16_t)(Half(h0.z) + vi05));
+    for (int k = 0; k < 4; k++)
+        set(13 + k, Load(r, (std::uint16_t)(4 + k)));
+    vf[10][3] = Add(1.0f, 0.0f);
+    for (int c = 0; c < 3; c++)
+        vf[11][c] = Add(0.0f, 0.0f);
+    for (int k = 0; k < 4; k++)
+        set(28 + k, Load(r, (std::uint16_t)(top + 7 + k)));
+    const float* one = vf[1];
+    float acc[4];
+    do {
+        set(17, Load(r, (std::uint16_t)(vi06 + 3)));
+        vf[19][3] = Sub(vf[4][3], vf[17][3]);
+        vf[18][0] = one[0];
+        vf[18][1] = Add(0.0f, vf[19][3]);
+        vf[18][2] = Add(0.0f, vf[19][3]);
+        vf[18][2] = Mul(vf[18][2], vf[18][2]);
+        std::uint16_t vi11 = Half(Load(r, (std::uint16_t)(vi06 + 2)).x);
+        auto times18 = [&](int dst, int src) {
+            for (int c = 0; c < 3; c++)
+                vf[dst][c] = Mul(vf[src][c], vf[18][c]);
+        };
+        times18(27, 5);
+        vf[12][1] = one[1];
+        vf[12][2] = one[2];
+        times18(26, 8);
+        vf[12][0] = 0.0f;   // vf00.x
+        times18(25, 7);
+        times18(24, 6);
+        Store(r, (std::uint16_t)(vi06 + 4), g(1));
+        acc[1] = Add(vf[27][1], vf[27][0]);
+        vf[9][1] = Add(acc[1], Mul(one[1], vf[27][2]));
+        Store(r, (std::uint16_t)(vi06 + 1), g(12));
+        acc[2] = Add(vf[26][2], vf[26][0]);
+        vf[12][0] = 0.0f;
+        vf[12][1] = 0.0f;
+        vf[9][2] = Add(acc[2], Mul(one[2], vf[26][1]));
+        acc[3] = Mul(one[3], vf[25][0]);
+        acc[3] = Add(acc[3], Mul(one[3], vf[25][1]));
+        vf[9][3] = Add(acc[3], Mul(one[3], vf[25][2]));
+        Store(r, (std::uint16_t)(vi06 + 6), g(12));
+        vf[9][1] = Mini(vf[9][1], 1.0f);
+        vf[9][2] = Mini(vf[9][2], 1.0f);
+        vf[12][0] = one[0];
+        acc[0] = Add(vf[24][0], vf[24][1]);
+        vf[9][0] = Add(acc[0], Mul(one[0], vf[24][2]));
+        vf[9][1] = Max(vf[9][1], 0.0f);
+        vf[9][2] = Max(vf[9][2], 0.0f);
+        Store(r, (std::uint16_t)(vi06 + 8), g(12));
+        vf[9][3] = Ftoi0(vf[9][3]);
+        std::uint16_t vi01 = Half(Load(r, (std::uint16_t)(vi06 + 2)).y);
+        {
+            V p = g(17);
+            F4 a = Mul4(g(28).v, Splat(p.x));
+            a = Add4(a, Mul4(g(29).v, Splat(p.y)));
+            a = Add4(a, Mul4(g(30).v, Splat(p.z)));
+            V o;
+            o.v = Add4(a, Mul4(g(31).v, Splat(1.0f)));
+            set(10, o);
+        }
+        std::uint16_t vi10 = (std::uint16_t)((vi01 + Half(vf[9][3])) & vi09);
+        vi01 = (std::uint16_t)(top - vi11);
+        {
+            V p = g(10);
+            F4 a = Mul4(g(13).v, Splat(p.x));
+            a = Add4(a, Mul4(g(14).v, Splat(p.y)));
+            a = Add4(a, Mul4(g(15).v, Splat(p.z)));
+            V o;
+            o.v = Add4(a, Mul4(g(16).v, Splat(p.w)));
+            set(21, Load(r, (std::uint16_t)(vi01 + 47)));
+            set(10, o);
+        }
+        if (vi08 & 1) {
+            V c = g(21);
+            for (int k = 0; k < 4; k++)
+                c[k] = Itof0(c[k]);
+            set(21, c);
+            vf[19][0] = Sub(one[0], vf[18][0]);
+            vi01 = (std::uint16_t)(vi01 - 1);
+            F4 a = Mul4(g(21).v, Splat(vf[19][0]));
+            V n = Load(r, (std::uint16_t)(vi01 + 47));
+            for (int k = 0; k < 4; k++)
+                n[k] = Itof0(n[k]);
+            n.v = Add4(a, Mul4(n.v, Splat(vf[9][2])));
+            for (int k = 0; k < 4; k++)
+                n[k] = Ftoi0(n[k]);
+            set(21, n);
+        }
+        vf[11][0] = Mul(vf[4][0], vf[9][0]);
+        vf[11][1] = Mul(vf[4][1], vf[9][0]);
+        float q = Reciprocal(r, vf[10][3]);
+        st.q = q;
+        vf[21][3] = Itof0(vf[21][3]);
+        vf[19][0] = Load(r, (std::uint16_t)(top + 11)).x;
+        vf[25][0] = Add(vf[10][0], vf[11][0]);
+        for (int c = 0; c < 3; c++)
+            vf[24][c] = Sub(vf[10][c], vf[11][c]);
+        vf[25][1] = Sub(vf[10][1], vf[11][1]);
+        vf[25][2] = Sub(vf[10][2], vf[11][2]);
+        vf[21][3] = Mul(vf[21][3], vf[9][1]);
+        vi10 = (std::uint16_t)(vi10 + top);
+        vf[26][0] = Sub(vf[10][0], vf[11][0]);
+        for (int c = 0; c < 3; c++)
+            vf[27][c] = Add(vf[10][c], vf[11][c]);
+        vf[26][1] = Add(vf[10][1], vf[11][1]);
+        vf[26][2] = Add(vf[10][2], vf[11][2]);
+        vf[21][3] = Mul(vf[21][3], vf[19][0]);
+        set(20, Load(r, (std::uint16_t)(vi10 + 15)));
+        std::uint32_t clip = st.clip;
+        for (int k = 0; k < 4; k++) {
+            V c = g(24 + k);
+            c.w = vf[10][3];
+            clip = ((clip << 6) | ClipCode(c)) & 0xFFFFFF;
+        }
+        st.clip = clip;
+        vf[21][3] = Ftoi0(vf[21][3]);
+        Store(r, vi06, g(20));
+        for (int c = 0; c < 3; c++)
+            vf[23][c] = Mul(vf[2][c], q);
+        Store(r, (std::uint16_t)(vi06 + 2), g(21));
+        if (clip) {
+            for (int k = 0; k < 4; k++)
+                r.Qword((std::uint16_t)(vi06 + 3 + 2 * k))[3] = FromBits(vi05);
+        } else {
+            const std::uint32_t wbits[4] = {0xFFFF8000u, 0xFFFF8000u, 0u, 0u};
+            for (int k = 0; k < 4; k++) {
+                for (int c = 0; c < 3; c++)
+                    vf[24 + k][c] = Add(Mul(vf[23][c], vf[24 + k][c]), Mul(one[c], vf[3][c]));
+                vf[24 + k][3] = FromBits(wbits[k]);
+            }
+            for (int k = 0; k < 4; k++)
+                Store(r, (std::uint16_t)(vi06 + 3 + 2 * k), g(24 + k));
+        }
+        vi06 = (std::uint16_t)(vi06 + 10);
+    } while (vi06 != vi07);
+    Kick(r, (std::uint16_t)(top + 48));
+    st.pc = 0x073;
+    return true;
+}
+
 }  // namespace
 
 // Every VF register but vf00 and vf01, and P: what the lights' handlers are compared on.
@@ -2599,6 +2766,7 @@ const HandlerEntry kHandlers[] = {
     {0xE1624411, 0x05F, UnlitFinish, "unlit batch finish", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I clip"},
     {0xE1624411, 0x051, BatchSetup, "batch setup", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I"},
     {0x6744EAB9, 0x1DE, SpotLight, "spot light", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q P I clip"},
+    {0x19FE9C91, 0x000, Quads, "particle quads", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q clip"},
     {0xE1624411, 0x01E, BatchSecond, "lit batch second pass", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I clip"},
 };
 const std::size_t kHandlerCount = sizeof kHandlers / sizeof kHandlers[0];
