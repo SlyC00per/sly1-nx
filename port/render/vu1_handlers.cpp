@@ -156,7 +156,12 @@ struct LitVertex {
     bool late;         // 0x274 returned one late (above)
 };
 
-bool LitBatchTransform(Runner& r)
+// The same loop at 0x29B (from 0x34A and 0x350) has vertices of three quadwords, the position in
+// the last, and calls the test through vi03: 0x274 as above (0x34A) or 0x28E (0x350), which only
+// leaves a triangle wholly beyond the far plane, or one a strip's start closes, unmarked.
+enum class Test { Guard274, Far28E };
+
+bool BatchTransform(Runner& r, const int stride, const Test test, const std::uint32_t endPc)
 {
     State& st = r.s;
     std::uint16_t top = (std::uint16_t)r.ctx.top;
@@ -166,9 +171,10 @@ bool LitBatchTransform(Runner& r)
     std::uint16_t span = (std::uint16_t)(end - first);
     // an empty batch or one not of whole vertices runs on past its end: left to the microcode
     constexpr int kMax = 256;
-    if (span == 0 || (span & 3) || span / 4 > kMax)
+    if (span == 0 || span % stride || span / stride > kMax)
         return false;
-    const int n = span / 4;
+    const int n = span / stride;
+    const int posAt = stride - 1;
     static LitVertex v[kMax + 4];
 
     V m[4] = {Load(r, top + 14), Load(r, top + 15), Load(r, top + 16), Load(r, top + 17)};
@@ -182,14 +188,14 @@ bool LitBatchTransform(Runner& r)
         backface.w = Add(zero.w, 16384.0f);
     params.x = Add(params.x, 32768.0f);
     const float wOutside = Add(zero.w, params.x), wToClip = Add(zero.w, params.w);
-    const std::uint16_t lastCheck = (std::uint16_t)(end - 4);
+    const std::uint16_t lastCheck = (std::uint16_t)(end - stride);
 
     // Every vertex the loop touches: the batch's n and the four after it it reads ahead.
     std::uint32_t codes = 0;   // FCSET 0, then each CLIP shifts in six bits
     for (int k = 0; k < n + 4; k++) {
         LitVertex& x = v[k];
-        std::uint16_t at = (std::uint16_t)(first + 4 * k);
-        x.pos = Load(r, at + 3);
+        std::uint16_t at = (std::uint16_t)(first + stride * k);
+        x.pos = Load(r, at + posAt);
         x.stq = Load(r, at);
         x.f = offset;
         x.f.w = x.pos.w;
@@ -218,16 +224,20 @@ bool LitBatchTransform(Runner& r)
         if (k >= 2 && (codes & 0x3FFFF)) {
             std::uint16_t control = Half(x.f.w);
             x.f.w = wOutside;
-            std::uint16_t behind = (std::uint16_t)(first + 4 * (k - 1));   // the program's vi05 then
+            std::uint16_t behind = (std::uint16_t)(first + stride * (k - 1));   // the program's vi05 then
             bool ended = (std::int16_t)(std::uint16_t)(behind - lastCheck) >= 0;
-            if (!ended) {
-                bool beyondNear = (codes & 0x20820) == 0x20820, beyondFar = (codes & 0x10410) == 0x10410;
-                if (!beyondNear && (control & 0x8000)) {
-                    v[k - 2].late = beyondFar;
-                } else if (!AllOutsideOnePlane(codes)) {
+            bool beyondNear = (codes & 0x20820) == 0x20820, beyondFar = (codes & 0x10410) == 0x10410;
+            if (ended) {
+            } else if (test == Test::Far28E) {
+                if (!beyondFar && !(control & 0x8000)) {
                     x.f.w = wToClip;
                     r.Qword(top + 13)[2] = FromBits(1);
                 }
+            } else if (!beyondNear && (control & 0x8000)) {
+                v[k - 2].late = beyondFar;
+            } else if (!AllOutsideOnePlane(codes)) {
+                x.f.w = wToClip;
+                r.Qword(top + 13)[2] = FromBits(1);
             }
         }
         x.s.v = Add4(Mul4(x.pq.v, scale.v), Mul4(x.f.v, Splat(1.0f)));
@@ -253,9 +263,9 @@ bool LitBatchTransform(Runner& r)
         float cross = (k & 1) ? Sub(Mul(cur.x, prev.y), Mul(prev.x, cur.y))
                               : Sub(Mul(prev.x, cur.y), Mul(cur.x, prev.y));
         negative = std::signbit(cross) && cross != 0.0f;
-        std::uint16_t at = (std::uint16_t)(first + 4 * k);
+        std::uint16_t at = (std::uint16_t)(first + stride * k);
         Store(r, at, x.tq);
-        Store(r, at + 3, x.s);
+        Store(r, at + posAt, x.s);
     }
 
     // The registers as the loop leaves them after the block of vertex n - 1.
@@ -292,9 +302,13 @@ bool LitBatchTransform(Runner& r)
     set(8, params);
     set(9, zero);
     st.clip = codes;
-    st.pc = 0x3D4;
+    st.pc = endPc;
     return true;
 }
+
+bool LitBatchTransform(Runner& r) { return BatchTransform(r, 4, Test::Guard274, 0x3D4); }
+bool BatchTransform274(Runner& r) { return BatchTransform(r, 3, Test::Guard274, 0x350); }
+bool BatchTransform28E(Runner& r) { return BatchTransform(r, 3, Test::Far28E, 0x356); }
 
 // --- The batch's colours and kicks (chunk E1624411): 0x002 after the transform, 0x01E for a
 // batch's second pass.
@@ -1077,6 +1091,14 @@ const char kAllVfAndP[] = VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "P";
 
 const HandlerEntry kHandlers[] = {
     {0x79A6F5FB, 0x356, LitBatchTransform, "lit batch transform",
+     "vf02.xyzw vf03.xyzw vf04.xyzw vf05.xyzw vf06.xyzw vf07.xyzw vf08.xyzw vf09.xyzw vf10.xyzw vf11.xyzw "
+     "vf12.xyzw vf14.xy vf15.xyzw vf16.xyzw vf17.xyzw vf19.xyzw vf20.xyzw vf21.xyzw vf22.xyzw vf24.xy "
+     "vf25.xyzw vf26.xyzw vf27.xyzw vf29.xy clip"},
+    {0x79A6F5FB, 0x34A, BatchTransform274, "batch transform (three quadwords)",
+     "vf02.xyzw vf03.xyzw vf04.xyzw vf05.xyzw vf06.xyzw vf07.xyzw vf08.xyzw vf09.xyzw vf10.xyzw vf11.xyzw "
+     "vf12.xyzw vf14.xy vf15.xyzw vf16.xyzw vf17.xyzw vf19.xyzw vf20.xyzw vf21.xyzw vf22.xyzw vf24.xy "
+     "vf25.xyzw vf26.xyzw vf27.xyzw vf29.xy clip"},
+    {0x79A6F5FB, 0x350, BatchTransform28E, "batch transform (three quadwords, far plane)",
      "vf02.xyzw vf03.xyzw vf04.xyzw vf05.xyzw vf06.xyzw vf07.xyzw vf08.xyzw vf09.xyzw vf10.xyzw vf11.xyzw "
      "vf12.xyzw vf14.xy vf15.xyzw vf16.xyzw vf17.xyzw vf19.xyzw vf20.xyzw vf21.xyzw vf22.xyzw vf24.xy "
      "vf25.xyzw vf26.xyzw vf27.xyzw vf29.xy clip"},
