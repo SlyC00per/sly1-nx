@@ -450,7 +450,9 @@ int main(int argc, char** argv)
     }
 
     pthread_t game, clock, render, gsThread;
-    if (!std::getenv("SLY1_GS_SAME_THREAD") &&
+    // SLY1_GS_THREAD: the GS on a thread of its own (measured slower on the Switch: the hand-over
+    // costs more than the GS's work there, and in batches the GS no longer overlaps VU1)
+    if (std::getenv("SLY1_GS_THREAD") &&
         port::StartThread(&gsThread, g_gsStack, sizeof g_gsStack,
                           [](void*) -> void* {
                               port::PlaceThread(port::ThreadRole::Gs);
