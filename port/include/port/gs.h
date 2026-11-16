@@ -13,6 +13,16 @@
 namespace port {
 namespace gs {
 
+// Holds the GS for a run of writes (a whole GIF packet), so that the writes inside it do not each
+// take the lock; Write, WritePacked and Image take it themselves when no Hold is in place.
+class Hold {
+public:
+    Hold();
+    ~Hold();
+    Hold(const Hold&) = delete;
+    Hold& operator=(const Hold&) = delete;
+};
+
 // A register write: the register's address and its 64 bits (REGLIST, A+D, or a PACKED write
 // in register form).
 void Write(std::uint32_t reg, std::uint64_t value);

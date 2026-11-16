@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <mutex>
+#include <optional>
 #include <cstdlib>
 #include <map>
 #include <string>
@@ -198,6 +199,7 @@ void KickPath1(std::uint32_t qaddr, void*)
 {
     const std::uint8_t* d = vu1::Data();
     g_counts.path1Packets++;
+    gs::Hold hold;
     for (int tags = 0; tags < 1024; tags++) {
         const std::uint32_t* tag = reinterpret_cast<const std::uint32_t*>(d + (qaddr & 0x3FF) * 16);
         bool eop = (tag[0] >> 15) & 1;
@@ -443,6 +445,61 @@ private:
     // rest from the mask's row or column. The mask (STMASK, with the m bit) picks per field and
     // cycle the data, the row, the column or nothing; the mode (STMOD) adds the row to the data
     // (offset) or accumulates the data into the row (difference).
+    // Unpack's plain case: each vector's fields (8, 16 or 32 bits, sign-extended unless usn) into
+    // its quadword; a single field fills all four, a field the format lacks keeps what was there.
+    template <std::uint32_t Fields, std::uint32_t Bits>
+    void UnpackFields(std::uint8_t* mem, std::uint32_t qmask, std::uint32_t addr, std::uint32_t n, bool usn,
+                      const std::uint8_t* bytes)
+    {
+        const std::uint32_t wl = wl_, cl = cl_;
+        std::uint32_t cyc = 0, base = addr;
+        for (std::uint32_t i = 0; i < n; i++) {
+            std::uint32_t* out = reinterpret_cast<std::uint32_t*>(mem + ((base + cyc) & qmask) * 16);
+            std::uint32_t v[4];
+            for (std::uint32_t f = 0; f < Fields; f++) {
+                const std::uint8_t* b = bytes + (i * Fields + f) * (Bits / 8);
+                if (Bits == 32) {
+                    std::memcpy(&v[f], b, 4);
+                } else if (Bits == 16) {
+                    std::uint16_t h;
+                    std::memcpy(&h, b, 2);
+                    v[f] = usn ? h : (std::uint32_t)(std::int32_t)(std::int16_t)h;
+                } else {
+                    v[f] = usn ? b[0] : (std::uint32_t)(std::int32_t)(std::int8_t)b[0];
+                }
+            }
+            if (Fields == 1) {
+                out[0] = out[1] = out[2] = out[3] = v[0];
+            } else {
+                for (std::uint32_t f = 0; f < Fields; f++)
+                    out[f] = v[f];
+            }
+            if (++cyc == wl) {
+                cyc = 0;
+                base += cl;
+            }
+        }
+    }
+
+    void UnpackPlain(std::uint8_t* mem, std::uint32_t qmask, std::uint32_t addr, std::uint32_t n, std::uint32_t fields,
+                     std::uint32_t bits, bool usn, const std::uint8_t* bytes)
+    {
+        switch (fields * 100 + bits) {
+        case 132: UnpackFields<1, 32>(mem, qmask, addr, n, usn, bytes); break;
+        case 116: UnpackFields<1, 16>(mem, qmask, addr, n, usn, bytes); break;
+        case 108: UnpackFields<1, 8>(mem, qmask, addr, n, usn, bytes); break;
+        case 232: UnpackFields<2, 32>(mem, qmask, addr, n, usn, bytes); break;
+        case 216: UnpackFields<2, 16>(mem, qmask, addr, n, usn, bytes); break;
+        case 208: UnpackFields<2, 8>(mem, qmask, addr, n, usn, bytes); break;
+        case 332: UnpackFields<3, 32>(mem, qmask, addr, n, usn, bytes); break;
+        case 316: UnpackFields<3, 16>(mem, qmask, addr, n, usn, bytes); break;
+        case 308: UnpackFields<3, 8>(mem, qmask, addr, n, usn, bytes); break;
+        case 432: UnpackFields<4, 32>(mem, qmask, addr, n, usn, bytes); break;
+        case 416: UnpackFields<4, 16>(mem, qmask, addr, n, usn, bytes); break;
+        default: UnpackFields<4, 8>(mem, qmask, addr, n, usn, bytes); break;
+        }
+    }
+
     void Unpack()
     {
         std::uint8_t* mem = vu0_ ? vu0::Vu0().data : vu1::Data();
@@ -473,6 +530,11 @@ private:
             return v;
         };
         bool filling = wl_ > cl_;
+        // the common case (no mask, no addition, no filling, not V4-5): the fields copied straight
+        if (!masked && mode_ == 0 && !filling && !v45 && have >= (std::size_t)n * fields * (bits / 8)) {
+            UnpackPlain(mem, qmask, addr, n, fields, bits, usn, bytes);
+            return;
+        }
         for (std::uint32_t i = 0; i < n; i++) {
             std::uint32_t cyc = i % wl_;
             std::uint32_t q = (filling ? addr + i : addr + (i / wl_) * cl_ + cyc) & qmask;
@@ -556,6 +618,7 @@ std::uint32_t* Spr(std::uint32_t sadr)
 void SendGifNormal(std::uint32_t madr, std::uint32_t qwc)
 {
     bool spr = (madr & 0x80000000u) != 0;
+    gs::Hold hold;
     for (std::uint32_t i = 0; i < qwc; i++)
         g_gif.Qword(At((madr & 0x7FFFFFFFu) + i * 16, spr));
 }
@@ -595,6 +658,9 @@ void RunDmaChain(std::uint32_t regs, std::uint32_t tadr)
         return;
     }
     g_counts.chains++;
+    std::optional<gs::Hold> gifHold;   // a GIF channel chain holds the GS throughout
+    if (gif)
+        gifHold.emplace();
     static const bool trace = std::getenv("SLY1_DMAC_TRACE") != nullptr;
     // SLY1_DMAC_TRACE=2: each tag too
     static const bool traceTags = trace && std::getenv("SLY1_DMAC_TRACE")[0] == '2';

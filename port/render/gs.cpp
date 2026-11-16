@@ -26,7 +26,16 @@ namespace gs {
 namespace {
 
 std::uint8_t g_local[kLocalBytes];
-std::recursive_mutex g_lock;   // the three paths can reach the GS from different threads
+std::mutex g_lock;   // the three paths can reach the GS from different threads
+thread_local int t_held;   // this thread's depth of holding g_lock
+
+// Takes g_lock unless this thread holds it already.
+struct Guard {
+    Guard() { if (t_held++ == 0) g_lock.lock(); }
+    ~Guard() { if (--t_held == 0) g_lock.unlock(); }
+    Guard(const Guard&) = delete;
+    Guard& operator=(const Guard&) = delete;
+};
 
 std::uint64_t Bits(std::uint64_t v, int lo, int n) { return (v >> lo) & ((n == 64 ? ~0ull : (1ull << n) - 1)); }
 
@@ -706,9 +715,12 @@ void StartTransfer()
 
 }  // namespace
 
+Hold::Hold() { if (t_held++ == 0) g_lock.lock(); }
+Hold::~Hold() { if (--t_held == 0) g_lock.unlock(); }
+
 void Image(const std::uint32_t* q)
 {
-    std::lock_guard<std::recursive_mutex> lk(g_lock);
+    Guard lk;
     Transfer& t = g_trx;
     if (!t.active)
         return;
@@ -735,7 +747,7 @@ void Image(const std::uint32_t* q)
 
 void Write(std::uint32_t reg, std::uint64_t value)
 {
-    std::lock_guard<std::recursive_mutex> lk(g_lock);
+    Guard lk;
     Regs& r = g_regs;
     switch (reg) {
     case 0x00:   // PRIM: a new primitive empties the vertex queue
@@ -805,7 +817,7 @@ void Write(std::uint32_t reg, std::uint64_t value)
 
 void WritePacked(std::uint32_t reg, const std::uint32_t* q)
 {
-    std::lock_guard<std::recursive_mutex> lk(g_lock);
+    Guard lk;
     Regs& r = g_regs;
     switch (reg) {
     case 0x0: Write(0x00, q[0] & 0x7FF); break;
@@ -843,7 +855,7 @@ void WritePacked(std::uint32_t reg, const std::uint32_t* q)
 
 void SetDisplay(std::uint64_t dispfb, std::uint64_t display)
 {
-    std::lock_guard<std::recursive_mutex> lk(g_lock);
+    Guard lk;
     static int traced;
     if (std::getenv("SLY1_GS_TRACE") && traced++ < 4)
         std::fprintf(stderr, "gs: display DISPFB %016llX (FBP %llu, FBW %llu, PSM 0x%llX), DISPLAY %016llX\n",
@@ -856,7 +868,7 @@ void SetDisplay(std::uint64_t dispfb, std::uint64_t display)
 
 bool ReadDisplay(std::string& rgb, int& width, int& height)
 {
-    std::lock_guard<std::recursive_mutex> lk(g_lock);
+    Guard lk;
     if (!g_displaySet)
         return false;
     std::uint32_t fbp = (std::uint32_t)Bits(g_dispfb, 0, 9) * 32, fbw = (std::uint32_t)Bits(g_dispfb, 9, 6);
