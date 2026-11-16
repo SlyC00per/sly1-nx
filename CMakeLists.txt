@@ -23,14 +23,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 if(NINTENDO_SWITCH)
     set(PLATFORM SWITCH)
-    # frame records for the port's reports of where a fault came from
-    add_compile_options(-fno-omit-frame-pointer)
 else()
     set(PLATFORM HOST_ASAN CACHE STRING "Host build: HOST_ASAN (sanitizers) or HOST (plain)")
     set_property(CACHE PLATFORM PROPERTY STRINGS HOST_ASAN HOST)
     enable_testing()
 endif()
 message(STATUS "sly1-nx: platform ${PLATFORM}")
+# Frame records on every target, for the port's reports of where a fault came from.
+add_compile_options(-fno-omit-frame-pointer)
 
 if(PLATFORM STREQUAL "HOST_ASAN")
     # No stack-use-after-return detection: it moves locals to a heap of its own, and the game's

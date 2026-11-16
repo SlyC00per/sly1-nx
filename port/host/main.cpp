@@ -25,6 +25,12 @@
 
 #include <pthread.h>
 
+#if !defined(__SWITCH__) && !defined(_WIN32)
+#include <csignal>
+#include <execinfo.h>
+#include <unistd.h>
+#endif
+
 #if defined(__SWITCH__)
 #include <arpa/inet.h>
 #include <switch.h>
@@ -107,6 +113,20 @@ void* Clock(void*)
 int g_verifyFrom = -1;
 int g_verifyTo = 46;   // --level N: that level alone
 std::vector<int> g_verifyList;   // --levels a,b,...: these, in this order
+int g_watchSeconds;               // --watch N: the state every N seconds
+
+// --watch: the frame count and the kernel's threads every few seconds, for a run that stops
+// without a report (on its own core, at the watchers' priority, on the Switch).
+void* Watch(void*)
+{
+    port::PlaceThread(port::ThreadRole::Watch);
+    for (int n = 1;; n++) {
+        std::this_thread::sleep_for(std::chrono::seconds(g_watchSeconds));
+        std::fprintf(stderr, "watch: %d s, frame %d\n", n * g_watchSeconds,
+                     *(const std::int32_t*)port::Native(0x002626C0));
+        port::KernelDump();
+    }
+}
 
 void VerifyLevels()
 {
@@ -184,6 +204,62 @@ void* GameMain(void*)
 
 }  // namespace
 
+#if !defined(__SWITCH__) && !defined(_WIN32) && !defined(__SANITIZE_ADDRESS__) && \
+    !(defined(__has_feature) && __has_feature(address_sanitizer))
+// A fatal signal in a build without the sanitizers: the stack, then an exit. Left to the system,
+// macOS's crash reporter holds a process with the game's large address space in an exit that does
+// not end until a restart.
+void FatalSignal(int sig, siginfo_t* info, void* ctx)
+{
+    char line[160];
+    int n = std::snprintf(line, sizeof line, "sly1: signal %d at address %p\n", sig, info ? info->si_addr : nullptr);
+    write(2, line, n);
+#if defined(__APPLE__)
+    {   // where: the faulting instruction and the frame chain from it
+        ucontext_t* uc = static_cast<ucontext_t*>(ctx);
+#if defined(__x86_64__)
+        std::uintptr_t pc = uc->uc_mcontext->__ss.__rip, fp = uc->uc_mcontext->__ss.__rbp;
+#else
+        std::uintptr_t pc = uc->uc_mcontext->__ss.__pc, fp = uc->uc_mcontext->__ss.__fp;
+#endif
+        n = std::snprintf(line, sizeof line, "sly1: pc %p (image at %p: atos -l)\n", (void*)pc, (void*)port::ImageBase());
+        write(2, line, n);
+        for (int i = 0; i < 16 && fp && fp % 8 == 0; i++) {
+            std::uintptr_t ret = reinterpret_cast<std::uintptr_t*>(fp)[1];
+            n = std::snprintf(line, sizeof line, "sly1:   from %p\n", (void*)ret);
+            write(2, line, n);
+            std::uintptr_t next = reinterpret_cast<std::uintptr_t*>(fp)[0];
+            if (next <= fp)
+                break;
+            fp = next;
+        }
+    }
+#endif
+    void* frames[48];
+    int count = backtrace(frames, 48);
+    backtrace_symbols_fd(frames, count, 2);
+    n = std::snprintf(line, sizeof line, "sly1: done, status %d\n", 128 + sig);
+    write(2, line, n);
+    _exit(128 + sig);
+}
+
+void CatchFatalSignals()
+{
+    static char altStack[64 * 1024];
+    stack_t ss{};
+    ss.ss_sp = altStack;
+    ss.ss_size = sizeof altStack;
+    sigaltstack(&ss, nullptr);
+    struct sigaction sa{};
+    sa.sa_sigaction = FatalSignal;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    for (int sig : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGTRAP})
+        sigaction(sig, &sa, nullptr);
+}
+#else
+void CatchFatalSignals() {}
+#endif
+
 extern "C" void port_data_init_all();   // written by tools/gen.py (port/retail_data.h)
 
 // The sanitizers' defaults in the host's checking build: a report ends the run with an exit, not
@@ -206,12 +282,27 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
                   ctx->error_desc, (unsigned long long)(ctx->pc.x - base), (unsigned long long)(ctx->lr.x - base),
                   (unsigned long long)ctx->far.x, (unsigned long long)ctx->sp.x);
     svcOutputDebugString(line, std::strlen(line));
+    std::fprintf(stderr, "%s\n", line);   // to nxlink on hardware
+    {   // the callers, by the frame records
+        std::uintptr_t fp = ctx->fp.x;
+        for (int i = 0; i < 16 && fp && fp % 8 == 0; i++) {
+            std::uintptr_t ret = reinterpret_cast<std::uintptr_t*>(fp)[1];
+            if (ret - base >= port::g_imageSize)
+                break;
+            std::snprintf(line, sizeof line, "sly1:   called from +0x%llX", (unsigned long long)(ret - base));
+            svcOutputDebugString(line, std::strlen(line));
+            std::fprintf(stderr, "%s\n", line);
+            fp = reinterpret_cast<std::uintptr_t*>(fp)[0];
+        }
+    }
     for (int i = 0; i < 29; i += 4) {
         std::snprintf(line, sizeof line, "sly1:   x%d %llX x%d %llX x%d %llX x%d %llX", i,
                       (unsigned long long)ctx->cpu_gprs[i].x, i + 1, (unsigned long long)ctx->cpu_gprs[i + 1].x,
                       i + 2, (unsigned long long)ctx->cpu_gprs[i + 2].x, i + 3, (unsigned long long)ctx->cpu_gprs[i + 3].x);
         svcOutputDebugString(line, std::strlen(line));
+        std::fprintf(stderr, "%s\n", line);
     }
+    std::fflush(stderr);
     Finish(3);
 }
 }
@@ -244,12 +335,14 @@ void ArgsFromFile(int& argc, char**& argv)
 
 int main(int argc, char** argv)
 {
+    CatchFatalSignals();
 #if defined(__SWITCH__)
     consoleDebugInit(debugDevice_SVC);
     if (__nxlink_host.s_addr != 0 && R_SUCCEEDED(socketInitializeDefault()))
         nxlinkStdio();
     if (argc <= 1)
         ArgsFromFile(argc, argv);
+    std::fprintf(stderr, "sly1: image at %p\n", (void*)port::ImageBase());   // for a debugger's addresses
     std::string iso = "sdmc:/switch/sly1/sly1.iso";
     port::SetSaveFolder("sdmc:/switch/sly1/save");
 #else
@@ -259,6 +352,11 @@ int main(int argc, char** argv)
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--iso") && i + 1 < argc)
             iso = argv[++i];
+        else if (!std::strcmp(argv[i], "--wait") && i + 1 < argc)
+            // seconds before the game starts: time for a debugger to attach
+            std::this_thread::sleep_for(std::chrono::seconds(std::atoi(argv[++i])));
+        else if (!std::strcmp(argv[i], "--watch") && i + 1 < argc)
+            g_watchSeconds = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--seconds") && i + 1 < argc)
             seconds = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--env") && i + 1 < argc) {
@@ -290,7 +388,7 @@ int main(int argc, char** argv)
             g_verifyTo = g_verifyFrom + 1;
         }
         else {
-            std::fprintf(stderr, "usage: %s --iso DISC.iso [--seconds N] [--save FOLDER] [--verify-levels [--from-level N] | --level N | --levels A,B,...]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s --iso DISC.iso [--seconds N] [--save FOLDER] [--watch N] [--env NAME=VALUE] [--verify-levels [--from-level N] | --level N | --levels A,B,...]\n", argv[0]);
             return 2;
         }
     }
@@ -303,6 +401,11 @@ int main(int argc, char** argv)
         return 1;
     }
     port_data_init_all();
+    if (g_watchSeconds > 0) {
+        pthread_t watch;
+        pthread_create(&watch, nullptr, Watch, nullptr);
+        pthread_detach(watch);
+    }
     if (g_verifyFrom >= 0) {
         if (g_verifyFrom >= 46)
             g_verifyFrom = 45;
