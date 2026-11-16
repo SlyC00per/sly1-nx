@@ -512,12 +512,14 @@ float Erleng(const V& v)
 
 void SetXyz(State& st, int reg, const V& x) { std::memcpy(st.vf[reg], &x, 12); }
 
+bool PointFourWide(Runner& r);
+
 bool PointLight(Runner& r)
 {
     State& st = r.s;
     std::uint16_t top = (std::uint16_t)r.ctx.top;
     if (Half(Load(r, top + 9).y) == 4)
-        return false;
+        return PointFourWide(r);
     V hdr = Load(r, top + 11);
     std::uint16_t first = (std::uint16_t)(top + Half(hdr.x));
     int n = Count(first, (std::uint16_t)(top + Half(hdr.y)), 4);
@@ -771,12 +773,14 @@ bool LitColours(Runner& r)
 // cosine with its normal (quadword 0) as d + d^3, the light (ambient + scale times that, clamped
 // to 0..1) added to quadword 2's xy and, through 22 by its z, to the colour. 9.y = 4 (0x0FE) is
 // left to the microcode.
+bool DirectionalFourWide(Runner& r);
+
 bool DirectionalLight(Runner& r)
 {
     State& st = r.s;
     std::uint16_t top = (std::uint16_t)r.ctx.top;
     if (Half(Load(r, top + 9).y) == 4)
-        return false;
+        return DirectionalFourWide(r);
     V hdr = Load(r, top + 11);
     std::uint16_t first = (std::uint16_t)(top + Half(hdr.x));
     int n = Count(first, (std::uint16_t)(top + Half(hdr.y)), 4);
@@ -897,7 +901,179 @@ bool Skin(Runner& r)
     return true;
 }
 
+// --- 0x0FE of chunk E1624411's set (reached from 0x17E and, through 0x142, from 0x1A6 when 9.y
+// is 4): a light four vertices at a time.
+//
+// The batch's normals come four at a time in a group of four vertices, x, y and z in quadword 0
+// of its first three. The light's direction (25) is turned by 4-6 and made unit length; each
+// group: the four cosines as d + d^3, the light (24 + 23 times that, at least 0) added to each
+// vertex's quadword 2 xy and through 22 by its z to its colour. The first time (13.w = 0) quadword
+// 2 and the colours start from 3 of data memory (y plus 13.y / 32768) and zero instead of what is
+// there; 13.w is then set. 0x142, for a point light, first makes 25 the unit direction from the
+// object's centre (10) to the light (26) and scales 23 and 24 by the attenuation there.
+// RegsAt reads and writes the registers' fields as the VU's partial loads and stores do.
+bool LightFourWide(Runner& r, Regs& R)
+{
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    V hdr = Load(r, top + 11);
+    std::uint16_t first = (std::uint16_t)(top + Half(hdr.x)), end = (std::uint16_t)(top + Half(hdr.y));
+    std::uint16_t span = (std::uint16_t)(end - first);
+    if (span == 0 || span > 0x400)
+        return false;
+    const int groups = (span + 15) / 16;
+    const int XY = 12, XYZ = 14, XYZW = 15, Y = 4, X = 8;
+    V zero;
+    zero.v = F4{Sub(0.0f, 0.0f), Sub(0.0f, 0.0f), Sub(0.0f, 0.0f), Sub(1.0f, 1.0f)};
+    R.put(17, zero, XYZW);
+    R.put(17, Load(r, 3), XY);
+    for (int k = 21; k <= 24; k++)
+        R.put(k, zero, XYZW);
+    R.put(31, Load(r, top + 13), Y);
+    R.put(2, Load(r, top + 25), XYZ);
+    R.put(6, Load(r, top + 4), XYZW);
+    R.put(7, Load(r, top + 5), XYZW);
+    R.put(8, Load(r, top + 6), XYZW);
+    { V v31 = R.get(31); v31.y = (float)(std::int32_t)Bits(v31.y) / 32768.0f; R.put(31, v31, Y); }
+    { V v17 = R.get(17); v17.y = Add(v17.y, R.vf[31][1]); R.put(17, v17, Y); }
+    V dir = R.get(2);
+    F4 acc = Mul4(R.get(6).v, Splat(dir.x));
+    acc = Add4(acc, Mul4(R.get(7).v, Splat(dir.y)));
+    V turned;
+    turned.v = Add4(acc, Mul4(R.get(8).v, Splat(dir.z)));
+    R.put(2, turned, XYZ);
+    R.put(3, Load(r, top + 22), XYZ);
+    R.put(4, Load(r, top + 23), XYZ);
+    R.put(5, Load(r, top + 24), XYZ);
+    float p = Erleng(R.get(2));
+    for (int k = 18; k <= 20; k++) {
+        V x;
+        x.v = Add4(R.get(21).v, R.get(17).v);
+        R.put(k, x, XYZW);
+    }
+    { V v31 = R.get(31); v31.x = p; R.put(31, v31, X); }
+    { V u; u.v = Mul4(R.get(2).v, Splat(p)); R.put(2, u, XYZ); }
+    const bool setUp = Half(Load(r, top + 13).w) != 0;
+    std::uint16_t colours = (std::uint16_t)(top + Half(Load(r, top + 12).w));
+    const V d = R.get(2);
+    for (int g = 0; g < groups; g++) {
+        std::uint16_t at = (std::uint16_t)(first + 16 * g);
+        R.put(25, Load(r, at), XYZW);
+        R.put(26, Load(r, (std::uint16_t)(at + 4)), XYZW);
+        R.put(27, Load(r, (std::uint16_t)(at + 8)), XYZW);
+        F4 a = Mul4(R.get(25).v, Splat(d.x));
+        a = Add4(a, Mul4(R.get(26).v, Splat(d.y)));
+        V v28;
+        v28.v = Add4(a, Mul4(R.get(27).v, Splat(d.z)));
+        R.put(28, v28, XYZW);
+        V v29;
+        v29.v = Mul4(v28.v, v28.v);
+        R.put(29, v29, XYZW);
+        F4 a2 = Add4(v28.v, Splat(0.0f));
+        V v30;
+        v30.v = Add4(a2, Mul4(v29.v, v28.v));
+        R.put(30, v30, XYZW);
+        F4 base = Add4(R.get(5).v, Splat(0.0f));
+        if (setUp) {
+            for (int j = 0; j < 4; j++)
+                R.put(17 + j, Load(r, (std::uint16_t)(at + 2 + 4 * j)), XYZW);
+            for (int j = 0; j < 4; j++)
+                R.put(21 + j, Load(r, (std::uint16_t)(colours + j)), XYZW);
+        }
+        const V scale = R.get(4);
+        for (int j = 0; j < 4; j++) {
+            V l;
+            l.v = Add4(base, Mul4(scale.v, Splat(v30[j])));
+            for (int c = 0; c < 3; c++)
+                l[c] = Max(l[c], 0.0f);
+            R.put(9 + j, l, XYZ);
+        }
+        for (int j = 0; j < 4; j++) {
+            V l = R.get(9 + j), q = R.get(17 + j);
+            l.x = Add(q.x, l.x);
+            l.y = Add(q.y, l.y);
+            R.put(9 + j, l, XY);
+        }
+        const V c22 = R.get(3);
+        for (int j = 0; j < 4; j++) {
+            F4 ca = Add4(Splat(0.0f), R.get(21 + j).v);
+            V c;
+            c.v = Add4(ca, Mul4(c22.v, Splat(R.vf[9 + j][2])));
+            R.put(13 + j, c, XYZ);
+            V l = R.get(9 + j);
+            float* q = r.Qword((std::uint16_t)(at + 2 + 4 * j));
+            q[0] = l.x;
+            q[1] = l.y;
+        }
+        for (int j = 0; j < 4; j++)
+            std::memcpy(r.Qword((std::uint16_t)(colours + j)), R.vf[13 + j], 12);
+        colours = (std::uint16_t)(colours + 4);
+    }
+    r.Qword(top + 13)[3] = FromBits(1);
+    r.s.p = p;
+    r.s.pc = 0x142;
+    return true;
+}
+
+bool DirectionalFourWide(Runner& r)
+{
+    Regs R;
+    std::memcpy(R.vf, r.s.vf, sizeof R.vf);
+    if (!LightFourWide(r, R))
+        return false;
+    std::memcpy(r.s.vf, R.vf, sizeof R.vf);
+    return true;
+}
+
+// 0x142 then 0x0FE.
+bool PointFourWide(Runner& r)
+{
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    V hdr = Load(r, top + 11);
+    std::uint16_t span = (std::uint16_t)(Half(hdr.y) - Half(hdr.x));
+    if (span == 0 || span > 0x400)
+        return false;
+    Regs R;
+    std::memcpy(R.vf, r.s.vf, sizeof R.vf);
+    const int X = 8, XY = 12, XYZ = 14;
+    R.put(2, Load(r, top + 10), XYZ);
+    R.put(3, Load(r, top + 26), XYZ);
+    V v04;
+    v04.v = Fix4(Fix4(R.get(3).v) - Fix4(R.get(2).v));
+    R.put(4, v04, XYZ);
+    R.put(8, Load(r, top + 25), XY);
+    float p = Erleng(R.get(4));
+    R.put(9, Load(r, top + 23), XYZ);
+    R.put(10, Load(r, top + 24), XYZ);
+    { V v05 = R.get(5); v05.x = p; R.put(5, v05, X); }
+    float a = Add(0.0f, R.vf[8][0]);
+    float fade = Add(a, Mul(p, R.vf[8][1]));
+    fade = Mini(Max(fade, 0.0f), 1.0f);
+    { V v07 = R.get(7); v07.x = fade; R.put(7, v07, X); }
+    V u;
+    u.v = Mul4(R.get(4).v, Splat(p));
+    R.put(4, u, XYZ);
+    V c9, c10;
+    c9.v = Mul4(R.get(9).v, Splat(fade));
+    c10.v = Mul4(R.get(10).v, Splat(fade));
+    R.put(9, c9, XYZ);
+    R.put(10, c10, XYZ);
+    std::memcpy(r.Qword(top + 25), R.vf[4], 12);
+    std::memcpy(r.Qword(top + 23), R.vf[9], 12);
+    std::memcpy(r.Qword(top + 24), R.vf[10], 12);
+    if (!LightFourWide(r, R))
+        return false;   // not reached: the span was checked first
+    std::memcpy(r.s.vf, R.vf, sizeof R.vf);
+    return true;
+}
+
 }  // namespace
+
+// Every VF register but vf00 and vf01, and P: what the lights' handlers are compared on.
+#define VF_2_TO_9 "vf02.xyzw vf03.xyzw vf04.xyzw vf05.xyzw vf06.xyzw vf07.xyzw vf08.xyzw vf09.xyzw "
+#define VF_10_TO_19 "vf10.xyzw vf11.xyzw vf12.xyzw vf13.xyzw vf14.xyzw vf15.xyzw vf16.xyzw vf17.xyzw vf18.xyzw vf19.xyzw "
+#define VF_20_TO_31 "vf20.xyzw vf21.xyzw vf22.xyzw vf23.xyzw vf24.xyzw vf25.xyzw vf26.xyzw vf27.xyzw vf28.xyzw vf29.xyzw " \
+                    "vf30.xyzw vf31.xyzw "
+const char kAllVfAndP[] = VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "P";
 
 const HandlerEntry kHandlers[] = {
     {0x79A6F5FB, 0x356, LitBatchTransform, "lit batch transform",
@@ -905,12 +1081,8 @@ const HandlerEntry kHandlers[] = {
      "vf12.xyzw vf14.xy vf15.xyzw vf16.xyzw vf17.xyzw vf19.xyzw vf20.xyzw vf21.xyzw vf22.xyzw vf24.xy "
      "vf25.xyzw vf26.xyzw vf27.xyzw vf29.xy clip"},
     {0xE1624411, 0x002, BatchFinish, "lit batch finish", "vf02.xyzw vf03.xyzw vf04.xyzw vf05.xyzw vf11.w vf12.xyz vf13.w"},
-    {0x6744EAB9, 0x17E, DirectionalLight, "directional light",
-     "vf02.xyz vf03.x vf04.x vf05.xyz vf06.xyz vf07.xyz vf08.xyzw vf09.xy vf10.xyz vf11.x vf12.x vf13.xyz "
-     "vf15.xyzw vf16.xyzw vf17.xyzw vf18.x P"},
-    {0x6744EAB9, 0x1A6, PointLight, "point light",
-     "vf02.xyz vf03.xyz vf04.xyz vf05.xyz vf06.xy vf07.xyzw vf08.xyzw vf09.xyzw vf10.xyzw vf11.xyz vf12.xyzw "
-     "vf13.xyz vf14.xyz vf15.xyz vf16.xyz vf17.x vf18.x vf19.x vf20.xyz P"},
+    {0x6744EAB9, 0x17E, DirectionalLight, "directional light", kAllVfAndP},
+    {0x6744EAB9, 0x1A6, PointLight, "point light", kAllVfAndP},
     {0xB90790F3, 0x242, LitColours, "lit colours",
      "vf02.xyzw vf03.xyzw vf04.xyzw vf05.xyzw vf06.xyzw vf07.xyzw vf08.xyzw vf09.xyzw vf10.xyzw vf11.xyzw "
      "vf12.xyzw vf13.xyzw vf14.xyzw vf15.xyzw vf16.xyzw I"},
