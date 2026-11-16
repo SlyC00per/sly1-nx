@@ -56,6 +56,7 @@ inline std::uintptr_t ImageBase() { return g_imageBase ? g_imageBase : FindImage
 inline std::uintptr_t ImageSize() { return g_imageBase ? g_imageSize : (FindImageBase(), g_imageSize); }
 // The port's scratchpad buffer (inside the image).
 unsigned char* Scratchpad();
+unsigned char* Vu1Memory();   // VU1's micro memory, then its data memory (16 KiB each)
 
 // A game address's native pointer, and back.
 void* NativeSlow(std::uint32_t addr);

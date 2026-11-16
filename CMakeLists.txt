@@ -162,6 +162,24 @@ target_compile_options(port_platform PRIVATE ${GAME_FLAGS})
 target_include_directories(port_platform PRIVATE ${GAME_INCLUDES})
 add_dependencies(port_platform sly1_gen)
 
+# The renderer: VU1 (port/render/vu1.cpp) and its microcode translated to C++ from the player's
+# disc (tools/vu1_translate.py, written into the build folder only). Without -DSLY1_ISO the table
+# of translated chunks is empty and the interpreter runs everything.
+set(SLY1_ISO "" CACHE FILEPATH "The player's disc image, for the VU1 microcode's translation")
+if(SLY1_ISO)
+    set(VU1_ARGS --iso ${SLY1_ISO})
+else()
+    set(VU1_ARGS --empty)
+endif()
+add_custom_command(OUTPUT ${GEN_DIR}/vu1_programs.cpp
+    COMMAND ${SLY1_PYTHON} ${CMAKE_SOURCE_DIR}/tools/vu1_translate.py ${VU1_ARGS} --out ${GEN_DIR}/vu1_programs.cpp
+    DEPENDS ${CMAKE_SOURCE_DIR}/tools/vu1_translate.py ${CMAKE_SOURCE_DIR}/tools/level_bytes.py
+    COMMENT "Translating the game's VU1 microcode (tools/vu1_translate.py)"
+    VERBATIM)
+add_library(port_render STATIC port/render/vu1.cpp ${GEN_DIR}/vu1_programs.cpp)
+target_include_directories(port_render PRIVATE port/include port/render)
+target_compile_options(port_render PRIVATE -Wall -Wextra -Wno-unused-label -Wno-unused-variable)
+
 # The game's hand-written assembly functions, in C++ (port/game_asm), with the game's headers.
 add_library(port_game_asm STATIC port/game_asm/game_asm.cpp)
 target_compile_options(port_game_asm PRIVATE ${GAME_FLAGS})
@@ -171,13 +189,13 @@ add_dependencies(port_game_asm sly1_gen)
 if(PLATFORM STREQUAL "SWITCH")
     add_executable(sly1 port/host/main.cpp $<TARGET_OBJECTS:sly1_game>)
     target_include_directories(sly1 PRIVATE port/include)
-    target_link_libraries(sly1 PRIVATE port_game_asm port_platform port_libm port_core)
+    target_link_libraries(sly1 PRIVATE port_game_asm port_platform port_render port_libm port_core)
     nx_generate_nacp(sly1.nacp NAME "Sly Cooper" AUTHOR "sly1-nx" VERSION "0.0.1")
     nx_create_nro(sly1 NACP sly1.nacp)
 else()
     find_package(Threads REQUIRED)
     add_executable(sly1_headless port/host/main.cpp $<TARGET_OBJECTS:sly1_game>)
     target_include_directories(sly1_headless PRIVATE port/include)
-    target_link_libraries(sly1_headless PRIVATE port_game_asm port_platform port_libm port_core Threads::Threads)
+    target_link_libraries(sly1_headless PRIVATE port_game_asm port_platform port_render port_libm port_core Threads::Threads)
 endif()
 endif()  # SLY1_BUILD_GAME

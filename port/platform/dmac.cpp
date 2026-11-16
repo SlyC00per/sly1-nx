@@ -12,7 +12,9 @@
 // microprograms are not run, so a FINISH a microprogram would send is not seen here.
 #include "port/dmac.h"
 
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdarg>
 #include <mutex>
 #include <cstdlib>
@@ -25,6 +27,7 @@
 #include "port/ptr32.h"
 #include "port/system.h"
 #include "port/vu0_micro.h"
+#include "port/vu1.h"
 
 namespace port {
 
@@ -37,6 +40,7 @@ constexpr int kCauseGs = 0, kCauseVif0 = 4, kCauseVif1 = 5;
 
 struct Counts {
     std::atomic<unsigned> chains{0}, tags{0}, vifInterrupts{0}, finishes{0}, unknownVifcodes{0}, sprChains{0};
+    std::atomic<std::uint64_t> vu1Instructions{0}, path1Packets{0}, vu1Nanoseconds{0};
 } g_counts;
 
 // SLY1_RENDER_SURVEY: what the renderer must handle (docs/RENDERER.md), printed by DmacDump.
@@ -77,6 +81,9 @@ const std::uint32_t* At(std::uint32_t addr, bool spr)
 class Gif {
 public:
     explicit Gif(int path) : path_(path) {}
+
+    // Quadwords still owed to the current tag's data (0: the next quadword is a tag).
+    std::uint32_t Left() const { return left_; }
 
     void Qword(const std::uint32_t* q)
     {
@@ -165,11 +172,52 @@ private:
     std::uint64_t regs_ = 0;
 };
 
+// GIF path 1: what VU1's XGKICK sends, from its data memory.
+Gif g_path1{1};
+
+// XGKICK: the GIF packet at quadword qaddr of VU1's data memory, tag by tag until a tag with
+// EOP has had its data (the data memory wraps at 1,024 quadwords).
+void KickPath1(std::uint32_t qaddr, void*)
+{
+    const std::uint8_t* d = vu1::Data();
+    g_counts.path1Packets++;
+    for (int tags = 0; tags < 1024; tags++) {
+        const std::uint32_t* tag = reinterpret_cast<const std::uint32_t*>(d + (qaddr & 0x3FF) * 16);
+        bool eop = (tag[0] >> 15) & 1;
+        g_path1.Qword(tag);
+        qaddr++;
+        for (std::uint32_t guard = 0; g_path1.Left() > 0 && guard < 1024; guard++) {
+            g_path1.Qword(reinterpret_cast<const std::uint32_t*>(d + (qaddr & 0x3FF) * 16));
+            qaddr++;
+        }
+        if (eop)
+            break;
+    }
+}
+
 // A VIF's stream of 32-bit words: its VIFcodes and their data.
 class Vif {
 public:
     // VIF0 feeds VU0 (port/vu0_micro.h): its MPG, UNPACK and microprogram starts take effect.
     Vif(int cause, bool vu0) : cause_(cause), vu0_(vu0) {}
+
+    // A quadword's words: the data of a kept VIFcode (an unpack, microcode) appended at once.
+    void Words(const std::uint32_t* w, int n)
+    {
+        int k = 0;
+        while (k < n) {
+            if (left_ != 0 && keep_ && !direct_) {
+                int take = (int)std::min<std::uint32_t>(left_, (std::uint32_t)(n - k));
+                data_.insert(data_.end(), w + k, w + k + take);
+                k += take;
+                left_ -= (std::uint32_t)take;
+                if (left_ == 0)
+                    End();
+            } else {
+                Word(w[k++]);
+            }
+        }
+    }
 
     void Word(std::uint32_t w)
     {
@@ -215,9 +263,9 @@ private:
         imm_ = imm;
         num_ = num;
         data_.clear();
-        keep_ = vu0_ && (cmd == 0x4A || (cmd & 0x60) == 0x60);
+        // the VIFcodes whose data the VIF keeps: microcode, unpacks, and its mask, row and column
+        keep_ = cmd == 0x4A || (cmd & 0x60) == 0x60 || cmd == 0x20 || cmd == 0x30 || cmd == 0x31;
         if (!vu0_ && g_survey.On()) {
-            keep_ = cmd == 0x4A;   // VIF1's microcode, to name the programs by a hash of it
             if ((cmd & 0x60) == 0x60)
                 g_survey.Count("vif1 UNPACK 0x%02X", cmd & 0x7F);
             if (cmd == 0x14 || cmd == 0x15 || cmd == 0x17)
@@ -232,14 +280,36 @@ private:
             left_ = (vectors * bits + 31) / 32;
         } else {
             switch (cmd) {
-            case 0x00: case 0x02: case 0x03: case 0x04: case 0x05: case 0x06: case 0x07:
-            case 0x10: case 0x11: case 0x13:
-                left_ = 0;   // NOP, OFFSET .. MARK, the flushes
+            case 0x00: case 0x06: case 0x07: case 0x10: case 0x11: case 0x13:
+                left_ = 0;   // NOP, MSKPATH3, MARK, the flushes (the port's transfers are done when they end)
                 break;
+            case 0x02:   // OFFSET: the double buffer's second half, and back to the first
+                ofst_ = imm & 0x3FF;
+                dbf_ = false;
+                tops_ = base_;
+                left_ = 0;
+                break;
+            case 0x03: base_ = imm & 0x3FF; left_ = 0; break;    // BASE
+            case 0x04: itops_ = imm & 0x3FF; left_ = 0; break;   // ITOP
+            case 0x05: mode_ = imm & 3; left_ = 0; break;        // STMOD
             case 0x14: case 0x15: case 0x17:   // MSCAL, MSCALF, MSCNT
                 left_ = 0;
-                if (vu0_)
+                if (vu0_) {
                     vu0::Run(cmd == 0x17 ? vu0::Vu0().pc * 8 : (imm & 0x1FF) * 8);
+                } else {
+                    // the double buffer swaps: the program gets TOPS as TOP, ITOPS as ITOP
+                    vu1::Context c;
+                    c.top = tops_;
+                    c.itop = itops_;
+                    c.kick = KickPath1;
+                    dbf_ = !dbf_;
+                    tops_ = (base_ + (dbf_ ? ofst_ : 0)) & 0x3FF;
+                    auto t0 = std::chrono::steady_clock::now();
+                    std::uint64_t n = vu1::Run(cmd == 0x17 ? vu1::Vu1().pc : (imm & 0x7FF), c);
+                    g_counts.vu1Instructions += n;
+                    g_counts.vu1Nanoseconds += (std::uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+                }
                 break;
             case 0x01:   // STCYCL
                 cl_ = imm & 0xFF;
@@ -279,12 +349,18 @@ private:
         direct_ = false;
         if (keep_) {
             keep_ = false;
-            if (!vu0_)
-                SurveyMicrocode();
-            else if (cmd_ == 0x4A)
+            if (cmd_ == 0x4A) {
+                if (!vu0_ && g_survey.On())
+                    SurveyMicrocode();
                 LoadMicrocode();
-            else
+            } else if (cmd_ == 0x20) {
+                mask_ = data_.empty() ? 0 : data_[0];
+            } else if (cmd_ == 0x30 || cmd_ == 0x31) {
+                for (std::size_t k = 0; k < 4 && k < data_.size(); k++)
+                    (cmd_ == 0x30 ? row_ : col_)[k] = data_[k];
+            } else {
                 Unpack();
+            }
         }
         if (irq_) {
             irq_ = false;
@@ -332,68 +408,114 @@ private:
             g_survey.Count("vif1 MSCAL entry 0x%03X of program %08X", entry, h);
     }
 
-    // MPG: the instructions to VU0's micro memory at imm (in 64-bit instructions).
+    // MPG: the instructions to the VU's micro memory at imm (in 64-bit instructions).
     void LoadMicrocode()
     {
-        vu0::State& s = vu0::Vu0();
+        std::uint32_t* micro = vu0_ ? vu0::Vu0().micro : vu1::Micro();
+        std::uint32_t words = vu0_ ? 1024 : 4096;
         for (std::size_t k = 0; k < data_.size(); k++)
-            s.micro[(imm_ * 2 + k) & 1023] = data_[k];
+            micro[(imm_ * 2 + k) & (words - 1)] = data_[k];
+        if (!vu0_)
+            vu1::MicrocodeLoaded(imm_ & 0x7FF, (std::uint32_t)data_.size() / 2);
     }
 
-    // UNPACK to VU0's data memory: num vectors of vn+1 fields of 32 >> vl bits (V4-5: 16-bit
-    // colours) from address imm, cl of every wl quadwords written (STCYCL); fields zero- or
-    // sign-extended (usn), a scalar to all four fields.
+    // UNPACK to the VU's data memory: num vectors of vn+1 fields of 32 >> vl bits (V4-5: 16-bit
+    // colours) from address imm (plus TOPS with the FLG bit, on VIF1), fields zero- or
+    // sign-extended (usn), a scalar to all four fields. STCYCL's cl and wl: with wl <= cl, wl of
+    // every cl quadwords are written; with wl > cl, wl in a row, cl of them from the data and the
+    // rest from the mask's row or column. The mask (STMASK, with the m bit) picks per field and
+    // cycle the data, the row, the column or nothing; the mode (STMOD) adds the row to the data
+    // (offset) or accumulates the data into the row (difference).
     void Unpack()
     {
+        std::uint8_t* mem = vu0_ ? vu0::Vu0().data : vu1::Data();
+        std::uint32_t qmask = vu0_ ? 0xFF : 0x3FF;
         std::uint32_t vn = (cmd_ >> 2) & 3, vl = cmd_ & 3, n = num_ ? num_ : 256;
-        if (cmd_ & 0x10) {
-            std::fprintf(stderr, "dmac: a masked UNPACK to VU0 (0x%02X), not done\n", cmd_);
-            return;
-        }
-        if (wl_ > cl_) {
-            std::fprintf(stderr, "dmac: a filling UNPACK to VU0 (cl %u, wl %u), not done\n", cl_, wl_);
-            return;
-        }
-        bool usn = (imm_ >> 14) & 1, v45 = vn == 3 && vl == 3;
+        bool masked = (cmd_ & 0x10) != 0, usn = (imm_ >> 14) & 1, v45 = vn == 3 && vl == 3;
         std::uint32_t bits = v45 ? 16 : 32u >> vl, fields = v45 ? 1 : vn + 1;
-        std::uint64_t pos = 0;   // bit position in the data
-        auto take = [&](std::uint32_t nb) {
+        std::uint32_t addr = imm_ & 0x3FF;
+        if (!vu0_ && ((imm_ >> 15) & 1))
+            addr += tops_;
+        // every format's fields are 8, 16 or 32 bits (V4-5 a 16-bit colour): read them as such
+        const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(data_.data());
+        std::size_t have = data_.size() * 4, at = 0;
+        auto take = [&](std::uint32_t nb) -> std::uint32_t {
             std::uint32_t v = 0;
-            for (std::uint32_t b = 0; b < nb; b++, pos++) {
-                std::size_t word = pos / 32;
-                if (word < data_.size() && (data_[word] >> (pos % 32)) & 1)
-                    v |= 1u << b;
+            std::size_t n = nb / 8;
+            if (at + n <= have) {
+                if (n == 4)
+                    std::memcpy(&v, bytes + at, 4);
+                else if (n == 2) {
+                    std::uint16_t h;
+                    std::memcpy(&h, bytes + at, 2);
+                    v = h;
+                } else
+                    v = bytes[at];
             }
+            at += n;
             return v;
         };
-        vu0::State& s = vu0::Vu0();
+        bool filling = wl_ > cl_;
         for (std::uint32_t i = 0; i < n; i++) {
-            std::uint32_t q = ((imm_ & 0x3FF) + (i / wl_) * cl_ + (i % wl_)) & 0xFF;
-            std::uint32_t* out = reinterpret_cast<std::uint32_t*>(s.data + q * 16);
-            std::uint32_t v[4];
-            for (std::uint32_t f = 0; f < fields; f++) {
-                std::uint32_t x = take(bits);
-                if (!usn && bits < 32 && (x >> (bits - 1)) & 1)
-                    x |= ~0u << bits;
-                v[f] = x;
+            std::uint32_t cyc = i % wl_;
+            std::uint32_t q = (filling ? addr + i : addr + (i / wl_) * cl_ + cyc) & qmask;
+            std::uint32_t* out = reinterpret_cast<std::uint32_t*>(mem + q * 16);
+            bool fromData = !filling || cyc < cl_;
+            std::uint32_t v[4] = {0, 0, 0, 0};
+            bool have[4] = {false, false, false, false};
+            if (fromData) {
+                std::uint32_t raw[4];
+                for (std::uint32_t f = 0; f < fields; f++) {
+                    std::uint32_t x = take(bits);
+                    if (!usn && bits < 32 && (x >> (bits - 1)) & 1)
+                        x |= ~0u << bits;
+                    raw[f] = x;
+                }
+                if (v45) {
+                    std::uint32_t c = raw[0];
+                    v[0] = (c & 0x1F) << 3;
+                    v[1] = ((c >> 5) & 0x1F) << 3;
+                    v[2] = ((c >> 10) & 0x1F) << 3;
+                    v[3] = ((c >> 15) & 1) << 7;
+                    have[0] = have[1] = have[2] = have[3] = true;
+                } else if (fields == 1) {
+                    v[0] = v[1] = v[2] = v[3] = raw[0];
+                    have[0] = have[1] = have[2] = have[3] = true;
+                } else {
+                    for (std::uint32_t f = 0; f < fields; f++) {
+                        v[f] = raw[f];
+                        have[f] = true;
+                    }
+                }
             }
-            if (v45) {
-                std::uint32_t c = v[0];
-                out[0] = (c & 0x1F) << 3;
-                out[1] = ((c >> 5) & 0x1F) << 3;
-                out[2] = ((c >> 10) & 0x1F) << 3;
-                out[3] = ((c >> 15) & 1) << 7;
-            } else if (fields == 1) {
-                out[0] = out[1] = out[2] = out[3] = v[0];
-            } else {
-                for (std::uint32_t f = 0; f < fields; f++)
-                    out[f] = v[f];
+            std::uint32_t c4 = cyc < 3 ? cyc : 3;
+            for (std::uint32_t f = 0; f < 4; f++) {
+                std::uint32_t m = masked ? (mask_ >> ((c4 * 4 + f) * 2)) & 3 : (fromData ? 0 : 1);
+                switch (m) {
+                case 0:
+                    if (!have[f])
+                        break;   // a field the format does not carry keeps what was there
+                    if (mode_ == 1)
+                        out[f] = v[f] + row_[f];
+                    else if (mode_ == 2)
+                        out[f] = row_[f] = row_[f] + v[f];
+                    else
+                        out[f] = v[f];
+                    break;
+                case 1: out[f] = row_[f]; break;
+                case 2: out[f] = col_[c4]; break;
+                default: break;   // write-protected
+                }
             }
         }
     }
 
     int cause_;
     bool vu0_ = false, keep_ = false;
+    // VIF1's registers (VIF0 keeps the unpacking ones too)
+    std::uint32_t row_[4] = {}, col_[4] = {}, mask_ = 0, mode_ = 0;
+    std::uint32_t base_ = 0, ofst_ = 0, tops_ = 0, itops_ = 0;
+    bool dbf_ = false;
     std::uint32_t cmd_ = 0, imm_ = 0, num_ = 0;
     std::vector<std::uint32_t> data_;
     std::uint32_t left_ = 0, cl_ = 1, wl_ = 1, filled_ = 0;
@@ -500,8 +622,7 @@ void RunDmaChain(std::uint32_t regs, std::uint32_t tadr)
                 std::memcpy(Spr(sadr), q, 16);
                 sadr += 16;
             } else if (vif) {
-                for (int k = 0; k < 4; k++)
-                    vif->Word(q[k]);
+                vif->Words(q, 4);
             } else {
                 gif->Qword(q);
             }
@@ -527,6 +648,10 @@ void DmacDump()
                  "%u VIFcodes not understood\n", g_counts.chains.load(), g_counts.sprChains.load(),
                  g_counts.tags.load(), g_counts.vifInterrupts.load(), g_counts.finishes.load(),
                  g_counts.unknownVifcodes.load());
+    std::fprintf(stderr, "dmac: VU1 ran %llu instructions in %.3f s (%.1f million a second, %llu translated); %llu packets on path 1\n",
+                 (unsigned long long)g_counts.vu1Instructions.load(), g_counts.vu1Nanoseconds.load() / 1e9,
+                 g_counts.vu1Nanoseconds.load() ? g_counts.vu1Instructions.load() * 1e3 / g_counts.vu1Nanoseconds.load() : 0.0,
+                 (unsigned long long)vu1::TranslatedInstructions(), (unsigned long long)g_counts.path1Packets.load());
     if (g_survey.On()) {
         std::lock_guard<std::mutex> lk(g_survey.lock);
         for (auto& kv : g_survey.counts)

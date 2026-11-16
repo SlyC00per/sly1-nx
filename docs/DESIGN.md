@@ -291,7 +291,22 @@ The port therefore **runs the game's VU1 code**:
   programs are translated to native code (once per uploaded program), with nothing else
   changing.
 
-### Fallback, if B cannot hold 60 frames a second: native handlers per program
+### Measured, and decided (maintainer, 2026-11-16): native handlers, checked against VU1
+
+B was built (port/render/vu1.cpp, VIF1 modelled whole, the microcode translated to C++ from the
+player's disc by tools/vu1_translate.py) and measured. VU1 runs about 1.4 million instructions a
+frame in the game's opening; the translated code runs 150 million a second on an Apple M2 and
+11.3 million on the Switch, where 60 frames a second would need about 85 million and a core of
+its own. The optimisations left (four lanes at once, flags only where read) are worth perhaps
+three to four times: not enough, and heavy on heat and battery.
+
+So the renderer takes the fallback below for the programs, **most or all of them as GPU
+shaders**, and keeps VU1 as the reference: on the host, every handler is checked against the
+interpreter on the same packets (what reaches the GS: positions, colours, texture coordinates,
+primitives), so that retail's output stays a test, not an assumption. A program without a
+handler yet runs in the interpreter. The GS model and its back ends are the same either way.
+
+### The handlers (the fallback first planned)
 
 Kept for reference, the plan this note first recommended. The game keeps doing everything it
 does today: culling, fades, sorting, group order, packet building. The port takes over where

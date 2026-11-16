@@ -144,6 +144,10 @@ static void* VuWindow(std::uint32_t off)
     return nullptr;
 }
 
+// VU1's micro memory (16 KiB) and data memory (16 KiB, from +0x4000), for the renderer's VIF1 and
+// VU1 (port/vu1.h).
+unsigned char* Vu1Memory() { return Registers(g_vu1Memory, 0x8000); }
+
 static bool VuAddr(std::uintptr_t v, std::uint32_t* addr)
 {
     vu0::State& s = vu0::Vu0();
