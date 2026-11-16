@@ -21,9 +21,10 @@ int StartThread(pthread_t* thread, void* stack, std::size_t size, void* (*entry)
 // core by time between threads of one priority (a thread that waits without blocking keeps the
 // others of its core from running): the game's threads on core 0 (one of them runs at a time,
 // the others block in the port's kernel), the vertical blank's clock on core 1, at a higher
-// priority, as an interrupt is, and the threads that watch the game (the verifier) on core 2.
-// Nothing on the host, whose scheduler shares the cores.
-enum class ThreadRole { Game, Clock, Watch };
+// priority, as an interrupt is, and the threads that watch the game (the verifier) on core 2,
+// where the render thread (VIF1, VU1 and the GS) runs too, at the game's priority. Nothing on the
+// host, whose scheduler shares the cores.
+enum class ThreadRole { Game, Clock, Watch, Render };
 void PlaceThread(ThreadRole role);
 
 }  // namespace port

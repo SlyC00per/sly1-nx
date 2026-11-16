@@ -53,6 +53,8 @@ alignas(16384) unsigned char g_mainStack[4 << 20];
 // The interrupt handlers are game code too (they link stack frames into game structures), so
 // the clock that calls them runs on a stack in game memory as well.
 alignas(16384) unsigned char g_clockStack[1 << 20];
+// The render thread's (port/dmac.h): it may run the VIF's and the GS's interrupt handlers.
+alignas(16384) unsigned char g_renderStack[1 << 20];
 std::atomic<bool> g_started;
 #if defined(__SWITCH__)
 int g_seconds = 0;   // until the program is closed
@@ -79,6 +81,7 @@ const auto g_programStart = std::chrono::steady_clock::now();
 // The run's report: the kernel's threads, the DMA counts, the frame semaphores, the card.
 void Report()
 {
+    port::RenderFlush();
     {
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_programStart).count();
         std::fprintf(stderr, "sly1: %llu frames shown in %.1f s since the program started\n",
@@ -445,7 +448,18 @@ int main(int argc, char** argv)
         pthread_detach(verify);
     }
 
-    pthread_t game, clock;
+    pthread_t game, clock, render;
+    if (port::StartThread(&render, g_renderStack, sizeof g_renderStack,
+                          [](void*) -> void* {
+                              port::PlaceThread(port::ThreadRole::Render);
+                              port::SetGameFloatMode();
+                              port::RenderThreadMain();
+                              return nullptr;
+                          },
+                          nullptr, true) != 0) {
+        std::fprintf(stderr, "sly1: cannot start the render thread on its stack in game memory\n");
+        return 1;
+    }
     if (port::StartThread(&game, g_mainStack, sizeof g_mainStack, GameMain, nullptr, true) != 0) {
         std::fprintf(stderr, "sly1: cannot start the game thread on its stack in game memory\n");
         return 1;

@@ -154,7 +154,9 @@ void WriteDisplayRegisters(void* self)
     WriteGsRegister(0x12000090, env[2]);
     WriteGsRegister(0x120000A0, env[3]);
     WriteGsRegister(0x120000E0, env[4]);
-    port::gs::SetDisplay(env[2], env[3]);
+    // in order with the drawing before it (the render thread, port/dmac.h)
+    port::RenderCall([](std::uint64_t dispfb, std::uint64_t display) { port::gs::SetDisplay(dispfb, display); },
+                     env[2], env[3]);
 }
 
 // A drawing environment's packet (its GIF tag and NLOOP quadwords) to the GS through the GIF
@@ -200,7 +202,7 @@ s32 SwapDoubleBuffer(void* self, s32 flag)
     s32 idx = flag & 1;
     WriteDisplayRegisters(base + idx * 0x28);
     s32 r = SendDrawEnvironment(base + (idx ? 0x140 : 0x50));
-    port::gs::FrameShown();
+    port::RenderCall([](std::uint64_t, std::uint64_t) { port::gs::FrameShown(); }, 0, 0);
     return r;
 }
 

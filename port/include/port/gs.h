@@ -13,8 +13,8 @@
 namespace port {
 namespace gs {
 
-// Holds the GS for a run of writes (a whole GIF packet), so that the writes inside it do not each
-// take the lock; Write, WritePacked and Image take it themselves when no Hold is in place.
+// Holds the GS for a run of writes (a whole GIF packet, a render queue item). Write, WritePacked
+// and Image are called with it held; the display's functions take it themselves.
 class Hold {
 public:
     Hold();

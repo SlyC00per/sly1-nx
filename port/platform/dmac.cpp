@@ -18,6 +18,8 @@
 #include <cstdarg>
 #include <mutex>
 #include <optional>
+#include <condition_variable>
+#include <deque>
 #include <cstdlib>
 #include <map>
 #include <string>
@@ -94,7 +96,9 @@ public:
             return;
         }
         if (flg_ == 0) {   // PACKED: one register a quadword, A+D carries its register's address
-            unsigned reg = (unsigned)(regs_ >> (4 * (index_ % nreg_))) & 0xF;
+            unsigned reg = (unsigned)(regs_ >> (4 * slot_)) & 0xF;
+            if (++slot_ == nreg_)
+                slot_ = 0;
             if (reg == 0xE) {
                 gs::Write(q[2] & 0xFF, q[0] | (std::uint64_t)q[1] << 32);
                 if ((q[2] & 0xFF) == 0x61)
@@ -102,7 +106,7 @@ public:
             } else {
                 gs::WritePacked(reg, q);
             }
-            if (g_survey.On())
+            if (survey_)
                 SurveyPacked(reg, q);
             index_++;
         } else if (flg_ == 1) {   // REGLIST: two registers a quadword, each 64 bits as it is
@@ -127,6 +131,8 @@ private:
             nreg_ = 16;
         regs_ = q[2] | (std::uint64_t)q[3] << 32;
         index_ = 0;
+        slot_ = 0;
+        survey_ = g_survey.On();
         regTotal_ = nloop * nreg_;
         if ((q[1] >> 14) & 1)   // PRE: the tag sets PRIM
             gs::Write(0x00, (q[1] >> 15) & 0x7FF);
@@ -186,7 +192,8 @@ private:
 
     int path_;
     unsigned dpsm_ = 0;
-    std::uint32_t left_ = 0, nreg_ = 1, flg_ = 0, index_ = 0, regTotal_ = 0;
+    std::uint32_t left_ = 0, nreg_ = 1, flg_ = 0, index_ = 0, regTotal_ = 0, slot_ = 0;
+    bool survey_ = false;
     std::uint64_t regs_ = 0;
 };
 
@@ -614,14 +621,6 @@ std::uint32_t* Spr(std::uint32_t sadr)
 
 }  // namespace
 
-void SendGifNormal(std::uint32_t madr, std::uint32_t qwc)
-{
-    bool spr = (madr & 0x80000000u) != 0;
-    gs::Hold hold;
-    for (std::uint32_t i = 0; i < qwc; i++)
-        g_gif.Qword(At((madr & 0x7FFFFFFFu) + i * 16, spr));
-}
-
 void RunFromSprChain(std::uint32_t regs)
 {
     // A destination chain: each tag is read from the scratchpad at SADR (cnt, cnts, end), and the
@@ -644,17 +643,81 @@ void RunFromSprChain(std::uint32_t regs)
     r[0] &= ~0x100u;
 }
 
-void RunDmaChainTimed(std::uint32_t regs, std::uint32_t tadr);
+// --- The render thread. VIF1 and the GIF (and so VU1 and the GS) run on a thread of their own,
+// on another core, as the PS2's run beside the EE: a VIF1 or GIF chain is walked on the game's
+// thread and its data copied into an item of the render queue (so the game may reuse its
+// buffers at once, as after a finished transfer), and the render thread passes the items on in
+// order, raising the VIF's and the GS's interrupts as it meets them. The display's registers and
+// the buffer swap go through the queue too. SLY1_RENDER_SYNC runs everything on the game's
+// thread, as before.
+struct RenderItem {
+    enum Kind : std::uint8_t { Vif1, Gif, Call } kind = Vif1;
+    std::vector<std::uint32_t> words;
+    void (*fn)(std::uint64_t, std::uint64_t) = nullptr;
+    std::uint64_t a = 0, b = 0;
+};
+std::mutex g_renderLock;
+std::condition_variable g_renderWake, g_renderIdle;
+std::deque<RenderItem> g_renderQueue;
+std::vector<std::vector<std::uint32_t>> g_renderSpare;   // emptied items' buffers, for reuse
+bool g_renderBusy;
+std::atomic<bool> g_renderStarted;
+std::atomic<std::uint64_t> g_renderQueuedWords, g_renderMaxQueued;
 
-// Every chain, timed for the report.
-void RunDmaChain(std::uint32_t regs, std::uint32_t tadr)
+bool RenderAsync()
 {
-    std::uint64_t t0 = NowNs();
-    RunDmaChainTimed(regs, tadr);
-    g_counts.dmaNanoseconds += NowNs() - t0;
+    static const bool sync = std::getenv("SLY1_RENDER_SYNC") != nullptr;
+    return !sync && g_renderStarted.load(std::memory_order_acquire);
 }
 
-void RunDmaChainTimed(std::uint32_t regs, std::uint32_t tadr)
+std::vector<std::uint32_t> SpareBuffer()
+{
+    std::lock_guard<std::mutex> lk(g_renderLock);
+    if (g_renderSpare.empty())
+        return {};
+    std::vector<std::uint32_t> v = std::move(g_renderSpare.back());
+    g_renderSpare.pop_back();
+    v.clear();
+    return v;
+}
+
+void Enqueue(RenderItem&& item)
+{
+    std::lock_guard<std::mutex> lk(g_renderLock);
+    std::uint64_t q = g_renderQueuedWords += item.words.size();
+    if (q > g_renderMaxQueued)
+        g_renderMaxQueued = q;
+    g_renderQueue.push_back(std::move(item));
+    g_renderWake.notify_one();
+}
+
+// The sinks: straight into VIF and GIF, or into an item.
+struct DirectSink {
+    Vif* vif;
+    Gif* gif;
+    std::optional<gs::Hold> hold;   // the chain holds the GS throughout (VIF1's DIRECT reaches it too)
+    // VIF1 (its DIRECT) and the GIF reach the GS; VIF0 does not, and must not wait for it (the
+    // render thread can hold the GS while it waits for an interrupt to be serviced)
+    DirectSink(Vif* v, Gif* g) : vif(v), gif(g)
+    {
+        if (g || v == &g_vif1)
+            hold.emplace();
+    }
+    void OnVif(const std::uint32_t* w, int n) { vif->Words(w, n); }
+    void OnGif(const std::uint32_t* q) { gif->Qword(q); }
+    bool Direct() const { return true; }
+};
+struct CaptureSink {
+    std::vector<std::uint32_t>& out;
+    void OnVif(const std::uint32_t* w, int n) { out.insert(out.end(), w, w + n); }
+    void OnGif(const std::uint32_t* q) { out.insert(out.end(), q, q + 4); }
+    bool Direct() const { return false; }
+};
+
+// A chain walked as the DMAC walks it, its data handed to sink: OnVif(words, n) for VIF0 and VIF1
+// (the tags' upper halves with TTE, then each quadword), OnGif(quadword) for the GIF channel.
+template <class Sink>
+void WalkChain(std::uint32_t regs, std::uint32_t tadr, Sink& sink)
 {
     volatile std::uint32_t* r = static_cast<volatile std::uint32_t*>(Native(regs));
     Vif* vif = regs == kVif0 ? &g_vif0 : regs == kVif1 ? &g_vif1 : nullptr;
@@ -667,9 +730,6 @@ void RunDmaChainTimed(std::uint32_t regs, std::uint32_t tadr)
         return;
     }
     g_counts.chains++;
-    std::optional<gs::Hold> gifHold;   // a GIF channel chain holds the GS throughout
-    if (gif)
-        gifHold.emplace();
     static const bool trace = std::getenv("SLY1_DMAC_TRACE") != nullptr;
     // SLY1_DMAC_TRACE=2: each tag too
     static const bool traceTags = trace && std::getenv("SLY1_DMAC_TRACE")[0] == '2';
@@ -687,10 +747,8 @@ void RunDmaChainTimed(std::uint32_t regs, std::uint32_t tadr)
             std::fprintf(stderr, "dmac:   tag at 0x%08X: %08X %08X %08X %08X (id %u, qwc %u, addr 0x%08X)\n", tadr,
                          tag[0], tag[1], tag[2], tag[3], id, qwc, addr);
         g_counts.tags++;
-        if (vif && tte) {
-            vif->Word(tag[2]);
-            vif->Word(tag[3]);
-        }
+        if (vif && tte)
+            sink.OnVif(tag + 2, 2);
         if (toSpr && tte) {
             std::memcpy(Spr(sadr), tag, 16);
             sadr += 16;
@@ -721,9 +779,9 @@ void RunDmaChainTimed(std::uint32_t regs, std::uint32_t tadr)
                 std::memcpy(Spr(sadr), q, 16);
                 sadr += 16;
             } else if (vif) {
-                vif->Words(q, 4);
+                sink.OnVif(q, 4);
             } else {
-                gif->Qword(q);
+                sink.OnGif(q);
             }
         }
         if (end || (irq && tie))
@@ -733,13 +791,110 @@ void RunDmaChainTimed(std::uint32_t regs, std::uint32_t tadr)
     if (trace)
         std::fprintf(stderr, "dmac: chain on 0x%08X from 0x%08X%s: %u tags, %u FINISH, VIF %s\n", regs, start,
                      tte ? " (TTE)" : "", g_counts.tags - tagsBefore, g_counts.finishes - finishesBefore,
-                     vif ? vif->State().c_str() : "-");
+                     vif && sink.Direct() ? vif->State().c_str() : "-");
     r[0x30 / 4] = tadr;
     if (toSpr)
         r[0x80 / 4] = sadr;
     r[0x20 / 4] = 0;
     r[0] &= ~0x100u;   // STR: the transfer is over
 }
+
+void RunDmaChain(std::uint32_t regs, std::uint32_t tadr)
+{
+    std::uint64_t t0 = NowNs();
+    if ((regs == kVif1 || regs == kGif) && RenderAsync()) {
+        RenderItem item;
+        item.kind = regs == kVif1 ? RenderItem::Vif1 : RenderItem::Gif;
+        item.words = SpareBuffer();
+        CaptureSink sink{item.words};
+        WalkChain(regs, tadr, sink);
+        Enqueue(std::move(item));
+    } else {
+        DirectSink sink(regs == kVif0 ? &g_vif0 : regs == kVif1 ? &g_vif1 : nullptr, regs == kGif ? &g_gif : nullptr);
+        WalkChain(regs, tadr, sink);
+    }
+    g_counts.dmaNanoseconds += NowNs() - t0;
+}
+
+void SendGifNormal(std::uint32_t madr, std::uint32_t qwc)
+{
+    bool spr = (madr & 0x80000000u) != 0;
+    if (RenderAsync()) {
+        RenderItem item;
+        item.kind = RenderItem::Gif;
+        item.words = SpareBuffer();
+        for (std::uint32_t i = 0; i < qwc; i++) {
+            const std::uint32_t* q = At((madr & 0x7FFFFFFFu) + i * 16, spr);
+            item.words.insert(item.words.end(), q, q + 4);
+        }
+        Enqueue(std::move(item));
+        return;
+    }
+    gs::Hold hold;
+    for (std::uint32_t i = 0; i < qwc; i++)
+        g_gif.Qword(At((madr & 0x7FFFFFFFu) + i * 16, spr));
+}
+
+void RenderCall(void (*fn)(std::uint64_t, std::uint64_t), std::uint64_t a, std::uint64_t b)
+{
+    if (!RenderAsync()) {
+        fn(a, b);
+        return;
+    }
+    RenderItem item;
+    item.kind = RenderItem::Call;
+    item.fn = fn;
+    item.a = a;
+    item.b = b;
+    Enqueue(std::move(item));
+}
+
+void RenderFlush()
+{
+    std::unique_lock<std::mutex> lk(g_renderLock);
+    g_renderIdle.wait_for(lk, std::chrono::seconds(5), [] { return g_renderQueue.empty() && !g_renderBusy; });
+}
+
+void RenderThreadMain()
+{
+    g_renderStarted.store(true, std::memory_order_release);
+    for (;;) {
+        RenderItem item;
+        {
+            std::unique_lock<std::mutex> lk(g_renderLock);
+            g_renderBusy = false;
+            if (g_renderQueue.empty())
+                g_renderIdle.notify_all();
+            g_renderWake.wait(lk, [] { return !g_renderQueue.empty(); });
+            item = std::move(g_renderQueue.front());
+            g_renderQueue.pop_front();
+            g_renderQueuedWords -= item.words.size();
+            g_renderBusy = true;
+        }
+        switch (item.kind) {
+        case RenderItem::Vif1: {
+            gs::Hold hold;
+            g_vif1.Words(item.words.data(), (int)item.words.size());
+            break;
+        }
+        case RenderItem::Gif: {
+            gs::Hold hold;
+            for (std::size_t k = 0; k + 4 <= item.words.size(); k += 4)
+                g_gif.Qword(&item.words[k]);
+            break;
+        }
+        case RenderItem::Call:
+            item.fn(item.a, item.b);
+            break;
+        }
+        if (item.words.capacity()) {
+            std::lock_guard<std::mutex> lk(g_renderLock);
+            if (g_renderSpare.size() < 64)
+                g_renderSpare.push_back(std::move(item.words));
+        }
+    }
+}
+
 
 void DmacDump()
 {
@@ -751,7 +906,9 @@ void DmacDump()
                  (unsigned long long)g_counts.vu1Instructions.load(), g_counts.vu1Nanoseconds.load() / 1e9,
                  g_counts.vu1Nanoseconds.load() ? g_counts.vu1Instructions.load() * 1e3 / g_counts.vu1Nanoseconds.load() : 0.0,
                  (unsigned long long)vu1::TranslatedInstructions(), (unsigned long long)g_counts.path1Packets.load());
-    std::fprintf(stderr, "dmac: chains took %.2f s in all (VU1 and the GS within them)\n", g_counts.dmaNanoseconds.load() / 1e9);
+    std::fprintf(stderr, "dmac: chains took %.2f s on the game's thread%s; the render queue held at most %.1f MB\n",
+                 g_counts.dmaNanoseconds.load() / 1e9, g_renderStarted ? " (VIF1 and GIF chains copied for the render thread)" : "",
+                 g_renderMaxQueued.load() * 4 / 1e6);
     vu1::ReportLive();
     std::uint64_t failures = 0, checked = vu1::HandlerChecks(&failures);
     if (checked)

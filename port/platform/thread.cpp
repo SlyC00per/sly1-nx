@@ -79,7 +79,7 @@ void PlaceThread(ThreadRole role)
     svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core);
     s32 prio = 0x2C;
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-    if (role != ThreadRole::Game)
+    if (role != ThreadRole::Game && role != ThreadRole::Render)
         svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2B);   // above the game's (libnx gives 0x2C to main)
     else
         svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2C);

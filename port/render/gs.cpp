@@ -720,7 +720,7 @@ Hold::~Hold() { if (--t_held == 0) g_lock.unlock(); }
 
 void Image(const std::uint32_t* q)
 {
-    Guard lk;
+    // the caller holds the GS (gs::Hold)
     Transfer& t = g_trx;
     if (!t.active)
         return;
@@ -747,7 +747,7 @@ void Image(const std::uint32_t* q)
 
 void Write(std::uint32_t reg, std::uint64_t value)
 {
-    Guard lk;
+    // the caller holds the GS (gs::Hold)
     Regs& r = g_regs;
     switch (reg) {
     case 0x00:   // PRIM: a new primitive empties the vertex queue
@@ -817,7 +817,7 @@ void Write(std::uint32_t reg, std::uint64_t value)
 
 void WritePacked(std::uint32_t reg, const std::uint32_t* q)
 {
-    Guard lk;
+    // the caller holds the GS (gs::Hold)
     Regs& r = g_regs;
     switch (reg) {
     case 0x0: Write(0x00, q[0] & 0x7FF); break;
