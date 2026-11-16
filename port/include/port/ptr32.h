@@ -193,6 +193,11 @@ template <class T> struct Ptr32 {
     Ptr32& operator-=(std::ptrdiff_t n) { return *this = get() - n; }
 };
 
+// A field of game memory as its type would be there: a pointer is a 32-bit game address, viewed
+// as a Ptr32; anything else as it is (the raw-offset macros of the game's code, tools/patches.py).
+template <class T> struct FieldOf { using type = T; };
+template <class U> struct FieldOf<U*> { using type = Ptr32<U>; };
+
 // A game address on its way into a Ptr32 of any type: port::P32's result. It initialises a
 // stored pointer (`Ptr32<T> g = port::P32(&x);`, `{ port::P32(&x), ... }` in a table) through
 // its conversion, as Ptr32 has no constructors.

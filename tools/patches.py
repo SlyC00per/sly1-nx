@@ -300,8 +300,9 @@ PATCHES = [
      "the oscillator reads three deltas from a two-vector pair; retail's frame made the third the vector after it"),
     ("src/main/player.cpp",
      "#define AT(T, p, o) (*(T*)((u8*)(p) + (o)))",
-     "#define AT(T, p, o) (*(T*)((u8*)port::AsAddress(p) + (o)))",
-     "the raw-offset macro is given words holding game addresses as well as pointers; a cast in a "
+     "#define AT(T, p, o) (*(typename port::FieldOf<T>::type*)((u8*)port::AsAddress(p) + (o)))",
+     "the raw-offset macro is given words holding game addresses as well as pointers, and a pointer "
+     "field it reads is a 32-bit game address (port::FieldOf views it as a Ptr32); a cast in a "
      "macro's body is not rewritten"),
 
     # Slot 27 of the switched colliders shows the typed-text caption box for an object it is
