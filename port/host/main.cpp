@@ -122,8 +122,11 @@ void* Watch(void*)
     port::PlaceThread(port::ThreadRole::Watch);
     for (int n = 1;; n++) {
         std::this_thread::sleep_for(std::chrono::seconds(g_watchSeconds));
-        std::fprintf(stderr, "watch: %d s, frame %d\n", n * g_watchSeconds,
-                     *(const std::int32_t*)port::Native(0x002626C0));
+        auto w = [](std::uint32_t a) { return *(const std::int32_t*)port::Native(a); };
+        // the pad record (g_padRecord, 0x262C70): device type, connection mode and step, buttons
+        std::fprintf(stderr, "watch: %d s, frame %d; pad device 0x%X, mode %d, step %d, buttons 0x%04X\n",
+                     n * g_watchSeconds, w(0x002626C0), w(0x262C70 + 0x10), w(0x262C70 + 0x14),
+                     w(0x262C70 + 0x18), *(const std::uint16_t*)port::Native(0x262C70 + 0xA8));
         port::KernelDump();
     }
 }

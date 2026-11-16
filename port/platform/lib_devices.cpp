@@ -4,7 +4,7 @@
 //
 // Disc: a read is done when it is started, from the player's image (port/iso.h); every status
 //   call reports a ready drive with no error.
-// Pad: no controller yet (milestone 2 maps the Switch's): every slot reports closed.
+// Pad: port/platform/pad.cpp.
 // GS and DMA: the port's renderer takes the game's packets at the DMA calls (milestone 4); until
 //   then they are accepted and dropped. A DMA channel the game asks for is a block of memory of
 //   the channel's register layout inside game memory, so the game's writes to it land somewhere
@@ -55,21 +55,6 @@ s32 ReadDiscSectors(s32 lsn, s32 sectors, void* buffer, void*)
     g_discReadCount += (std::uint32_t)sectors;
     return 1;
 }
-
-// --- the pad: no controller yet
-
-s32 InitPadLibrary(s32) { return 1; }
-s32 OpenPadPort(s32, s32, u8*) { return 1; }
-s32 ReadPadFrame(s32, s32, u8*) { return 0; }
-s32 GetPadSlotState(s32, s32) { return 0x63; }       // closed
-s32 GetPadRequestMode(s32, s32) { return 0; }
-s32 GetPadReplyTableByte(s32, s32, s32, s32) { return 0; }
-s32 GetPadReplyListValue(s32, s32, s32, s32) { return 0; }
-s32 SendPadTwoWordRequest(s32, s32, s32, s32) { return 0; }
-s32 SetPadActuatorBytes(s32, s32, u8*) { return 0; }
-s32 SendPadSixByteRequest(s32, s32, u8*) { return 0; }
-s32 HasFullPadMask(s32, s32) { return 0; }
-s32 SendFullPadMask(s32, s32) { return 0; }
 
 // --- the GS: display set-up, accepted
 
