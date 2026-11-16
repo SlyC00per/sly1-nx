@@ -764,6 +764,84 @@ bool LitColours(Runner& r)
     return true;
 }
 
+// --- 0x17E of chunk 6744EAB9: a directional light on a batch's vertices.
+//
+// From TOP: 4-6 the matrix turning the light's direction (25) into the batch's space, 22, 23 and
+// 24 as for the point light. The direction is turned and made unit length once; each vertex: the
+// cosine with its normal (quadword 0) as d + d^3, the light (ambient + scale times that, clamped
+// to 0..1) added to quadword 2's xy and, through 22 by its z, to the colour. 9.y = 4 (0x0FE) is
+// left to the microcode.
+bool DirectionalLight(Runner& r)
+{
+    State& st = r.s;
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    if (Half(Load(r, top + 9).y) == 4)
+        return false;
+    V hdr = Load(r, top + 11);
+    std::uint16_t first = (std::uint16_t)(top + Half(hdr.x));
+    int n = Count(first, (std::uint16_t)(top + Half(hdr.y)), 4);
+    if (n == 0)
+        return false;
+    std::uint16_t colours = (std::uint16_t)(top + Half(Load(r, top + 12).w));
+    V dir = Load(r, top + 25);
+    V m4 = Load(r, top + 4), m5 = Load(r, top + 5), m6 = Load(r, top + 6);
+    F4 acc = Mul4(m4.v, Splat(dir.x));
+    acc = Add4(acc, Mul4(m5.v, Splat(dir.y)));
+    V turned;
+    turned.v = Add4(acc, Mul4(m6.v, Splat(dir.z)));
+    float p = Erleng(turned);
+    V unit;
+    unit.v = Mul4(turned.v, Splat(p));
+    float dy = Add(0.0f, unit.y), dz = Add(0.0f, unit.z);
+    V colour = Load(r, top + 22), ambient = Load(r, top + 24), scale = Load(r, top + 23);
+    V nrm, q2, col, lit;
+    float cosine = 0, cube = 0;
+    for (int k = 0; k < n; k++) {
+        std::uint16_t at = (std::uint16_t)(first + 4 * k);
+        nrm = Load(r, at);
+        q2 = Load(r, at + 2);
+        col = Load(r, (std::uint16_t)(colours + k));
+        float a = Mul(unit.x, nrm.x);
+        a = Add(a, Mul(dy, nrm.y));
+        cosine = Add(a, Mul(dz, nrm.z));
+        cube = Mul(cosine, cosine);
+        a = Add(cosine, 0.0f);
+        cosine = Add(a, Mul(cube, cosine));
+        F4 l = Add4(Splat(0.0f), ambient.v);
+        lit.v = Add4(l, Mul4(scale.v, Splat(cosine)));
+        for (int c = 0; c < 3; c++)
+            lit[c] = Mini(Max(lit[c], 0.0f), 1.0f);
+        q2.x = Add(q2.x, lit.x);
+        q2.y = Add(q2.y, lit.y);
+        l = Add4(Splat(0.0f), col.v);
+        col.v = Add4(l, Mul4(colour.v, Splat(lit.z)));
+        float* out = r.Qword(at + 2);
+        out[0] = q2.x;
+        out[1] = q2.y;
+        std::memcpy(r.Qword((std::uint16_t)(colours + k)), &col, 12);
+    }
+    SetXyz(st, 2, unit);
+    st.vf[3][0] = dy;
+    st.vf[4][0] = dz;
+    SetXyz(st, 5, ambient);
+    SetXyz(st, 6, scale);
+    SetXyz(st, 7, colour);
+    SetVf(st, 8, nrm);
+    st.vf[9][0] = q2.x;
+    st.vf[9][1] = q2.y;
+    SetXyz(st, 10, col);
+    st.vf[11][0] = cosine;
+    st.vf[12][0] = cube;
+    SetXyz(st, 13, lit);
+    SetVf(st, 15, m4);
+    SetVf(st, 16, m5);
+    SetVf(st, 17, m6);
+    st.vf[18][0] = p;
+    st.p = p;
+    st.pc = 0x1A6;
+    return true;
+}
+
 }  // namespace
 
 const HandlerEntry kHandlers[] = {
@@ -772,6 +850,9 @@ const HandlerEntry kHandlers[] = {
      "vf12.xyzw vf14.xy vf15.xyzw vf16.xyzw vf17.xyzw vf19.xyzw vf20.xyzw vf21.xyzw vf22.xyzw vf24.xy "
      "vf25.xyzw vf26.xyzw vf27.xyzw vf29.xy clip"},
     {0xE1624411, 0x002, BatchFinish, "lit batch finish", "vf02.xyzw vf03.xyzw vf04.xyzw vf05.xyzw vf11.w vf12.xyz vf13.w"},
+    {0x6744EAB9, 0x17E, DirectionalLight, "directional light",
+     "vf02.xyz vf03.x vf04.x vf05.xyz vf06.xyz vf07.xyz vf08.xyzw vf09.xy vf10.xyz vf11.x vf12.x vf13.xyz "
+     "vf15.xyzw vf16.xyzw vf17.xyzw vf18.x P"},
     {0x6744EAB9, 0x1A6, PointLight, "point light",
      "vf02.xyz vf03.xyz vf04.xyz vf05.xyz vf06.xy vf07.xyzw vf08.xyzw vf09.xyzw vf10.xyzw vf11.xyz vf12.xyzw "
      "vf13.xyz vf14.xyz vf15.xyz vf16.xyz vf17.x vf18.x vf19.x vf20.xyz P"},
