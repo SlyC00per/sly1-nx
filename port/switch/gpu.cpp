@@ -25,6 +25,7 @@
 #include <deko3d.h>
 
 #include "port/gs_backend.h"
+#include "port/system.h"
 #include "gs_vsh_dksh.h"
 #include "gs_fsh_dksh.h"
 
@@ -70,7 +71,9 @@ struct Texture {
 class Renderer : public gs::Backend {
 public:
     bool Create();
-    void Draw(const gs::DrawState& state, const gs::DrawVertex* v, std::size_t count) override;
+    void Begin(const gs::DrawState& state) override;
+    void Draw(const gs::DrawState& state, const gs::DrawVertex* v, std::size_t vertices, const std::uint32_t* index,
+              std::size_t indices) override;
     void Present(std::uint64_t dispfb, std::uint64_t display) override;
     void Report();
 
@@ -93,14 +96,26 @@ private:
     DkShader vertexShader_, fragmentShader_;
     std::uint32_t frameUsed_ = 0, draws_ = 0, textureUsed_ = 0, nextTexture_ = 0;
     int bound_ = -1;
+    const Texture* texture_ = nullptr;   // the run's, from Begin
     std::uint32_t vertexUbo_ = 0, fragmentUbo_ = 0, imageSet_ = 0, samplerSet_ = 0, capture_ = 0;   // offsets in dataMem_
     std::unordered_map<std::uint64_t, Texture> textures_;
     std::vector<std::uint32_t> pixels_;
 
     // the report's counts
-    std::uint64_t frames_ = 0, runs_ = 0, vertices_ = 0, uploads_ = 0, decodes_ = 0, otherTargets_ = 0, cacheResets_ = 0,
+    std::uint64_t frames_ = 0, runs_ = 0, vertices_ = 0, uploads_ = 0, decodes_ = 0, hashes_ = 0, otherTargets_ = 0, cacheResets_ = 0,
                   sends_ = 0, destinationAlpha_ = 0, unsupportedBlends_ = 0;
     long captureAt_ = -1;
+    std::uint64_t drawNs_ = 0, textureNs_ = 0, presentNs_ = 0, waitNs_ = 0, acquireNs_ = 0;
+
+    // what the commands so far last bound, to bind only what changes
+    struct Bound {
+        bool any = false;
+        DkBlendState blend;
+        FragmentParams fp;
+        DkResHandle texture;
+        DkScissor scissor;
+        std::uint32_t colour, write, depth, aref;
+    } last_;
 };
 
 DkMemBlock Renderer::Block(std::uint32_t size, std::uint32_t flags)
@@ -223,6 +238,7 @@ void Renderer::BeginCommands()
     frameUsed_ = 0;
     draws_ = 0;
     bound_ = -1;
+    last_.any = false;
     DkGpuAddr data = dkMemBlockGetGpuAddr(dataMem_);
     const DkShader* shaders[2] = {&vertexShader_, &fragmentShader_};
     dkCmdBufBindShaders(cmd_, DkStageFlag_GraphicsMask, shaders, 2);
@@ -247,6 +263,7 @@ void Renderer::BeginCommands()
     dkCmdBufBindVtxBufferState(cmd_, &buffer, 1);
     DkBufExtents vertices = {dkMemBlockGetGpuAddr(frameMem_), kFrameMemory};
     dkCmdBufBindVtxBuffers(cmd_, 0, &vertices, 1);
+    dkCmdBufBindIdxBuffer(cmd_, DkIdxFormat_Uint32, dkMemBlockGetGpuAddr(frameMem_));
     dkCmdBufSetLineWidth(cmd_, 1.5f);
     dkCmdBufSetPointSize(cmd_, 2.0f);
     // window pixels to clip space: x right, y up, the image's first row at the top
@@ -294,16 +311,15 @@ const Texture* Renderer::TextureFor(const gs::DrawState& state)
     auto it = textures_.find(key);
     if (it != textures_.end() && it->second.generation == generation)
         return &it->second;
-    int w, h;
-    gs::DecodeTexture(state, pixels_, w, h);
-    decodes_++;
-    std::uint64_t hash = 0xCBF29CE484222325ull;
-    for (std::uint32_t p : pixels_)
-        hash = (hash ^ p) * 0x100000001B3ull;
+    std::uint64_t hash = gs::TextureSource(state);
+    hashes_++;
     if (it != textures_.end() && it->second.hash == hash) {
         it->second.generation = generation;
         return &it->second;
     }
+    int w, h;
+    gs::DecodeTexture(state, pixels_, w, h);
+    decodes_++;
     std::uint32_t bytes = (std::uint32_t)pixels_.size() * 4;
     if (frameUsed_ + bytes > kFrameMemory)
         Send(true);
@@ -354,24 +370,37 @@ const Texture* Renderer::TextureFor(const gs::DrawState& state)
     return &t;
 }
 
-void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t count)
+void Renderer::Begin(const gs::DrawState& s)
 {
+    std::uint64_t t0 = NowNs();
+    texture_ = s.tme && TargetOf(s.frame & 0x1FF) >= 0 ? TextureFor(s) : nullptr;
+    textureNs_ += NowNs() - t0;
+}
+
+void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t count, const std::uint32_t* index,
+                    std::size_t indices)
+{
+    struct Timed {
+        std::uint64_t& total;
+        std::uint64_t start = NowNs();
+        ~Timed() { total += NowNs() - start; }
+    } timed{drawNs_};
     int target = TargetOf(s.frame & 0x1FF);
     if (target < 0) {
         otherTargets_++;
         return;
     }
-    std::uint32_t bytes = (std::uint32_t)(count * sizeof(gs::DrawVertex));
-    if (bytes > kFrameMemory)
+    std::uint32_t bytes = (std::uint32_t)(count * sizeof(gs::DrawVertex)), indexBytes = (std::uint32_t)(indices * 4);
+    if (bytes + indexBytes + 64 > kFrameMemory)
         return;
-    if (frameUsed_ + bytes > kFrameMemory || draws_ >= kMaxDraws)
+    if (frameUsed_ + bytes + indexBytes + 64 > kFrameMemory || draws_ >= kMaxDraws)
         Send(true);
-    const Texture* texture = s.tme ? TextureFor(s) : nullptr;   // may send what is recorded
-    if (frameUsed_ + bytes > kFrameMemory)
-        Send(true);
+    const Texture* texture = texture_;
+    bool fresh = !last_.any;
+    last_.any = true;
     BindTarget(target);
     runs_++;
-    vertices_ += count;
+    vertices_ += indices;
     draws_++;
 
     // the tests: ATE's and what a failing pixel still writes (AFAIL), the depth test
@@ -422,7 +451,10 @@ void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t
         if (sneg && dneg)
             unsupportedBlends_++;
     }
-    dkCmdBufBindBlendStates(cmd_, 0, &blend, 1);
+    if (fresh || std::memcmp(&blend, &last_.blend, sizeof blend) != 0) {
+        dkCmdBufBindBlendStates(cmd_, 0, &blend, 1);
+        last_.blend = blend;
+    }
 
     fp.mode[0] = s.tme;
     fp.mode[1] = (std::int32_t)((s.tex0 >> 35) & 3);
@@ -431,11 +463,19 @@ void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t
     fp.fogColour[0] = (float)(s.fogcol & 0xFF);
     fp.fogColour[1] = (float)((s.fogcol >> 8) & 0xFF);
     fp.fogColour[2] = (float)((s.fogcol >> 16) & 0xFF);
-    dkCmdBufPushConstants(cmd_, dkMemBlockGetGpuAddr(dataMem_) + fragmentUbo_, sizeof fp, 0, sizeof fp, &fp);
+    if (fresh || std::memcmp(&fp, &last_.fp, sizeof fp) != 0) {
+        dkCmdBufPushConstants(cmd_, dkMemBlockGetGpuAddr(dataMem_) + fragmentUbo_, sizeof fp, 0, sizeof fp, &fp);
+        last_.fp = fp;
+    }
     if (texture) {
         std::uint32_t sampler = (((s.clamp >> 0) & 3) == 1 ? 1 : 0) | (((s.clamp >> 2) & 3) == 1 ? 2 : 0);
         DkResHandle handle = dkMakeTextureHandle(texture->id, sampler);
-        dkCmdBufBindTextures(cmd_, DkStage_Fragment, 0, &handle, 1);
+        if (fresh || handle != last_.texture) {
+            dkCmdBufBindTextures(cmd_, DkStage_Fragment, 0, &handle, 1);
+            last_.texture = handle;
+        }
+    } else if (fresh) {
+        last_.texture = ~0u;
     }
 
     // SCISSOR's rectangle (inclusive) in the image's pixels
@@ -448,14 +488,22 @@ void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t
         sc.y = std::min((std::uint32_t)(y0 * sy), kHeight);
         sc.width = std::min((std::uint32_t)(x1 * sx + 0.5f), kWidth) - sc.x;
         sc.height = std::min((std::uint32_t)(y1 * sy + 0.5f), kHeight) - sc.y;
-        dkCmdBufSetScissors(cmd_, 0, &sc, 1);
+        if (fresh || std::memcmp(&sc, &last_.scissor, sizeof sc) != 0) {
+            dkCmdBufSetScissors(cmd_, 0, &sc, 1);
+            last_.scissor = sc;
+        }
     }
+    if (fresh)
+        last_.colour = last_.write = last_.depth = last_.aref = ~0u;
 
     std::uint32_t first = frameUsed_ / sizeof(gs::DrawVertex);
     frameUsed_ = Align(frameUsed_, sizeof(gs::DrawVertex));
     first = frameUsed_ / sizeof(gs::DrawVertex);
     std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(frameMem_) + frameUsed_, v, bytes);
     frameUsed_ += bytes;
+    std::uint32_t firstIndex = frameUsed_ / 4;
+    std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(frameMem_) + frameUsed_, index, indexBytes);
+    frameUsed_ += indexBytes;
     static const DkPrimitive kPrimitive[3] = {DkPrimitive_Points, DkPrimitive_Lines, DkPrimitive_Triangles};
     DkPrimitive primitive = kPrimitive[s.kind < 3 ? s.kind : 2];
 
@@ -465,19 +513,33 @@ void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t
         dkColorStateDefaults(&colour);
         colour.blendEnableMask = s.abe ? 1 : 0;
         colour.alphaCompareOp = alphaOp;
-        dkCmdBufBindColorState(cmd_, &colour);
-        dkCmdBufSetAlphaRef(cmd_, aref / 255.0f);
+        std::uint32_t colourKey = (s.abe ? 1u : 0u) | (std::uint32_t)alphaOp << 1;
+        if (colourKey != last_.colour) {
+            dkCmdBufBindColorState(cmd_, &colour);
+            last_.colour = colourKey;
+        }
+        if (aref != last_.aref) {
+            dkCmdBufSetAlphaRef(cmd_, aref / 255.0f);
+            last_.aref = aref;
+        }
         DkColorWriteState write;
         dkColorWriteStateDefaults(&write);
         write.masks = (rgb ? DkColorMask_RGB : 0) | (alpha ? DkColorMask_A : 0);
-        dkCmdBufBindColorWriteState(cmd_, &write);
+        if (write.masks != last_.write) {
+            dkCmdBufBindColorWriteState(cmd_, &write);
+            last_.write = write.masks;
+        }
         DkDepthStencilState ds;
         dkDepthStencilStateDefaults(&ds);
         ds.depthTestEnable = 1;
         ds.depthWriteEnable = depthWrite && !zmsk;
         ds.depthCompareOp = !zte || ztst == 1 ? DkCompareOp_Always : ztst == 2 ? DkCompareOp_Gequal : DkCompareOp_Greater;
-        dkCmdBufBindDepthStencilState(cmd_, &ds);
-        dkCmdBufDraw(cmd_, primitive, (std::uint32_t)count, 1, first, 0);
+        std::uint32_t depthKey = (std::uint32_t)ds.depthWriteEnable | (std::uint32_t)ds.depthCompareOp << 1;
+        if (depthKey != last_.depth) {
+            dkCmdBufBindDepthStencilState(cmd_, &ds);
+            last_.depth = depthKey;
+        }
+        dkCmdBufDrawIndexed(cmd_, primitive, (std::uint32_t)indices, 1, firstIndex, (std::int32_t)first, 0);
     };
     // ATST: NEVER, ALWAYS, LESS, LEQUAL, EQUAL, GEQUAL, GREATER, NOTEQUAL
     static const DkCompareOp kPasses[8] = {DkCompareOp_Never, DkCompareOp_Always, DkCompareOp_Less, DkCompareOp_Lequal,
@@ -536,7 +598,9 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
         target = 0;
     if (captureAt_ >= 0 && (long)frames_ == captureAt_)
         Capture(target);
+    std::uint64_t t0 = NowNs();
     int slot = dkQueueAcquireImage(queue_, swapchain_);
+    acquireNs_ += NowNs() - t0;
     DkImageView screen, from;
     dkImageViewDefaults(&screen, &screen_[slot]);
     dkImageViewDefaults(&from, &colour_[target]);
@@ -550,8 +614,11 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
     dkCmdBufBlitImage(cmd_, &from, &src, &screen, &dst, 0, 0);
     Send(false);
     dkQueuePresentImage(queue_, swapchain_, slot);
+    std::uint64_t t1 = NowNs();
     dkQueueWaitIdle(queue_);
+    waitNs_ += NowNs() - t1;
     BeginCommands();
+    presentNs_ += NowNs() - t0;
 }
 
 void Renderer::Report()
@@ -559,9 +626,11 @@ void Renderer::Report()
     std::fprintf(stderr, "gpu: %llu frames, %llu runs of primitives (%llu vertices), %llu command lists sent\n",
                  (unsigned long long)frames_, (unsigned long long)runs_, (unsigned long long)vertices_,
                  (unsigned long long)sends_);
-    std::fprintf(stderr, "gpu: %zu textures held (%u KB), %llu decoded, %llu uploaded, %llu times the cache was emptied\n",
-                 textures_.size(), textureUsed_ >> 10, (unsigned long long)decodes_, (unsigned long long)uploads_,
+    std::fprintf(stderr, "gpu: %zu textures held (%u KB), %llu checked after uploads, %llu decoded, %llu uploaded, %llu times the cache "
+                 "was emptied\n", textures_.size(), textureUsed_ >> 10, (unsigned long long)hashes_, (unsigned long long)decodes_, (unsigned long long)uploads_,
                  (unsigned long long)cacheResets_);
+    std::fprintf(stderr, "gpu: %.3f s in draws (%.3f s of it textures), %.3f s in swaps (%.3f s for a screen image, %.3f s "
+                 "for the GPU to finish)\n", drawNs_ / 1e9, textureNs_ / 1e9, presentNs_ / 1e9, acquireNs_ / 1e9, waitNs_ / 1e9);
     std::fprintf(stderr, "gpu: not drawn as the GS would: %llu runs into other buffers, %llu with the destination alpha test, "
                  "%llu blends approximated\n", (unsigned long long)otherTargets_, (unsigned long long)destinationAlpha_,
                  (unsigned long long)unsupportedBlends_);

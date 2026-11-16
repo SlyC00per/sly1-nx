@@ -33,8 +33,13 @@ struct DrawState {
 class Backend {
 public:
     virtual ~Backend() {}
-    // A run of count vertices (kind's primitives one after another), called with the GS held.
-    virtual void Draw(const DrawState& state, const DrawVertex* v, std::size_t count) = 0;
+    // A run starts: the registers its primitives will be drawn by. Called with the GS held, while
+    // the palette the state's texture is read through is the one loaded (DecodeTexture).
+    virtual void Begin(const DrawState& state) = 0;
+    // The run begun: its vertices, and its primitives as indices of them (kind's, one after
+    // another). Called with the GS held.
+    virtual void Draw(const DrawState& state, const DrawVertex* v, std::size_t vertices, const std::uint32_t* index,
+                      std::size_t indices) = 0;
     // The game swapped its double buffer: DISPFB's buffer is the one to show.
     virtual void Present(std::uint64_t dispfb, std::uint64_t display) = 0;
 };
@@ -42,12 +47,16 @@ public:
 // The renderer the GS draws through, or none (the reference drawing, when --dump-fb asks).
 void SetBackend(Backend* backend);
 
-// For a backend, inside Draw. The state's texture as 32-bit RGBA (the GS's alpha, 0x80 for 1),
+// For a backend, inside Begin. The state's texture as 32-bit RGBA (the GS's alpha, 0x80 for 1),
 // tw by th, through the palette loaded now.
 void DecodeTexture(const DrawState& state, std::vector<std::uint32_t>& rgba, int& width, int& height);
 
 // A number that changes when an upload may have changed the state's texture or its palette.
 std::uint32_t TextureGeneration(const DrawState& state);
+
+// For a backend, inside Begin. A hash of what the state's texture is read from: the pages of
+// local memory it lies in and the palette loaded.
+std::uint64_t TextureSource(const DrawState& state);
 
 }  // namespace gs
 }  // namespace port

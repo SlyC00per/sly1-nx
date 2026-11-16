@@ -625,7 +625,10 @@ std::uint32_t BitsPerPixel(std::uint32_t psm);
 
 Backend* g_backend;
 std::vector<DrawVertex> g_run;
+std::vector<std::uint32_t> g_runIndex;
+int g_queueIndex[3] = {-1, -1, -1};   // where in the run each queued vertex is, -1 not yet
 DrawState g_runState;
+bool g_runBegun;
 bool g_stateChanged = true;
 
 // Uploads by page of local memory (8,192 bytes): the count of uploads when each last changed.
@@ -634,9 +637,11 @@ std::uint32_t g_pageUpload[kLocalBytes / 8192];
 
 void FlushRun()
 {
-    if (g_backend && !g_run.empty())
-        g_backend->Draw(g_runState, g_run.data(), g_run.size());
+    if (g_backend && !g_runIndex.empty())
+        g_backend->Draw(g_runState, g_run.data(), g_run.size(), g_runIndex.data(), g_runIndex.size());
     g_run.clear();
+    g_runIndex.clear();
+    g_queueIndex[0] = g_queueIndex[1] = g_queueIndex[2] = -1;
 }
 
 DrawState StateOf(const Draw& d, std::uint32_t kind)
@@ -673,9 +678,11 @@ void Gather(std::uint64_t prim, std::uint32_t type)
     if (g_stateChanged) {
         d = DrawOf(prim);
         DrawState s = StateOf(d, kKind[type]);
-        if (std::memcmp(&s, &g_runState, sizeof s) != 0) {
+        if (!g_runBegun || std::memcmp(&s, &g_runState, sizeof s) != 0) {
             FlushRun();
             g_runState = s;
+            g_runBegun = true;
+            g_backend->Begin(s);
         }
         g_stateChanged = false;
     }
@@ -696,15 +703,29 @@ void Gather(std::uint64_t prim, std::uint32_t type)
         o.fog = v.f;
         return o;
     };
+    auto add = [&](const DrawVertex& v) {
+        g_runIndex.push_back((std::uint32_t)g_run.size());
+        g_run.push_back(v);
+    };
     switch (type) {
-    case 0: g_run.push_back(vertex(g_queue[0], g_queue[0])); break;
+    case 0: add(vertex(g_queue[0], g_queue[0])); break;
     case 1: case 2:
-        g_run.push_back(vertex(g_queue[0], g_queue[1]));
-        g_run.push_back(vertex(g_queue[1], g_queue[1]));
+        add(vertex(g_queue[0], g_queue[1]));
+        add(vertex(g_queue[1], g_queue[1]));
         break;
     case 3: case 4: case 5:
-        for (int k = 0; k < 3; k++)
-            g_run.push_back(vertex(g_queue[k], g_queue[2]));
+        if (d.iip) {   // each vertex in the run once, the triangles its indices
+            for (int k = 0; k < 3; k++) {
+                if (g_queueIndex[k] < 0) {
+                    g_queueIndex[k] = (int)g_run.size();
+                    g_run.push_back(vertex(g_queue[k], g_queue[k]));
+                }
+                g_runIndex.push_back((std::uint32_t)g_queueIndex[k]);
+            }
+        } else {       // flat: the third vertex's colour on all three
+            for (int k = 0; k < 3; k++)
+                add(vertex(g_queue[k], g_queue[2]));
+        }
         break;
     case 6: {   // a sprite: the rectangle of its two corners, the second's colour, depth and fog
         DrawVertex a = vertex(g_queue[0], g_queue[1]), b = vertex(g_queue[1], g_queue[1]);
@@ -717,8 +738,10 @@ void Gather(std::uint64_t prim, std::uint32_t type)
         DrawVertex ab = a, ba = a;
         ab.x = b.x; ab.s = b.s;
         ba.y = b.y; ba.t = b.t;
-        g_run.push_back(a); g_run.push_back(ab); g_run.push_back(ba);
-        g_run.push_back(ab); g_run.push_back(b); g_run.push_back(ba);
+        std::uint32_t first = (std::uint32_t)g_run.size();
+        g_run.push_back(a); g_run.push_back(ab); g_run.push_back(ba); g_run.push_back(b);
+        for (std::uint32_t k : {0u, 1u, 2u, 1u, 3u, 2u})
+            g_runIndex.push_back(first + k);
         break;
     }
     default: break;
@@ -828,8 +851,12 @@ void Kick(bool draw)
     }
     switch (type) {
     case 2: g_queue[0] = g_queue[1]; g_queued = 1; break;                       // line strip
-    case 4: g_queue[0] = g_queue[1]; g_queue[1] = g_queue[2]; g_queued = 2; break;   // triangle strip
-    case 5: g_queue[1] = g_queue[2]; g_queued = 2; break;                       // triangle fan
+    case 4:                                                                     // triangle strip
+        g_queue[0] = g_queue[1]; g_queue[1] = g_queue[2];
+        g_queueIndex[0] = g_queueIndex[1]; g_queueIndex[1] = g_queueIndex[2];
+        g_queued = 2;
+        break;
+    case 5: g_queue[1] = g_queue[2]; g_queueIndex[1] = g_queueIndex[2]; g_queued = 2; break;   // triangle fan
     default: g_queued = 0; break;
     }
 }
@@ -846,6 +873,7 @@ void PushVertex(std::int32_t x, std::int32_t y, std::uint32_t z, std::uint8_t f,
     v.u = g_regs.u; v.v = g_regs.v;
     if (g_queued >= 3)
         g_queued = 2;
+    g_queueIndex[g_queued] = -1;
     g_queue[g_queued++] = v;
     Kick(draw);
 }
@@ -878,6 +906,8 @@ void StartTransfer()
     g_trx = Transfer();
     if (g_backend && dir != 1) {   // what is gathered is drawn by the textures as they were
         FlushRun();
+        g_runBegun = false;   // the next run's texture looked at again
+        g_stateChanged = true;
         g_uploads++;
         PagesOf((std::uint32_t)Bits(bb, 32, 14), (std::uint32_t)Bits(bb, 48, 6), (std::uint32_t)Bits(bb, 56, 6),
                 (std::uint32_t)Bits(pos, 32, 11), (std::uint32_t)Bits(pos, 48, 11), (std::uint32_t)Bits(reg, 0, 12),
@@ -1275,6 +1305,7 @@ void SetBackend(Backend* backend)
     Guard lk;
     g_backend = backend;
     g_stateChanged = true;
+    g_runBegun = false;
 }
 
 void DecodeTexture(const DrawState& state, std::vector<std::uint32_t>& rgba, int& width, int& height)
@@ -1287,9 +1318,50 @@ void DecodeTexture(const DrawState& state, std::vector<std::uint32_t>& rgba, int
     width = (int)t.tw;
     height = (int)t.th;
     rgba.resize((std::size_t)t.tw * t.th);
-    for (std::uint32_t y = 0; y < t.th; y++)
-        for (std::uint32_t x = 0; x < t.tw; x++)
-            rgba[(std::size_t)y * t.tw + x] = Texel(t, (int)x, (int)y);
+    std::uint32_t* out = rgba.data();
+    if (t.psm == PSMT8 && t.cpsm == PSMCT32) {          // the game's formats without Texel's cases
+        for (std::uint32_t y = 0; y < t.th; y++)
+            for (std::uint32_t x = 0; x < t.tw; x++)
+                *out++ = g_clut[g_local[Addr8(t.tbp, t.tbw, x, y)]];
+    } else if (t.psm == PSMT4 && t.cpsm == PSMCT32) {
+        std::uint32_t base = (t.csa & 15) * 16;
+        for (std::uint32_t y = 0; y < t.th; y++)
+            for (std::uint32_t x = 0; x < t.tw; x++) {
+                std::uint32_t n = Addr4(t.tbp, t.tbw, x, y);
+                *out++ = g_clut[(base + ((g_local[n >> 1] >> ((n & 1) * 4)) & 0xF)) & 255];
+            }
+    } else if (t.psm == PSMCT32) {
+        for (std::uint32_t y = 0; y < t.th; y++)
+            for (std::uint32_t x = 0; x < t.tw; x++)
+                *out++ = Read32(Addr32(t.tbp, t.tbw, x, y));
+    } else {
+        for (std::uint32_t y = 0; y < t.th; y++)
+            for (std::uint32_t x = 0; x < t.tw; x++)
+                *out++ = Texel(t, (int)x, (int)y);
+    }
+}
+
+std::uint64_t TextureSource(const DrawState& state)
+{
+    Context c;
+    c.tex0 = state.tex0;
+    Tex t = TexOf(c);
+    std::uint64_t hash = 0xCBF29CE484222325ull;
+    auto words = [&](const void* p, std::size_t bytes) {
+        const std::uint8_t* b = static_cast<const std::uint8_t*>(p);
+        for (std::size_t k = 0; k + 8 <= bytes; k += 8) {
+            std::uint64_t w;
+            std::memcpy(&w, b + k, 8);
+            hash = (hash ^ w) * 0x9E3779B97F4A7C15ull;
+            hash ^= hash >> 29;
+        }
+    };
+    PagesOf(t.tbp, t.tbw, t.psm, 0, 0, t.tw, t.th, [&](std::uint32_t page) { words(g_local + page * 8192, 8192); });
+    if (t.psm == PSMT8 || t.psm == PSMT8H)
+        words(g_clut, sizeof g_clut);
+    else if (t.psm == PSMT4 || t.psm == PSMT4HL || t.psm == PSMT4HH)
+        words(&g_clut[((t.csa & 15) * 16) & 255], 64);
+    return hash;
 }
 
 std::uint32_t TextureGeneration(const DrawState& state)
