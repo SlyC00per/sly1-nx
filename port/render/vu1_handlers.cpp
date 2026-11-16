@@ -489,6 +489,123 @@ bool BatchFinish(Runner& r)
     return true;
 }
 
+// --- 0x1A6 of chunk 6744EAB9: a point light on a batch's vertices.
+//
+// From TOP: 0-3 the matrix to world space, 22 the light's colour for the vertex colours, 23 and 24
+// its scale and ambient, 25.xy the attenuation (a + b / distance), 26 its position; 11.x and 11.y
+// the vertices, 12.w the colours (one quadword a vertex). Each vertex: the normal (quadword 0)
+// turned and made unit length (ERLENG), the position (quadword 3) to world space, the light's
+// direction from it; the cosine over the distance d, as d + d^3 (the z term weighted by vf01.x);
+// the light (ambient + scale times that, clamped to 0..1) times the attenuation (clamped), added
+// to quadword 2's xy and, through 22 by its z, to the colour. 9.y = 4 (another kind of light, at
+// 0x142) is left to the microcode.
+
+float Max(float a, float b) { return In(a) > In(b) ? In(a) : In(b); }
+
+// ERLENG: 1 / the length of xyz, or the largest float for 0.
+float Erleng(const V& v)
+{
+    float x = In(v.x), y = In(v.y), z = In(v.z);
+    float sum2 = Add(Add(Mul(x, x), Mul(y, y)), Mul(z, z));
+    return sum2 == 0.0f ? 3.4028235e38f : core::Fix(1.0f / std::sqrt(sum2));
+}
+
+void SetXyz(State& st, int reg, const V& x) { std::memcpy(st.vf[reg], &x, 12); }
+
+bool PointLight(Runner& r)
+{
+    State& st = r.s;
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    if (Half(Load(r, top + 9).y) == 4)
+        return false;
+    V hdr = Load(r, top + 11);
+    std::uint16_t first = (std::uint16_t)(top + Half(hdr.x));
+    int n = Count(first, (std::uint16_t)(top + Half(hdr.y)), 4);
+    if (n == 0)
+        return false;
+    std::uint16_t colours = (std::uint16_t)(top + Half(Load(r, top + 12).w));
+    V m[4] = {Load(r, top + 0), Load(r, top + 1), Load(r, top + 2), Load(r, top + 3)};
+    V light = Load(r, top + 26), colour = Load(r, top + 22), ambient = Load(r, top + 24), scale = Load(r, top + 23);
+    V atten = Load(r, top + 25);
+    const float one = st.vf[1][0];   // vf01.x
+    V nrm, pos, dir, lit, q2, col, prod;
+    float p1 = 0, p2 = 0, cosine = 0, cube = 0, fade = 0;
+    for (int k = 0; k < n; k++) {
+        std::uint16_t at = (std::uint16_t)(first + 4 * k);
+        nrm = Load(r, at);
+        V p = Load(r, at + 3);
+        pos = p;
+        F4 acc = Mul4(m[0].v, Splat(nrm.x));
+        acc = Add4(acc, Mul4(m[1].v, Splat(nrm.y)));
+        V turned;
+        turned.v = Add4(acc, Mul4(m[2].v, Splat(nrm.z)));
+        acc = Mul4(m[0].v, Splat(p.x));
+        acc = Add4(acc, Mul4(m[1].v, Splat(p.y)));
+        acc = Add4(acc, Mul4(m[2].v, Splat(p.z)));
+        pos.v = Add4(acc, Mul4(m[3].v, Splat(1.0f)));
+        p1 = Erleng(turned);
+        q2 = Load(r, at + 2);
+        dir.v = Fix4(Fix4(light.v) - Fix4(pos.v));
+        nrm.x = turned.x;
+        nrm.y = turned.y;
+        nrm.z = turned.z;
+        V unit;
+        unit.v = Mul4(turned.v, Splat(p1));
+        nrm.x = unit.x;
+        nrm.y = unit.y;
+        nrm.z = unit.z;
+        p2 = Erleng(dir);
+        prod.v = Mul4(unit.v, dir.v);
+        col = Load(r, (std::uint16_t)(colours + k));
+        float a = Add(prod.x, prod.y);
+        cosine = Add(a, Mul(one, prod.z));
+        cosine = Mul(cosine, p2);
+        cube = Mul(cosine, cosine);
+        a = Add(cosine, 0.0f);
+        cosine = Add(a, Mul(cube, cosine));
+        acc = Add4(Splat(0.0f), ambient.v);
+        lit.v = Add4(acc, Mul4(scale.v, Splat(cosine)));
+        for (int c = 0; c < 3; c++)
+            lit[c] = Mini(Max(lit[c], 0.0f), 1.0f);
+        a = Add(0.0f, atten.x);
+        fade = Add(a, Mul(p2, atten.y));
+        fade = Mini(Max(fade, 0.0f), 1.0f);
+        lit.v = Mul4(lit.v, Splat(fade));
+        q2.x = Add(q2.x, lit.x);
+        q2.y = Add(q2.y, lit.y);
+        acc = Add4(Splat(0.0f), col.v);
+        col.v = Add4(acc, Mul4(colour.v, Splat(lit.z)));
+        float* out = r.Qword(at + 2);
+        out[0] = q2.x;
+        out[1] = q2.y;
+        std::memcpy(r.Qword((std::uint16_t)(colours + k)), &col, 12);
+    }
+    // the registers as the loop leaves them
+    SetXyz(st, 2, colour);
+    SetXyz(st, 3, ambient);
+    SetXyz(st, 4, scale);
+    SetXyz(st, 5, light);
+    st.vf[6][0] = atten.x;
+    st.vf[6][1] = atten.y;
+    for (int c = 0; c < 4; c++)
+        SetVf(st, 7 + c, m[c]);
+    SetXyz(st, 11, pos);
+    SetVf(st, 12, nrm);
+    SetXyz(st, 13, q2);
+    SetXyz(st, 14, col);
+    SetXyz(st, 15, dir);
+    st.vf[16][0] = cosine;
+    st.vf[16][1] = prod.y;
+    st.vf[16][2] = prod.z;
+    st.vf[17][0] = cube;
+    st.vf[18][0] = p2;
+    st.vf[19][0] = fade;
+    SetXyz(st, 20, lit);
+    st.p = p2;
+    st.pc = 0x1DE;
+    return true;
+}
+
 }  // namespace
 
 const HandlerEntry kHandlers[] = {
@@ -497,6 +614,9 @@ const HandlerEntry kHandlers[] = {
      "vf12.xyzw vf14.xy vf15.xyzw vf16.xyzw vf17.xyzw vf19.xyzw vf20.xyzw vf21.xyzw vf22.xyzw vf24.xy "
      "vf25.xyzw vf26.xyzw vf27.xyzw vf29.xy clip"},
     {0xE1624411, 0x002, BatchFinish, "lit batch finish", "vf02.xyzw vf03.xyzw vf04.xyzw vf05.xyzw vf11.w vf12.xyz vf13.w"},
+    {0x6744EAB9, 0x1A6, PointLight, "point light",
+     "vf02.xyz vf03.xyz vf04.xyz vf05.xyz vf06.xy vf07.xyzw vf08.xyzw vf09.xyzw vf10.xyzw vf11.xyz vf12.xyzw "
+     "vf13.xyz vf14.xyz vf15.xyz vf16.xyz vf17.x vf18.x vf19.x vf20.xyz P"},
     {0xE1624411, 0x01E, BatchSecond, "lit batch second pass", "vf03.xyzw vf11.w vf12.xyz vf13.w"},
 };
 const std::size_t kHandlerCount = sizeof kHandlers / sizeof kHandlers[0];
