@@ -103,6 +103,7 @@ float Reciprocal(Runner& r, float d)
 }
 
 float Mini(float a, float b) { return In(a) < In(b) ? In(a) : In(b); }
+float Max(float a, float b) { return In(a) > In(b) ? In(a) : In(b); }
 
 // FCOR's six planes over the last three vertices' clip codes (bits 0-17): whether all three are
 // outside one plane, as 0x274's tests find it.
@@ -406,12 +407,375 @@ void KickBatch(Runner& r, std::uint16_t top, std::uint16_t tag)
     Kick(r, verts - 1);
 }
 
-// Whether a batch can be done here: whole vertices, and no triangle flagged for the clipper.
+// --- The clipper (chunk E1624411's 0x5EF with 0x54D, 0x545, 0x507, 0x5D2 and 0x5E5), for a batch
+// whose transform marked triangles to clip (13.z).
+//
+// For each vertex from the third whose control word marks its triangle (bit 13 of the control
+// word plus 4096), the triangle's three vertices (STQ, the colour at quadword vi03, the position)
+// are copied to the work area at 13 of data memory and taken back to clip space (0x54D: the
+// screen position less the viewport's offset, over its scale, times w; STQ times w), with codes
+// against a guard band 6.34 by 18.1 times the screen. A triangle wholly outside one side of it
+// is dropped; then the polygon is clipped against the planes w - z, w + z, w + y, w - y, w + x,
+// w - x in turn (0x507: Sutherland-Hodgman in place, colours interpolated with w unless an end has
+// w below 1), each only when CLIP's codes (of the polygon's last four vertices: after the first
+// plane they are computed again once, then kept) put a vertex beyond it. The polygon is projected
+// as 0x356 projects, culled by its signed area against the strip's winding (0x5D2, when 9.z asks),
+// and kicked from the tag at 12 (its count with EOP), followed by an empty packet at 2; 13.z is
+// set again for the next pass. The flags read are those of the operations four instructions
+// before (five for the plane loop's MAC test), as the microcode is scheduled.
+struct Clipper {
+    Runner& r;
+    State& st;
+    std::uint16_t top;
+    float (*vf)[4];
+    explicit Clipper(Runner& run) : r(run), st(run.s), top((std::uint16_t)run.ctx.top), vf(run.s.vf) {}
+
+    V g(int k) const { V x; std::memcpy(&x, vf[k], 16); return x; }
+    void p(int k, const V& x, int mask = 15)
+    {
+        for (int c = 0; c < 4; c++)
+            if (mask & (8 >> c))
+                vf[k][c] = x[c];
+    }
+    void lq(int k, std::uint16_t a, int mask = 15) { p(k, Load(r, a), mask); }
+    void sq(int k, std::uint16_t a, int mask = 15)
+    {
+        V m = Load(r, a), x = g(k);
+        for (int c = 0; c < 4; c++)
+            if (mask & (8 >> c))
+                m[c] = x[c];
+        Store(r, a, m);
+    }
+    void Clip(const V& v) { st.clip = ((st.clip << 6) | ClipCode(v)) & 0xFFFFFF; }
+    bool Fcor(std::uint32_t mask) const { return ((st.clip | mask) & 0xFFFFFF) == 0xFFFFFF; }
+    bool Fcand(std::uint32_t mask) const { return (st.clip & mask) != 0; }
+    static bool Negative(float x) { return std::signbit(x) && x != 0.0f; }
+    // DIV Q, fs, ft
+    float Div(float fs, float ft)
+    {
+        float a = In(fs), b = In(ft);
+        if (b == 0.0f) {
+            st.status |= a == 0.0f ? 0x410 : 0x820;
+            return (std::signbit(a) != std::signbit(b)) ? -3.4028235e38f : 3.4028235e38f;
+        }
+        return core::Fix(a / b);
+    }
+
+    std::uint16_t vi06 = 13, vi07 = 22, vi10 = 0;
+
+    // 0x545: the codes of the polygon's vertices against their w.
+    void Codes()
+    {
+        std::uint16_t a = vi06;
+        do {
+            lq(9, (std::uint16_t)(a + 2));
+            Clip(g(9));
+            a = (std::uint16_t)(a + 3);
+        } while (a != vi07);
+    }
+
+    // 0x507: the polygon clipped against the plane in vf06, in place.
+    void Plane()
+    {
+        const float one = vf[1][0];
+        vi10 = 1;
+        vf[16][3] = FromBits(1);
+        lq(13, (std::uint16_t)(vi06 + 2));
+        auto dist = [&]() {
+            V x;
+            x.v = Mul4(g(6).v, g(13).v);
+            p(14, x);
+            float acc = Add(vf[14][0], vf[14][1]);
+            acc = Add(acc, Mul(one, vf[14][2]));
+            vf[14][0] = Add(acc, Mul(one, vf[14][3]));
+        };
+        dist();
+        lq(12, (std::uint16_t)(vi06 + 1));
+        lq(11, vi06);
+        std::uint16_t vi12 = vi06, vi02 = vi06;
+        auto weight = [&]() {
+            V x;
+            x.v = Mul4(g(12).v, Splat(vf[13][3]));
+            p(20, x);
+        };
+        weight();
+        bool vi11 = Negative(vf[14][0]);
+        sq(11, vi07);
+        sq(12, (std::uint16_t)(vi07 + 1));
+        sq(13, (std::uint16_t)(vi07 + 2));
+        do {
+            V x;
+            x.v = Add4(g(13).v, Splat(0.0f));
+            p(9, x);
+            bool vi10b = vi11;
+            x.v = Add4(g(14).v, Splat(0.0f));
+            p(10, x);
+            p(7, g(11));
+            x.v = Add4(g(20).v, Splat(0.0f));
+            p(19, x);
+            p(8, g(12));
+            lq(13, (std::uint16_t)(vi12 + 5));
+            {
+                V d;
+                d.v = Mul4(g(6).v, g(13).v);
+                p(14, d);
+            }
+            lq(12, (std::uint16_t)(vi12 + 4));
+            float acc = Add(vf[14][0], vf[14][1]);
+            lq(11, (std::uint16_t)(vi12 + 3));
+            acc = Add(acc, Mul(one, vf[14][2]));
+            vf[21][2] = vf[9][3];
+            vf[14][0] = Add(acc, Mul(one, vf[14][3]));
+            vf[21][3] = vf[13][3];
+            weight();
+            vi11 = Negative(vf[14][0]);
+            vf[15][0] = Sub(vf[14][0], vf[10][0]);
+            vf[21][2] = Sub(vf[21][2], 1.0f);
+            vf[21][3] = Sub(vf[21][3], 1.0f);
+            if (vi10b != vi11) {
+                float t = Div(vf[14][0], vf[15][0]);
+                st.q = t;
+                bool lowBefore = Negative(vf[21][2]);
+                bool low = lowBefore || Negative(vf[21][3]);
+                p(17, g(8));
+                if (lowBefore)
+                    p(17, g(12));
+                vf[15][3] = Sub(1.0f, t);
+                V n;
+                n.v = Add4(Mul4(g(9).v, Splat(t)), Mul4(g(13).v, Splat(vf[15][3])));
+                p(18, n);
+                V s;
+                s.v = Add4(Mul4(g(7).v, Splat(t)), Mul4(g(11).v, Splat(vf[15][3])));
+                p(16, s, 14);
+                if (!low) {
+                    F4 c = Mul4(g(19).v, Splat(t));
+                    st.q = Reciprocal(r, vf[18][3]);
+                    V col;
+                    col.v = Add4(c, Mul4(g(20).v, Splat(vf[15][3])));
+                    col.v = Mul4(col.v, Splat(st.q));
+                    p(17, col);
+                }
+                sq(18, (std::uint16_t)(vi02 + 2));
+                sq(16, vi02);
+                sq(17, (std::uint16_t)(vi02 + 1));
+                vi02 = (std::uint16_t)(vi02 + 3);
+            }
+            if (!vi11) {
+                sq(11, vi02);
+                sq(12, (std::uint16_t)(vi02 + 1));
+                sq(13, (std::uint16_t)(vi02 + 2));
+                vi02 = (std::uint16_t)(vi02 + 3);
+            }
+            vi12 = (std::uint16_t)(vi12 + 3);
+        } while (vi12 != vi07);
+        vi07 = vi02;
+    }
+
+    // 0x54D: the triangle at the work area to clip space, tested, clipped and projected; vi10 the
+    // vertices left (0 when dropped).
+    void Polygon()
+    {
+        V zero;
+        zero.v = F4{Sub(0.0f, 0.0f), Sub(0.0f, 0.0f), Sub(0.0f, 0.0f), Sub(1.0f, 1.0f)};
+        p(7, zero);
+        lq(5, (std::uint16_t)(top + 8));
+        lq(2, 1);
+        lq(3, 0);
+        vf[2][3] = Mul(1.0f, vf[5][0]);
+        vf[3][3] = Mul(1.0f, vf[5][1]);
+        for (int c = 0; c < 4; c++)
+            vf[11][c] = Max(c == 3 ? 1.0f : 0.0f, 1.0f);
+        st.i = FromBits(0x40CAE148u);
+        vf[11][0] = Add(0.0f, st.i);
+        st.i = FromBits(0x4190CCCDu);
+        vf[11][1] = Add(0.0f, st.i);
+        for (int c = 0; c < 3; c++) {
+            st.q = Reciprocal(r, vf[3][c]);
+            vf[4][c] = Add(0.0f, st.q);
+        }
+        st.clip = 0;
+        std::uint16_t a = vi06;
+        do {
+            lq(9, (std::uint16_t)(a + 2));
+            lq(7, a);
+            lq(8, (std::uint16_t)(a + 1));
+            V old7 = g(7), v9 = g(9);
+            for (int c = 0; c < 3; c++)
+                v9[c] = Sub(v9[c], vf[2][c]);
+            for (int c = 0; c < 3; c++)
+                vf[7][c] = Mul(old7[c], old7.w);
+            v9.w = old7.w;
+            p(9, v9);
+            vf[7][3] = Sub(1.0f, 1.0f);
+            for (int c = 0; c < 4; c++)
+                vf[8][c] = Itof0(vf[8][c]);
+            a = (std::uint16_t)(a + 3);
+            for (int c = 0; c < 3; c++)
+                vf[9][c] = Mul(vf[9][c], vf[4][c]);
+            for (int c = 0; c < 3; c++)
+                vf[9][c] = Mul(vf[9][c], vf[9][3]);
+            V v12;
+            v12.v = Mul4(g(11).v, g(9).v);
+            p(12, v12);
+            sq(9, (std::uint16_t)(a - 1));
+            Clip(v12);
+            sq(8, (std::uint16_t)(a - 2));
+            sq(7, (std::uint16_t)(a - 3));
+        } while (a != vi07);
+        // the triangle off one side of the guard band (vi03 is 0 here)
+        if (Fcor(0xFF7DF7) || Fcor(0xFFBEFB) || Fcor(0xFFDF7D) || Fcor(0xFFEFBE)) {
+            vi10 = 0;
+            vi07 = vi06;
+            return;
+        }
+        st.clip = 0;
+        Codes();
+        V base;
+        base.v = F4{Add(0.0f, 0.0f), Add(0.0f, 0.0f), Add(0.0f, 0.0f), Add(1.0f, 0.0f)};
+        p(6, base);
+        if (Fcand(0x410410)) {
+            vf[6][2] = Sub(vf[6][2], 1.0f);
+            Plane();
+            if (vi06 == vi07) {
+                vi10 = 0;
+                vi07 = vi06;
+                return;
+            }
+            st.clip = 0;
+            Codes();
+        }
+        struct { std::uint32_t mask; int field; bool add; } planes[5] = {
+            {0x820820, 2, true}, {0x208208, 1, true}, {0x104104, 1, false}, {0x082082, 0, true}, {0x041041, 0, false}};
+        for (const auto& pl : planes) {
+            p(6, base);
+            if (!Fcand(pl.mask))
+                continue;
+            vf[6][pl.field] = pl.add ? Add(vf[6][pl.field], 1.0f) : Sub(vf[6][pl.field], 1.0f);
+            Plane();
+            if (vi06 == vi07) {
+                vi10 = 0;
+                vi07 = vi06;
+                return;
+            }
+        }
+        // 0x5B8: projected as the transform projects
+        vi10 = 0;
+        a = vi06;
+        do {
+            lq(7, a);
+            lq(8, (std::uint16_t)(a + 1));
+            lq(9, (std::uint16_t)(a + 2));
+            float q = Reciprocal(r, vf[9][3]);
+            st.q = q;
+            vf[9][3] = Mini(vf[9][3], vf[5][2]);
+            for (int c = 0; c < 3; c++)
+                vf[7][c] = Mul(vf[7][c], q);
+            V v9;
+            v9.v = Mul4(g(9).v, Splat(q));
+            v9.v = Add4(Mul4(v9.v, g(3).v), Mul4(g(2).v, Splat(1.0f)));
+            p(9, v9);
+            st.i = 0.5f;
+            V v8;
+            v8.v = Add4(g(8).v, Splat(st.i));
+            for (int c = 0; c < 4; c++)
+                v8[c] = Ftoi0(v8[c]);
+            p(8, v8);
+            sq(7, a);
+            sq(8, (std::uint16_t)(a + 1));
+            sq(9, (std::uint16_t)(a + 2));
+            a = (std::uint16_t)(a + 3);
+            vi10 = (std::uint16_t)(vi10 + 1);
+        } while (a != vi07);
+    }
+
+    // 0x5D2: the polygon culled by its winding when 9.z asks.
+    void Cull(std::uint16_t vi05)
+    {
+        float acc = Sub(0.0f, 0.0f);
+        std::uint16_t enabled = Half(Load(r, (std::uint16_t)(top + 9)).z);
+        lq(10, (std::uint16_t)(vi06 + 2));
+        lq(11, (std::uint16_t)(vi06 + 5));
+        lq(12, (std::uint16_t)(vi06 + 8));
+        vf[13][0] = Sub(vf[11][0], vf[10][0]);
+        vf[13][1] = Sub(vf[11][1], vf[10][1]);
+        std::uint16_t vi11 = (std::uint16_t)(vi06 + 6);
+        if (enabled == 0)
+            return;
+        do {
+            vf[14][0] = Sub(vf[12][0], vf[10][0]);
+            vf[14][1] = Sub(vf[12][1], vf[10][1]);
+            vi11 = (std::uint16_t)(vi11 + 3);
+            acc = Add(acc, Mul(vf[14][0], vf[13][1]));
+            lq(12, (std::uint16_t)(vi11 + 2));
+            acc = Sub(acc, Mul(vf[13][0], vf[14][1]));
+            p(13, g(14));
+        } while (vi11 != vi07);
+        std::uint16_t vi01 = Negative(acc) ? 2 : 0, vi02 = vi05 & 2;
+        if (vi01 == vi02)
+            vi07 = vi06;
+    }
+
+    // 0x5EF with the colour at quadword colour of each vertex.
+    void Run(std::uint16_t colour)
+    {
+        r.Qword((std::uint16_t)(top + 13))[2] = FromBits(0);
+        V hdr = Load(r, (std::uint16_t)(top + 11));
+        std::uint16_t vi08 = (std::uint16_t)(top + Half(hdr.x) + 8), vi09 = (std::uint16_t)(top + Half(hdr.y));
+        vf[30][0] = FromBits((std::uint32_t)(std::int32_t)(std::int16_t)colour);
+        std::uint16_t vi05 = 2;
+        do {
+            std::uint16_t control = Half(Load(r, (std::uint16_t)(vi08 + 3)).w);
+            if ((std::uint16_t)(control + 4096) & 8192) {
+                vi06 = 13;
+                vi07 = 22;
+                std::uint16_t vi11 = vi06, a = (std::uint16_t)(vi08 - 12);
+                do {
+                    a = (std::uint16_t)(a + 4);
+                    lq(2, a);
+                    lq(3, (std::uint16_t)(a + colour));
+                    lq(4, (std::uint16_t)(a + 3));
+                    sq(2, vi11);
+                    sq(3, (std::uint16_t)(vi11 + 1));
+                    sq(4, (std::uint16_t)(vi11 + 2));
+                    vi11 = (std::uint16_t)(vi11 + 3);
+                } while (vi11 != vi07);
+                Polygon();
+                if (vi10 != 0) {
+                    Cull(vi05);
+                    if (vi06 != vi07) {
+                        r.Qword(12)[0] = FromBits((std::uint16_t)(32768 + vi10));
+                        r.Qword((std::uint16_t)(top + 13))[2] = FromBits(1);
+                        Kick(r, 12);
+                        float* nop = r.Qword(2);
+                        nop[1] = 0.0f;
+                        nop[2] = 0.0f;
+                        nop[3] = 1.0f;
+                        nop[0] = FromBits(32768);
+                        Kick(r, 2);
+                    }
+                }
+            }
+            vi08 = (std::uint16_t)(vi08 + 4);
+            vi05 = (std::uint16_t)(vi05 + 2);
+        } while (vi08 != vi09);
+    }
+};
+
+void ClipIfMarked(Runner& r, std::uint16_t top, std::uint16_t colour)
+{
+    if (Half(Load(r, top + 13).z) != 0) {
+        Clipper c(r);
+        c.Run(colour);
+    }
+}
+
+// Whether a batch can be done here: whole vertices, and at least three when a triangle is marked
+// for the clipper.
 bool Plain(Runner& r, std::uint16_t top, int& n)
 {
     V hdr = Load(r, top + 11);
     n = Count((std::uint16_t)(top + Half(hdr.x)), (std::uint16_t)(top + Half(hdr.y)), 4);
-    return n > 0 && Half(Load(r, top + 13).z) == 0;
+    return n > 0 && (Half(Load(r, top + 13).z) == 0 || n >= 3);
 }
 
 // 0x01E's body from 0x020: the colours (0x4C1), the kick of the packet at 12.y, and when 9.w is
@@ -420,10 +784,12 @@ void SecondPass(Runner& r, std::uint16_t top, int n)
 {
     Colours4C1(r, top, n);
     KickBatch(r, top, Half(Load(r, top + 12).y));
+    ClipIfMarked(r, top, 2);
     if (Half(Load(r, top + 9).w) == 1)
         return;
     Colours4DD(r, top, n);
     KickBatch(r, top, Half(Load(r, top + 12).z));
+    ClipIfMarked(r, top, 1);
 }
 
 bool BatchSecond(Runner& r)
@@ -493,6 +859,7 @@ bool BatchFinish(Runner& r)
         return false;
     }
     KickBatch(r, top, Half(Load(r, top + 12).x));
+    ClipIfMarked(r, top, 1);
     if (Half(nine.y) == 0) {
         r.s.pc = 0x01E;
         return true;
@@ -513,8 +880,6 @@ bool BatchFinish(Runner& r)
 // the light (ambient + scale times that, clamped to 0..1) times the attenuation (clamped), added
 // to quadword 2's xy and, through 22 by its z, to the colour. 9.y = 4 (another kind of light, at
 // 0x142) is left to the microcode.
-
-float Max(float a, float b) { return In(a) > In(b) ? In(a) : In(b); }
 
 // ERLENG: 1 / the length of xyz, or the largest float for 0.
 float Erleng(const V& v)
@@ -1474,7 +1839,7 @@ const HandlerEntry kHandlers[] = {
      "vf02.xyzw vf03.xyzw vf04.xyzw vf05.xyzw vf06.xyzw vf07.xyzw vf08.xyzw vf09.xyzw vf10.xyzw vf11.xyzw "
      "vf12.xyzw vf14.xy vf15.xyzw vf16.xyzw vf17.xyzw vf19.xyzw vf20.xyzw vf21.xyzw vf22.xyzw vf24.xy "
      "vf25.xyzw vf26.xyzw vf27.xyzw vf29.xy clip"},
-    {0xE1624411, 0x002, BatchFinish, "lit batch finish", "vf02.xyzw vf03.xyzw vf04.xyzw vf05.xyzw vf11.w vf12.xyz vf13.w"},
+    {0xE1624411, 0x002, BatchFinish, "lit batch finish", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I clip"},
     {0x6744EAB9, 0x17E, DirectionalLight, "directional light", kAllVfAndP},
     {0x6744EAB9, 0x1A6, PointLight, "point light", kAllVfAndP},
     {0xB90790F3, 0x242, LitColours, "lit colours",
@@ -1486,7 +1851,7 @@ const HandlerEntry kHandlers[] = {
      "vf22.xyz vf23.xyz"},
     {0x7B92AF0F, 0x26D, Outlines, "outlines", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "P clip"},
     {0xE1624411, 0x076, Sprites, "sprites", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I"},
-    {0xE1624411, 0x01E, BatchSecond, "lit batch second pass", "vf03.xyzw vf11.w vf12.xyz vf13.w"},
+    {0xE1624411, 0x01E, BatchSecond, "lit batch second pass", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I clip"},
 };
 const std::size_t kHandlerCount = sizeof kHandlers / sizeof kHandlers[0];
 
