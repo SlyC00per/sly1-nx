@@ -853,6 +853,82 @@ void WritePacked(std::uint32_t reg, const std::uint32_t* q)
     }
 }
 
+namespace {
+Regs g_checkRegs;
+Vertex g_checkQueue[3];
+int g_checkQueued;
+bool g_checking;
+}  // namespace
+
+void PackedRun(std::uint64_t regs, std::uint32_t nreg, const std::uint32_t* q, std::uint32_t loops)
+{
+    // the caller holds the GS (gs::Hold)
+    //
+    // Nothing drawn (no rasteriser): only what the run leaves matters, the registers and the vertex
+    // queue. For loops of vertex registers alone that is the last three loops' doing, on a queue
+    // as long as the vertices before them left it. A fan keeps its first vertex, and PRIM or a
+    // context register in the loop is left to the plain way.
+    std::uint32_t type = (std::uint32_t)(g_regs.prim & 7);
+    if (!g_rasterise && loops > 3 && type != 5) {
+        std::uint32_t vertices = 0;
+        bool only = true;
+        for (std::uint32_t k = 0; k < nreg; k++) {
+            unsigned reg = (unsigned)(regs >> (4 * k)) & 0xF;
+            if (reg == 0x4 || reg == 0x5)
+                vertices++;
+            else if (reg != 0x1 && reg != 0x2 && reg != 0x3 && reg != 0xA && reg != 0xF)
+                only = false;
+        }
+        static const bool check = std::getenv("SLY1_GS_CHECK") != nullptr;
+        if (only && check) {   // SLY1_GS_CHECK: the short way against every write, on copies
+            Regs regsBefore = g_regs;
+            Vertex queueBefore[3] = {g_queue[0], g_queue[1], g_queue[2]};
+            int queuedBefore = g_queued;
+            const std::uint32_t* w = q;
+            for (std::uint32_t l = 0; l < loops; l++)
+                for (std::uint32_t k = 0; k < nreg; k++, w += 4)
+                    WritePacked((unsigned)(regs >> (4 * k)) & 0xF, w);
+            g_checkRegs = g_regs;
+            std::memcpy(g_checkQueue, g_queue, sizeof g_queue);
+            g_checkQueued = g_queued;
+            g_checking = true;
+            g_regs = regsBefore;
+            std::memcpy(g_queue, queueBefore, sizeof g_queue);
+            g_queued = queuedBefore;
+        }
+        if (only) {
+            std::uint64_t skipped = (std::uint64_t)vertices * (loops - 3);
+            static const int kNeeded[8] = {1, 2, 2, 3, 3, 3, 2, 1};
+            int needed = kNeeded[type];
+            if (g_queued >= 3)
+                g_queued = 2;
+            if (type == 2 || type == 4)
+                g_queued = (int)std::min<std::uint64_t>(g_queued + skipped, (std::uint64_t)needed - 1);
+            else
+                g_queued = (int)((g_queued + skipped) % (std::uint64_t)needed);
+            q += (std::size_t)(loops - 3) * nreg * 4;
+            loops = 3;
+        }
+    }
+    for (std::uint32_t l = 0; l < loops; l++)
+        for (std::uint32_t k = 0; k < nreg; k++, q += 4)
+            WritePacked((unsigned)(regs >> (4 * k)) & 0xF, q);
+    if (g_checking) {
+        g_checking = false;
+        static std::uint64_t runs, differed;
+        runs++;
+        bool same = g_queued == g_checkQueued && std::memcmp(&g_regs, &g_checkRegs, sizeof g_regs) == 0;
+        for (int k = 0; same && k < g_queued; k++)
+            same = std::memcmp(&g_queue[k], &g_checkQueue[k], sizeof(Vertex)) == 0;
+        if (!same && differed++ < 8)
+            std::fprintf(stderr, "gs check: a packed run left something else (primitive %u, %u registers, queue %d and %d)\n",
+                         type, nreg, g_queued, g_checkQueued);
+        if ((runs & (runs - 1)) == 0)
+            std::fprintf(stderr, "gs check: %llu packed runs, %llu differed\n", (unsigned long long)runs,
+                         (unsigned long long)differed);
+    }
+}
+
 void SetDisplay(std::uint64_t dispfb, std::uint64_t display)
 {
     Guard lk;

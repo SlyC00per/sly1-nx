@@ -31,6 +31,10 @@ void Write(std::uint32_t reg, std::uint64_t value);
 // FOG, XYZF3, XYZ3), in its packed layout.
 void WritePacked(std::uint32_t reg, const std::uint32_t* q);
 
+// A run of PACKED data without A+D: loops times the nreg registers of regs (four bits each), a
+// quadword a register, as WritePacked would take them one by one.
+void PackedRun(std::uint64_t regs, std::uint32_t nreg, const std::uint32_t* q, std::uint32_t loops);
+
 // IMAGE data: a quadword of the transfer BITBLTBUF, TRXPOS, TRXREG and TRXDIR started.
 void Image(const std::uint32_t* q);
 

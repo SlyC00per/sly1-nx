@@ -121,6 +121,21 @@ public:
         left_--;
     }
 
+    // A run of PACKED data in one piece of memory: its whole loops handed to the GS at once
+    // (gs::PackedRun). Returns the quadwords taken, 0 when the data must go a quadword at a time.
+    std::uint32_t Run(const std::uint32_t* q, std::uint32_t avail)
+    {
+        if (!plain_ || slot_ != 0 || left_ < nreg_)
+            return 0;
+        std::uint32_t loops = std::min(left_, avail) / nreg_;
+        if (loops == 0)
+            return 0;
+        gs::PackedRun(regs_, nreg_, q, loops);
+        left_ -= loops * nreg_;
+        index_ += loops * nreg_;
+        return loops * nreg_;
+    }
+
 private:
     void Tag(const std::uint32_t* q)
     {
@@ -143,6 +158,13 @@ private:
                 g_survey.Count("gif path %d: primitive %s (from a tag)", path_, Prim(q[1] >> 15));
             if (flg_ == 2)
                 g_survey.Count("gif path %d: image uploads, format 0x%02X", path_, dpsm_);
+        }
+        plain_ = false;
+        if (flg_ == 0 && !survey_) {   // PACKED without A+D: nothing the GIF itself acts on
+            plain_ = true;
+            for (std::uint32_t k = 0; k < nreg_; k++)
+                if (((regs_ >> (4 * k)) & 0xF) == 0xE)
+                    plain_ = false;
         }
         if (flg_ == 0)
             left_ = nloop * nreg_;
@@ -193,7 +215,7 @@ private:
     int path_;
     unsigned dpsm_ = 0;
     std::uint32_t left_ = 0, nreg_ = 1, flg_ = 0, index_ = 0, regTotal_ = 0, slot_ = 0;
-    bool survey_ = false;
+    bool survey_ = false, plain_ = false;
     std::uint64_t regs_ = 0;
 };
 
@@ -298,8 +320,13 @@ void KickPath1(std::uint32_t qaddr, void*)
         g_path1.Qword(tag);
         qaddr++;
         for (std::uint32_t guard = 0; g_path1.Left() > 0 && guard < 1024; guard++) {
-            g_path1.Qword(reinterpret_cast<const std::uint32_t*>(d + (qaddr & 0x3FF) * 16));
-            qaddr++;
+            const std::uint32_t* q = reinterpret_cast<const std::uint32_t*>(d + (qaddr & 0x3FF) * 16);
+            std::uint32_t taken = g_path1.Run(q, 1024 - (qaddr & 0x3FF));   // up to the memory's wrap
+            if (taken == 0) {
+                g_path1.Qword(q);
+                taken = 1;
+            }
+            qaddr += taken;
         }
         if (eop)
             break;
