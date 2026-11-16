@@ -217,8 +217,13 @@ std::mutex g_gsLock;
 std::condition_variable g_gsWake, g_gsIdle;
 std::deque<GsItem> g_gsQueue;
 std::vector<std::vector<std::uint32_t>> g_gsSpare;
-bool g_gsBusy;
+bool g_gsBusy, g_gsWaiting;
 std::atomic<bool> g_gsStarted;
+// The render thread's items for the GS, passed on together at the end of each of its own items
+// (a wake of the GS thread is a system call on the Switch: one a packet cost more than the GS's
+// work), and its own stock of emptied buffers.
+std::vector<GsItem> g_gsPending;
+std::vector<std::vector<std::uint32_t>> g_gsLocalSpare;
 
 // Only with the render thread: without it, the paths reach the GS from the game's thread in turn.
 bool GsAsync()
@@ -229,20 +234,34 @@ bool GsAsync()
 
 std::vector<std::uint32_t> GsSpare()
 {
-    std::lock_guard<std::mutex> lk(g_gsLock);
-    if (g_gsSpare.empty())
-        return {};
-    std::vector<std::uint32_t> v = std::move(g_gsSpare.back());
-    g_gsSpare.pop_back();
+    if (g_gsLocalSpare.empty()) {
+        std::lock_guard<std::mutex> lk(g_gsLock);
+        for (int k = 0; k < 64 && !g_gsSpare.empty(); k++) {
+            g_gsLocalSpare.push_back(std::move(g_gsSpare.back()));
+            g_gsSpare.pop_back();
+        }
+        if (g_gsLocalSpare.empty())
+            return {};
+    }
+    std::vector<std::uint32_t> v = std::move(g_gsLocalSpare.back());
+    g_gsLocalSpare.pop_back();
     v.clear();
     return v;
 }
 
-void GsEnqueue(GsItem&& item)
+// (on the render thread)
+void GsEnqueue(GsItem&& item) { g_gsPending.push_back(std::move(item)); }
+
+void GsPassOn()
 {
+    if (g_gsPending.empty())
+        return;
     std::lock_guard<std::mutex> lk(g_gsLock);
-    g_gsQueue.push_back(std::move(item));
-    g_gsWake.notify_one();
+    for (GsItem& item : g_gsPending)
+        g_gsQueue.push_back(std::move(item));
+    g_gsPending.clear();
+    if (g_gsWaiting)
+        g_gsWake.notify_one();
 }
 
 // XGKICK: the GIF packet at quadword qaddr of VU1's data memory, tag by tag until a tag with
@@ -737,7 +756,7 @@ std::mutex g_renderLock;
 std::condition_variable g_renderWake, g_renderIdle;
 std::deque<RenderItem> g_renderQueue;
 std::vector<std::vector<std::uint32_t>> g_renderSpare;   // emptied items' buffers, for reuse
-bool g_renderBusy;
+bool g_renderBusy, g_renderWaiting;
 std::atomic<bool> g_renderStarted;
 std::atomic<std::uint64_t> g_renderQueuedWords, g_renderMaxQueued;
 
@@ -765,7 +784,8 @@ void Enqueue(RenderItem&& item)
     if (q > g_renderMaxQueued)
         g_renderMaxQueued = q;
     g_renderQueue.push_back(std::move(item));
-    g_renderWake.notify_one();
+    if (g_renderWaiting)
+        g_renderWake.notify_one();
 }
 
 // The sinks: straight into VIF and GIF, or into an item.
@@ -944,9 +964,12 @@ void GsThreadMain()
         {
             std::unique_lock<std::mutex> lk(g_gsLock);
             g_gsBusy = false;
-            if (g_gsQueue.empty())
+            if (g_gsQueue.empty()) {
                 g_gsIdle.notify_all();
-            g_gsWake.wait(lk, [] { return !g_gsQueue.empty(); });
+                g_gsWaiting = true;
+                g_gsWake.wait(lk, [] { return !g_gsQueue.empty(); });
+                g_gsWaiting = false;
+            }
             item = std::move(g_gsQueue.front());
             g_gsQueue.pop_front();
             g_gsBusy = true;
@@ -975,9 +998,12 @@ void RenderThreadMain()
         {
             std::unique_lock<std::mutex> lk(g_renderLock);
             g_renderBusy = false;
-            if (g_renderQueue.empty())
+            if (g_renderQueue.empty()) {
                 g_renderIdle.notify_all();
-            g_renderWake.wait(lk, [] { return !g_renderQueue.empty(); });
+                g_renderWaiting = true;
+                g_renderWake.wait(lk, [] { return !g_renderQueue.empty(); });
+                g_renderWaiting = false;
+            }
             item = std::move(g_renderQueue.front());
             g_renderQueue.pop_front();
             g_renderQueuedWords -= item.words.size();
@@ -1016,6 +1042,7 @@ void RenderThreadMain()
             }
             break;
         }
+        GsPassOn();
         if (item.words.capacity()) {
             std::lock_guard<std::mutex> lk(g_renderLock);
             if (g_renderSpare.size() < 64)
