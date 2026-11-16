@@ -74,6 +74,17 @@ std::mutex g_kernel;
 Thread g_threads[kThreads];
 Sema g_semas[kSemaphores];
 int g_current = kIdle;        // the game thread that runs, or none
+std::uint64_t g_idleSince, g_idleNs;   // how long no game thread has run, for the report
+
+// The running game thread changes (under g_kernel): the time with none running is counted.
+void SetCurrent(int next)
+{
+    if (g_current == kIdle && next != kIdle && g_idleSince)
+        g_idleNs += NowNs() - g_idleSince;
+    if (next == kIdle && g_current != kIdle)
+        g_idleSince = NowNs();
+    g_current = next;
+}
 
 // Each stack has a guard above it, filled with a pattern: game code has been seen writing above
 // its thread's first frame, which on the Switch reached the kernel's globals the linker put after
@@ -144,7 +155,7 @@ void Switch(std::unique_lock<std::mutex>& lk)
     int next = Pick();
     if (next == self)
         return;
-    g_current = next;
+    SetCurrent(next);
     if (next != kIdle)
         g_threads[next].cv.notify_one();
     g_threads[self].cv.wait(lk, [self] { return g_current == self; });
@@ -155,7 +166,7 @@ void MakeReady(std::unique_lock<std::mutex>& lk, int id, bool fromGameThread)
 {
     g_threads[id].state = Ready;
     if (g_current == kIdle) {
-        g_current = id;
+        SetCurrent(id);
         g_threads[id].cv.notify_one();
     } else if (g_threads[id].priority < g_threads[g_current].priority) {
         if (fromGameThread)
@@ -191,7 +202,7 @@ void RunGameThread(int id)
         g_threads[id].stack = -1;
     }
     int next = Pick();
-    g_current = next;
+    SetCurrent(next);
     if (next != kIdle)
         g_threads[next].cv.notify_one();
 }
@@ -238,7 +249,7 @@ void KernelStartMainThread()
     std::lock_guard<std::mutex> lk(g_kernel);
     g_threads[1].state = Ready;
     g_threads[1].priority = 1;
-    g_current = 1;
+    SetCurrent(1);
     t_self = 1;
 }
 
@@ -247,6 +258,7 @@ std::int32_t CurrentThreadId() { return t_self; }
 // The kernel's threads, for a diagnosis when the port stops: state, priority, what each waits on.
 void KernelDump()
 {
+    std::fprintf(stderr, "kernel: no game thread ran for %.2f s\n", g_idleNs / 1e9);
     for (int s = 0; s < 8; s++)
         CheckStackGuard(s, "the kernel's report");
     static const char* kStates[] = {"free", "dormant", "ready", "waiting", "ended"};
@@ -421,7 +433,7 @@ s32 EndOwnThread()
             g_threads[self].stack = -1;
         }
         int next = Pick();
-        g_current = next;
+        SetCurrent(next);
         if (next != kIdle)
             g_threads[next].cv.notify_one();
     }

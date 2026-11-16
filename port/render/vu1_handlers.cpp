@@ -162,7 +162,64 @@ struct LitVertex {
 // leaves a triangle wholly beyond the far plane, or one a strip's start closes, unmarked.
 enum class Test { Guard274, Far28E };
 
-bool BatchTransform(Runner& r, const int stride, const Test test, const std::uint32_t endPc)
+// The VU's arithmetic with its rules applied (E) or as the host does it: the game's thread
+// rounds toward zero (so an overflow is the largest finite float, as on the VU) and flushes
+// denormals to signed zeros (as the VU reads and writes them), so the two agree whenever no
+// input has the largest exponent or is a denormal; a handler scans its inputs to choose.
+template <bool E> inline F4 M4(F4 a, F4 b) { if (E) return Mul4(a, b); return a * b; }
+template <bool E> inline F4 A4(F4 a, F4 b) { if (E) return Add4(a, b); return a + b; }
+template <bool E> inline float M1(float a, float b) { if (E) return Mul(a, b); return a * b; }
+template <bool E> inline float A1(float a, float b) { if (E) return Add(a, b); return a + b; }
+template <bool E> inline float S1(float a, float b) { if (E) return Sub(a, b); return a - b; }
+template <bool E> inline float Mini1(float a, float b) { if (E) return Mini(a, b); return a < b ? a : b; }
+template <bool E> V TransformT(const V* m, const V& p)
+{
+    V o;
+    F4 acc = M4<E>(m[0].v, Splat(p.x));
+    acc = A4<E>(acc, M4<E>(m[1].v, Splat(p.y)));
+    acc = A4<E>(acc, M4<E>(m[2].v, Splat(p.z)));
+    o.v = A4<E>(acc, M4<E>(m[3].v, Splat(1.0f)));
+    return o;
+}
+template <bool E> std::uint32_t ClipCodeT(const V& p)
+{
+    if (E)
+        return ClipCode(p);
+    float wv = std::fabs(p.w);
+    std::uint32_t j = 0;
+    for (int k = 0; k < 3; k++) {
+        if (p[k] > wv)
+            j |= 1u << (2 * k);
+        if (p[k] < -wv)
+            j |= 2u << (2 * k);
+    }
+    return j;
+}
+
+// Whether every field of the n quadwords at qaddr is an ordinary float (neither the largest
+// exponent nor a denormal), so that the host's arithmetic gives the VU's results.
+bool Ordinary(Runner& r, std::uint16_t qaddr, int n, int stride = 1)
+{
+    std::uint32_t bad = 0;
+    for (int k = 0; k < n; k++) {
+        const std::uint32_t* q = reinterpret_cast<const std::uint32_t*>(r.Qword((std::uint16_t)(qaddr + k * stride)));
+        for (int c = 0; c < 4; c++) {
+            std::uint32_t e = q[c] & 0x7F800000u;
+            bad |= (e == 0x7F800000u) | (e == 0 && (q[c] & 0x007FFFFFu) != 0);
+        }
+    }
+    return bad == 0;
+}
+constexpr int kEdgeRegs[3] = {24, 29, 14};
+
+bool OrdinaryField(float f)
+{
+    std::uint32_t b = Bits(f), e = b & 0x7F800000u;
+    return e != 0x7F800000u && !(e == 0 && (b & 0x007FFFFFu) != 0);
+}
+
+template <bool E>
+bool BatchTransformT(Runner& r, const int stride, const Test test, const std::uint32_t endPc)
 {
     State& st = r.s;
     std::uint16_t top = (std::uint16_t)r.ctx.top;
@@ -181,14 +238,14 @@ bool BatchTransform(Runner& r, const int stride, const Test test, const std::uin
     V m[4] = {Load(r, top + 14), Load(r, top + 15), Load(r, top + 16), Load(r, top + 17)};
     V params = Load(r, top + 8);
     V scale = Load(r, 0), offset = Load(r, 1);
-    scale.w = Mul(1.0f, params.y);
+    scale.w = M1<E>(1.0f, params.y);
     V zero;   // vf09, and vf07 before its w
-    zero.v = F4{Sub(0.0f, 0.0f), Sub(0.0f, 0.0f), Sub(0.0f, 0.0f), Sub(1.0f, 1.0f)};
+    zero.v = F4{S1<E>(0.0f, 0.0f), S1<E>(0.0f, 0.0f), S1<E>(0.0f, 0.0f), S1<E>(1.0f, 1.0f)};
     V backface = zero;
     if (Half(Load(r, top + 9).z) != 0)
-        backface.w = Add(zero.w, 16384.0f);
-    params.x = Add(params.x, 32768.0f);
-    const float wOutside = Add(zero.w, params.x), wToClip = Add(zero.w, params.w);
+        backface.w = A1<E>(zero.w, 16384.0f);
+    params.x = A1<E>(params.x, 32768.0f);
+    const float wOutside = A1<E>(zero.w, params.x), wToClip = A1<E>(zero.w, params.w);
     const std::uint16_t lastCheck = (std::uint16_t)(end - stride);
 
     // Every vertex the loop touches: the batch's n and the four after it it reads ahead.
@@ -203,18 +260,18 @@ bool BatchTransform(Runner& r, const int stride, const Test test, const std::uin
         x.late = false;
         if (k > n + 2)
             continue;   // the last read ahead is only loaded
-        x.p = Transform(m, x.pos);
-        x.code = ClipCode(x.p);
+        x.p = TransformT<E>(m, x.pos);
+        x.code = ClipCodeT<E>(x.p);
         float q = Reciprocal(r, x.p.w);
         x.pClamped = x.p;
-        x.pClamped.w = Mini(x.p.w, params.z);
+        x.pClamped.w = Mini1<E>(x.p.w, params.z);
         x.tq = x.stq;
         x.tq.w = x.p.w;
         if (k > n + 1)
             continue;   // its divide is not reached
-        x.tq.v = Mul4(x.stq.v, Splat(q));
+        x.tq.v = M4<E>(x.stq.v, Splat(q));
         x.tq.w = x.p.w;
-        x.pq.v = Mul4(x.pClamped.v, Splat(q));
+        x.pq.v = M4<E>(x.pClamped.v, Splat(q));
     }
     for (int k = 0; k < n + 3; k++) {
         LitVertex& x = v[k];
@@ -241,7 +298,7 @@ bool BatchTransform(Runner& r, const int stride, const Test test, const std::uin
                 r.Qword(top + 13)[2] = FromBits(1);
             }
         }
-        x.s.v = Add4(Mul4(x.pq.v, scale.v), Mul4(x.f.v, Splat(1.0f)));
+        x.s.v = A4<E>(M4<E>(x.pq.v, scale.v), M4<E>(x.f.v, Splat(1.0f)));
     }
 
     // The blocks: vertex k stored, the edge to k + 1, the backface of k by the cross product the
@@ -256,13 +313,13 @@ bool BatchTransform(Runner& r, const int stride, const Test test, const std::uin
         V& cur = edge[k & 3];
         const V& prev = edge[(k + 3) & 3];
         if (!x.late) {
-            cur.x = Sub(v[k + 1].s.x, x.s.x);
-            cur.y = Sub(v[k + 1].s.y, x.s.y);
+            cur.x = S1<E>(v[k + 1].s.x, x.s.x);
+            cur.y = S1<E>(v[k + 1].s.y, x.s.y);
         }
         if (x.late || negative)
-            x.s.w = Add(x.s.w, backface.w);
-        float cross = (k & 1) ? Sub(Mul(cur.x, prev.y), Mul(prev.x, cur.y))
-                              : Sub(Mul(prev.x, cur.y), Mul(cur.x, prev.y));
+            x.s.w = A1<E>(x.s.w, backface.w);
+        float cross = (k & 1) ? S1<E>(M1<E>(cur.x, prev.y), M1<E>(prev.x, cur.y))
+                              : S1<E>(M1<E>(prev.x, cur.y), M1<E>(cur.x, prev.y));
         negative = std::signbit(cross) && cross != 0.0f;
         std::uint16_t at = (std::uint16_t)(first + stride * k);
         Store(r, at, x.tq);
@@ -305,6 +362,26 @@ bool BatchTransform(Runner& r, const int stride, const Test test, const std::uin
     st.clip = codes;
     st.pc = endPc;
     return true;
+}
+
+bool BatchTransform(Runner& r, const int stride, const Test test, const std::uint32_t endPc)
+{
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    V hdr = Load(r, top + 11);
+    std::uint16_t first = (std::uint16_t)(top + Half(hdr.x));
+    std::uint16_t span = (std::uint16_t)(Half(hdr.y) - Half(hdr.x));
+    bool plain = span != 0 && span % stride == 0 && span / stride <= 256 && Ordinary(r, top + 14, 4) &&
+                 Ordinary(r, top + 8, 1) && Ordinary(r, 0, 2);
+    if (plain) {
+        int n = span / stride;
+        for (int k = 0; k < n + 4 && plain; k++) {
+            std::uint16_t at = (std::uint16_t)(first + stride * k);
+            plain = Ordinary(r, at, 1) && Ordinary(r, (std::uint16_t)(at + stride - 1), 1);
+        }
+        for (int e : kEdgeRegs)
+            plain = plain && OrdinaryField(r.s.vf[e][0]) && OrdinaryField(r.s.vf[e][1]);
+    }
+    return plain ? BatchTransformT<false>(r, stride, test, endPc) : BatchTransformT<true>(r, stride, test, endPc);
 }
 
 bool LitBatchTransform(Runner& r) { return BatchTransform(r, 4, Test::Guard274, 0x3D4); }

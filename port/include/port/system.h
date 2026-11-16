@@ -12,6 +12,8 @@ std::uint32_t Cop0Status();
 // The EE's cycle counter: 294,912,000 counts a second, from the port's clock (in a deterministic
 // run, from the frame count).
 std::uint64_t CycleCount();
+// A monotonic clock in nanoseconds, cheap to read (the Switch's CPU counter, no system call).
+std::uint64_t NowNs();
 // The id of the game thread that is running.
 std::int32_t CurrentThreadId();
 // The EE's float rules on the calling thread: rounding toward zero, denormals flushed.

@@ -42,7 +42,7 @@ constexpr int kCauseGs = 0, kCauseVif0 = 4, kCauseVif1 = 5;
 
 struct Counts {
     std::atomic<unsigned> chains{0}, tags{0}, vifInterrupts{0}, finishes{0}, unknownVifcodes{0}, sprChains{0};
-    std::atomic<std::uint64_t> vu1Instructions{0}, path1Packets{0}, vu1Nanoseconds{0};
+    std::atomic<std::uint64_t> vu1Instructions{0}, path1Packets{0}, vu1Nanoseconds{0}, dmaNanoseconds{0};
 } g_counts;
 
 // SLY1_RENDER_SURVEY: what the renderer must handle (docs/RENDERER.md), printed by DmacDump.
@@ -323,11 +323,10 @@ private:
                     c.kick = KickPath1;
                     dbf_ = !dbf_;
                     tops_ = (base_ + (dbf_ ? ofst_ : 0)) & 0x3FF;
-                    auto t0 = std::chrono::steady_clock::now();
+                    std::uint64_t t0 = NowNs();
                     std::uint64_t n = vu1::Run(cmd == 0x17 ? vu1::Vu1().pc : (imm & 0x7FF), c);
                     g_counts.vu1Instructions += n;
-                    g_counts.vu1Nanoseconds += (std::uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now() - t0).count();
+                    g_counts.vu1Nanoseconds += NowNs() - t0;
                 }
                 break;
             case 0x01:   // STCYCL
@@ -645,7 +644,17 @@ void RunFromSprChain(std::uint32_t regs)
     r[0] &= ~0x100u;
 }
 
+void RunDmaChainTimed(std::uint32_t regs, std::uint32_t tadr);
+
+// Every chain, timed for the report.
 void RunDmaChain(std::uint32_t regs, std::uint32_t tadr)
+{
+    std::uint64_t t0 = NowNs();
+    RunDmaChainTimed(regs, tadr);
+    g_counts.dmaNanoseconds += NowNs() - t0;
+}
+
+void RunDmaChainTimed(std::uint32_t regs, std::uint32_t tadr)
 {
     volatile std::uint32_t* r = static_cast<volatile std::uint32_t*>(Native(regs));
     Vif* vif = regs == kVif0 ? &g_vif0 : regs == kVif1 ? &g_vif1 : nullptr;
@@ -742,6 +751,7 @@ void DmacDump()
                  (unsigned long long)g_counts.vu1Instructions.load(), g_counts.vu1Nanoseconds.load() / 1e9,
                  g_counts.vu1Nanoseconds.load() ? g_counts.vu1Instructions.load() * 1e3 / g_counts.vu1Nanoseconds.load() : 0.0,
                  (unsigned long long)vu1::TranslatedInstructions(), (unsigned long long)g_counts.path1Packets.load());
+    std::fprintf(stderr, "dmac: chains took %.2f s in all (VU1 and the GS within them)\n", g_counts.dmaNanoseconds.load() / 1e9);
     vu1::ReportLive();
     std::uint64_t failures = 0, checked = vu1::HandlerChecks(&failures);
     if (checked)

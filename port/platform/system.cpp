@@ -4,6 +4,9 @@
 #include "port/retail_data.h"
 
 #include <chrono>
+#if defined(__SWITCH__)
+#include <switch.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 
@@ -13,12 +16,21 @@ namespace port {
 
 std::uint32_t Cop0Status() { return 0x10001; }
 
+std::uint64_t NowNs()
+{
+#if defined(__SWITCH__)
+    return armTicksToNs(armGetSystemTick());
+#else
+    using namespace std::chrono;
+    return (std::uint64_t)duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count();
+#endif
+}
+
 std::uint64_t CycleCount()
 {
-    using namespace std::chrono;
-    static const steady_clock::time_point start = steady_clock::now();
-    auto ns = duration_cast<nanoseconds>(steady_clock::now() - start).count();
-    return std::uint64_t(ns) * 294912 / 1000000;   // 294.912 MHz
+    static const std::uint64_t start = NowNs();
+    std::uint64_t ns = NowNs() - start;
+    return ns * 294912 / 1000000;   // 294.912 MHz
 }
 
 }  // namespace port

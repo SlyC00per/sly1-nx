@@ -16,6 +16,7 @@
 // old value (WAITQ and WAITP wait, and stall the upper operation beside them too). Register results otherwise follow in order, as the VU's
 // interlocks make them.
 #include "port/vu1.h"
+#include "port/system.h"
 
 #include <cmath>
 #include <cstdio>
@@ -57,7 +58,21 @@ int g_owner[2048];   // the index of the chunk installed there, or -1
 bool g_tableReady;
 std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> g_profile;   // SLY1_VU1_PROFILE
 std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> g_profileCalls;
-std::uint64_t g_handlerNs[64], g_handlerCalls[64], g_fallbacks[64];
+std::uint64_t g_handlerNs[64], g_handlerCalls[64], g_fallbacks[64], g_handlerKickNs[64];
+
+// SLY1_VU1_PROFILE: a kick passed on and timed, to tell the GS's share from the handler's.
+struct TimedKick {
+    const Context* real;
+    std::uint64_t* ns;
+};
+void KickTimed(std::uint32_t qaddr, void* user)
+{
+    TimedKick* t = static_cast<TimedKick*>(user);
+    std::uint64_t t0 = NowNs();
+    if (t->real->kick)
+        t->real->kick(qaddr, t->real->user);
+    *t->ns += NowNs() - t0;
+}
 std::map<std::uint32_t, std::uint64_t> g_stretch;
 std::uint64_t g_translatedRun;
 
@@ -283,12 +298,16 @@ std::uint64_t Run(std::uint32_t start, const Context& ctx)
         static const bool profile = std::getenv("SLY1_VU1_PROFILE") != nullptr;
         if (!profile)
             return h->fn(r) ? 0 : Interpret(start, ctx);
-        auto t0 = std::chrono::steady_clock::now();
-        bool done = h->fn(r);
+        TimedKick tk{&ctx, &g_handlerKickNs[h - kHandlers]};
+        Context timed = ctx;
+        timed.kick = KickTimed;
+        timed.user = &tk;
+        Runner rt(timed);
+        std::uint64_t t0 = NowNs();
+        bool done = h->fn(rt);
         if (!done)
             g_fallbacks[h - kHandlers]++;
-        g_handlerNs[h - kHandlers] += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                          std::chrono::steady_clock::now() - t0).count();
+        g_handlerNs[h - kHandlers] += NowNs() - t0;
         g_handlerCalls[h - kHandlers]++;
         return done ? 0 : Interpret(start, ctx);
     }
@@ -349,9 +368,9 @@ void ReportLive()
     std::sort(rows.rbegin(), rows.rend());
     for (std::size_t k = 0; k < kHandlerCount && k < 64; k++)
         if (g_handlerCalls[k])
-            std::fprintf(stderr, "vu1 profile: handler %s: %llu calls (%llu left to the microcode), %.3f s\n",
+            std::fprintf(stderr, "vu1 profile: handler %s: %llu calls (%llu left to the microcode), %.3f s, %.3f s of it in kicks\n",
                          kHandlers[k].name, (unsigned long long)g_handlerCalls[k], (unsigned long long)g_fallbacks[k],
-                         g_handlerNs[k] / 1e9);
+                         g_handlerNs[k] / 1e9, g_handlerKickNs[k] / 1e9);
     for (const auto& row : rows)
         std::fprintf(stderr, "vu1 profile: chunk %08X entry 0x%03X: %llu instructions (%.1f%%) in %llu calls\n",
                      row.second.first, row.second.second, (unsigned long long)row.first,
