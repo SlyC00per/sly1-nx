@@ -76,6 +76,17 @@ inline float FDiv(float a, float b)
 }
 inline float& FDivAssign(float& a, float b) { return a = FDiv(a, b); }
 
+// The level stream's state when a load closes it (instrumentation for --verify-levels): its
+// unread decompressed bytes, compressed bytes not yet read, read but not yet unpacked, carried.
+// The state of each level load's stream when it closes (milestone 1's byte check,
+// tools/level_bytes.py): the last 16 closes, by count, with the texture block's state.
+struct LevelStreamEnd {
+    int remaining, bytesToRead, nextCount, carry, count, blockSize, blockLoad;
+};
+extern LevelStreamEnd g_levelStreamEnds[16];
+extern std::atomic<int> g_levelStreamCloses;
+void NoteLevelStreamEnd(int remaining, int bytesToRead, int nextCount, int carry);
+
 // A base address as the game's raw-offset macros take it (player.cpp's AT): a pointer as it is, a
 // stored pointer, or a word holding a game address.
 template <class T> inline void* AsAddress(T* p) { return (void*)p; }

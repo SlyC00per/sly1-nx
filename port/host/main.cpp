@@ -14,6 +14,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <pthread.h>
 
@@ -75,6 +76,7 @@ void* Clock(void*)
 // thread only watches and writes the request between loads.
 int g_verifyFrom = -1;
 int g_verifyTo = 46;   // --level N: that level alone
+std::vector<int> g_verifyList;   // --levels a,b,...: these, in this order
 
 void VerifyLevels()
 {
@@ -96,7 +98,11 @@ void VerifyLevels()
         std::fflush(stderr);
         std::_Exit(1);
     };
-    for (int i = g_verifyFrom; i < g_verifyTo; i++) {
+    std::vector<int> order = g_verifyList;
+    if (order.empty())
+        for (int i = g_verifyFrom; i < g_verifyTo; i++)
+            order.push_back(i);
+    for (int i : order) {
         std::uint32_t entry = kLevels + i * 0x2C;
         std::int32_t code = word(entry + 0x20);
         std::uint32_t name = (std::uint32_t)word(entry + 0x24);
@@ -105,6 +111,7 @@ void VerifyLevels()
         auto t0 = std::chrono::steady_clock::now();
         if (!waitFor([&] { return word(kRequest) == 0; }, 120))
             fail("the previous load never ended", i + 1);
+        int closes = port::g_levelStreamCloses.load();
         word(kRequest + 0x04) = (std::int32_t)entry;   // the key: the level's record
         word(kRequest + 0x08) = -1;
         word(kRequest + 0x0C) = -1;
@@ -113,13 +120,22 @@ void VerifyLevels()
         word(kRequest) = 1;
         if (!waitFor([&] { return word(kRequest) == 0; }, 120))
             fail("the load did not end within 120 s", i + 1);
+        // this load's stream, before the level's own play can load another (a story level whose
+        // movie ends at once goes on to the next)
+        // the first close after the request is this level's (one whose movie ends at once goes on
+        // to load the next)
+        waitFor([&] { return port::g_levelStreamCloses.load() != closes; }, 10);
+        port::LevelStreamEnd end = port::g_levelStreamEnds[(closes + 1) % 16];
         std::int32_t frames = word(kFrames);
         if (!waitFor([&] { return word(kFrames) - frames >= 60; }, 60))
             fail("60 frames did not run within 60 s of the load", i + 1);
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "verify: level %2d loaded and ran 60 frames (%.1f s)\n", i + 1, s);
+        std::fprintf(stderr, "verify: level %2d stream at close: %d decompressed bytes unread, %d compressed bytes "
+                     "unread, %d read but not unpacked, %d carried, texture block %d bytes %s\n", i + 1, end.remaining,
+                     end.bytesToRead, end.nextCount, end.carry, end.blockSize, end.blockLoad ? "read" : "kept");
     }
-    std::fprintf(stderr, "verify: all %d levels loaded and ran 60 frames\n", g_verifyTo - g_verifyFrom);
+    std::fprintf(stderr, "verify: all %d levels loaded and ran 60 frames\n", (int)order.size());
     Report();
     std::fflush(stderr);
     std::_Exit(0);
@@ -161,12 +177,24 @@ int main(int argc, char** argv)
             g_verifyFrom = 0;
         else if (!std::strcmp(argv[i], "--from-level") && i + 1 < argc)
             g_verifyFrom = std::atoi(argv[++i]) - 1;
+        else if (!std::strcmp(argv[i], "--levels") && i + 1 < argc) {
+            for (char* s = argv[++i]; *s;) {
+                int n = (int)std::strtol(s, &s, 10);
+                if (n >= 1 && n <= 46)
+                    g_verifyList.push_back(n - 1);
+                if (*s == ',')
+                    s++;
+                else if (*s)
+                    break;
+            }
+            g_verifyFrom = 0;
+        }
         else if (!std::strcmp(argv[i], "--level") && i + 1 < argc) {
             g_verifyFrom = std::atoi(argv[++i]) - 1;
             g_verifyTo = g_verifyFrom + 1;
         }
         else {
-            std::fprintf(stderr, "usage: %s --iso DISC.iso [--seconds N] [--save FOLDER] [--verify-levels [--from-level N] | --level N]\n", argv[0]);
+            std::fprintf(stderr, "usage: %s --iso DISC.iso [--seconds N] [--save FOLDER] [--verify-levels [--from-level N] | --level N | --levels A,B,...]\n", argv[0]);
             return 2;
         }
     }

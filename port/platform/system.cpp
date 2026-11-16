@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The platform layer's system state (port/system.h) and the VU0 microprogram stand-in.
 #include "port/system.h"
+#include "port/retail_data.h"
 
 #include <chrono>
 #include <cstdio>
@@ -34,3 +35,17 @@ void Microprogram(const char* what)
 }
 
 }  // namespace port_vu0
+
+namespace port {
+LevelStreamEnd g_levelStreamEnds[16];
+std::atomic<int> g_levelStreamCloses{0};
+
+void NoteLevelStreamEnd(int remaining, int bytesToRead, int nextCount, int carry)
+{
+    int n = g_levelStreamCloses.load() + 1;
+    // ReadBufferedBlockHeader's g_bufferedBlockSize and g_bufferedBlockLoad
+    g_levelStreamEnds[n % 16] = {remaining, bytesToRead, nextCount, carry, n,
+                                 *(std::int32_t*)Native(0x275720), *(std::int32_t*)Native(0x27571C)};
+    g_levelStreamCloses.store(n);
+}
+}  // namespace port

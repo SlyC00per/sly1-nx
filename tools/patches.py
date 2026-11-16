@@ -185,6 +185,15 @@ PATCHES = [
      "    struct Tri { s32 i[3]; } *tris;",
      "    struct Tri { s32 i[3]; };\n    Tri* tris;",
      "the mesh motion record's face triples are a stored pointer, 4 bytes as in retail"),
+
+    # Instrumentation, no change to the game: the level stream's state when the load closes it,
+    # for --verify-levels's check that a load consumes the bytes docs/DISC.md gives.
+    ("src/main/on_off_object.cpp",
+     "            g_currentWorld->desc->m0A(g_currentWorld, &sub);\n            CloseBufferedStream(&sub);",
+     "            g_currentWorld->desc->m0A(g_currentWorld, &sub);\n"
+     "            port::NoteLevelStreamEnd(sub.remaining, sub.bytesToRead, sub.nextCount, sub.unpackCarry);\n"
+     "            CloseBufferedStream(&sub);",
+     "records where the level's load left its stream (instrumentation only)"),
     ('src/main/gauge_collider.cpp',
      '                Vec4 pair[2];\n                Vec4 in = dir;\n',
      "                // port: retail's frame put `in` right after pair, and ComputeOscillatorDisplacement\n                // reads three deltas from pair: the third is `in`.\n                Vec4 pair[3];\n                pair[2] = dir;\n                Vec4& in = pair[2];\n",

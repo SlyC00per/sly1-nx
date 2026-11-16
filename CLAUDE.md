@@ -65,6 +65,11 @@ Fill these in as the build takes shape; keep them current. They must work on mac
   Saves go to `--save FOLDER` (default `save/`, gitignored); `SLY1_CARD_TRACE=1` prints every
   memory card request.
 - Every level on its own, in parallel, failures grouped: `python3 tools/verify_parallel.py --iso <path> [--jobs 8]`.
+  `sly1_headless --levels 3,2` verifies the given levels in that order.
+- Milestone 1's byte check (each load reads exactly its level's bytes, from the disc's own
+  decompressed files): `python3 tools/level_bytes.py --iso <path> build-host/verify/level-*.log`.
+  A level loaded right after itself keeps its texture block, as retail does, and is checked
+  from a run that loads it after another level.
 - The room audit (which widened locals are reached past their size): build `build-audit` with
   `-DSLY1_ROOM_AUDIT=ON`, then `python3 tools/room_audit.py --iso <path>`.
 - Switch: `cmake -B build-switch -DCMAKE_TOOLCHAIN_FILE=$DEVKITPRO/cmake/Switch.cmake -G Ninja && cmake --build build-switch`
