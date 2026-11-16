@@ -2049,6 +2049,123 @@ bool Particles(Runner& r)
     return true;
 }
 
+// --- 0x411 of chunk 2DDC9AA2: a batch's normals skinned and laid out four at a time.
+//
+// From TOP: 11.x and 11.y the vertices (four quadwords, the normal in quadword 0), 11.z the four
+// matrices, 11.w the weights. Each normal goes through the four matrices' 3x3 parts, blended by
+// its weights, is made unit length (ERLENG) and joins vf25, vf26 and vf27 (x, y and z of four
+// normals, the newest in w, MR32 moving the others along); every four, they and vf28 (zero) are
+// stored over quadword 0 of the group's four vertices, for 0x0FE. The loop is pipelined two
+// deep: it runs two passes past the end, and P, read by MFP ten instructions after the ERLENG
+// before it, holds the ERLENG of two passes back (the first two passes read the P, and divide the
+// vf29 and vf30, a program before left). A last group short of four is rotated into place and
+// stored as it is.
+bool SkinNormals(Runner& r)
+{
+    State& st = r.s;
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    V hdr = Load(r, top + 11);
+    std::uint16_t vi05 = (std::uint16_t)(top + Half(hdr.x)), vi06 = (std::uint16_t)(top + Half(hdr.y) + 8);
+    std::uint16_t span = (std::uint16_t)(vi06 - vi05);
+    if (span == 0 || (span & 3) || span > 0x400)
+        return false;
+    float (*vf)[4] = st.vf;
+    auto g = [&](int k) { V x; std::memcpy(&x, vf[k], 16); return x; };
+    auto p = [&](int k, const V& x, int mask) {
+        for (int c = 0; c < 4; c++)
+            if (mask & (8 >> c))
+                vf[k][c] = x[c];
+    };
+    const int XYZ = 14, XYZW = 15;
+    std::uint16_t mats = (std::uint16_t)(top + Half(hdr.z)), vi08 = (std::uint16_t)(top + Half(hdr.w));
+    for (int k = 0; k < 16; k++)
+        p(4 + k, Load(r, (std::uint16_t)(mats + k)), XYZW);
+    p(2, Load(r, vi05), XYZ);
+    p(3, Load(r, vi08), XYZW);
+    vi08 = (std::uint16_t)(vi08 + 1);
+    V zero;
+    zero.v = F4{Sub(0.0f, 0.0f), Sub(0.0f, 0.0f), Sub(0.0f, 0.0f), Sub(1.0f, 1.0f)};
+    p(28, zero, XYZW);
+    int vi09 = 6;
+    float visible = st.p;   // what MFP reads
+    float pending = 0.0f;   // the ERLENG issued in the pass before, not yet done
+    bool havePending = false;
+    auto mr32 = [&](int k) {
+        V x = g(k), y;
+        for (int c = 0; c < 4; c++)
+            y[c] = x[(c + 1) & 3];
+        p(k, y, XYZW);
+    };
+    auto turn = [&](int row, const V& n) {
+        F4 acc = Mul4(g(row).v, Splat(n.x));
+        acc = Add4(acc, Mul4(g(row + 1).v, Splat(n.y)));
+        V o;
+        o.v = Add4(acc, Mul4(g(row + 2).v, Splat(n.z)));
+        return o;
+    };
+    do {
+        mr32(25);
+        mr32(26);
+        mr32(27);
+        V n = g(2);
+        p(20, turn(4, n), XYZ);
+        p(21, turn(8, n), XYZ);
+        p(22, turn(12, n), XYZ);
+        vf[24][0] = visible;
+        p(23, turn(16, n), XYZ);
+        {
+            V u = g(30);
+            V o;
+            o.v = Mul4(u.v, Splat(vf[24][0]));
+            p(2, o, XYZ);
+        }
+        vi09--;
+        V w = g(3);
+        F4 acc = Mul4(g(20).v, Splat(w.x));
+        acc = Add4(acc, Mul4(g(21).v, Splat(w.y)));
+        acc = Add4(acc, Mul4(g(22).v, Splat(w.z)));
+        V blend;
+        blend.v = Add4(acc, Mul4(g(23).v, Splat(w.w)));
+        p(30, g(29), XYZW);
+        p(29, blend, XYZ);
+        vf[25][3] = Add(vf[28][3], vf[2][0]);
+        vf[26][3] = Add(vf[28][3], vf[2][1]);
+        vf[27][3] = Add(vf[28][3], vf[2][2]);
+        vi05 = (std::uint16_t)(vi05 + 4);
+        if (vi09 == 0) {
+            Store(r, (std::uint16_t)(vi05 - 12), g(28));
+            Store(r, (std::uint16_t)(vi05 - 24), g(25));
+            Store(r, (std::uint16_t)(vi05 - 20), g(26));
+            Store(r, (std::uint16_t)(vi05 - 16), g(27));
+            vi09 = 4;
+        }
+        p(2, Load(r, vi05), XYZ);
+        p(3, Load(r, vi08), XYZW);
+        vi08 = (std::uint16_t)(vi08 + 1);
+        // the ERLENG of the pass before is done by the next MFP; this one is not
+        if (havePending)
+            visible = pending;
+        pending = Erleng(g(29));
+        havePending = true;
+    } while (vi05 != vi06);
+    st.p = pending;
+    if (vi09 - 4 < 0) {
+        do {
+            mr32(25);
+            mr32(26);
+            mr32(27);
+            vi09--;
+            vi05 = (std::uint16_t)(vi05 + 4);
+        } while (vi09 != 0);
+        Store(r, (std::uint16_t)(vi05 - 24), g(25));
+        Store(r, (std::uint16_t)(vi05 - 20), g(26));
+        Store(r, (std::uint16_t)(vi05 - 16), g(27));
+        Store(r, (std::uint16_t)(vi05 - 12), g(28));
+    }
+    st.pc = 0x45C;
+    return true;
+}
+
 }  // namespace
 
 // Every VF register but vf00 and vf01, and P: what the lights' handlers are compared on.
@@ -2084,6 +2201,7 @@ const HandlerEntry kHandlers[] = {
     {0x7B92AF0F, 0x26D, Outlines, "outlines", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "P clip"},
     {0xE1624411, 0x076, Sprites, "sprites", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I"},
     {0x1AE4A8D6, 0x110, Particles, "particles", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q P I clip"},
+    {0x2DDC9AA2, 0x411, SkinNormals, "skinned normals", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "P"},
     {0xE1624411, 0x01E, BatchSecond, "lit batch second pass", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I clip"},
 };
 const std::size_t kHandlerCount = sizeof kHandlers / sizeof kHandlers[0];
