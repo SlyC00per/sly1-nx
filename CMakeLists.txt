@@ -176,12 +176,13 @@ add_custom_command(OUTPUT ${GEN_DIR}/vu1_programs.cpp
     DEPENDS ${CMAKE_SOURCE_DIR}/tools/vu1_translate.py ${CMAKE_SOURCE_DIR}/tools/level_bytes.py
     COMMENT "Translating the game's VU1 microcode (tools/vu1_translate.py)"
     VERBATIM)
-add_library(port_render STATIC port/render/vu1.cpp port/render/vu1_handlers.cpp port/render/gs.cpp ${GEN_DIR}/vu1_programs.cpp)
+add_library(port_render STATIC port/render/vu1.cpp port/render/vu1_handlers.cpp port/render/vu1_live.cpp port/render/gs.cpp ${GEN_DIR}/vu1_programs.cpp)
 target_include_directories(port_render PRIVATE port/include port/render)
-target_compile_options(port_render PRIVATE -Wall -Wextra -Wno-unused-label -Wno-unused-variable)
+# VU arithmetic rounds each operation (port/render/vu1_runner.h): never fused into one.
+target_compile_options(port_render PRIVATE -Wall -Wextra -Wno-unused-label -Wno-unused-variable -ffp-contract=off)
 # The translated microcode, generated from the core the interpreter runs: optimised and without
 # the sanitizers' checks in every build (instrumented, its inlined instructions came to 290 MB).
-set_source_files_properties(${GEN_DIR}/vu1_programs.cpp PROPERTIES COMPILE_OPTIONS "-O2;-fno-sanitize=all")
+set_source_files_properties(${GEN_DIR}/vu1_programs.cpp PROPERTIES COMPILE_OPTIONS "-O2;-fno-sanitize=all;-ffp-contract=off")
 
 # The game's hand-written assembly functions, in C++ (port/game_asm), with the game's headers.
 add_library(port_game_asm STATIC port/game_asm/game_asm.cpp)

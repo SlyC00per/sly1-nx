@@ -13,7 +13,7 @@
 // Timing, where the game's code is scheduled around it: the MAC, status and clip flags an
 // operation sets are seen four instructions later; DIV, SQRT and RSQRT write Q after 7, 7 and 13,
 // the EFU's operations write P after their latencies, and a read of Q or P before then sees the
-// old value (WAITQ and WAITP wait). Register results otherwise follow in order, as the VU's
+// old value (WAITQ and WAITP wait, and stall the upper operation beside them too). Register results otherwise follow in order, as the VU's
 // interlocks make them.
 #include "port/vu1.h"
 
@@ -24,7 +24,11 @@
 
 #include "vu1_runner.h"
 #include "vu1_handlers.h"
+#include "vu1_live.h"
 
+#include <algorithm>
+#include <chrono>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -51,6 +55,8 @@ namespace {
 core::ChunkFn g_table[2048];
 int g_owner[2048];   // the index of the chunk installed there, or -1
 bool g_tableReady;
+std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> g_profile;   // SLY1_VU1_PROFILE
+std::uint64_t g_handlerNs[64], g_handlerCalls[64];
 std::uint64_t g_translatedRun;
 
 std::uint32_t HashWords(const std::uint32_t* w, std::size_t n)
@@ -108,8 +114,15 @@ std::uint64_t Interpret(std::uint32_t start, const Context& ctx)
     s.vi[0] = 0;
     Runner r(ctx);
     std::uint32_t pc = start & 0x7FF;
-    static const bool interpretOnly = std::getenv("SLY1_VU1_INTERPRET") != nullptr;
+    static const bool tracking = live::Enabled();
+    static const bool interpretOnly = tracking || std::getenv("SLY1_VU1_INTERPRET") != nullptr;
+    if (tracking) {
+        int o = g_owner[pc];
+        live::Begin(pc, o < 0 ? 0 : core::kTranslated[o].hash);
+    }
     while (!r.done) {
+        if (tracking)
+            live::Instruction(pc, Micro()[pc * 2 + 1], Micro()[pc * 2], r.cycle);
         if (!interpretOnly && r.branch < 0 && !r.ending && g_table[pc]) {
             std::uint64_t before = r.executed;
             pc = g_table[pc](r, pc);
@@ -121,6 +134,11 @@ std::uint64_t Interpret(std::uint32_t start, const Context& ctx)
             std::fprintf(stderr, "port: a VU1 microprogram from 0x%03X ran without ending\n", start);
             std::abort();
         }
+    }
+    static const bool profile = std::getenv("SLY1_VU1_PROFILE") != nullptr;
+    if (profile) {
+        int o = g_owner[start & 0x7FF];
+        g_profile[{o < 0 ? 0u : core::kTranslated[o].hash, start & 0x7FF}] += r.executed;
     }
     s.pc = pc;
     r.cycle += 64;   // the program's last results settle
@@ -187,31 +205,39 @@ struct Snapshot {
 
 std::uint64_t g_checked, g_checkFailures;
 
-// The first difference between the handler's results and the interpreter's, or empty.
-std::string Compare(const Snapshot& h, const Capture& hc, const Snapshot& i, const Capture& ic)
+// The first difference between the handler's results and the interpreter's, or empty: in what
+// the entry leaves for later programs (its registers named in leaves), the end pc, data memory
+// and the packets kicked.
+std::string Compare(const Snapshot& h, const Capture& hc, const Snapshot& i, const Capture& ic, const live::Set& leaves)
 {
     char buf[200];
-    for (int r = 0; r < 32; r++)
-        for (int k = 0; k < 4; k++)
-            if (std::memcmp(&h.state.vf[r][k], &i.state.vf[r][k], 4)) {
-                std::snprintf(buf, sizeof buf, "vf%02d.%c: handler %08X, interpreter %08X", r, "xyzw"[k],
-                              core::Bits(h.state.vf[r][k]), core::Bits(i.state.vf[r][k]));
-                return buf;
-            }
-    for (int r = 1; r < 16; r++)
-        if (h.state.vi[r] != i.state.vi[r]) {
-            std::snprintf(buf, sizeof buf, "vi%02d: handler %04X, interpreter %04X", r, h.state.vi[r], i.state.vi[r]);
+    auto word = [](const State& st, int bit) -> std::uint32_t {
+        if (bit < live::kVi)
+            return core::Bits(st.vf[bit / 4][bit % 4]);
+        if (bit < live::kAcc)
+            return st.vi[bit - live::kVi];
+        if (bit < live::kQ)
+            return core::Bits(st.acc[bit - live::kAcc]);
+        switch (bit) {
+        case live::kQ: return core::Bits(st.q);
+        case live::kP: return core::Bits(st.p);
+        case live::kI: return core::Bits(st.i);
+        case live::kMac: return st.mac & 0xFFFF;
+        case live::kStatus: return st.status & 0x3F;
+        case live::kSticky: return st.status & 0xFC0;
+        default: return st.clip & 0xFFFFFF;
+        }
+    };
+    for (int b = 0; b < live::kCount; b++) {
+        if (!leaves[b])
+            continue;
+        std::uint32_t a = word(h.state, b), c = word(i.state, b);
+        if (a != c) {
+            char name[16];
+            std::snprintf(buf, sizeof buf, "%s: handler %08X, interpreter %08X", live::Name(b, name, sizeof name), a, c);
             return buf;
         }
-    for (int k = 0; k < 4; k++)
-        if (std::memcmp(&h.state.acc[k], &i.state.acc[k], 4))
-            return std::string("ACC.") + "xyzw"[k];
-    if (std::memcmp(&h.state.q, &i.state.q, 4)) return "Q";
-    if (std::memcmp(&h.state.p, &i.state.p, 4)) return "P";
-    if (std::memcmp(&h.state.i, &i.state.i, 4)) return "I";
-    if (h.state.mac != i.state.mac) return "the MAC flags";
-    if ((h.state.status & 0xFFF) != (i.state.status & 0xFFF)) return "the status flags";
-    if (h.state.clip != i.state.clip) return "the clip flags";
+    }
     if (h.state.pc != i.state.pc) return "the end pc";
     for (std::size_t k = 0; k < h.data.size(); k += 4)
         if (std::memcmp(&h.data[k], &i.data[k], 4)) {
@@ -238,14 +264,22 @@ std::string Compare(const Snapshot& h, const Capture& hc, const Snapshot& i, con
 
 std::uint64_t Run(std::uint32_t start, const Context& ctx)
 {
-    const HandlerEntry* h = HandlerFor(start);
+    static const bool off = std::getenv("SLY1_VU1_NO_HANDLERS") != nullptr;
+    const HandlerEntry* h = live::Enabled() || off ? nullptr : HandlerFor(start);
     static const bool check = std::getenv("SLY1_VU1_CHECK") != nullptr;
     if (!h)
         return Interpret(start, ctx);
     if (!check) {
         Runner r(ctx);
-        h->fn(r);
-        return 0;
+        static const bool profile = std::getenv("SLY1_VU1_PROFILE") != nullptr;
+        if (!profile)
+            return h->fn(r) ? 0 : Interpret(start, ctx);
+        auto t0 = std::chrono::steady_clock::now();
+        bool done = h->fn(r);
+        g_handlerNs[h - kHandlers] += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - t0).count();
+        g_handlerCalls[h - kHandlers]++;
+        return done ? 0 : Interpret(start, ctx);
     }
     // Both, from the same state: the handler's results kept aside, the interpreter's kept.
     Snapshot before;
@@ -256,7 +290,10 @@ std::uint64_t Run(std::uint32_t start, const Context& ctx)
     hctx.user = &hc;
     {
         Runner r(hctx);
-        h->fn(r);
+        if (!h->fn(r)) {   // a case the handler leaves to the microcode
+            before.Restore();
+            return Interpret(start, ctx);
+        }
     }
     Snapshot afterHandler;
     afterHandler.Take();
@@ -270,7 +307,11 @@ std::uint64_t Run(std::uint32_t start, const Context& ctx)
     Snapshot afterInterpreter;
     afterInterpreter.Take();
     g_checked++;
-    std::string diff = Compare(afterHandler, hc, afterInterpreter, ic);
+    static std::vector<live::Set> leaves;
+    if (leaves.empty())
+        for (std::size_t k = 0; k < kHandlerCount; k++)
+            leaves.push_back(live::Parse(kHandlers[k].leaves));
+    std::string diff = Compare(afterHandler, hc, afterInterpreter, ic, leaves[h - kHandlers]);
     if (!diff.empty() && g_checkFailures++ < 20)
         std::fprintf(stderr, "vu1 check: %s (entry 0x%03X): %s\n", h->name, start & 0x7FF, diff.c_str());
     return n;
@@ -281,6 +322,26 @@ std::uint64_t HandlerChecks(std::uint64_t* failures)
     if (failures)
         *failures = g_checkFailures;
     return g_checked;
+}
+
+void ReportLive()
+{
+    if (live::Enabled())
+        live::Report();
+    std::vector<std::pair<std::uint64_t, std::pair<std::uint32_t, std::uint32_t>>> rows;
+    std::uint64_t total = 0;
+    for (const auto& e : g_profile) {
+        rows.push_back({e.second, e.first});
+        total += e.second;
+    }
+    std::sort(rows.rbegin(), rows.rend());
+    for (std::size_t k = 0; k < kHandlerCount && k < 64; k++)
+        if (g_handlerCalls[k])
+            std::fprintf(stderr, "vu1 profile: handler %s: %llu calls, %.3f s\n", kHandlers[k].name,
+                         (unsigned long long)g_handlerCalls[k], g_handlerNs[k] / 1e9);
+    for (const auto& row : rows)
+        std::fprintf(stderr, "vu1 profile: chunk %08X entry 0x%03X: %llu instructions (%.1f%%)\n", row.second.first,
+                     row.second.second, (unsigned long long)row.first, total ? row.first * 100.0 / total : 0.0);
 }
 
 std::uint64_t TranslatedInstructions() { return g_translatedRun; }

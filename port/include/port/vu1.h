@@ -45,6 +45,9 @@ std::uint64_t Run(std::uint32_t pc, const Context& ctx);
 // The handler calls checked against the interpreter (SLY1_VU1_CHECK), and how many differed.
 std::uint64_t HandlerChecks(std::uint64_t* failures);
 
+// SLY1_VU1_LIVE's findings (port/render/vu1_live.h), written to stderr when it is on.
+void ReportLive();
+
 // The instructions run in translated chunks so far.
 std::uint64_t TranslatedInstructions();
 

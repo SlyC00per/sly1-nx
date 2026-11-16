@@ -158,6 +158,28 @@ struct Runner {
     }
     void WaitQ() { if (lateQ.busy && lateQ.at > cycle) cycle = lateQ.at; Q(); }
     void WaitP() { if (lateP.busy && lateP.at > cycle) cycle = lateP.at; P(); }
+    // A lower operation that waits for the divider (WAITQ, or DIV, SQRT, RSQRT while one is
+    // busy) or the EFU (WAITP, or an EFU operation) stalls its whole instruction: the upper
+    // operation beside it reads Q and P after the wait.
+    static int Stalls(std::uint32_t lo)
+    {
+        if (((lo >> 25) & 0x7F) != 0x40 || (lo & 0x3F) < 0x3C)
+            return 0;
+        int o2 = (((lo >> 6) & 31) << 2) | (lo & 3);
+        if (o2 >= 0x38 && o2 <= 0x3B)
+            return 1;
+        if (o2 >= 0x70 && o2 <= 0x7E && o2 != 0x77)
+            return 2;
+        return 0;
+    }
+    __attribute__((always_inline)) void Stall(std::uint32_t lo)
+    {
+        int k = Stalls(lo);
+        if (k == 1)
+            WaitQ();
+        else if (k == 2)
+            WaitP();
+    }
     void SetQ(float v, int latency) { WaitQ(); lateQ = {cycle + (std::uint64_t)latency, v, true}; }
     void SetP(float v, int latency) { WaitP(); lateP = {cycle + (std::uint64_t)latency, v, true}; }
 
@@ -537,6 +559,8 @@ inline void Step(Runner& r, std::uint32_t& pc)
 {
     const std::uint32_t* micro = Micro();
     std::uint32_t lo = micro[pc * 2], hi = micro[pc * 2 + 1];
+    if (!(hi & 0x80000000u))
+        r.Stall(lo);
     Runner::Out up = r.Upper(pc, hi);
     Runner::Out low;
     long next = -1;

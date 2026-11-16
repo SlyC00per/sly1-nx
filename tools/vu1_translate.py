@@ -75,11 +75,20 @@ def target(pc, lo):
     return (pc + 1 + imm) & 0x7FF
 
 
+def stalls(lo, hi):
+    """Whether the lower operation waits for the divider or the EFU (Runner::Stalls)."""
+    if hi & 0x80000000 or (lo >> 25) & 0x7F != 0x40 or (lo & 0x3F) < 0x3C:
+        return False
+    o2 = (((lo >> 6) & 31) << 2) | (lo & 3)
+    return 0x38 <= o2 <= 0x3B or (0x70 <= o2 <= 0x7E and o2 != 0x77)
+
+
 def body(pc, lo, hi):
+    stall = "r.Stall(0x%08Xu); " % lo if stalls(lo, hi) else ""
     lower = ("{ std::uint32_t i = 0x%08Xu; std::memcpy(&r.s.i, &i, 4); }" % lo if hi & 0x80000000
              else "next = r.Lower(0x%03X, 0x%08Xu, low);" % (pc, lo))
-    return ("{ Runner::Out up = r.Upper(0x%03X, 0x%08Xu); Runner::Out low; long next = -1; %s "
-            "r.Write(low); r.Write(up); r.cycle++; r.executed++; t = next; }" % (pc, hi, lower))
+    return ("{ %sRunner::Out up = r.Upper(0x%03X, 0x%08Xu); Runner::Out low; long next = -1; %s "
+            "r.Write(low); r.Write(up); r.cycle++; r.executed++; t = next; }" % (stall, pc, hi, lower))
 
 
 def chunk(addr, words):

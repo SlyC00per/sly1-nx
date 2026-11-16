@@ -15,14 +15,19 @@ namespace port {
 namespace vu1 {
 
 // Runs the entry: leaves the state as the microprogram leaves it at its end (s.pc where MSCNT
-// would go on, the flags, Q and P settled), and kicks through r.ctx.kick as it would.
-typedef void (*Handler)(core::Runner& r);
+// would go on, what later programs read), and kicks through r.ctx.kick as it would. Gives false,
+// having changed nothing, for an input it leaves to the microcode.
+typedef bool (*Handler)(core::Runner& r);
 
 struct HandlerEntry {
     std::uint32_t chunkHash;   // the upload holding the entry (tools/vu1_translate.py's hash)
     std::uint32_t entry;       // the entry, in instructions
     Handler fn;
     const char* name;
+    // What the entry leaves that a later program reads (SLY1_VU1_LIVE's report: the pieces it is
+    // the last writer of when an entry reads them), in port/render/vu1_live.h's names. The handler
+    // leaves these as the microcode does; the other registers it writes are scratch.
+    const char* leaves;
 };
 
 extern const HandlerEntry kHandlers[];

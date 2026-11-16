@@ -676,6 +676,7 @@ void DmacDump()
                  (unsigned long long)g_counts.vu1Instructions.load(), g_counts.vu1Nanoseconds.load() / 1e9,
                  g_counts.vu1Nanoseconds.load() ? g_counts.vu1Instructions.load() * 1e3 / g_counts.vu1Nanoseconds.load() : 0.0,
                  (unsigned long long)vu1::TranslatedInstructions(), (unsigned long long)g_counts.path1Packets.load());
+    vu1::ReportLive();
     std::uint64_t failures = 0, checked = vu1::HandlerChecks(&failures);
     if (checked)
         std::fprintf(stderr, "dmac: VU1 handlers checked %llu times, %llu differed\n", (unsigned long long)checked,
