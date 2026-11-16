@@ -333,6 +333,8 @@ void RunDmaChain(std::uint32_t regs, std::uint32_t tadr)
     }
     g_counts.chains++;
     static const bool trace = std::getenv("SLY1_DMAC_TRACE") != nullptr;
+    // SLY1_DMAC_TRACE=2: each tag too
+    static const bool traceTags = trace && std::getenv("SLY1_DMAC_TRACE")[0] == '2';
     unsigned finishesBefore = g_counts.finishes, tagsBefore = g_counts.tags;
     std::uint32_t start = tadr;
     bool tte = (r[0] & 0x40) != 0, tie = (r[0] & 0x80) != 0;
@@ -343,6 +345,9 @@ void RunDmaChain(std::uint32_t regs, std::uint32_t tadr)
         const std::uint32_t* tag = At(tadr, tagSpr);
         std::uint32_t qwc = tag[0] & 0xFFFF, id = (tag[0] >> 28) & 7, addr = tag[1] & 0x7FFFFFF0;
         bool irq = (tag[0] >> 31) != 0, spr = (tag[1] >> 31) != 0;
+        if (traceTags)
+            std::fprintf(stderr, "dmac:   tag at 0x%08X: %08X %08X %08X %08X (id %u, qwc %u, addr 0x%08X)\n", tadr,
+                         tag[0], tag[1], tag[2], tag[3], id, qwc, addr);
         g_counts.tags++;
         if (vif && tte) {
             vif->Word(tag[2]);

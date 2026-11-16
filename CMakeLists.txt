@@ -115,6 +115,10 @@ endif()
 set(GAME_INCLUDES ${CMAKE_SOURCE_DIR}/port/include ${GEN_DIR}/include ${GEN_DIR}/src)
 
 add_library(sly1_game OBJECT ${GEN_UNITS})
+option(SLY1_SENTINEL "Check a word after the thread stacks at every preemption point" OFF)
+if(SLY1_SENTINEL)
+    add_compile_definitions(PORT_SENTINEL)
+endif()
 target_compile_options(sly1_game PRIVATE ${GAME_FLAGS})
 if(PLATFORM STREQUAL "HOST_ASAN")
     # The game indexes past a member array on purpose (views that start before an array or run on

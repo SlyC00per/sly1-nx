@@ -267,6 +267,17 @@ PATCHES = [
      "((s32 (*)(Player*, BodyContact*))self->desc06()->m56)(self, n)",
      "((s32 (*)(Player*, BodyContact*, s32))self->desc06()->m56)(self, n, k)",
      "slot 90 takes the contact's end: k, in $a2 at retail's call"),
+    # AimSlotFn is variadic, the methods behind it are not: through `...` a Ptr32 argument went as
+    # its 32-bit game address where slot 35 (CopyPlacedObjectFrame) reads a pointer, and Apple's
+    # ARM64 passes variadic arguments on the stack, not in the registers the callee reads.
+    ("src/main/player_aim.cpp",
+     "            a->vt[35](a, self->f23D0);",
+     "            ((void (*)(AimSlotObject*, void*))a->vt[35])(a, (void*)self->f23D0);",
+     "a table call through a variadic type, made with its method's own"),
+    ("src/main/player_aim.cpp",
+     "            a->vt[35](a, self->f23D8);",
+     "            ((void (*)(AimSlotObject*, void*))a->vt[35])(a, (void*)self->f23D8);",
+     "a table call through a variadic type, made with its method's own"),
     # Instrumentation, no change to the game: the level stream before its first read, under
     # SLY1_STREAM_TRACE, to compare platforms.
     ("src/main/on_off_object.cpp",

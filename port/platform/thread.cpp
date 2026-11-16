@@ -60,7 +60,11 @@ int StartThread(pthread_t* thread, void* stack, std::size_t size, void* (*entry)
     pthread_attr_setstacksize(&attr, 64 * 1024);   // only the start runs on it
     if (detached)
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-    auto top = reinterpret_cast<void*>((reinterpret_cast<std::uintptr_t>(stack) + size) & ~std::uintptr_t(15));
+    // Room above the first frame, as a start-up frame would leave: game code writes into its
+    // caller's frame (the argument area above its own, as on MIPS), and from the thread's first
+    // frame that reached past the stack's end, into the kernel's globals the linker put there.
+    constexpr std::uintptr_t kAbove = 0x400;
+    auto top = reinterpret_cast<void*>((reinterpret_cast<std::uintptr_t>(stack) + size - kAbove) & ~std::uintptr_t(15));
     Start* s = new Start{top, entry, arg};
     int r = pthread_create(thread, &attr, OnGameStack, s);
     if (r != 0)

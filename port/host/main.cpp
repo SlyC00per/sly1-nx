@@ -295,13 +295,17 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
             fp = reinterpret_cast<std::uintptr_t*>(fp)[0];
         }
     }
-    for (int i = 0; i < 29; i += 4) {
-        std::snprintf(line, sizeof line, "sly1:   x%d %llX x%d %llX x%d %llX x%d %llX", i,
-                      (unsigned long long)ctx->cpu_gprs[i].x, i + 1, (unsigned long long)ctx->cpu_gprs[i + 1].x,
-                      i + 2, (unsigned long long)ctx->cpu_gprs[i + 2].x, i + 3, (unsigned long long)ctx->cpu_gprs[i + 3].x);
+    for (int i = 0; i < 29; i += 4) {   // x0 to x28 (cpu_gprs holds 29)
+        int n = std::snprintf(line, sizeof line, "sly1:  ");
+        for (int k = i; k < i + 4 && k < 29; k++)
+            n += std::snprintf(line + n, sizeof line - n, " x%d %llX", k, (unsigned long long)ctx->cpu_gprs[k].x);
         svcOutputDebugString(line, std::strlen(line));
         std::fprintf(stderr, "%s\n", line);
     }
+    std::snprintf(line, sizeof line, "sly1:   fp %llX lr %llX sp %llX", (unsigned long long)ctx->fp.x,
+                  (unsigned long long)ctx->lr.x, (unsigned long long)ctx->sp.x);
+    svcOutputDebugString(line, std::strlen(line));
+    std::fprintf(stderr, "%s\n", line);
     std::fflush(stderr);
     Finish(3);
 }

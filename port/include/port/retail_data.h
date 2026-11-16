@@ -102,8 +102,18 @@ inline void* AsAddress(T word) { return Native((std::uint32_t)word); }
 // moment for the host's other threads.
 extern std::atomic<bool> g_preemptPending;
 void PreemptSlow();
+#ifdef PORT_SENTINEL
+// A software watchpoint (cmake -DSLY1_SENTINEL=ON): a zero word the kernel places right after its
+// thread stacks, checked at every preemption point; a change is reported with the caller's frames.
+extern volatile std::uint32_t g_stackEndSentinel[4];
+[[noreturn]] void SentinelTripped();
+#endif
 inline void Preempt()
 {
+#ifdef PORT_SENTINEL
+    if (g_stackEndSentinel[0] != 0)
+        SentinelTripped();
+#endif
     if (g_preemptPending.load(std::memory_order_relaxed))
         PreemptSlow();
 }

@@ -500,7 +500,14 @@ class Walker:
         have = fn.type.get_canonical()
         if have.kind != TK.FUNCTIONPROTO:
             return
-        if returned_in_place(have.get_result()) and len(list(want.argument_types())) == \
+        wanted = list(want.argument_types())
+        # A class result the cast passes the place of, first, as the PS2 does: one with its own
+        # copy or destructor always; any other record too when the cast says so (one parameter
+        # more, a pointer first). MultiplyMatrices returns a Mat4A, which ARM64 returns through x8:
+        # the place the cast passed went unwritten, and the result went where x8 pointed.
+        record_by_cast = have.get_result().get_canonical().kind == TK.RECORD and wanted and \
+            wanted[0].get_canonical().kind == TK.POINTER
+        if (returned_in_place(have.get_result()) or record_by_cast) and len(wanted) == \
                 len(list(have.argument_types())) + 1:
             self.in_place_cast(c, e, fn, have, f)
             return
@@ -1315,6 +1322,33 @@ class Walker:
                             self.addressed.add((r.location.file.name, r.location.offset))
             stack.extend(ch for ch in c.get_children() if self.ours(ch))
 
+    def align_local(self, c):
+        """A local struct or array of 16 bytes or more starts on a 16-byte boundary, as the PS2's
+        g++ placed them in a frame (the quadword loads and stores and the DMA need it): a packet
+        built in a local (FadeScreenToBlack's FadePacket, a PacketWriter of 4-byte words) was put
+        where the host's compiler chose, and a DMA chain from it started 16 bytes early."""
+        try:
+            t = c.type.get_canonical()
+        except Exception:
+            return
+        if t.kind not in (TK.RECORD, TK.CONSTANTARRAY) or t.get_size() < 16 or c.location.file is None:
+            return
+        f = c.location.file.name
+        start = c.extent.start.offset
+        if c.extent.start.file is None or c.extent.start.file.name != f:
+            return   # in a macro
+        data = self.texts.get(f)
+        if data is None:
+            data = self.texts[f] = Path(f).read_bytes()
+        j = start - 1
+        while j >= 0 and data[j:j + 1] in b" \t":
+            j -= 1
+        if data[j:j + 1] == b"(" and not data[max(0, j - 4):j].rstrip().endswith(b"for"):
+            return   # a condition's declaration
+        if data[j:j + 1] not in (b"\n", b";", b"{", b"}", b"(", b")", b":"):
+            return   # the second declarator of a list, or something not at a declaration's start
+        self.edits.wrap(f, start, start, "alignas(16) ", "", -2, "locals aligned to 16 bytes")
+
     def walk_cursors(self, cursors):
         for ch in cursors:
             self.walk_one(ch, 0, False)
@@ -1341,6 +1375,8 @@ class Walker:
                 if not local:
                     self.record_global(ch)
                 addressed = (ch.location.file.name, ch.location.offset) in self.addressed
+                if local:
+                    self.align_local(ch)
                 self.declaration(ch, not local or addressed)
                 if not local or addressed:
                     self.initializer(ch, depth)

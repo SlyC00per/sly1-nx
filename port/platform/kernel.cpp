@@ -21,6 +21,8 @@
 #include <mutex>
 #include <thread>
 
+#include <csetjmp>
+#include <cstring>
 #include <pthread.h>
 
 #include "port/thread.h"
@@ -73,8 +75,51 @@ Thread g_threads[kThreads];
 Sema g_semas[kSemaphores];
 int g_current = kIdle;        // the game thread that runs, or none
 
-alignas(16384) unsigned char g_stacks[8][kStackSize];   // page-aligned (port/thread.h)
+// Each stack has a guard above it, filled with a pattern: game code has been seen writing above
+// its thread's first frame, which on the Switch reached the kernel's globals the linker put after
+// the stacks. A changed guard is reported (CheckStackGuards) rather than left to corrupt them.
+constexpr std::size_t kStackGuard = 64 * 1024;
+constexpr unsigned char kGuardByte = 0xA5;
+#ifdef PORT_SENTINEL
+}  // namespace
+// Zero, in .bss: declared just before the stacks, which GCC then places it right after (it lays
+// out a file's .bss in reverse order), the place a stray store hit on the Switch.
+volatile std::uint32_t g_stackEndSentinel[4];
+namespace {
+#endif
+alignas(16384) unsigned char g_stacks[8][kStackSize + kStackGuard];   // page-aligned (port/thread.h)
 bool g_stackUsed[8];
+bool g_guardFilled[8];
+
+void FillStackGuard(int s)
+{
+    std::memset(g_stacks[s] + kStackSize, kGuardByte, kStackGuard);
+    g_guardFilled[s] = true;
+}
+
+// Reports (once per change) bytes written into a stack's guard: the stack, the offsets above its
+// top, and the first words there.
+void CheckStackGuard(int s, const char* when)
+{
+    if (!g_guardFilled[s])
+        return;
+    const unsigned char* g = g_stacks[s] + kStackSize;
+    std::size_t first = kStackGuard, last = 0;
+    for (std::size_t i = 0; i < kStackGuard; i++)
+        if (g[i] != kGuardByte) {
+            if (first == kStackGuard)
+                first = i;
+            last = i;
+        }
+    if (first == kStackGuard)
+        return;
+    std::fprintf(stderr, "kernel: stack %d (game 0x%08X) written above its top at +0x%zX..+0x%zX (%s):", s,
+                 GameAddr(g), first, last, when);
+    for (std::size_t i = first & ~std::size_t(3); i <= last && i < first + 32; i += 4)
+        std::fprintf(stderr, " %08X", *reinterpret_cast<const std::uint32_t*>(g + i));
+    std::fprintf(stderr, "\n");
+    FillStackGuard(s);
+}
 
 void (*g_handlers[16])(void);
 bool g_enabled[16];
@@ -129,12 +174,10 @@ void UpdatePreemptPending()
     g_preemptPending.store(pending, std::memory_order_relaxed);
 }
 
-void* HostEntry(void* p)
+// A game thread from its start to its return, on its slot's host thread.
+void RunGameThread(int id)
 {
-    int id = (int)(std::intptr_t)p;
     t_self = id;
-    PlaceThread(ThreadRole::Game);
-    SetGameFloatMode();
     {
         std::unique_lock<std::mutex> lk(g_kernel);
         g_threads[id].cv.wait(lk, [id] { return g_current == id; });
@@ -142,11 +185,49 @@ void* HostEntry(void* p)
     g_threads[id].entry(g_threads[id].arg);
     std::unique_lock<std::mutex> lk(g_kernel);
     g_threads[id].state = Ended;
+    if (g_threads[id].stack >= 0) {   // returned from its entry: its stack is free again
+        CheckStackGuard(g_threads[id].stack, "the thread returned");
+        g_stackUsed[g_threads[id].stack] = false;
+        g_threads[id].stack = -1;
+    }
     int next = Pick();
     g_current = next;
     if (next != kIdle)
         g_threads[next].cv.notify_one();
-    return nullptr;
+}
+
+// Each stack has a host thread of its own, started with the first game thread given that stack
+// and kept: it runs the game threads given its stack one after another. (A host thread for each
+// game thread ran out on the Switch, which does not take back a detached thread's resources
+// fully; the game starts and ends threads at every load.) A thread that ends itself
+// (EndOwnThread, deep in game code) comes back to its slot's loop with longjmp, as pthread_exit
+// left it before: the game's frames have nothing to destroy.
+struct StackSlot {
+    std::condition_variable cv;
+    int id = -1;          // the game thread to run, or -1
+    bool started = false;
+    std::jmp_buf end;
+};
+StackSlot g_slots[8];
+
+void* SlotWorker(void* p)
+{
+    int s = (int)(std::intptr_t)p;
+    PlaceThread(ThreadRole::Game);
+    SetGameFloatMode();
+    for (;;) {
+        int id;
+        {
+            std::unique_lock<std::mutex> lk(g_kernel);
+            g_slots[s].cv.wait(lk, [s] { return g_slots[s].id >= 0; });
+            id = g_slots[s].id;
+        }
+        if (setjmp(g_slots[s].end) == 0)
+            RunGameThread(id);
+        std::lock_guard<std::mutex> lk(g_kernel);
+        if (g_slots[s].id == id)   // not given the next thread already
+            g_slots[s].id = -1;
+    }
 }
 
 }  // namespace
@@ -166,6 +247,8 @@ std::int32_t CurrentThreadId() { return t_self; }
 // The kernel's threads, for a diagnosis when the port stops: state, priority, what each waits on.
 void KernelDump()
 {
+    for (int s = 0; s < 8; s++)
+        CheckStackGuard(s, "the kernel's report");
     static const char* kStates[] = {"free", "dormant", "ready", "waiting", "ended"};
     for (int i = 1; i < kThreads; i++) {
         if (g_threads[i].state == Free)
@@ -307,29 +390,43 @@ void RunThread(s32 id, void* arg)
         std::abort();
     }
     g_stackUsed[s] = true;
+    FillStackGuard(s);
     g_threads[id].stack = s;
     g_threads[id].arg = arg;
-    pthread_t h;
-    if (StartThread(&h, g_stacks[s], kStackSize, HostEntry, (void*)(std::intptr_t)id, true) != 0) {
-        std::fprintf(stderr, "port: a game thread on its stack in game memory could not start\n");
-        std::abort();
+    g_slots[s].id = id;
+    if (!g_slots[s].started) {
+        pthread_t h;
+        if (StartThread(&h, g_stacks[s], kStackSize, SlotWorker, (void*)(std::intptr_t)s, true) != 0) {
+            std::fprintf(stderr, "port: a game thread on its stack in game memory could not start\n");
+            std::abort();
+        }
+        g_slots[s].started = true;
+    } else {
+        g_slots[s].cv.notify_one();
     }
     MakeReady(lk, id, true);
 }
 
 s32 EndOwnThread()
 {
+    int slot = -1;
     {
         std::lock_guard<std::mutex> lk(g_kernel);
         int self = t_self;
         g_threads[self].state = Ended;
-        if (g_threads[self].stack >= 0)
-            g_stackUsed[g_threads[self].stack] = false;
+        if (g_threads[self].stack >= 0) {
+            slot = g_threads[self].stack;
+            CheckStackGuard(slot, "the thread ended");
+            g_stackUsed[slot] = false;
+            g_threads[self].stack = -1;
+        }
         int next = Pick();
         g_current = next;
         if (next != kIdle)
             g_threads[next].cv.notify_one();
     }
+    if (slot >= 0)
+        std::longjmp(g_slots[slot].end, 1);   // back to the slot's loop (SlotWorker)
     pthread_exit(nullptr);
 }
 
@@ -422,3 +519,39 @@ s32 AwaitSemaphore(void* a)
 }
 
 }  // extern "C"
+
+#ifdef PORT_SENTINEL
+namespace port {
+
+void SentinelTripped()
+{
+    std::fprintf(stderr, "kernel: the word after the stacks (game 0x%08X) changed to %08X %08X %08X %08X\n",
+                 GameAddr((const void*)g_stackEndSentinel), g_stackEndSentinel[0], g_stackEndSentinel[1],
+                 g_stackEndSentinel[2], g_stackEndSentinel[3]);
+    {   // the packet writers (g_gsPacketWriter 0x262280, g_vifPacketWriter 0x2622A8: end, begin, cur
+        // at +0, +4, +0xC) and the frame being built (0x2622D8)
+        auto w = [](std::uint32_t a) { return *(const std::uint32_t*)Native(a); };
+        std::fprintf(stderr, "kernel: GS writer end %08X begin %08X cur %08X; VIF writer end %08X begin %08X cur %08X; "
+                     "build frame %08X; thread %d on stack %d\n", w(0x262280), w(0x262284), w(0x26228C), w(0x2622A8),
+                     w(0x2622AC), w(0x2622B4), w(0x2622D8), t_self, t_self > 0 ? g_threads[t_self].stack : -1);
+    }
+    for (int i = 1; i < kThreads; i++)
+        if (g_threads[i].state != Free)
+            std::fprintf(stderr, "kernel: thread %d state %d priority %d stack %d entry %p\n", i, (int)g_threads[i].state,
+                         g_threads[i].priority, g_threads[i].stack,
+                         (void*)(reinterpret_cast<std::uintptr_t>(g_threads[i].entry) - ImageBase()));
+    auto* fp = static_cast<std::uintptr_t*>(__builtin_frame_address(0));
+    for (int i = 0; i < 16 && fp && reinterpret_cast<std::uintptr_t>(fp) % 8 == 0; i++) {
+        std::uintptr_t lr = fp[1];
+        if (lr - ImageBase() >= ImageSize())
+            break;
+        std::fprintf(stderr, "kernel:   from image +0x%llX\n", (unsigned long long)(lr - ImageBase()));
+        fp = reinterpret_cast<std::uintptr_t*>(fp[0]);
+    }
+    std::fflush(stderr);
+    std::fprintf(stderr, "sly1: done, status 5\n");
+    std::fflush(stderr);
+    std::_Exit(5);
+}
+}  // namespace port
+#endif
