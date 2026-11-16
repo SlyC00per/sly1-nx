@@ -28,6 +28,7 @@
 #include "port/system.h"
 #include "port/vu0_micro.h"
 #include "port/vu1.h"
+#include "port/gs.h"
 
 namespace port {
 
@@ -93,11 +94,24 @@ public:
         }
         if (flg_ == 0) {   // PACKED: one register a quadword, A+D carries its register's address
             unsigned reg = (unsigned)(regs_ >> (4 * (index_ % nreg_))) & 0xF;
-            if (reg == 0xE && (q[2] & 0xFF) == 0x61)
-                Finish();
+            if (reg == 0xE) {
+                gs::Write(q[2] & 0xFF, q[0] | (std::uint64_t)q[1] << 32);
+                if ((q[2] & 0xFF) == 0x61)
+                    Finish();
+            } else {
+                gs::WritePacked(reg, q);
+            }
             if (g_survey.On())
                 SurveyPacked(reg, q);
             index_++;
+        } else if (flg_ == 1) {   // REGLIST: two registers a quadword, each 64 bits as it is
+            for (int h = 0; h < 2 && index_ < regTotal_; h++, index_++) {
+                unsigned reg = (unsigned)(regs_ >> (4 * (index_ % nreg_))) & 0xF;
+                if (reg != 0xE && reg != 0xF)
+                    gs::Write(reg, q[h * 2] | (std::uint64_t)q[h * 2 + 1] << 32);
+            }
+        } else {                  // IMAGE
+            gs::Image(q);
         }
         left_--;
     }
@@ -112,6 +126,9 @@ private:
             nreg_ = 16;
         regs_ = q[2] | (std::uint64_t)q[3] << 32;
         index_ = 0;
+        regTotal_ = nloop * nreg_;
+        if ((q[1] >> 14) & 1)   // PRE: the tag sets PRIM
+            gs::Write(0x00, (q[1] >> 15) & 0x7FF);
         if (g_survey.On()) {
             static const char* kFlg[] = {"PACKED", "REGLIST", "IMAGE", "IMAGE"};
             g_survey.Count("gif path %d: %s packets", path_, kFlg[flg_]);
@@ -168,7 +185,7 @@ private:
 
     int path_;
     unsigned dpsm_ = 0;
-    std::uint32_t left_ = 0, nreg_ = 1, flg_ = 0, index_ = 0;
+    std::uint32_t left_ = 0, nreg_ = 1, flg_ = 0, index_ = 0, regTotal_ = 0;
     std::uint64_t regs_ = 0;
 };
 
@@ -535,6 +552,13 @@ std::uint32_t* Spr(std::uint32_t sadr)
 }
 
 }  // namespace
+
+void SendGifNormal(std::uint32_t madr, std::uint32_t qwc)
+{
+    bool spr = (madr & 0x80000000u) != 0;
+    for (std::uint32_t i = 0; i < qwc; i++)
+        g_gif.Qword(At((madr & 0x7FFFFFFFu) + i * 16, spr));
+}
 
 void RunFromSprChain(std::uint32_t regs)
 {

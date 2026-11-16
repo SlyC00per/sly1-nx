@@ -37,6 +37,7 @@
 #endif
 
 #include "port/dmac.h"
+#include "port/gs.h"
 #include "port/iso.h"
 #include "port/memory_card.h"
 #include "port/retail_data.h"
@@ -114,6 +115,8 @@ int g_verifyFrom = -1;
 int g_verifyTo = 46;   // --level N: that level alone
 std::vector<int> g_verifyList;   // --levels a,b,...: these, in this order
 int g_watchSeconds;               // --watch N: the state every N seconds
+int g_dumpEvery = 60;             // --dump-every N: every N-th frame shown, with --dump-fb
+std::string g_dumpDirArg;
 
 // --watch: the frame count and the kernel's threads every few seconds, for a run that stops
 // without a report (on its own core, at the watchers' priority, on the Switch).
@@ -362,6 +365,15 @@ int main(int argc, char** argv)
         else if (!std::strcmp(argv[i], "--wait") && i + 1 < argc)
             // seconds before the game starts: time for a debugger to attach
             std::this_thread::sleep_for(std::chrono::seconds(std::atoi(argv[++i])));
+        else if (!std::strcmp(argv[i], "--dump-fb") && i + 1 < argc)
+        {
+            g_dumpDirArg = argv[++i];
+            port::gs::SetFrameDump(g_dumpDirArg, g_dumpEvery);
+        }
+        else if (!std::strcmp(argv[i], "--dump-every") && i + 1 < argc) {
+            g_dumpEvery = std::atoi(argv[++i]);
+            port::gs::SetFrameDump(g_dumpDirArg, g_dumpEvery);
+        }
         else if (!std::strcmp(argv[i], "--watch") && i + 1 < argc)
             g_watchSeconds = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--seconds") && i + 1 < argc)

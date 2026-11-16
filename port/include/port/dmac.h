@@ -18,6 +18,10 @@ void RunDmaChain(std::uint32_t regs, std::uint32_t tadr);
 // Runs a destination chain out of the scratchpad (channel 8), from its SADR.
 void RunFromSprChain(std::uint32_t regs);
 
+// A normal-mode transfer on the GIF channel: qwc quadwords from madr (bit 31: the scratchpad), as
+// the graphics library's SendDrawEnvironment starts one.
+void SendGifNormal(std::uint32_t madr, std::uint32_t qwc);
+
 // What the transfers have done so far, for the run's report.
 void DmacDump();
 
