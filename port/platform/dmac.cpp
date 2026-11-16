@@ -1017,6 +1017,9 @@ void GsThreadMain()
     }
 }
 
+// The render thread's time in each kind of item (VIF1 data, GIF data, calls), for the report.
+std::atomic<std::uint64_t> g_renderNs[3];
+
 void RenderThreadMain()
 {
     g_renderStarted.store(true, std::memory_order_release);
@@ -1037,6 +1040,8 @@ void RenderThreadMain()
             g_renderBusy = true;
         }
         const bool gsThread = GsAsync();
+        const std::uint64_t started = NowNs();
+        const int kind = (int)item.kind;
         switch (item.kind) {
         case RenderItem::Vif1: {
             std::optional<gs::Hold> hold;
@@ -1070,6 +1075,7 @@ void RenderThreadMain()
             break;
         }
         GsPassOn();
+        g_renderNs[kind < 3 ? kind : 0] += NowNs() - started;
         if (item.words.capacity()) {
             std::lock_guard<std::mutex> lk(g_renderLock);
             if (g_renderSpare.size() < 64)
@@ -1092,6 +1098,10 @@ void DmacDump()
     std::fprintf(stderr, "dmac: chains took %.2f s on the game's thread%s; the render queue held at most %.1f MB\n",
                  g_counts.dmaNanoseconds.load() / 1e9, g_renderStarted ? " (VIF1 and GIF chains copied for the render thread)" : "",
                  g_renderMaxQueued.load() * 4 / 1e6);
+    if (g_renderStarted)
+        std::fprintf(stderr, "dmac: the render thread took %.2f s for VIF1's data (VU1 and its kicks among it), %.2f s for the "
+                     "GIF's, %.2f s for calls (the swaps)\n", g_renderNs[0].load() / 1e9, g_renderNs[1].load() / 1e9,
+                     g_renderNs[2].load() / 1e9);
     vu1::ReportLive();
     std::uint64_t failures = 0, checked = vu1::HandlerChecks(&failures);
     if (checked)

@@ -624,8 +624,33 @@ void Line(const Draw& d, const Vertex& v0, const Vertex& v1)
 std::uint32_t BitsPerPixel(std::uint32_t psm);
 
 Backend* g_backend;
-std::vector<DrawVertex> g_run;
-std::vector<std::uint32_t> g_runIndex;
+// A run's vertices or indices: grown without filling (a vector would write each new element twice).
+template <typename T>
+class Buffer {
+public:
+    T* data() { return p_; }
+    std::size_t size() const { return n_; }
+    bool empty() const { return n_ == 0; }
+    void clear() { n_ = 0; }
+    void resize(std::size_t n) { Reserve(n); n_ = n; }
+    void push_back(const T& v) { Reserve(n_ + 1); p_[n_++] = v; }
+    T& operator[](std::size_t k) { return p_[k]; }
+    // Room for more elements after the last: written there, then counted by resize.
+    T* Room(std::size_t more) { Reserve(n_ + more); return p_ + n_; }
+
+private:
+    void Reserve(std::size_t n)
+    {
+        if (n <= cap_)
+            return;
+        cap_ = std::max<std::size_t>(n, cap_ ? cap_ * 2 : 4096);
+        p_ = static_cast<T*>(std::realloc(p_, cap_ * sizeof(T)));
+    }
+    T* p_ = nullptr;
+    std::size_t n_ = 0, cap_ = 0;
+};
+Buffer<DrawVertex> g_run;
+Buffer<std::uint32_t> g_runIndex;
 int g_queueIndex[3] = {-1, -1, -1};   // where in the run each queued vertex is, -1 not yet
 DrawState g_runState;
 bool g_runBegun;
@@ -1146,7 +1171,8 @@ bool StripRun(std::uint64_t regs, std::uint32_t nreg, const std::uint32_t* q, st
     std::size_t at = g_run.size();
     g_run.resize(at + loops);
     DrawVertex* out = g_run.data() + at;
-    std::uint64_t drawn = 0;
+    std::uint32_t* index = g_runIndex.Room((std::size_t)loops * 3);
+    std::uint32_t* const indexStart = index;
     for (std::uint32_t l = 0; l < loops; l++, out++, at++) {
         const std::uint32_t* st = stAt + l * stride;
         const std::uint32_t* c = rgbaAt + l * stride;
@@ -1162,15 +1188,16 @@ bool StripRun(std::uint64_t regs, std::uint32_t nreg, const std::uint32_t* q, st
             continue;
         }
         if (!((p[3] >> 15) & 1)) {
-            g_runIndex.push_back(slot[0]);
-            g_runIndex.push_back(slot[1]);
-            g_runIndex.push_back((std::uint32_t)at);
-            drawn++;
+            index[0] = slot[0];
+            index[1] = slot[1];
+            index[2] = (std::uint32_t)at;
+            index += 3;
         }
         slot[0] = slot[1];
         slot[1] = (std::uint32_t)at;
     }
-    g_drawn += drawn;
+    g_runIndex.resize(g_runIndex.size() + (std::size_t)(index - indexStart));
+    g_drawn += (std::uint64_t)(index - indexStart) / 3;
 
     // what the loops leave: the registers of the last one, the queue's last two vertices
     std::uint32_t tail = std::min<std::uint32_t>(loops, 2);
