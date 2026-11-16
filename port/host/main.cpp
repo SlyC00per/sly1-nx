@@ -39,6 +39,7 @@
 #include "port/dmac.h"
 #include "port/gpu.h"
 #include "port/gs.h"
+#include "port/gs_backend.h"
 #include "port/iso.h"
 #include "port/memory_card.h"
 #include "port/retail_data.h"
@@ -454,6 +455,25 @@ int main(int argc, char** argv)
     }
 
     pthread_t game, clock, render, gsThread;
+    // SLY1_GS_COUNT: a renderer that only counts what the GS hands it (the way to a GPU renderer
+    // exercised and timed on the host).
+    if (std::getenv("SLY1_GS_COUNT")) {
+        struct Counting : port::gs::Backend {
+            std::uint64_t runs = 0, vertices = 0, indices = 0, frames = 0;
+            void Begin(const port::gs::DrawState&) override {}
+            void Draw(const port::gs::DrawState&, const port::gs::DrawVertex*, std::size_t v, const std::uint32_t*,
+                      std::size_t i) override { runs++; vertices += v; indices += i; }
+            void Present(std::uint64_t, std::uint64_t) override
+            {
+                if ((++frames & 255) == 0)
+                    std::fprintf(stderr, "gs count: %llu frames, %llu runs, %llu vertices, %llu indices\n",
+                                 (unsigned long long)frames, (unsigned long long)runs, (unsigned long long)vertices,
+                                 (unsigned long long)indices);
+            }
+        };
+        static Counting counting;
+        port::gs::SetBackend(&counting);
+    }
     // The Switch's GPU renderer, before any thread draws (SLY1_NO_GPU: without it, nothing shown).
     if (!std::getenv("SLY1_NO_GPU"))
         port::gpu::Start();

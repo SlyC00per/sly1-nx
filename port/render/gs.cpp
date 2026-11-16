@@ -671,7 +671,8 @@ DrawState StateOf(const Draw& d, std::uint32_t kind)
 }
 
 // The primitive in the vertex queue added to the run.
-void Gather(std::uint64_t prim, std::uint32_t type)
+// The run the next primitive belongs to: begun anew when the registers it is drawn by changed.
+const Draw& RunState(std::uint64_t prim, std::uint32_t type)
 {
     static const std::uint32_t kKind[8] = {0, 1, 1, 2, 2, 2, 2, 0};
     static Draw d;
@@ -686,6 +687,12 @@ void Gather(std::uint64_t prim, std::uint32_t type)
         }
         g_stateChanged = false;
     }
+    return d;
+}
+
+void Gather(std::uint64_t prim, std::uint32_t type)
+{
+    const Draw& d = RunState(prim, type);
     int ofx = d.ofx, ofy = d.ofy & ~15;   // the odd field's half line dropped
     float sw = 1.0f / (16.0f * d.tex.tw), sh = 1.0f / (16.0f * d.tex.th);
     auto vertex = [&](const Vertex& v, const Vertex& flat) {
@@ -1085,6 +1092,181 @@ void WritePacked(std::uint32_t reg, const std::uint32_t* q)
 }
 
 namespace {
+
+// With a GPU renderer: a triangle strip's loops of ST, RGBAQ and then XYZ2 or XYZF2 (what the
+// game's batches are) put into the run as WritePacked, PushVertex, Kick and Gather would one
+// register at a time: each vertex once, a triangle's indices for each vertex without ADC once
+// two came before it, and the registers and the vertex queue as the last loops leave them.
+bool StripRun(std::uint64_t regs, std::uint32_t nreg, const std::uint32_t* q, std::uint32_t loops)
+{
+    if (nreg < 3 || nreg > 4 || (g_regs.prim & 7) != 4 || loops == 0)
+        return false;
+    int stSlot = -1, rgbaSlot = -1;
+    for (std::uint32_t k = 0; k + 1 < nreg; k++) {   // ST and RGBAQ once each, anything else NOP
+        unsigned reg = (unsigned)(regs >> (4 * k)) & 0xF;
+        if (reg == 2 && stSlot < 0)
+            stSlot = (int)k;
+        else if (reg == 1 && rgbaSlot < 0)
+            rgbaSlot = (int)k;
+        else if (reg != 0xF)
+            return false;
+    }
+    unsigned last = (unsigned)(regs >> (4 * (nreg - 1))) & 0xF;
+    if (stSlot < 0 || rgbaSlot < 0 || (last != 4 && last != 5))
+        return false;
+    const Draw& d = RunState(g_regs.prim, 4);
+    if (!d.iip || d.fst)
+        return false;
+    const std::uint32_t stride = nreg * 4;
+    const std::uint32_t* stAt = q + stSlot * 4;
+    const std::uint32_t* rgbaAt = q + rgbaSlot * 4;
+    const std::uint32_t* xyzAt = q + (nreg - 1) * 4;
+    const bool fogged = last == 4;
+    const int ofx = d.ofx, ofy = d.ofy & ~15;
+    const float fog = g_regs.fog;
+
+    int have = std::min(g_queued, 2);
+    std::uint32_t slot[2] = {0, 0};
+    for (int k = 0; k < have; k++) {   // the vertices queued before, in the run if not yet
+        if (g_queueIndex[k] < 0) {
+            const Vertex& v = g_queue[k];
+            DrawVertex o;
+            o.x = (v.x - ofx) * (1.0f / 16);
+            o.y = (v.y - ofy) * (1.0f / 16);
+            o.z = v.z;
+            o.r = v.r; o.g = v.g; o.b = v.b; o.a = v.a;
+            o.s = v.s; o.t = v.t; o.q = v.q;
+            o.fog = v.f;
+            g_queueIndex[k] = (int)g_run.size();
+            g_run.push_back(o);
+        }
+        slot[k] = (std::uint32_t)g_queueIndex[k];
+    }
+    const int haveBefore = have;
+    std::size_t at = g_run.size();
+    g_run.resize(at + loops);
+    DrawVertex* out = g_run.data() + at;
+    std::uint64_t drawn = 0;
+    for (std::uint32_t l = 0; l < loops; l++, out++, at++) {
+        const std::uint32_t* st = stAt + l * stride;
+        const std::uint32_t* c = rgbaAt + l * stride;
+        const std::uint32_t* p = xyzAt + l * stride;
+        out->x = ((std::int32_t)(p[0] & 0xFFFF) - ofx) * (1.0f / 16);
+        out->y = ((std::int32_t)(p[1] & 0xFFFF) - ofy) * (1.0f / 16);
+        out->z = fogged ? (p[2] >> 4) & 0xFFFFFF : p[2];
+        out->r = (std::uint8_t)c[0]; out->g = (std::uint8_t)c[1]; out->b = (std::uint8_t)c[2]; out->a = (std::uint8_t)c[3];
+        std::memcpy(&out->s, st, 12);
+        out->fog = fogged ? (float)((p[3] >> 4) & 0xFF) : fog;
+        if (have < 2) {
+            slot[have++] = (std::uint32_t)at;
+            continue;
+        }
+        if (!((p[3] >> 15) & 1)) {
+            g_runIndex.push_back(slot[0]);
+            g_runIndex.push_back(slot[1]);
+            g_runIndex.push_back((std::uint32_t)at);
+            drawn++;
+        }
+        slot[0] = slot[1];
+        slot[1] = (std::uint32_t)at;
+    }
+    g_drawn += drawn;
+
+    // what the loops leave: the registers of the last one, the queue's last two vertices
+    std::uint32_t tail = std::min<std::uint32_t>(loops, 2);
+    int queued = std::min<int>(haveBefore + (int)(loops - tail), 2);
+    for (std::uint32_t l = loops - tail; l < loops; l++) {
+        const std::uint32_t* st = stAt + l * stride;
+        const std::uint32_t* c = rgbaAt + l * stride;
+        const std::uint32_t* p = xyzAt + l * stride;
+        Vertex v;
+        v.x = (std::int32_t)(p[0] & 0xFFFF);
+        v.y = (std::int32_t)(p[1] & 0xFFFF);
+        v.z = fogged ? (p[2] >> 4) & 0xFFFFFF : p[2];
+        v.f = fogged ? (std::uint8_t)((p[3] >> 4) & 0xFF) : g_regs.fog;
+        v.r = (std::uint8_t)c[0]; v.g = (std::uint8_t)c[1]; v.b = (std::uint8_t)c[2]; v.a = (std::uint8_t)c[3];
+        v.s = FloatOf(st[0]); v.t = FloatOf(st[1]); v.q = FloatOf(st[2]);
+        v.u = g_regs.u; v.v = g_regs.v;
+        if (queued == 2) {
+            g_queue[0] = g_queue[1];
+            queued = 1;
+        }
+        g_queue[queued++] = v;
+        g_regs.r = v.r; g_regs.g = v.g; g_regs.b = v.b; g_regs.a = v.a;
+        g_regs.s = v.s; g_regs.t = v.t; g_regs.q = v.q;
+    }
+    g_queued = have;
+    g_queueIndex[0] = have > 0 ? (int)slot[0] : -1;
+    g_queueIndex[1] = have > 1 ? (int)slot[1] : -1;
+    return true;
+}
+
+bool SameVertex(const Vertex& a, const Vertex& b)
+{
+    return a.x == b.x && a.y == b.y && a.z == b.z && a.f == b.f && a.r == b.r && a.g == b.g && a.b == b.b && a.a == b.a &&
+           std::memcmp(&a.s, &b.s, 4) == 0 && std::memcmp(&a.t, &b.t, 4) == 0 && std::memcmp(&a.q, &b.q, 4) == 0 &&
+           a.u == b.u && a.v == b.v;
+}
+
+// SLY1_GS_CHECK with a GPU renderer: a strip's loops both ways from the same state, the
+// triangles added to the run, the registers and the queue compared.
+bool CheckedStripRun(std::uint64_t regs, std::uint32_t nreg, const std::uint32_t* q, std::uint32_t loops)
+{
+    if (nreg < 3 || nreg > 4 || (g_regs.prim & 7) != 4 || loops == 0)
+        return false;
+    RunState(g_regs.prim, 4);   // a new run begun now, not inside either way
+    Regs regsBefore = g_regs;
+    Vertex queueBefore[3] = {g_queue[0], g_queue[1], g_queue[2]};
+    int queuedBefore = g_queued, indexBefore[3] = {g_queueIndex[0], g_queueIndex[1], g_queueIndex[2]};
+    std::size_t runBefore = g_run.size(), indicesBefore = g_runIndex.size();
+    std::uint64_t drawnBefore = g_drawn;
+    auto triangles = [&]() {
+        std::vector<DrawVertex> t;
+        for (std::size_t k = indicesBefore; k < g_runIndex.size(); k++)
+            t.push_back(g_run[g_runIndex[k]]);
+        return t;
+    };
+    const std::uint32_t* w = q;
+    for (std::uint32_t l = 0; l < loops; l++)
+        for (std::uint32_t k = 0; k < nreg; k++, w += 4)
+            WritePacked((unsigned)(regs >> (4 * k)) & 0xF, w);
+    std::vector<DrawVertex> slow = triangles();
+    Regs slowRegs = g_regs;
+    Vertex slowQueue[3] = {g_queue[0], g_queue[1], g_queue[2]};
+    int slowQueued = g_queued;
+    std::uint64_t slowDrawn = g_drawn;
+    g_regs = regsBefore;
+    std::memcpy(g_queue, queueBefore, sizeof g_queue);
+    g_queued = queuedBefore;
+    std::memcpy(g_queueIndex, indexBefore, sizeof g_queueIndex);
+    g_run.resize(runBefore);
+    g_runIndex.resize(indicesBefore);
+    g_drawn = drawnBefore;
+    if (!StripRun(regs, nreg, q, loops)) {   // not a run it takes: as the plain way left it
+        w = q;
+        for (std::uint32_t l = 0; l < loops; l++)
+            for (std::uint32_t k = 0; k < nreg; k++, w += 4)
+                WritePacked((unsigned)(regs >> (4 * k)) & 0xF, w);
+        return true;
+    }
+    static std::uint64_t runs, differed;
+    runs++;
+    std::vector<DrawVertex> fast = triangles();
+    bool same = fast.size() == slow.size() && (fast.empty() || std::memcmp(fast.data(), slow.data(), fast.size() * sizeof(DrawVertex)) == 0);
+    same = same && g_queued == slowQueued && g_drawn == slowDrawn;
+    same = same && g_regs.r == slowRegs.r && g_regs.g == slowRegs.g && g_regs.b == slowRegs.b && g_regs.a == slowRegs.a &&
+           std::memcmp(&g_regs.s, &slowRegs.s, 4) == 0 && std::memcmp(&g_regs.t, &slowRegs.t, 4) == 0 &&
+           std::memcmp(&g_regs.q, &slowRegs.q, 4) == 0 && g_regs.prim == slowRegs.prim && g_regs.fog == slowRegs.fog;
+    for (int k = 0; same && k < g_queued; k++)
+        same = SameVertex(g_queue[k], slowQueue[k]);
+    if (!same && differed++ < 8)
+        std::fprintf(stderr, "gs check: a strip's run left something else (%u loops, %zu and %zu triangle vertices, queue %d and %d)\n",
+                     loops, fast.size(), slow.size(), g_queued, slowQueued);
+    if ((runs & (runs - 1)) == 0)
+        std::fprintf(stderr, "gs check: %llu strip runs, %llu differed\n", (unsigned long long)runs, (unsigned long long)differed);
+    return true;
+}
+
 Regs g_checkRegs;
 Vertex g_checkQueue[3];
 int g_checkQueued;
@@ -1100,6 +1282,18 @@ void PackedRun(std::uint64_t regs, std::uint32_t nreg, const std::uint32_t* q, s
     // as long as the vertices before them left it. A fan keeps its first vertex, and PRIM or a
     // context register in the loop is left to the plain way.
     std::uint32_t type = (std::uint32_t)(g_regs.prim & 7);
+    if (Surveying()) {   // the shapes of the packed runs, by their loops
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "packed run: primitive type %u, %u registers %llX", type, nreg,
+                      (unsigned long long)(regs & ((nreg >= 16 ? 0 : (1ull << (4 * nreg))) - 1)));
+        g_surveyCounts[buf] += loops;
+    }
+    if (g_backend && !g_rasterise && !Surveying()) {
+        static const bool check = std::getenv("SLY1_GS_CHECK") != nullptr;
+        static const bool plain = std::getenv("SLY1_GS_PLAIN") != nullptr;   // every register written, for comparison
+        if (!plain && (check ? CheckedStripRun(regs, nreg, q, loops) : StripRun(regs, nreg, q, loops)))
+            return;
+    }
     if (!g_rasterise && !g_backend && !Surveying() && loops > 3 && type != 5) {
         std::uint32_t vertices = 0;
         bool only = true;
