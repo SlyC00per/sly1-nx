@@ -38,6 +38,9 @@ void PackedRun(std::uint64_t regs, std::uint32_t nreg, const std::uint32_t* q, s
 // IMAGE data: a quadword of the transfer BITBLTBUF, TRXPOS, TRXREG and TRXDIR started.
 void Image(const std::uint32_t* q);
 
+// A run of IMAGE data: count quadwords, as Image would take them one by one.
+void ImageRun(const std::uint32_t* q, std::uint32_t count);
+
 // The display (the game's double buffer, sceGsSwapDBuff's): DISPFB and DISPLAY's values.
 void SetDisplay(std::uint64_t dispfb, std::uint64_t display);
 

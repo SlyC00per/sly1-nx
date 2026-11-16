@@ -125,6 +125,12 @@ public:
     // (gs::PackedRun). Returns the quadwords taken, 0 when the data must go a quadword at a time.
     std::uint32_t Run(const std::uint32_t* q, std::uint32_t avail)
     {
+        if (flg_ >= 2 && left_ != 0) {   // IMAGE: the data as it is
+            std::uint32_t n = std::min(left_, avail);
+            gs::ImageRun(q, n);
+            left_ -= n;
+            return n;
+        }
         if (!plain_ || slot_ != 0 || left_ < nreg_)
             return 0;
         std::uint32_t loops = std::min(left_, avail) / nreg_;
@@ -1058,8 +1064,14 @@ void RenderThreadMain()
                 GsEnqueue(std::move(g));
             } else {
                 gs::Hold hold;
-                for (std::size_t k = 0; k + 4 <= item.words.size(); k += 4)
-                    g_gif.Qword(&item.words[k]);
+                for (std::size_t k = 0; k + 4 <= item.words.size();) {
+                    std::uint32_t taken = g_gif.Left() ? g_gif.Run(&item.words[k], (std::uint32_t)((item.words.size() - k) / 4)) : 0;
+                    if (taken == 0) {
+                        g_gif.Qword(&item.words[k]);
+                        taken = 1;
+                    }
+                    k += (std::size_t)taken * 4;
+                }
             }
             break;
         case RenderItem::Call:

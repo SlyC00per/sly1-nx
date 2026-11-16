@@ -1004,6 +1004,72 @@ void Image(const std::uint32_t* q)
     }
 }
 
+namespace {
+bool g_checkingImage;
+}
+
+void ImageRun(const std::uint32_t* q, std::uint32_t count)
+{
+    // the caller holds the GS (gs::Hold)
+    Transfer& t = g_trx;
+    static const bool check = std::getenv("SLY1_GS_CHECK") != nullptr;
+    if (check && t.active && !g_checkingImage) {   // SLY1_GS_CHECK: the pixels both ways, on a copy of local memory
+        static std::vector<std::uint8_t> before(kLocalBytes), slow(kLocalBytes);
+        static std::uint64_t runs, differed;
+        Transfer t0 = t;
+        std::memcpy(before.data(), g_local, kLocalBytes);
+        for (std::uint32_t k = 0; k < count; k++)
+            Image(q + k * 4);
+        Transfer t1 = t;
+        std::memcpy(slow.data(), g_local, kLocalBytes);
+        std::memcpy(g_local, before.data(), kLocalBytes);
+        t = t0;
+        g_checkingImage = true;
+        ImageRun(q, count);
+        g_checkingImage = false;
+        runs++;
+        bool same = std::memcmp(slow.data(), g_local, kLocalBytes) == 0 && t.active == t1.active &&
+                    (!t.active || (t.x == t1.x && t.y == t1.y && t.nbits == t1.nbits));
+        if (!same && differed++ < 8)
+            std::fprintf(stderr, "gs check: an image run left something else (format 0x%02X, %u quadwords)\n", t.dpsm, count);
+        if ((runs & (runs - 1)) == 0)
+            std::fprintf(stderr, "gs check: %llu image runs, %llu differed\n", (unsigned long long)runs, (unsigned long long)differed);
+        return;
+    }
+    // The game's formats with no bits left over from the quadword before: each pixel straight to
+    // its place, without Image's gathering of bits.
+    if (t.active && t.nbits == 0 && t.rrw != 0 && t.y < t.rrh && (t.dpsm == PSMCT32 || t.dpsm == PSMT8 || t.dpsm == PSMT4)) {
+        const std::uint8_t* b = reinterpret_cast<const std::uint8_t*>(q);
+        const std::uint32_t bp = t.dbp, bw = t.dbw;
+        std::uint32_t x = t.x, y = t.y;
+        const std::uint32_t pixels = t.dpsm == PSMCT32 ? count * 4 : t.dpsm == PSMT8 ? count * 16 : count * 32;
+        for (std::uint32_t k = 0; k < pixels; k++) {
+            std::uint32_t px = (t.dsax + x) & 2047, py = (t.dsay + y) & 2047;
+            if (t.dpsm == PSMT8) {
+                g_local[Addr8(bp, bw, px, py)] = b[k];
+            } else if (t.dpsm == PSMCT32) {
+                std::memcpy(g_local + Addr32(bp, bw, px, py), b + k * 4, 4);
+            } else {
+                std::uint32_t n = Addr4(bp, bw, px, py), v = (b[k >> 1] >> ((k & 1) * 4)) & 0xF;
+                std::uint8_t& o = g_local[n >> 1];
+                o = (n & 1) ? (std::uint8_t)((o & 0x0F) | v << 4) : (std::uint8_t)((o & 0xF0) | v);
+            }
+            if (++x >= t.rrw) {
+                x = 0;
+                if (++y >= t.rrh) {
+                    t.active = false;
+                    break;
+                }
+            }
+        }
+        t.x = x;
+        t.y = y;
+        return;
+    }
+    for (std::uint32_t k = 0; k < count; k++)
+        Image(q + k * 4);
+}
+
 void Write(std::uint32_t reg, std::uint64_t value)
 {
     // the caller holds the GS (gs::Hold)
