@@ -53,6 +53,9 @@ void SetFrameDump(const std::string& dir, int every);
 // The frames shown so far (the game's buffer swaps).
 std::uint64_t FramesShown();
 
+// SLY1_GS_SURVEY: the drawing states the game uses, counted by primitive: their report.
+void SurveyReport();
+
 // The primitives drawn so far.
 std::uint64_t PrimitivesDrawn();
 

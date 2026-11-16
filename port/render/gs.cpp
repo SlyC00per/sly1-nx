@@ -11,10 +11,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
+#include <set>
+#include <string>
 #include <vector>
 
 #include "gs_memory.h"
@@ -612,6 +616,60 @@ void Line(const Draw& d, const Vertex& v0, const Vertex& v1)
     }
 }
 
+// SLY1_GS_SURVEY: the drawing states the game uses, for the GPU renderer (docs/RENDERER.md):
+// each distinct combination counted by its primitives, printed by SurveyReport.
+bool Surveying()
+{
+    static const bool on = std::getenv("SLY1_GS_SURVEY") != nullptr;   // read on first use: --env sets it late
+    return on;
+}
+std::map<std::string, std::uint64_t> g_surveyCounts;
+std::set<std::uint32_t> g_surveyTargets;
+
+void SurveyDraw(std::uint64_t prim)
+{
+    Draw d = DrawOf(prim);
+    char buf[256];
+    auto count = [&](const char* fmt, ...) __attribute__((format(printf, 2, 3))) {
+        va_list va;
+        va_start(va, fmt);
+        std::vsnprintf(buf, sizeof buf, fmt, va);
+        va_end(va);
+        g_surveyCounts[buf]++;
+    };
+    count("primitive type %u%s%s%s%s", (unsigned)(prim & 7), d.iip ? " gouraud" : " flat", d.tme ? " textured" : "",
+          d.fge ? " fogged" : "", d.fst ? " UV" : "");
+    count("frame FBP %u FBW %u PSM 0x%02X mask %08X, Z %u PSM 0x%02X%s", d.fbp / 32, d.fbw, d.fpsm, d.fbmsk, d.zbp / 32, d.zpsm,
+          d.zmsk ? " (no Z write)" : "");
+    count("scissor %d-%d x %d-%d, offset %d.%d,%d.%d", d.scax0, d.scax1, d.scay0, d.scay1, d.ofx / 16, d.ofx & 15, d.ofy / 16,
+          d.ofy & 15);
+    if (d.abe)
+        count("blend A %u B %u C %u D %u FIX %u", d.ba, d.bb, d.bc, d.bd, d.bc == 2 ? d.bfix : 0);
+    else
+        count("blend off");
+    count("alpha test %s ATST %u AREF %u AFAIL %u", d.ate ? "on" : "off", d.ate ? d.atst : 0, d.ate ? d.aref : 0,
+          d.ate ? d.afail : 0);
+    count("destination alpha test %s DATM %d", d.date ? "on" : "off", d.date ? (int)d.datm : 0);
+    count("depth test %s ZTST %u", d.zte ? "on" : "off", d.ztst);
+    count("FBA %d, PABE %d, COLCLAMP %d, DTHE %d", (int)d.fba, (int)(g_regs.pabe & 1), (int)(g_regs.colclamp & 1),
+          (int)(g_regs.dthe & 1));
+    if (d.tme) {
+        count("texture PSM 0x%02X CPSM 0x%X, %ux%u, TFX %u TCC %u, %s", d.tex.psm, d.tex.cpsm, d.tex.tw, d.tex.th, d.tex.tfx,
+              d.tex.tcc, d.tex.bilinear ? "bilinear" : "nearest");
+        count("texture format PSM 0x%02X CPSM 0x%X CSM %u", d.tex.psm, d.tex.cpsm, (unsigned)Bits(d.c->tex0, 55, 1));
+        count("texture wrap %u %u", d.tex.wms, d.tex.wmt);
+        count("TEX1 LCM %u MXL %u MMAG %u MMIN %u", (unsigned)Bits(d.c->tex1, 0, 1), (unsigned)Bits(d.c->tex1, 2, 3),
+              (unsigned)Bits(d.c->tex1, 5, 1), (unsigned)Bits(d.c->tex1, 6, 3));
+        count("TEXA TA0 %u AEM %u TA1 %u", (unsigned)Bits(g_regs.texa, 0, 8), (unsigned)Bits(g_regs.texa, 15, 1),
+              (unsigned)Bits(g_regs.texa, 32, 8));
+        // a texture where a frame or Z buffer some draw used lies: drawn to, then read
+        if (g_surveyTargets.count(d.tex.tbp))
+            count("texture at a drawn buffer: TBP %u PSM 0x%02X %ux%u TBW %u", d.tex.tbp, d.tex.psm, d.tex.tw, d.tex.th, d.tex.tbw);
+    }
+    g_surveyTargets.insert(d.fbp);
+    g_surveyTargets.insert(d.zbp);
+}
+
 void Kick(bool draw)
 {
     std::uint64_t prim = g_regs.prim;
@@ -620,6 +678,8 @@ void Kick(bool draw)
     int needed = kNeeded[type];
     if (g_queued < needed)
         return;
+    if (draw && Surveying())
+        SurveyDraw(prim);
     if (draw && g_rasterise) {
         Draw d = DrawOf(prim);
         g_drawn++;
@@ -869,7 +929,7 @@ void PackedRun(std::uint64_t regs, std::uint32_t nreg, const std::uint32_t* q, s
     // as long as the vertices before them left it. A fan keeps its first vertex, and PRIM or a
     // context register in the loop is left to the plain way.
     std::uint32_t type = (std::uint32_t)(g_regs.prim & 7);
-    if (!g_rasterise && loops > 3 && type != 5) {
+    if (!g_rasterise && !Surveying() && loops > 3 && type != 5) {
         std::uint32_t vertices = 0;
         bool only = true;
         for (std::uint32_t k = 0; k < nreg; k++) {
@@ -1061,6 +1121,13 @@ void SetFrameDump(const std::string& dir, int every)
 }
 
 std::uint64_t FramesShown() { return g_framesShown; }
+
+void SurveyReport()
+{
+    Hold hold;
+    for (const auto& kv : g_surveyCounts)
+        std::fprintf(stderr, "gs survey: %10llu  %s\n", (unsigned long long)kv.second, kv.first.c_str());
+}
 
 void FrameShown()
 {

@@ -90,6 +90,8 @@ void Report()
     }
     port::KernelDump();
     port::DmacDump();
+    if (std::getenv("SLY1_GS_SURVEY"))
+        port::gs::SurveyReport();
     {   // the display's and the render frames' semaphores and flags, for the report
         auto w = [](std::uint32_t a) { return *(const std::int32_t*)port::Native(a); };
         std::fprintf(stderr, "sly1: semaphores: vblank %d, GS finish %d, frame ready %d, frame done %d; "
