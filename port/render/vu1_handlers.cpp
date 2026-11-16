@@ -2166,6 +2166,57 @@ bool SkinNormals(Runner& r)
     return true;
 }
 
+// --- 0x318 of chunk 79A6F5FB: the matrix at 14-17 made from 4-7 of data memory and 0-3 (0x22B).
+bool MatrixAt14(Runner& r)
+{
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    MatrixProduct(r, r.s.vf, 4, top, (std::uint16_t)(top + 14));
+    r.s.pc = 0x31F;
+    return true;
+}
+
+// --- 0x31F of chunk 79A6F5FB: quadwords 0-10 and 14-21 copied from the other buffer (572 - TOP).
+bool CopyFromOtherBuffer(Runner& r)
+{
+    State& st = r.s;
+    std::uint16_t top = (std::uint16_t)r.ctx.top, from = (std::uint16_t)(572 - top);
+    V v[11];
+    for (int k = 0; k < 11; k++)
+        v[k] = Load(r, (std::uint16_t)(from + k));
+    for (int k = 0; k < 11; k++)
+        Store(r, (std::uint16_t)(top + k), v[k]);
+    for (int k = 0; k < 11; k++)
+        SetVf(st, 2 + k, v[k]);
+    for (int half = 0; half < 2; half++) {
+        V w[4];
+        for (int k = 0; k < 4; k++)
+            w[k] = Load(r, (std::uint16_t)(from + 14 + 4 * half + k));
+        for (int k = 0; k < 4; k++)
+            Store(r, (std::uint16_t)(top + 14 + 4 * half + k), w[k]);
+        for (int k = 0; k < 4; k++)
+            SetVf(st, 2 + k, w[k]);
+    }
+    st.pc = 0x34A;
+    return true;
+}
+
+// --- 0x05F of chunk E1624411: an unlit batch's finish (0x4A9's scaling, the kick of the packet at
+// 12.x and the batch); one with a triangle marked for the clipper (0x671) is left to the microcode.
+bool UnlitFinish(Runner& r)
+{
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    if (Half(Load(r, top + 13).z) != 0)
+        return false;
+    State saved = r.s;
+    if (!Scale4A9(r, top)) {
+        r.s = saved;
+        return false;
+    }
+    KickBatch(r, top, Half(Load(r, top + 12).x));
+    r.s.pc = 0x076;
+    return true;
+}
+
 }  // namespace
 
 // Every VF register but vf00 and vf01, and P: what the lights' handlers are compared on.
@@ -2202,6 +2253,9 @@ const HandlerEntry kHandlers[] = {
     {0xE1624411, 0x076, Sprites, "sprites", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I"},
     {0x1AE4A8D6, 0x110, Particles, "particles", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q P I clip"},
     {0x2DDC9AA2, 0x411, SkinNormals, "skinned normals", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "P"},
+    {0x79A6F5FB, 0x318, MatrixAt14, "matrix at 14", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31},
+    {0x79A6F5FB, 0x31F, CopyFromOtherBuffer, "copy from the other buffer", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31},
+    {0xE1624411, 0x05F, UnlitFinish, "unlit batch finish", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31},
     {0xE1624411, 0x01E, BatchSecond, "lit batch second pass", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I clip"},
 };
 const std::size_t kHandlerCount = sizeof kHandlers / sizeof kHandlers[0];
