@@ -90,6 +90,12 @@ private:
     DkQueue queue_ = nullptr;
     DkSwapchain swapchain_ = nullptr;
     DkCmdBuf cmd_ = nullptr;
+    // a frame's vertices, uploads and commands: two sets in turn, so that a frame is recorded while
+    // the GPU draws the one before
+    DkMemBlock frameMems_[2] = {nullptr, nullptr}, commandMems_[2] = {nullptr, nullptr};
+    DkFence fences_[2];
+    bool fenced_[2] = {false, false};
+    int set_ = 0;
     DkMemBlock imageMem_ = nullptr, frameMem_ = nullptr, commandMem_ = nullptr, codeMem_ = nullptr, dataMem_ = nullptr,
                textureMem_ = nullptr;
     DkImage screen_[2], colour_[2], depth_;
@@ -208,8 +214,14 @@ bool Renderer::Create()
     }
 
     textureMem_ = Block(kTextureMemory, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image);
-    frameMem_ = Block(kFrameMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
-    commandMem_ = Block(kCommandMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
+    for (int k = 0; k < 2; k++) {
+        frameMems_[k] = Block(kFrameMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
+        commandMems_[k] = Block(kCommandMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
+        if (!frameMems_[k] || !commandMems_[k])
+            return false;
+    }
+    frameMem_ = frameMems_[0];
+    commandMem_ = commandMems_[0];
     DkCmdBufMaker cmdMaker;
     dkCmdBufMakerDefaults(&cmdMaker, device_);
     cmd_ = dkCmdBufCreate(&cmdMaker);
@@ -613,10 +625,18 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
     DkImageRect src = {0, 0, 0, kWidth, kHeight, 1}, dst = {(kScreenWidth - kWidth) / 2, 0, 0, kWidth, kHeight, 1};
     dkCmdBufBlitImage(cmd_, &from, &src, &screen, &dst, 0, 0);
     Send(false);
+    dkQueueSignalFence(queue_, &fences_[set_], false);
+    fenced_[set_] = true;
     dkQueuePresentImage(queue_, swapchain_, slot);
+    // the other set, once the GPU has done with the frame recorded in it
+    set_ ^= 1;
     std::uint64_t t1 = NowNs();
-    dkQueueWaitIdle(queue_);
+    if (fenced_[set_])
+        dkFenceWait(&fences_[set_], -1);
+    fenced_[set_] = false;
     waitNs_ += NowNs() - t1;
+    frameMem_ = frameMems_[set_];
+    commandMem_ = commandMems_[set_];
     BeginCommands();
     presentNs_ += NowNs() - t0;
 }
