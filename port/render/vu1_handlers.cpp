@@ -865,23 +865,23 @@ bool DirectionalLight(Runner& r)
 // From TOP: 11.x and 11.y the vertices (stride 13.x, the position in each one's last quadword),
 // 11.z the four matrices (16 quadwords), 11.w the weights (one quadword a vertex). Each position:
 // through each matrix (rows x, y, z and the translation), the four results blended by the weights.
-bool Skin(Runner& r)
+// The loop at 0x3D4 (and its copy at 0x226): positions at first, every step quadwords, until end,
+// through the four matrices at mats and blended by the weights at weights; vf02-vf23 as it
+// leaves them. False when the loop would run on past its end.
+bool SkinLoop(Runner& r, float (*vf)[4], std::uint16_t first, std::uint16_t end, std::uint16_t step,
+              std::uint16_t mats, std::uint16_t weights)
 {
-    State& st = r.s;
-    std::uint16_t top = (std::uint16_t)r.ctx.top;
-    V hdr = Load(r, top + 11);
-    std::uint16_t step = Half(Load(r, top + 13).x);
-    std::uint16_t back = (std::uint16_t)(step - 1);
-    std::uint16_t first = (std::uint16_t)(top + Half(hdr.x) + back);
-    std::uint16_t end = (std::uint16_t)(top + Half(hdr.y) + back);
     int n = Count(first, end, step);
     if (n == 0 || step > 64)
         return false;
-    std::uint16_t mats = (std::uint16_t)(top + Half(hdr.z)), weights = (std::uint16_t)(top + Half(hdr.w));
     V m[16];
     for (int k = 0; k < 16; k++)
         m[k] = Load(r, (std::uint16_t)(mats + k));
-    V pos = {}, w = {}, t[4];
+    V pos, w, t[4];
+    std::memcpy(&pos, vf[2], 16);
+    std::memcpy(&w, vf[3], 16);
+    for (int j = 0; j < 4; j++)
+        std::memcpy(&t[j], vf[20 + j], 16);
     for (int k = 0; k < n; k++) {
         std::uint16_t at = (std::uint16_t)(first + step * k);
         V p = Load(r, at);
@@ -893,7 +893,11 @@ bool Skin(Runner& r)
             F4 acc = Mul4(m[4 * j].v, Splat(p.x));
             acc = Add4(acc, Mul4(m[4 * j + 1].v, Splat(p.y)));
             acc = Add4(acc, Mul4(m[4 * j + 2].v, Splat(p.z)));
-            t[j].v = Add4(acc, Mul4(m[4 * j + 3].v, Splat(1.0f)));
+            V x;
+            x.v = Add4(acc, Mul4(m[4 * j + 3].v, Splat(1.0f)));
+            t[j].x = x.x;
+            t[j].y = x.y;
+            t[j].z = x.z;
         }
         F4 acc = Mul4(t[0].v, Splat(w.x));
         acc = Add4(acc, Mul4(t[1].v, Splat(w.y)));
@@ -905,12 +909,28 @@ bool Skin(Runner& r)
         pos.z = out.z;
         std::memcpy(r.Qword(at), &out, 12);
     }
-    SetXyz(st, 2, pos);
-    SetVf(st, 3, w);
+    std::memcpy(vf[2], &pos, 16);
+    std::memcpy(vf[3], &w, 16);
     for (int k = 0; k < 16; k++)
-        SetVf(st, 4 + k, m[k]);
+        std::memcpy(vf[4 + k], &m[k], 16);
     for (int j = 0; j < 4; j++)
-        SetXyz(st, 20 + j, t[j]);
+        std::memcpy(vf[20 + j], &t[j], 16);
+    return true;
+}
+
+bool Skin(Runner& r)
+{
+    State& st = r.s;
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    V hdr = Load(r, top + 11);
+    std::uint16_t step = Half(Load(r, top + 13).x);
+    std::uint16_t back = (std::uint16_t)(step - 1);
+    float vf[32][4];
+    std::memcpy(vf, st.vf, sizeof vf);
+    if (!SkinLoop(r, vf, (std::uint16_t)(top + Half(hdr.x) + back), (std::uint16_t)(top + Half(hdr.y) + back), step,
+                  (std::uint16_t)(top + Half(hdr.z)), (std::uint16_t)(top + Half(hdr.w))))
+        return false;
+    std::memcpy(st.vf, vf, sizeof vf);
     st.pc = 0x411;
     return true;
 }
@@ -1080,6 +1100,220 @@ bool PointFourWide(Runner& r)
     return true;
 }
 
+// --- 0x26D of chunk 7B92AF0F: the outlines.
+//
+// From TOP: 22.x and 22.y the points, 22.z and 22.w the edges (four point indices each: the edge
+// from y to z, with x and w the far corners of the two faces it joins), 23.x and 23.y the four
+// matrices and weights when the points are skinned first (0x226, as 0x3D4), 14-17 the projection,
+// 24 a packet kicked first, 27 and 35 two packets the edges take in turn. The points are projected
+// in place (a loop pipelined three deep: a point's w is 0, or for every third the w of the quadword
+// before the first point, which the loop loads and stores back). An edge is drawn when its two
+// faces' normals (cross products) point opposite ways in z and none of its four points is outside
+// the guard band: the edge's ends moved out by a perpendicular of length about 1/4096 (its side by
+// the first face's z), to the screen, into the packet's two vertex pairs, the packet kicked. The
+// flags the tests read are those of the operations exactly four instructions before.
+bool Outlines(Runner& r)
+{
+    State& st = r.s;
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    V h22 = Load(r, top + 22), h23 = Load(r, top + 23);
+    std::uint16_t base = (std::uint16_t)(top + Half(h22.x)), end = (std::uint16_t)(top + Half(h22.y));
+    std::uint16_t edge = (std::uint16_t)(top + Half(h22.z)), edgeEnd = (std::uint16_t)(top + Half(h22.w));
+    if (edge == edgeEnd || (std::uint16_t)(edgeEnd - edge) > 0x400 || (std::uint16_t)(end - base) > 0x400)
+        return false;
+    float vf[32][4];
+    std::memcpy(vf, st.vf, sizeof vf);
+    auto get = [&](int k) { V x; std::memcpy(&x, vf[k], 16); return x; };
+    auto put = [&](int k, const V& x, int mask) {
+        for (int c = 0; c < 4; c++)
+            if (mask & (8 >> c))
+                vf[k][c] = x[c];
+    };
+    const int XY = 12, XYZ = 14, XYZW = 15;
+    if (Half(h23.x) != 0 &&
+        !SkinLoop(r, vf, base, end, 1, (std::uint16_t)(top + Half(h23.x)), (std::uint16_t)(top + Half(h23.y))))
+        return false;
+
+    // the projection, 0x279-0x295
+    V zero;
+    zero.v = F4{Sub(0.0f, 0.0f), Sub(0.0f, 0.0f), Sub(0.0f, 0.0f), Sub(1.0f, 1.0f)};
+    V m[4] = {Load(r, top + 14), Load(r, top + 15), Load(r, top + 16), Load(r, top + 17)};
+    auto project = [&](const V& p) { return Transform(m, p); };
+    V v08, v09, v10, v19, v20 = zero, v21 = zero, v22, v23, v24;
+    v09 = Load(r, base);
+    v23 = project(v09);
+    v10 = Load(r, (std::uint16_t)(base + 1));
+    v08 = Load(r, (std::uint16_t)(base + 2));
+    v19 = Load(r, (std::uint16_t)(base - 1));
+    float qOf23 = Reciprocal(r, v23.w);
+    V scale = Load(r, 0), offset = Load(r, 1);
+    v24 = project(v10);
+    float qOf24 = Reciprocal(r, v24.w), qOf22 = 0;
+    std::uint16_t at = (std::uint16_t)(base - 1);
+    Store(r, at, v19);
+    at = (std::uint16_t)(at + 1);
+    auto mulq = [](V& d, const V& a, float q) {
+        d.x = Mul(a.x, q);
+        d.y = Mul(a.y, q);
+        d.z = Mul(a.z, q);
+    };
+    for (;;) {
+        v22 = project(v08);
+        v09 = Load(r, (std::uint16_t)(at + 3));
+        mulq(v20, v23, qOf23);
+        qOf22 = Reciprocal(r, v22.w);   // in the exit's delay slot too
+        if (at == end)
+            break;
+        Store(r, at, v20);
+        at = (std::uint16_t)(at + 1);
+        v23 = project(v09);
+        v10 = Load(r, (std::uint16_t)(at + 3));
+        mulq(v21, v24, qOf24);
+        qOf23 = Reciprocal(r, v23.w);
+        if (at == end)
+            break;
+        Store(r, at, v21);
+        at = (std::uint16_t)(at + 1);
+        v24 = project(v10);
+        v08 = Load(r, (std::uint16_t)(at + 3));
+        mulq(v19, v22, qOf22);
+        if (at == end)
+            break;
+        qOf24 = Reciprocal(r, v24.w);
+        Store(r, at, v19);
+        at = (std::uint16_t)(at + 1);
+    }
+    (void)qOf22;
+    for (int c = 0; c < 4; c++)
+        put(4 + c, m[c], XYZW);
+    put(2, scale, XYZW);
+    put(3, offset, XYZW);
+    put(19, v19, XYZW);
+    put(20, v20, XYZW);
+    put(21, v21, XYZW);
+    put(22, v22, XYZW);
+    put(23, v23, XYZW);
+    put(24, v24, XYZW);
+
+    // the edges, 0x296-0x2D7
+    std::uint16_t packet = 27;
+    auto corners = [&](std::uint16_t e, V* out) {
+        V idx = Load(r, e);
+        for (int k = 0; k < 4; k++)
+            out[k] = Load(r, (std::uint16_t)(Half(idx[k]) + base));
+    };
+    V pts[4];
+    corners(edge, pts);
+    V v11, v12 = get(12), v13 = get(13), v14 = get(14), v15 = get(15), v16 = get(16), v17 = get(17), v18 = get(18);
+    V v25 = get(25), v26 = get(26), v27 = get(27), v28 = get(28), v29 = get(29), v30 = get(30);
+    v08 = pts[0];
+    v09 = pts[1];
+    v10 = pts[2];
+    v11 = pts[3];
+    Kick(r, (std::uint16_t)(top + 24));
+    std::uint32_t clip = st.clip;
+    float p = st.p, i = st.i;
+    auto code = [&](const V& x) { V c = x; c.w = 1.0f; return ClipCode(c); };
+    auto sub3 = [](V& d, const V& a, const V& b) {
+        d.x = Sub(a.x, b.x);
+        d.y = Sub(a.y, b.y);
+        d.z = Sub(a.z, b.z);
+    };
+    // OPMULA a, b then OPMSUB d, b, a: a x b's fields
+    auto cross = [](V& d, const V& a, const V& b) {
+        for (int k = 0; k < 3; k++)
+            d[k] = Sub(Mul(a[(k + 1) % 3], b[(k + 2) % 3]), Mul(b[(k + 1) % 3], a[(k + 2) % 3]));
+    };
+    do {
+        sub3(v15, v10, v09);
+        sub3(v14, v09, v08);
+        sub3(v16, v11, v10);
+        std::uint32_t c0 = code(v08);
+        edge = (std::uint16_t)(edge + 1);
+        v12.x = Mul(v15.x, v15.x);
+        v12.y = Mul(v15.y, v15.y);
+        cross(v18, v14, v15);
+        cross(v17, v16, v15);
+        std::uint32_t c1 = code(v09);
+        v25 = v09;
+        std::uint32_t c2 = code(v10);
+        v26 = v10;
+        std::uint32_t c3 = code(v11);
+        clip = (c0 << 18) | (c1 << 12) | (c2 << 6) | c3;
+        corners(edge, pts);
+        v08 = pts[0];
+        v09 = pts[1];
+        v10 = pts[2];
+        v11 = pts[3];
+        float facing = Mul(v18.z, v17.z);
+        bool opposite = std::signbit(facing) && facing != 0.0f;
+        v12.x = Add(v12.x, v12.y);
+        bool outside = clip != 0;
+        float side = Add(v18.z, 0.0f);
+        bool negative = std::signbit(side) && side != 0.0f;
+        {   // ERSQRT P, vf12x, in the branch's delay slot
+            float d = std::sqrt(std::fabs(In(v12.x)));
+            p = d == 0.0f ? 3.4028235e38f : core::Fix(1.0f / d);
+        }
+        if (outside)
+            continue;
+        v29.x = Add(0.0f, v15.y);
+        v29.y = Sub(0.0f, v15.x);
+        if (!opposite)
+            continue;
+        i = FromBits(0x397BA882u);
+        v30.x = Mul(v15.x, i);
+        v30.y = Mul(v15.y, i);
+        if (negative)
+            i = FromBits(0xB97BA882u);
+        v29.x = Mul(v29.x, i);
+        v29.y = Mul(v29.y, i);
+        v30.x = Add(v30.x, v29.x);
+        v30.y = Add(v30.y, v29.y);
+        v13.x = p;
+        v29.x = Mul(v29.x, p);
+        v29.y = Mul(v29.y, p);
+        v30.x = Mul(v30.x, p);
+        v30.y = Mul(v30.y, p);
+        v25.x = Add(v25.x, v29.x);
+        v25.y = Add(v25.y, v29.y);
+        v26.x = Add(v26.x, v30.x);
+        v26.y = Add(v26.y, v30.y);
+        v27.v = Add4(Mul4(v25.v, scale.v), Mul4(offset.v, Splat(1.0f)));
+        v28.v = Add4(Mul4(v26.v, scale.v), Mul4(offset.v, Splat(1.0f)));
+        std::uint16_t q = (std::uint16_t)(packet + top);
+        Store(r, (std::uint16_t)(q + 2), v27);
+        Store(r, (std::uint16_t)(q + 6), v27);
+        Store(r, (std::uint16_t)(q + 3), v28);
+        Store(r, (std::uint16_t)(q + 7), v28);
+        packet = (std::uint16_t)(62 - packet);
+        Kick(r, q);
+    } while (edge != edgeEnd);
+    put(8, v08, XYZW);
+    put(9, v09, XYZW);
+    put(10, v10, XYZW);
+    put(11, v11, XYZW);
+    put(12, v12, XY);
+    put(13, v13, XYZW);
+    put(14, v14, XYZ);
+    put(15, v15, XYZ);
+    put(16, v16, XYZ);
+    put(17, v17, XYZ);
+    put(18, v18, XYZ);
+    put(25, v25, XYZW);
+    put(26, v26, XYZW);
+    put(27, v27, XYZW);
+    put(28, v28, XYZW);
+    put(29, v29, XY);
+    put(30, v30, XY);
+    std::memcpy(st.vf, vf, sizeof vf);
+    st.clip = clip;
+    st.p = p;
+    st.i = i;
+    st.pc = 0x2DA;
+    return true;
+}
+
 }  // namespace
 
 // Every VF register but vf00 and vf01, and P: what the lights' handlers are compared on.
@@ -1112,6 +1346,7 @@ const HandlerEntry kHandlers[] = {
      "vf02.xyz vf03.xyzw vf04.xyzw vf05.xyzw vf06.xyzw vf07.xyzw vf08.xyzw vf09.xyzw vf10.xyzw vf11.xyzw "
      "vf12.xyzw vf13.xyzw vf14.xyzw vf15.xyzw vf16.xyzw vf17.xyzw vf18.xyzw vf19.xyzw vf20.xyz vf21.xyz "
      "vf22.xyz vf23.xyz"},
+    {0x7B92AF0F, 0x26D, Outlines, "outlines", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "P clip"},
     {0xE1624411, 0x01E, BatchSecond, "lit batch second pass", "vf03.xyzw vf11.w vf12.xyz vf13.w"},
 };
 const std::size_t kHandlerCount = sizeof kHandlers / sizeof kHandlers[0];
