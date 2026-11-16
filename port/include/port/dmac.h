@@ -27,6 +27,9 @@ void SendGifNormal(std::uint32_t madr, std::uint32_t qwc);
 // the transfers before it (the display's registers, the buffer swap); and a wait until the
 // queue is empty. Without the thread (or with SLY1_RENDER_SYNC) everything runs at once.
 void RenderThreadMain();
+// The GS thread's body (the GS's packets and the display's calls, after the render thread's), on
+// a stack in game memory too (it raises the GS's interrupt).
+void GsThreadMain();
 void RenderCall(void (*fn)(std::uint64_t, std::uint64_t), std::uint64_t a, std::uint64_t b);
 void RenderFlush();
 

@@ -75,11 +75,11 @@ int StartThread(pthread_t* thread, void* stack, std::size_t size, void* (*entry)
 
 void PlaceThread(ThreadRole role)
 {
-    int core = role == ThreadRole::Game ? 0 : role == ThreadRole::Clock ? 1 : 2;
+    int core = role == ThreadRole::Game ? 0 : role == ThreadRole::Clock || role == ThreadRole::Gs ? 1 : 2;
     svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core);
     s32 prio = 0x2C;
     svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
-    if (role != ThreadRole::Game && role != ThreadRole::Render)
+    if (role != ThreadRole::Game && role != ThreadRole::Render && role != ThreadRole::Gs)
         svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2B);   // above the game's (libnx gives 0x2C to main)
     else
         svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2C);

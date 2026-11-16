@@ -199,6 +199,51 @@ private:
 
 // GIF path 1: what VU1's XGKICK sends, from its data memory.
 Gif g_path1{1};
+// Path 2 (VIF1's DIRECT) as the GS thread parses it.
+Gif g_path2{2};
+
+// --- The GS thread: the GS's work (the three paths' packets and the display's calls) on a core
+// of its own, after the render thread's VIF1 and VU1 (core 1 on the Switch, beside the clock).
+// A path-1 packet is copied out of VU1's data memory when it is kicked (the microcode writes the
+// next one over it), VIF1's DIRECT data and the GIF channel's items are passed on as they come,
+// all in one queue, in order, so the GS sees what it would have seen.
+struct GsItem {
+    std::uint8_t path = 0;   // 1-3, or 0: a call
+    std::vector<std::uint32_t> words;
+    void (*fn)(std::uint64_t, std::uint64_t) = nullptr;
+    std::uint64_t a = 0, b = 0;
+};
+std::mutex g_gsLock;
+std::condition_variable g_gsWake, g_gsIdle;
+std::deque<GsItem> g_gsQueue;
+std::vector<std::vector<std::uint32_t>> g_gsSpare;
+bool g_gsBusy;
+std::atomic<bool> g_gsStarted;
+
+// Only with the render thread: without it, the paths reach the GS from the game's thread in turn.
+bool GsAsync()
+{
+    static const bool sync = std::getenv("SLY1_RENDER_SYNC") != nullptr;
+    return !sync && g_gsStarted.load(std::memory_order_acquire);
+}
+
+std::vector<std::uint32_t> GsSpare()
+{
+    std::lock_guard<std::mutex> lk(g_gsLock);
+    if (g_gsSpare.empty())
+        return {};
+    std::vector<std::uint32_t> v = std::move(g_gsSpare.back());
+    g_gsSpare.pop_back();
+    v.clear();
+    return v;
+}
+
+void GsEnqueue(GsItem&& item)
+{
+    std::lock_guard<std::mutex> lk(g_gsLock);
+    g_gsQueue.push_back(std::move(item));
+    g_gsWake.notify_one();
+}
 
 // XGKICK: the GIF packet at quadword qaddr of VU1's data memory, tag by tag until a tag with
 // EOP has had its data (the data memory wraps at 1,024 quadwords).
@@ -206,6 +251,27 @@ void KickPath1(std::uint32_t qaddr, void*)
 {
     const std::uint8_t* d = vu1::Data();
     g_counts.path1Packets++;
+    if (GsAsync()) {   // the packet copied, tag by tag to the one with EOP
+        GsItem item;
+        item.path = 1;
+        item.words = GsSpare();
+        for (int tags = 0; tags < 1024; tags++) {
+            const std::uint32_t* tag = reinterpret_cast<const std::uint32_t*>(d + (qaddr & 0x3FF) * 16);
+            std::uint32_t nloop = tag[0] & 0x7FFF, flg = (tag[1] >> 26) & 3, nreg = (tag[1] >> 28) & 0xF;
+            if (nreg == 0)
+                nreg = 16;
+            std::uint32_t n = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
+            for (std::uint32_t k = 0; k <= n && k < 1024; k++) {
+                const std::uint32_t* q = reinterpret_cast<const std::uint32_t*>(d + ((qaddr + k) & 0x3FF) * 16);
+                item.words.insert(item.words.end(), q, q + 4);
+            }
+            qaddr += std::min<std::uint32_t>(n, 1023) + 1;
+            if ((tag[0] >> 15) & 1)
+                break;
+        }
+        GsEnqueue(std::move(item));
+        return;
+    }
     gs::Hold hold;
     for (int tags = 0; tags < 1024; tags++) {
         const std::uint32_t* tag = reinterpret_cast<const std::uint32_t*>(d + (qaddr & 0x3FF) * 16);
@@ -256,7 +322,10 @@ public:
         if (direct_) {
             qword_[filled_++] = w;
             if (filled_ == 4) {
-                gif_.Qword(qword_);
+                if (!vu0_ && GsAsync())
+                    directData_.insert(directData_.end(), qword_, qword_ + 4);
+                else
+                    gif_.Qword(qword_);
                 filled_ = 0;
             }
         }
@@ -371,6 +440,13 @@ private:
     // it go on (FBRST's STC).
     void End()
     {
+        if (direct_ && !directData_.empty()) {   // a DIRECT's data, to the GS thread
+            GsItem item;
+            item.path = 2;
+            item.words = std::move(directData_);
+            directData_ = GsSpare();
+            GsEnqueue(std::move(item));
+        }
         direct_ = false;
         if (keep_) {
             keep_ = false;
@@ -606,6 +682,7 @@ private:
     std::uint32_t left_ = 0, cl_ = 1, wl_ = 1, filled_ = 0;
     std::uint32_t qword_[4] = {};
     bool irq_ = false, direct_ = false;
+    std::vector<std::uint32_t> directData_;   // a DIRECT's quadwords for the GS thread
     Gif gif_{2};
     std::map<std::uint32_t, unsigned> seen_;
 };
@@ -851,8 +928,43 @@ void RenderCall(void (*fn)(std::uint64_t, std::uint64_t), std::uint64_t a, std::
 
 void RenderFlush()
 {
-    std::unique_lock<std::mutex> lk(g_renderLock);
-    g_renderIdle.wait_for(lk, std::chrono::seconds(5), [] { return g_renderQueue.empty() && !g_renderBusy; });
+    {
+        std::unique_lock<std::mutex> lk(g_renderLock);
+        g_renderIdle.wait_for(lk, std::chrono::seconds(5), [] { return g_renderQueue.empty() && !g_renderBusy; });
+    }
+    std::unique_lock<std::mutex> lk(g_gsLock);
+    g_gsIdle.wait_for(lk, std::chrono::seconds(5), [] { return g_gsQueue.empty() && !g_gsBusy; });
+}
+
+void GsThreadMain()
+{
+    g_gsStarted.store(true, std::memory_order_release);
+    for (;;) {
+        GsItem item;
+        {
+            std::unique_lock<std::mutex> lk(g_gsLock);
+            g_gsBusy = false;
+            if (g_gsQueue.empty())
+                g_gsIdle.notify_all();
+            g_gsWake.wait(lk, [] { return !g_gsQueue.empty(); });
+            item = std::move(g_gsQueue.front());
+            g_gsQueue.pop_front();
+            g_gsBusy = true;
+        }
+        if (item.path == 0) {
+            item.fn(item.a, item.b);
+        } else {
+            Gif& gif = item.path == 1 ? g_path1 : item.path == 2 ? g_path2 : g_gif;
+            gs::Hold hold;
+            for (std::size_t k = 0; k + 4 <= item.words.size(); k += 4)
+                gif.Qword(&item.words[k]);
+        }
+        if (item.words.capacity()) {
+            std::lock_guard<std::mutex> lk(g_gsLock);
+            if (g_gsSpare.size() < 256)
+                g_gsSpare.push_back(std::move(item.words));
+        }
+    }
 }
 
 void RenderThreadMain()
@@ -871,20 +983,37 @@ void RenderThreadMain()
             g_renderQueuedWords -= item.words.size();
             g_renderBusy = true;
         }
+        const bool gsThread = GsAsync();
         switch (item.kind) {
         case RenderItem::Vif1: {
-            gs::Hold hold;
+            std::optional<gs::Hold> hold;
+            if (!gsThread)
+                hold.emplace();
             g_vif1.Words(item.words.data(), (int)item.words.size());
             break;
         }
-        case RenderItem::Gif: {
-            gs::Hold hold;
-            for (std::size_t k = 0; k + 4 <= item.words.size(); k += 4)
-                g_gif.Qword(&item.words[k]);
+        case RenderItem::Gif:
+            if (gsThread) {
+                GsItem g;
+                g.path = 3;
+                g.words = std::move(item.words);
+                GsEnqueue(std::move(g));
+            } else {
+                gs::Hold hold;
+                for (std::size_t k = 0; k + 4 <= item.words.size(); k += 4)
+                    g_gif.Qword(&item.words[k]);
+            }
             break;
-        }
         case RenderItem::Call:
-            item.fn(item.a, item.b);
+            if (gsThread) {
+                GsItem g;
+                g.fn = item.fn;
+                g.a = item.a;
+                g.b = item.b;
+                GsEnqueue(std::move(g));
+            } else {
+                item.fn(item.a, item.b);
+            }
             break;
         }
         if (item.words.capacity()) {
