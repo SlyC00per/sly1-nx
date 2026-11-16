@@ -2289,6 +2289,275 @@ bool UnlitFinish(Runner& r)
     return true;
 }
 
+// --- 0x051 of chunk E1624411: a batch's setup. 13.w is set (in a branch's delay slot) and, by
+// 9.y: 1, the colours converted (0x0E1); 2 or 3, quadword 2 and the colours started (0x0D2);
+// otherwise 13.w cleared again.
+bool BatchSetup(Runner& r)
+{
+    State& st = r.s;
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    std::uint16_t kind = Half(Load(r, top + 9).y);
+    V hdr = Load(r, top + 11);
+    std::uint16_t first = (std::uint16_t)(top + Half(hdr.x)), end = (std::uint16_t)(top + Half(hdr.y));
+    std::uint16_t colours = (std::uint16_t)(top + Half(Load(r, top + 12).w));
+    int n = Count(first, end, 4);
+    if ((kind == 1 || kind == 2 || kind == 3) && n == 0)
+        return false;
+    r.Qword(top + 13)[3] = FromBits(1);
+    if (kind == 2 || kind == 3) {   // 0x0D2
+        V v02 = Load(r, 3), v03 = Load(r, top + 13);
+        v02.z = Sub(0.0f, 0.0f);
+        v02.w = Sub(1.0f, 1.0f);
+        float y = (float)(std::int32_t)Bits(v03.y) / 32768.0f;
+        st.vf[3][1] = y;
+        v02.y = Add(v02.y, y);
+        SetVf(st, 2, v02);
+        for (int k = 0; k < n; k++) {
+            std::memset(r.Qword((std::uint16_t)(colours + k)), 0, 12);
+            Store(r, (std::uint16_t)(first + 4 * k + 2), v02);
+        }
+        st.pc = 0x0E1;
+        return true;
+    }
+    if (kind != 1) {
+        r.Qword(top + 13)[3] = FromBits(0);
+        st.pc = 0x05F;
+        return true;
+    }
+    // 0x0E1: alpha over 255 into quadword 2's xy, the colour times 3 over its base's sum
+    float (*vf)[4] = st.vf;
+    st.i = FromBits(0x3B808081u);
+    vf[4][0] = Add(0.0f, st.i);
+    vf[4][1] = Add(0.0f, st.i);
+    st.i = 3.0f;
+    vf[6][0] = Add(0.0f, st.i);
+    auto loadXyz = [&](int reg, std::uint16_t a) { std::memcpy(vf[reg], r.Qword(a), 12); };
+    auto sum = [&]() {
+        float acc = Add(vf[7][0], vf[7][1]);
+        vf[7][0] = Add(acc, Mul(vf[1][0], vf[7][2]));
+    };
+    loadXyz(8, (std::uint16_t)(first + 1));
+    for (int c = 0; c < 3; c++)
+        vf[7][c] = Itof0(vf[8][c]);
+    vf[9][3] = r.Qword((std::uint16_t)(first + 2))[3];
+    std::memcpy(vf[10], r.Qword(colours), 16);
+    sum();
+    loadXyz(8, (std::uint16_t)(first + 5));
+    auto div = [&]() {
+        float a = In(vf[6][0]), b = In(vf[7][0]);
+        if (b == 0.0f) {
+            st.status |= a == 0.0f ? 0x410 : 0x820;
+            return (std::signbit(a) != std::signbit(b)) ? -3.4028235e38f : 3.4028235e38f;
+        }
+        return core::Fix(a / b);
+    };
+    float q = div();
+    std::uint16_t at = first, col = colours;
+    do {
+        vf[2][3] = Itof0(vf[9][3]);
+        for (int c = 0; c < 4; c++)
+            vf[3][c] = Itof0(vf[10][c]);
+        for (int c = 0; c < 3; c++)
+            vf[7][c] = Itof0(vf[8][c]);
+        at = (std::uint16_t)(at + 4);
+        vf[5][1] = Mul(vf[4][1], vf[2][3]);
+        vf[5][0] = Mul(vf[4][0], vf[3][3]);
+        for (int c = 0; c < 3; c++)
+            vf[3][c] = Mul(vf[3][c], q);
+        vf[9][3] = r.Qword((std::uint16_t)(at + 2))[3];
+        std::memcpy(vf[10], r.Qword((std::uint16_t)(col + 1)), 16);
+        sum();
+        loadXyz(8, (std::uint16_t)(at + 5));
+        float* q2 = r.Qword((std::uint16_t)(at - 2));
+        q2[0] = vf[5][0];
+        q2[1] = vf[5][1];
+        std::memcpy(r.Qword(col), vf[3], 12);
+        col = (std::uint16_t)(col + 1);
+        q = div();
+    } while (at != end);
+    st.q = q;
+    st.pc = 0x0FE;
+    return true;
+}
+
+// --- 0x1DE of chunk 6744EAB9: a spot light.
+//
+// From TOP: 28-31 made from 0-3 and itself (0x22B) and used to project; 27 the spot's direction
+// (turned by 4-6), 22-24 as for the other lights, 25 and 26 the cone's offset and scale over the
+// screen radius squared. Each vertex: projected and tested against the guard band (outside, it is
+// stored back unlit); the cone factor (the clamped fields of 26 * (|x|, |y|, r^2, w) + 25,
+// multiplied), the cosine with the normal as d + d^3, the light clamped and times the cone added
+// to quadword 2 (its z as the register held it) and through 22 to the colour. When 9.y is 4,
+// 0x154 takes the cone at the object's centre (10) to scale 23 and 24 (or makes 23 23.0 when the
+// centre is outside, and ends) and the light continues four-wide at 0x0FE.
+bool SpotLight(Runner& r)
+{
+    State& st = r.s;
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    float (*vf)[4] = st.vf;
+    auto g = [&](int k) { V x; std::memcpy(&x, vf[k], 16); return x; };
+    auto xyz = [&](int k, const V& x) { std::memcpy(vf[k], &x, 12); };
+    // the cone factor of the projected point in reg (q applied to xy), from scale and offset
+    auto cone = [&](int reg, int sq, int scale, int offset, int out) {
+        V p = g(reg);
+        p.x = std::fabs(In(p.x));
+        p.y = std::fabs(In(p.y));
+        vf[sq][0] = Mul(p.x, p.x);
+        vf[sq][1] = Mul(p.y, p.y);
+        vf[sq][0] = Add(vf[sq][0], vf[sq][1]);
+        p.z = Add(0.0f, vf[sq][0]);
+        vf[reg][0] = p.x;
+        vf[reg][1] = p.y;
+        vf[reg][2] = p.z;
+        V c;
+        c.v = Add4(Mul4(g(scale).v, g(reg).v), Mul4(g(offset).v, Splat(1.0f)));
+        for (int k = 0; k < 4; k++)
+            c[k] = Max(Mini(c[k], 1.0f), 0.0f);
+        c.x = Mul(c.x, c.w);
+        c.x = Mul(c.x, c.z);
+        c.x = Mul(c.x, c.y);
+        std::memcpy(vf[out], &c, 16);
+    };
+    if (Half(Load(r, top + 9).y) == 4) {   // 0x154
+        V hdr = Load(r, top + 11);
+        std::uint16_t span = (std::uint16_t)(Half(hdr.y) - Half(hdr.x));
+        if (span == 0 || span > 0x400)
+            return false;
+        Regs R;
+        std::memcpy(R.vf, vf, sizeof R.vf);
+        float (*rv)[4] = R.vf;
+        auto rg = [&](int k) { V x; std::memcpy(&x, rv[k], 16); return x; };
+        std::memcpy(rv[2], r.Qword(top + 10), 12);
+        for (int k = 0; k < 4; k++)
+            std::memcpy(rv[3 + k], r.Qword((std::uint16_t)(top + 28 + k)), 16);
+        V c = rg(2);
+        F4 acc = Mul4(rg(3).v, Splat(c.x));
+        acc = Add4(acc, Mul4(rg(4).v, Splat(c.y)));
+        acc = Add4(acc, Mul4(rg(5).v, Splat(c.z)));
+        std::memcpy(rv[7], r.Qword(top + 27), 12);
+        std::memcpy(rv[8], r.Qword(top + 25), 16);
+        std::memcpy(rv[9], r.Qword(top + 26), 16);
+        V v12;
+        v12.v = Add4(acc, Mul4(rg(6).v, Splat(1.0f)));
+        std::memcpy(rv[12], &v12, 16);
+        std::memcpy(rv[10], r.Qword(top + 23), 12);
+        std::memcpy(rv[11], r.Qword(top + 24), 12);
+        st.clip = ((st.clip << 6) | ClipCode(v12)) & 0xFFFFFF;
+        float q = Reciprocal(r, v12.w);
+        st.q = q;
+        if (st.clip & 0x3F) {   // 0x179: the centre outside
+            st.i = 23.0f;
+            for (int k = 0; k < 3; k++)
+                rv[10][k] = Add(0.0f, st.i);
+            std::memcpy(r.Qword(top + 23), rv[10], 12);
+            std::memcpy(vf, R.vf, sizeof R.vf);
+            st.pc = 0x17E;
+            return true;
+        }
+        rv[12][0] = Mul(rv[12][0], q);
+        rv[12][1] = Mul(rv[12][1], q);
+        // the cone, on R
+        {
+            float (*save)[4] = vf;
+            vf = rv;
+            cone(12, 13, 9, 8, 14);
+            vf = save;
+        }
+        for (int k = 0; k < 3; k++) {
+            rv[10][k] = Mul(rv[10][k], rv[14][0]);
+            rv[11][k] = Mul(rv[11][k], rv[14][0]);
+        }
+        std::memcpy(r.Qword(top + 25), rv[7], 12);
+        std::memcpy(r.Qword(top + 23), rv[10], 12);
+        std::memcpy(r.Qword(top + 24), rv[11], 12);
+        if (!LightFourWide(r, R))
+            return false;   // not reached: the span was checked first
+        std::memcpy(vf, R.vf, sizeof R.vf);
+        return true;
+    }
+    V hdr = Load(r, top + 11);
+    std::uint16_t first = (std::uint16_t)(top + Half(hdr.x));
+    int n = Count(first, (std::uint16_t)(top + Half(hdr.y)), 4);
+    if (n == 0)
+        return false;
+    MatrixProduct(r, vf, (std::uint16_t)(top + 28), top, (std::uint16_t)(top + 28));
+    for (int k = 0; k < 4; k++)
+        SetVf(st, 2 + k, Load(r, (std::uint16_t)(top + 28 + k)));
+    std::uint16_t colours = (std::uint16_t)(top + Half(Load(r, top + 12).w));
+    xyz(9, Load(r, top + 27));
+    for (int k = 0; k < 3; k++)
+        SetVf(st, 14 + k, Load(r, (std::uint16_t)(top + 4 + k)));
+    {
+        V d = g(9);
+        F4 acc = Mul4(g(14).v, Splat(d.x));
+        acc = Add4(acc, Mul4(g(15).v, Splat(d.y)));
+        V t;
+        t.v = Add4(acc, Mul4(g(16).v, Splat(d.z)));
+        xyz(9, t);
+    }
+    xyz(6, Load(r, top + 22));
+    xyz(7, Load(r, top + 24));
+    xyz(8, Load(r, top + 23));
+    float p = Erleng(g(9));
+    vf[28][0] = p;
+    {
+        V u;
+        u.v = Mul4(g(9).v, Splat(p));
+        xyz(9, u);
+    }
+    vf[10][0] = Add(0.0f, vf[9][1]);
+    vf[11][0] = Add(0.0f, vf[9][2]);
+    SetVf(st, 13, Load(r, top + 25));
+    SetVf(st, 12, Load(r, top + 26));
+    for (int k = 0; k < n; k++) {
+        std::uint16_t at = (std::uint16_t)(first + 4 * k);
+        xyz(17, Load(r, (std::uint16_t)(at + 3)));
+        V v19 = Load(r, (std::uint16_t)(at + 2));
+        vf[19][0] = v19.x;
+        vf[19][1] = v19.y;
+        xyz(20, Load(r, (std::uint16_t)(colours + k)));
+        SetVf(st, 18, Load(r, at));
+        V pos = g(17);
+        F4 acc = Mul4(g(2).v, Splat(pos.x));
+        acc = Add4(acc, Mul4(g(3).v, Splat(pos.y)));
+        acc = Add4(acc, Mul4(g(4).v, Splat(pos.z)));
+        V v21;
+        v21.v = Add4(acc, Mul4(g(5).v, Splat(1.0f)));
+        SetVf(st, 21, v21);
+        st.clip = ((st.clip << 6) | ClipCode(v21)) & 0xFFFFFF;
+        float q = Reciprocal(r, v21.w);
+        st.q = q;
+        if (!(st.clip & 0x3F)) {
+            vf[21][0] = Mul(vf[21][0], q);
+            vf[21][1] = Mul(vf[21][1], q);
+            cone(21, 27, 12, 13, 22);
+            float a = Mul(vf[9][0], vf[18][0]);
+            a = Add(a, Mul(vf[10][0], vf[18][1]));
+            vf[25][0] = Add(a, Mul(vf[11][0], vf[18][2]));
+            vf[26][0] = Mul(vf[25][0], vf[25][0]);
+            a = Add(vf[25][0], 0.0f);
+            vf[25][0] = Add(a, Mul(vf[26][0], vf[25][0]));
+            V lit;
+            lit.v = Add4(Add4(Splat(0.0f), g(7).v), Mul4(g(8).v, Splat(vf[25][0])));
+            for (int c = 0; c < 3; c++)
+                lit[c] = Mini(Max(lit[c], 0.0f), 1.0f);
+            for (int c = 0; c < 3; c++)
+                lit[c] = Mul(lit[c], vf[22][0]);
+            xyz(23, lit);
+            vf[19][0] = Add(vf[19][0], lit.x);
+            vf[19][1] = Add(vf[19][1], lit.y);
+            V col;
+            col.v = Add4(Add4(Splat(0.0f), g(20).v), Mul4(g(6).v, Splat(lit.z)));
+            xyz(20, col);
+        }
+        std::memcpy(r.Qword((std::uint16_t)(at + 2)), vf[19], 12);
+        std::memcpy(r.Qword((std::uint16_t)(colours + k)), vf[20], 12);
+    }
+    st.p = p;
+    st.pc = 0x22B;
+    return true;
+}
+
 }  // namespace
 
 // Every VF register but vf00 and vf01, and P: what the lights' handlers are compared on.
@@ -2328,6 +2597,8 @@ const HandlerEntry kHandlers[] = {
     {0x79A6F5FB, 0x318, MatrixAt14, "matrix at 14", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31},
     {0x79A6F5FB, 0x31F, CopyFromOtherBuffer, "copy from the other buffer", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31},
     {0xE1624411, 0x05F, UnlitFinish, "unlit batch finish", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I clip"},
+    {0xE1624411, 0x051, BatchSetup, "batch setup", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I"},
+    {0x6744EAB9, 0x1DE, SpotLight, "spot light", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q P I clip"},
     {0xE1624411, 0x01E, BatchSecond, "lit batch second pass", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I clip"},
 };
 const std::size_t kHandlerCount = sizeof kHandlers / sizeof kHandlers[0];
