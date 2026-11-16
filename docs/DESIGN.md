@@ -268,30 +268,50 @@ instruction; the full survey (`docs/RENDERER.md`) is the first task of milestone
 | textures, render targets | `texture_upload.cpp` (`StartImageUpload`, `StartPaletteUpload`, `SetupTextureRenderTarget`) | GS memory transfers by load class; a texture as draw target |
 | videos | `movie_player.cpp` (`UploadMovieFrame`, `DrawMovieFrame`) | decoded picture uploaded and drawn as a sprite |
 
-### Recommendation: read the game's own packets, one native handler per program
+### Decision (maintainer, 2026-11-16): run the game's own VU1 code
 
-The game keeps doing everything it does today: culling, fades, sorting, group order,
-packet building. The port takes over where the packets would go to the hardware:
+The survey of milestone 4's first step (`SLY1_RENDER_SURVEY`, `SLY1_VU1_DUMP`) found the 3D
+going through VU1 microprograms: two program sets (one of about 1,880 instructions filling
+micro memory from 0x000 to 0x756, one of about 730 loaded over its start for some draw groups),
+about 25 entry points in use, and about 90 distinct VU operations, all of the documented set
+(vector arithmetic, integer and branch operations, `CLIP`, `XGKICK`, a few of the EFU's).
+2D, fades and texture uploads go through the GIF channel; VIF1's DIRECT carries register setup.
+
+The port therefore **runs the game's VU1 code**:
+
+- VIF1 is modelled whole (UNPACK with its masks, modes and double buffering, MPG, the program
+  starts, BASE/OFFSET/ITOP), and VU1 runs its microprograms in an interpreter on a core of its
+  own; what it sends with `XGKICK` (path 1), with VIF1's DIRECT (path 2) and on the GIF channel
+  (path 3) goes to one GS model;
+- the GS model keeps the GS's registers and local memory (textures and palettes as the game
+  uploads them, in the GS's own layouts) and turns primitives into draws: deko3d on the Switch,
+  the host reference rasteriser on the host (`--dump-fb`);
+- retail's output follows by construction, for every draw path, including the rare ones. The
+  cost is CPU time; if the interpreter cannot hold 60 frames a second, the same decoded
+  programs are translated to native code (once per uploaded program), with nothing else
+  changing.
+
+### Fallback, if B cannot hold 60 frames a second: native handlers per program
+
+Kept for reference, the plan this note first recommended. The game keeps doing everything it
+does today: culling, fades, sorting, group order, packet building. The port takes over where
+the packets would go to the hardware:
 
 - a reader walks the frame's chain and its VIF commands (public formats). It does not run
   VU1 code: each program entry point (the named ones, by role) has a **native handler**
   that knows that program's inputs and turns them into a draw with the matching shader;
 - GS register writes (state, 2D primitives, uploads) are translated to pipeline state,
-  draws and texture updates. Textures are identified through the game's own texture
-  tables, not by modelling GS memory;
+  draws and texture updates;
 - a model packet built at load is converted **once** into a GPU vertex buffer, keyed by
   the packet's address and dropped at level unload: that gives static geometry in GPU
   memory without touching the builders. Dynamic batches go to a ring buffer.
 
-Why not intercept at the builders instead: it would mean patching dozens of game
-functions and re-deriving the frame's ordering and state, each a chance to differ from
-retail; the packet boundary is narrow, is where the game's decisions are already final,
-and lets every draw path be brought up and tested one handler at a time, with a counter
-of packets no handler claimed. How lighting, skinning, outlines and fades work is **not
-assumed here**; it is established per handler from the builders and the microprograms'
-behaviour, and written down before each is implemented.
+It is faster at run time, but each handler re-derives by hand what a microprogram computes
+(lighting, skinning, morphs, clipping, outlines, particles) and is a place where the output can
+differ from retail. If it is ever needed, it can replace B program by program: the interpreter's
+results are the reference each handler is checked against.
 
-The front end (reader, handlers, draw list) is independent of the graphics API. Back
+The front end (VIF1, VU1, the GS model and its draw list) is independent of the graphics API. Back
 ends: **deko3d** on Switch (GLSL 450 through `uam`, 1280×720 and 1920×1080), and a
 **host reference rasteriser** in plain C++ that draws the same list to a PNG. The second
 exists because I cannot see a Switch screen: it makes `--dump-fb` work on the host and in

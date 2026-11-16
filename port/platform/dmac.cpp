@@ -13,6 +13,8 @@
 #include "port/dmac.h"
 
 #include <atomic>
+#include <cstdarg>
+#include <mutex>
 #include <cstdlib>
 #include <map>
 #include <string>
@@ -37,6 +39,30 @@ struct Counts {
     std::atomic<unsigned> chains{0}, tags{0}, vifInterrupts{0}, finishes{0}, unknownVifcodes{0}, sprChains{0};
 } g_counts;
 
+// SLY1_RENDER_SURVEY: what the renderer must handle (docs/RENDERER.md), printed by DmacDump.
+struct Survey {
+    // read on first use: --env sets it after static initialisation
+    bool On()
+    {
+        static const bool on = std::getenv("SLY1_RENDER_SURVEY") != nullptr;
+        return on;
+    }
+    std::mutex lock;
+    std::map<std::string, unsigned long> counts;          // "what" -> times
+    std::map<std::uint32_t, std::uint32_t> programAt;     // VU1 micro address (qwords) -> hash of its upload
+    std::map<std::uint32_t, std::uint32_t> programSize;   // hash -> 64-bit instructions
+    void Count(const char* fmt, ...) __attribute__((format(printf, 2, 3)))
+    {
+        char buf[128];
+        va_list va;
+        va_start(va, fmt);
+        std::vsnprintf(buf, sizeof buf, fmt, va);
+        va_end(va);
+        std::lock_guard<std::mutex> lk(lock);
+        counts[buf]++;
+    }
+} g_survey;
+
 // Main memory or the scratchpad at a tag's address (bit 31 of the address field: the scratchpad).
 // The rest is a game address as the port has them: main memory, its uncached alias, or the port's
 // image (a packet the game builds on a thread's stack).
@@ -50,6 +76,8 @@ const std::uint32_t* At(std::uint32_t addr, bool spr)
 // A GIF packet stream, a quadword at a time.
 class Gif {
 public:
+    explicit Gif(int path) : path_(path) {}
+
     void Qword(const std::uint32_t* q)
     {
         if (left_ == 0) {
@@ -60,6 +88,8 @@ public:
             unsigned reg = (unsigned)(regs_ >> (4 * (index_ % nreg_))) & 0xF;
             if (reg == 0xE && (q[2] & 0xFF) == 0x61)
                 Finish();
+            if (g_survey.On())
+                SurveyPacked(reg, q);
             index_++;
         }
         left_--;
@@ -75,6 +105,14 @@ private:
             nreg_ = 16;
         regs_ = q[2] | (std::uint64_t)q[3] << 32;
         index_ = 0;
+        if (g_survey.On()) {
+            static const char* kFlg[] = {"PACKED", "REGLIST", "IMAGE", "IMAGE"};
+            g_survey.Count("gif path %d: %s packets", path_, kFlg[flg_]);
+            if ((q[1] >> 14) & 1)   // PRE: the tag sets PRIM
+                g_survey.Count("gif path %d: primitive %s (from a tag)", path_, Prim(q[1] >> 15));
+            if (flg_ == 2)
+                g_survey.Count("gif path %d: image uploads, format 0x%02X", path_, dpsm_);
+        }
         if (flg_ == 0)
             left_ = nloop * nreg_;
         else if (flg_ == 1)
@@ -92,6 +130,37 @@ private:
         RaiseInterrupt(kCauseGs);
     }
 
+    static const char* Prim(std::uint32_t prim)
+    {
+        static const char* kNames[] = {"point", "line", "line strip", "triangle", "triangle strip",
+                                       "triangle fan", "sprite", "(7)"};
+        return kNames[prim & 7];
+    }
+
+    // A PACKED register write: the primitive kinds, texture formats and upload formats seen.
+    void SurveyPacked(unsigned reg, const std::uint32_t* q)
+    {
+        unsigned addr = reg == 0xE ? (q[2] & 0xFF) : reg;
+        std::uint64_t data = q[0] | (std::uint64_t)q[1] << 32;
+        switch (addr) {
+        case 0x00:   // PRIM
+            g_survey.Count("gif path %d: primitive %s%s%s", path_, Prim((std::uint32_t)data),
+                           (data >> 4) & 1 ? ", textured" : "", (data >> 6) & 1 ? ", blended" : "");
+            break;
+        case 0x06: case 0x07:   // TEX0_1, TEX0_2: the texture's format
+            g_survey.Count("gif path %d: texture format 0x%02X", path_, (unsigned)(data >> 20) & 0x3F);
+            break;
+        case 0x50:   // BITBLTBUF: an upload's format
+            dpsm_ = (unsigned)(data >> 56) & 0x3F;
+            break;
+        default:
+            if (reg == 0xE)
+                g_survey.Count("gif path %d: A+D register 0x%02X", path_, addr);
+        }
+    }
+
+    int path_;
+    unsigned dpsm_ = 0;
     std::uint32_t left_ = 0, nreg_ = 1, flg_ = 0, index_ = 0;
     std::uint64_t regs_ = 0;
 };
@@ -147,6 +216,13 @@ private:
         num_ = num;
         data_.clear();
         keep_ = vu0_ && (cmd == 0x4A || (cmd & 0x60) == 0x60);
+        if (!vu0_ && g_survey.On()) {
+            keep_ = cmd == 0x4A;   // VIF1's microcode, to name the programs by a hash of it
+            if ((cmd & 0x60) == 0x60)
+                g_survey.Count("vif1 UNPACK 0x%02X", cmd & 0x7F);
+            if (cmd == 0x14 || cmd == 0x15 || cmd == 0x17)
+                SurveyStart(cmd == 0x17 ? 0xFFFF : (imm & 0x3FF));
+        }
         if ((cmd & 0x60) == 0x60) {   // UNPACK: num vectors of vn+1 elements of 32 >> vl bits
             std::uint32_t vn = (cmd >> 2) & 3, vl = cmd & 3, n = num ? num : 256;
             std::uint32_t vectors = n;
@@ -203,7 +279,9 @@ private:
         direct_ = false;
         if (keep_) {
             keep_ = false;
-            if (cmd_ == 0x4A)
+            if (!vu0_)
+                SurveyMicrocode();
+            else if (cmd_ == 0x4A)
                 LoadMicrocode();
             else
                 Unpack();
@@ -213,6 +291,45 @@ private:
             g_counts.vifInterrupts++;
             RaiseInterrupt(cause_);
         }
+    }
+
+    // VIF1's MPG: the program's instructions hashed, its addresses noted.
+    void SurveyMicrocode()
+    {
+        std::uint32_t h = 2166136261u;
+        for (std::uint32_t w : data_)
+            h = (h ^ w) * 16777619u;
+        std::lock_guard<std::mutex> lk(g_survey.lock);
+        for (std::uint32_t k = 0; k < data_.size() / 2; k++)
+            g_survey.programAt[(imm_ + k) & 0x7FF] = h;
+        g_survey.programSize[h] = (std::uint32_t)data_.size() / 2;
+        // SLY1_VU1_DUMP=FOLDER: each upload written there as <address>-<hash>.bin (the player's own
+        // game data: build folders only, never committed)
+        if (const char* dir = std::getenv("SLY1_VU1_DUMP")) {
+            char path[512];
+            std::snprintf(path, sizeof path, "%s/%03X-%08X.bin", dir, imm_ & 0x7FF, h);
+            if (std::FILE* f = std::fopen(path, "wb")) {
+                std::fwrite(data_.data(), 4, data_.size(), f);
+                std::fclose(f);
+            }
+        }
+    }
+
+    // A microprogram start: the program (its upload's hash) and the entry, in 64-bit instructions.
+    void SurveyStart(std::uint32_t entry)
+    {
+        std::uint32_t h = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_survey.lock);
+            if (entry != 0xFFFF) {
+                auto it = g_survey.programAt.find(entry);
+                h = it == g_survey.programAt.end() ? 0 : it->second;
+            }
+        }
+        if (entry == 0xFFFF)
+            g_survey.Count("vif1 MSCNT (continue)");
+        else
+            g_survey.Count("vif1 MSCAL entry 0x%03X of program %08X", entry, h);
     }
 
     // MPG: the instructions to VU0's micro memory at imm (in 64-bit instructions).
@@ -282,12 +399,12 @@ private:
     std::uint32_t left_ = 0, cl_ = 1, wl_ = 1, filled_ = 0;
     std::uint32_t qword_[4] = {};
     bool irq_ = false, direct_ = false;
-    Gif gif_;
+    Gif gif_{2};
     std::map<std::uint32_t, unsigned> seen_;
 };
 
 Vif g_vif0(kCauseVif0, true), g_vif1(kCauseVif1, false);
-Gif g_gif;
+Gif g_gif{3};
 
 // A quadword of the scratchpad, by SADR's offset (it wraps at 16 KiB).
 std::uint32_t* Spr(std::uint32_t sadr)
@@ -410,6 +527,13 @@ void DmacDump()
                  "%u VIFcodes not understood\n", g_counts.chains.load(), g_counts.sprChains.load(),
                  g_counts.tags.load(), g_counts.vifInterrupts.load(), g_counts.finishes.load(),
                  g_counts.unknownVifcodes.load());
+    if (g_survey.On()) {
+        std::lock_guard<std::mutex> lk(g_survey.lock);
+        for (auto& kv : g_survey.counts)
+            std::fprintf(stderr, "survey: %10lu  %s\n", kv.second, kv.first.c_str());
+        for (auto& kv : g_survey.programSize)
+            std::fprintf(stderr, "survey: program %08X: %u instructions\n", kv.first, kv.second);
+    }
 }
 
 }  // namespace port
