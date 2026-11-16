@@ -73,9 +73,17 @@ int g_seconds = 10;
     std::_Exit(status);
 }
 
+// When the program started, for the report's frame rate.
+const auto g_programStart = std::chrono::steady_clock::now();
+
 // The run's report: the kernel's threads, the DMA counts, the frame semaphores, the card.
 void Report()
 {
+    {
+        double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_programStart).count();
+        std::fprintf(stderr, "sly1: %llu frames shown in %.1f s since the program started\n",
+                     (unsigned long long)port::gs::FramesShown(), s);
+    }
     port::KernelDump();
     port::DmacDump();
     {   // the display's and the render frames' semaphores and flags, for the report

@@ -430,7 +430,7 @@ struct Clipper {
     float (*vf)[4];
     explicit Clipper(Runner& run) : r(run), st(run.s), top((std::uint16_t)run.ctx.top), vf(run.s.vf) {}
 
-    V g(int k) const { V x; std::memcpy(&x, vf[k], 16); return x; }
+    V g(int k) const { V x = {}; std::memcpy(&x, vf[k], 16); return x; }
     void p(int k, const V& x, int mask = 15)
     {
         for (int c = 0; c < 4; c++)
@@ -1056,7 +1056,7 @@ bool PointLight(Runner& r)
 // prologue read before the buffers), so it is followed here on the registers themselves.
 struct Regs {
     float vf[32][4];
-    V get(int r) const { V x; std::memcpy(&x, vf[r], 16); return x; }
+    V get(int r) const { V x = {}; std::memcpy(&x, vf[r], 16); return x; }
     void put(int r, const V& x, int mask) { for (int k = 0; k < 4; k++) if (mask & (8 >> k)) vf[r][k] = x[k]; }
 };
 
@@ -1544,7 +1544,7 @@ bool Outlines(Runner& r)
         return false;
     float vf[32][4];
     std::memcpy(vf, st.vf, sizeof vf);
-    auto get = [&](int k) { V x; std::memcpy(&x, vf[k], 16); return x; };
+    auto get = [&](int k) { V x = {}; std::memcpy(&x, vf[k], 16); return x; };
     auto put = [&](int k, const V& x, int mask) {
         for (int c = 0; c < 4; c++)
             if (mask & (8 >> c))
@@ -1790,7 +1790,7 @@ bool Sprites(Runner& r)
     const int n = span / step + 1;
     float vf[32][4];
     std::memcpy(vf, st.vf, sizeof vf);
-    auto get = [&](int k) { V x; std::memcpy(&x, vf[k], 16); return x; };
+    auto get = [&](int k) { V x = {}; std::memcpy(&x, vf[k], 16); return x; };
     auto set = [&](int k, const V& x) { std::memcpy(vf[k], &x, 16); };
     MatrixProduct(r, vf, (std::uint16_t)(top + 22), 8, (std::uint16_t)(top + 22));
     V m[4] = {Load(r, top + 22), Load(r, top + 23), Load(r, top + 24), Load(r, top + 25)};
@@ -1907,7 +1907,7 @@ bool Particles(Runner& r)
     if (span == 0 || span % 10 || span > 0x400)
         return false;
     float (*vf)[4] = st.vf;
-    auto g = [&](int k) { V x; std::memcpy(&x, vf[k], 16); return x; };
+    auto g = [&](int k) { V x = {}; std::memcpy(&x, vf[k], 16); return x; };
     auto p = [&](int k, const V& x, int mask) {
         for (int c = 0; c < 4; c++)
             if (mask & (8 >> c))
@@ -2137,7 +2137,7 @@ bool SkinNormals(Runner& r)
     if (span == 0 || (span & 3) || span > 0x400)
         return false;
     float (*vf)[4] = st.vf;
-    auto g = [&](int k) { V x; std::memcpy(&x, vf[k], 16); return x; };
+    auto g = [&](int k) { V x = {}; std::memcpy(&x, vf[k], 16); return x; };
     auto p = [&](int k, const V& x, int mask) {
         for (int c = 0; c < 4; c++)
             if (mask & (8 >> c))
@@ -2395,7 +2395,7 @@ bool SpotLight(Runner& r)
     State& st = r.s;
     std::uint16_t top = (std::uint16_t)r.ctx.top;
     float (*vf)[4] = st.vf;
-    auto g = [&](int k) { V x; std::memcpy(&x, vf[k], 16); return x; };
+    auto g = [&](int k) { V x = {}; std::memcpy(&x, vf[k], 16); return x; };
     auto xyz = [&](int k, const V& x) { std::memcpy(vf[k], &x, 12); };
     // the cone factor of the projected point in reg (q applied to xy), from scale and offset
     auto cone = [&](int reg, int sq, int scale, int offset, int out) {
@@ -2426,7 +2426,7 @@ bool SpotLight(Runner& r)
         Regs R;
         std::memcpy(R.vf, vf, sizeof R.vf);
         float (*rv)[4] = R.vf;
-        auto rg = [&](int k) { V x; std::memcpy(&x, rv[k], 16); return x; };
+        auto rg = [&](int k) { V x = {}; std::memcpy(&x, rv[k], 16); return x; };
         std::memcpy(rv[2], r.Qword(top + 10), 12);
         for (int k = 0; k < 4; k++)
             std::memcpy(rv[3 + k], r.Qword((std::uint16_t)(top + 28 + k)), 16);
@@ -2575,7 +2575,7 @@ bool Quads(Runner& r)
     if (span == 0 || span % 10 || span > 0x400)
         return false;
     float (*vf)[4] = st.vf;
-    auto g = [&](int k) { V x; std::memcpy(&x, vf[k], 16); return x; };
+    auto g = [&](int k) { V x = {}; std::memcpy(&x, vf[k], 16); return x; };
     auto set = [&](int k, const V& x) { std::memcpy(vf[k], &x, 16); };
     const std::uint16_t vi05 = 32768;
     set(2, Load(r, 0));
@@ -2788,7 +2788,7 @@ bool UnitNormals(Runner& r)
     if (span == 0 || (span & 3) || span > 0x400)
         return false;
     float (*vf)[4] = st.vf;
-    auto g = [&](int k) { V x; std::memcpy(&x, vf[k], 16); return x; };
+    auto g = [&](int k) { V x = {}; std::memcpy(&x, vf[k], 16); return x; };
     auto set = [&](int k, const V& x) { std::memcpy(vf[k], &x, 16); };
     std::memcpy(vf[2], r.Qword(vi05), 12);
     V zero;

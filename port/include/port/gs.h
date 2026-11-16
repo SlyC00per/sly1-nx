@@ -46,6 +46,9 @@ void FrameShown();
 // --dump-fb: every every-th frame shown written to dir as frame-NNNNN.png.
 void SetFrameDump(const std::string& dir, int every);
 
+// The frames shown so far (the game's buffer swaps).
+std::uint64_t FramesShown();
+
 // The primitives drawn so far.
 std::uint64_t PrimitivesDrawn();
 

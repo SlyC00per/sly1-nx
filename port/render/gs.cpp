@@ -984,6 +984,8 @@ void SetFrameDump(const std::string& dir, int every)
     g_dumpEvery = every > 0 ? every : 60;
 }
 
+std::uint64_t FramesShown() { return g_framesShown; }
+
 void FrameShown()
 {
     std::uint64_t n = ++g_framesShown;
