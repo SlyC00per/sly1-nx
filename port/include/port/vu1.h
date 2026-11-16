@@ -42,6 +42,9 @@ void MicrocodeLoaded(std::uint32_t addr, std::uint32_t count);
 // Runs the microprogram at instruction address pc until its end bit; gives the instructions run.
 std::uint64_t Run(std::uint32_t pc, const Context& ctx);
 
+// The handler calls checked against the interpreter (SLY1_VU1_CHECK), and how many differed.
+std::uint64_t HandlerChecks(std::uint64_t* failures);
+
 // The instructions run in translated chunks so far.
 std::uint64_t TranslatedInstructions();
 

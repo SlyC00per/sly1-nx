@@ -23,6 +23,10 @@
 #include <cstring>
 
 #include "vu1_runner.h"
+#include "vu1_handlers.h"
+
+#include <string>
+#include <vector>
 
 namespace port {
 namespace vu1 {
@@ -93,7 +97,10 @@ void MicrocodeLoaded(std::uint32_t addr, std::uint32_t count)
     }
 }
 
-std::uint64_t Run(std::uint32_t start, const Context& ctx)
+namespace {
+
+// The microprogram, interpreted (through the translated chunks where installed).
+std::uint64_t Interpret(std::uint32_t start, const Context& ctx)
 {
     State& s = Vu1();
     s.vf[0][0] = s.vf[0][1] = s.vf[0][2] = 0.0f;
@@ -107,8 +114,9 @@ std::uint64_t Run(std::uint32_t start, const Context& ctx)
             std::uint64_t before = r.executed;
             pc = g_table[pc](r, pc);
             g_translatedRun += r.executed - before;
-        } else
+        } else {
             core::Step(r, pc);
+        }
         if (r.executed > (1u << 24)) {
             std::fprintf(stderr, "port: a VU1 microprogram from 0x%03X ran without ending\n", start);
             std::abort();
@@ -120,6 +128,159 @@ std::uint64_t Run(std::uint32_t start, const Context& ctx)
     r.Q();
     r.P();
     return r.executed;
+}
+
+// The handler registered for the entry of the chunk installed there, or none.
+const HandlerEntry* HandlerFor(std::uint32_t start)
+{
+    int o = g_owner[start & 0x7FF];
+    if (o < 0)
+        return nullptr;
+    std::uint32_t hash = core::kTranslated[o].hash;
+    for (std::size_t i = 0; i < kHandlerCount; i++)
+        if (kHandlers[i].chunkHash == hash && kHandlers[i].entry == (start & 0x7FF))
+            return &kHandlers[i];
+    return nullptr;
+}
+
+// A packet as XGKICK sends it: its quadwords from qaddr through the tag with EOP.
+std::vector<std::uint32_t> PacketAt(std::uint32_t qaddr)
+{
+    std::vector<std::uint32_t> out;
+    const std::uint8_t* d = Data();
+    for (int tags = 0; tags < 1024; tags++) {
+        const std::uint32_t* tag = reinterpret_cast<const std::uint32_t*>(d + (qaddr & 0x3FF) * 16);
+        std::uint32_t nloop = tag[0] & 0x7FFF, flg = (tag[1] >> 26) & 3, nreg = (tag[1] >> 28) & 0xF;
+        if (nreg == 0)
+            nreg = 16;
+        std::uint32_t n = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
+        for (std::uint32_t k = 0; k <= n && k < 1024; k++) {
+            const std::uint32_t* q = reinterpret_cast<const std::uint32_t*>(d + ((qaddr + k) & 0x3FF) * 16);
+            out.insert(out.end(), q, q + 4);
+        }
+        qaddr += n + 1;
+        if ((tag[0] >> 15) & 1)
+            break;
+    }
+    return out;
+}
+
+struct Capture {
+    std::vector<std::vector<std::uint32_t>> packets;
+    const Context* real = nullptr;   // passed on to it too, when set
+};
+
+void CaptureKick(std::uint32_t qaddr, void* user)
+{
+    Capture* c = static_cast<Capture*>(user);
+    c->packets.push_back(PacketAt(qaddr));
+    if (c->real && c->real->kick)
+        c->real->kick(qaddr, c->real->user);
+}
+
+struct Snapshot {
+    State state;
+    std::vector<std::uint8_t> data;
+    void Take() { state = Vu1(); data.assign(Data(), Data() + 0x4000); }
+    void Restore() const { Vu1() = state; std::memcpy(Data(), data.data(), 0x4000); }
+};
+
+std::uint64_t g_checked, g_checkFailures;
+
+// The first difference between the handler's results and the interpreter's, or empty.
+std::string Compare(const Snapshot& h, const Capture& hc, const Snapshot& i, const Capture& ic)
+{
+    char buf[200];
+    for (int r = 0; r < 32; r++)
+        for (int k = 0; k < 4; k++)
+            if (std::memcmp(&h.state.vf[r][k], &i.state.vf[r][k], 4)) {
+                std::snprintf(buf, sizeof buf, "vf%02d.%c: handler %08X, interpreter %08X", r, "xyzw"[k],
+                              core::Bits(h.state.vf[r][k]), core::Bits(i.state.vf[r][k]));
+                return buf;
+            }
+    for (int r = 1; r < 16; r++)
+        if (h.state.vi[r] != i.state.vi[r]) {
+            std::snprintf(buf, sizeof buf, "vi%02d: handler %04X, interpreter %04X", r, h.state.vi[r], i.state.vi[r]);
+            return buf;
+        }
+    for (int k = 0; k < 4; k++)
+        if (std::memcmp(&h.state.acc[k], &i.state.acc[k], 4))
+            return std::string("ACC.") + "xyzw"[k];
+    if (std::memcmp(&h.state.q, &i.state.q, 4)) return "Q";
+    if (std::memcmp(&h.state.p, &i.state.p, 4)) return "P";
+    if (std::memcmp(&h.state.i, &i.state.i, 4)) return "I";
+    if (h.state.mac != i.state.mac) return "the MAC flags";
+    if ((h.state.status & 0xFFF) != (i.state.status & 0xFFF)) return "the status flags";
+    if (h.state.clip != i.state.clip) return "the clip flags";
+    if (h.state.pc != i.state.pc) return "the end pc";
+    for (std::size_t k = 0; k < h.data.size(); k += 4)
+        if (std::memcmp(&h.data[k], &i.data[k], 4)) {
+            std::uint32_t a, b;
+            std::memcpy(&a, &h.data[k], 4);
+            std::memcpy(&b, &i.data[k], 4);
+            std::snprintf(buf, sizeof buf, "data memory at quadword 0x%03zX word %zu: handler %08X, interpreter %08X",
+                          k / 16, (k / 4) % 4, a, b);
+            return buf;
+        }
+    if (hc.packets.size() != ic.packets.size()) {
+        std::snprintf(buf, sizeof buf, "packets kicked: handler %zu, interpreter %zu", hc.packets.size(), ic.packets.size());
+        return buf;
+    }
+    for (std::size_t p = 0; p < hc.packets.size(); p++)
+        if (hc.packets[p] != ic.packets[p]) {
+            std::snprintf(buf, sizeof buf, "packet %zu differs", p);
+            return buf;
+        }
+    return std::string();
+}
+
+}  // namespace
+
+std::uint64_t Run(std::uint32_t start, const Context& ctx)
+{
+    const HandlerEntry* h = HandlerFor(start);
+    static const bool check = std::getenv("SLY1_VU1_CHECK") != nullptr;
+    if (!h)
+        return Interpret(start, ctx);
+    if (!check) {
+        Runner r(ctx);
+        h->fn(r);
+        return 0;
+    }
+    // Both, from the same state: the handler's results kept aside, the interpreter's kept.
+    Snapshot before;
+    before.Take();
+    Capture hc;
+    Context hctx = ctx;
+    hctx.kick = CaptureKick;
+    hctx.user = &hc;
+    {
+        Runner r(hctx);
+        h->fn(r);
+    }
+    Snapshot afterHandler;
+    afterHandler.Take();
+    before.Restore();
+    Capture ic;
+    ic.real = &ctx;
+    Context ictx = ctx;
+    ictx.kick = CaptureKick;
+    ictx.user = &ic;
+    std::uint64_t n = Interpret(start, ictx);
+    Snapshot afterInterpreter;
+    afterInterpreter.Take();
+    g_checked++;
+    std::string diff = Compare(afterHandler, hc, afterInterpreter, ic);
+    if (!diff.empty() && g_checkFailures++ < 20)
+        std::fprintf(stderr, "vu1 check: %s (entry 0x%03X): %s\n", h->name, start & 0x7FF, diff.c_str());
+    return n;
+}
+
+std::uint64_t HandlerChecks(std::uint64_t* failures)
+{
+    if (failures)
+        *failures = g_checkFailures;
+    return g_checked;
 }
 
 std::uint64_t TranslatedInstructions() { return g_translatedRun; }
