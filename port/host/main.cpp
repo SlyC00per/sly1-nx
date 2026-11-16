@@ -92,6 +92,12 @@ void Report()
     }
     port::KernelDump();
     port::DmacDump();
+    {
+        std::uint64_t whole, skipped, other;
+        port::gs::UploadCounts(&whole, &skipped, &other);
+        std::fprintf(stderr, "gs: %llu uploads in one run of data, %llu of them the same as last time and not written; %llu others\n",
+                     (unsigned long long)whole, (unsigned long long)skipped, (unsigned long long)other);
+    }
     port::gpu::Report();
     if (std::getenv("SLY1_GS_SURVEY"))
         port::gs::SurveyReport();
@@ -460,7 +466,13 @@ int main(int argc, char** argv)
     if (std::getenv("SLY1_GS_COUNT")) {
         struct Counting : port::gs::Backend {
             std::uint64_t runs = 0, vertices = 0, indices = 0, frames = 0;
-            void Begin(const port::gs::DrawState&) override {}
+            std::vector<std::uint32_t> pixels;
+            void Begin(const port::gs::DrawState& s) override
+            {
+                int w, h;
+                if (s.tme && std::getenv("SLY1_GS_CHECK"))   // the decoder exercised (and checked)
+                    port::gs::DecodeTexture(s, pixels, w, h);
+            }
             void Draw(const port::gs::DrawState&, const port::gs::DrawVertex*, std::size_t v, const std::uint32_t*,
                       std::size_t i) override { runs++; vertices += v; indices += i; }
             void Present(std::uint64_t, std::uint64_t) override

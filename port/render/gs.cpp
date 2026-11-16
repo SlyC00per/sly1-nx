@@ -20,6 +20,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "gs_memory.h"
@@ -790,13 +791,18 @@ void PagesOf(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, std::uint32_
     std::uint32_t pw = bpp >= 16 ? 64 : 128, ph = bpp == 32 || bpp == 24 ? 32 : bpp == 4 ? 128 : 64;
     if (psm == PSMT8H || psm == PSMT4HL || psm == PSMT4HH)
         pw = 64, ph = 32;
-    if (bw == 0)
-        bw = 1;
+    // pages to a row of the buffer, as Addr32, Addr16, Addr8 and Addr4 count them
+    std::uint32_t across = pw == 128 ? std::max<std::uint32_t>((bw ? bw : 2) >> 1, 1) : std::max<std::uint32_t>(bw, 1);
     if (w == 0 || h == 0)
         return;
+    // a buffer need not start at a page's first block: the page after the last one too
     for (std::uint32_t py = y0 / ph; py <= (y0 + h - 1) / ph; py++)
-        for (std::uint32_t px = x0 / pw; px <= (x0 + w - 1) / pw; px++)
-            f((bp / 32 + py * bw + px) % (kLocalBytes / 8192));
+        for (std::uint32_t px = x0 / pw; px <= (x0 + w - 1) / pw; px++) {
+            std::uint32_t block = bp + (py * across + px) * 32;
+            f((block / 32) % (kLocalBytes / 8192));
+            if (bp % 32)
+                f((block / 32 + 1) % (kLocalBytes / 8192));
+        }
 }
 
 // SLY1_GS_SURVEY: the drawing states the game uses, for the GPU renderer (docs/RENDERER.md):
@@ -915,6 +921,8 @@ void PushVertex(std::int32_t x, std::int32_t y, std::uint32_t z, std::uint8_t f,
 
 struct Transfer {
     bool active = false;
+    bool fresh = false;   // no data yet: the pages it will change not yet marked
+    std::uint64_t bb = 0, pos = 0, reg = 0;   // BITBLTBUF, TRXPOS and TRXREG as it started
     std::uint32_t dbp, dbw, dpsm, dsax, dsay, rrw, rrh, x, y;
     std::uint64_t bits = 0;
     int nbits = 0;
@@ -931,22 +939,45 @@ std::uint32_t BitsPerPixel(std::uint32_t psm)
     }
 }
 
+// A transfer is about to change its destination's pages: what is gathered is drawn by the
+// textures as they were, and the pages are marked with a new count of uploads.
+void Touch(std::uint64_t bb, std::uint64_t pos, std::uint64_t reg)
+{
+    if (g_backend) {
+        FlushRun();
+        g_runBegun = false;   // the next run's texture looked at again
+        g_stateChanged = true;
+    }
+    g_uploads++;
+    PagesOf((std::uint32_t)Bits(bb, 32, 14), (std::uint32_t)Bits(bb, 48, 6), (std::uint32_t)Bits(bb, 56, 6),
+            (std::uint32_t)Bits(pos, 32, 11), (std::uint32_t)Bits(pos, 48, 11), (std::uint32_t)Bits(reg, 0, 12),
+            (std::uint32_t)Bits(reg, 32, 12), [](std::uint32_t page) { g_pageUpload[page] = g_uploads; });
+}
+
+// The uploads that came whole in one run of data, by destination: a hash of the data and the
+// count of uploads it was written at. The same data to the same place, with no upload to any of
+// its pages since, changes nothing and is not written again (the game sends its textures to the
+// GS over and over).
+struct Uploaded {
+    std::uint64_t bb, pos, reg, hash;
+    std::uint32_t at;
+};
+std::unordered_map<std::uint64_t, Uploaded> g_uploaded;
+std::uint64_t g_uploadsWhole, g_uploadsSkipped, g_uploadsOther;
+
 void StartTransfer()
 {
     std::uint64_t bb = g_regs.bitbltbuf, pos = g_regs.trxpos, reg = g_regs.trxreg;
     std::uint32_t dir = (std::uint32_t)Bits(g_regs.trxdir, 0, 2);
     g_trx = Transfer();
-    if (g_backend && dir != 1) {   // what is gathered is drawn by the textures as they were
-        FlushRun();
-        g_runBegun = false;   // the next run's texture looked at again
-        g_stateChanged = true;
-        g_uploads++;
-        PagesOf((std::uint32_t)Bits(bb, 32, 14), (std::uint32_t)Bits(bb, 48, 6), (std::uint32_t)Bits(bb, 56, 6),
-                (std::uint32_t)Bits(pos, 32, 11), (std::uint32_t)Bits(pos, 48, 11), (std::uint32_t)Bits(reg, 0, 12),
-                (std::uint32_t)Bits(reg, 32, 12), [](std::uint32_t page) { g_pageUpload[page] = g_uploads; });
-    }
+    g_trx.bb = bb;
+    g_trx.pos = pos;
+    g_trx.reg = reg;
+    if (dir == 2)
+        Touch(bb, pos, reg);
     if (dir == 0) {   // host to local
         g_trx.active = true;
+        g_trx.fresh = true;
         g_trx.dbp = (std::uint32_t)Bits(bb, 32, 14);
         g_trx.dbw = (std::uint32_t)Bits(bb, 48, 6);
         g_trx.dpsm = (std::uint32_t)Bits(bb, 56, 6);
@@ -983,6 +1014,11 @@ void Image(const std::uint32_t* q)
     Transfer& t = g_trx;
     if (!t.active)
         return;
+    if (t.fresh) {
+        t.fresh = false;
+        g_uploadsOther++;
+        Touch(t.bb, t.pos, t.reg);
+    }
     std::uint32_t bpp = BitsPerPixel(t.dpsm);
     for (int w = 0; w < 4; w++) {
         t.bits |= (std::uint64_t)q[w] << t.nbits;
@@ -1006,6 +1042,26 @@ void Image(const std::uint32_t* q)
 
 namespace {
 bool g_checkingImage;
+
+// Where a pixel lies inside its block, for the game's formats: bytes from the block's start for
+// a 32-bit pixel (blocks of 8 by 8) and an 8-bit one (16 by 16), nibbles for a 4-bit one (32 by
+// 16). A block's start is its first pixel's address (Addr32, Addr8, Addr4).
+struct BlockTables {
+    std::uint16_t in32[64], in8[256], in4[512];
+    BlockTables()
+    {
+        for (std::uint32_t y = 0; y < 8; y++)
+            for (std::uint32_t x = 0; x < 8; x++)
+                in32[y * 8 + x] = (std::uint16_t)Addr32(0, 1, x, y);
+        for (std::uint32_t y = 0; y < 16; y++)
+            for (std::uint32_t x = 0; x < 16; x++)
+                in8[y * 16 + x] = (std::uint16_t)Addr8(0, 2, x, y);
+        for (std::uint32_t y = 0; y < 16; y++)
+            for (std::uint32_t x = 0; x < 32; x++)
+                in4[y * 32 + x] = (std::uint16_t)Addr4(0, 2, x, y);
+    }
+};
+const BlockTables g_blocks;
 }
 
 void ImageRun(const std::uint32_t* q, std::uint32_t count)
@@ -1018,6 +1074,7 @@ void ImageRun(const std::uint32_t* q, std::uint32_t count)
         static std::uint64_t runs, differed;
         Transfer t0 = t;
         std::memcpy(before.data(), g_local, kLocalBytes);
+        t.fresh = false;   // the pages marked by the other way alone: it decides by them whether to write
         for (std::uint32_t k = 0; k < count; k++)
             Image(q + k * 4);
         Transfer t1 = t;
@@ -1043,14 +1100,68 @@ void ImageRun(const std::uint32_t* q, std::uint32_t count)
         const std::uint32_t bp = t.dbp, bw = t.dbw;
         std::uint32_t x = t.x, y = t.y;
         const std::uint32_t pixels = t.dpsm == PSMCT32 ? count * 4 : t.dpsm == PSMT8 ? count * 16 : count * 32;
+        if (t.fresh) {
+            t.fresh = false;
+            std::uint64_t all = (std::uint64_t)t.rrw * t.rrh;
+            if (all <= pixels && !g_rasterise) {   // the whole upload: written before, and nothing since?
+                std::size_t bytes = (std::size_t)(all * BitsPerPixel(t.dpsm) + 7) / 8;
+                std::uint64_t hash = 0xCBF29CE484222325ull ^ bytes;
+                std::size_t k = 0;
+                for (; k + 8 <= bytes; k += 8) {
+                    std::uint64_t w;
+                    std::memcpy(&w, b + k, 8);
+                    hash = (hash ^ w) * 0x9E3779B97F4A7C15ull;
+                    hash ^= hash >> 32;
+                }
+                for (; k < bytes; k++)
+                    hash = (hash ^ b[k]) * 0x100000001B3ull;
+                std::uint64_t key = (t.bb >> 32) * 0x9E3779B97F4A7C15ull ^ (t.pos >> 32) * 0xC2B2AE3D27D4EB4Full ^ t.reg;
+                Uploaded& u = g_uploaded[key];
+                bool same = u.at != 0 && u.bb == t.bb >> 32 && u.pos == t.pos >> 32 && u.reg == t.reg && u.hash == hash;
+                if (same)
+                    PagesOf(t.dbp, t.dbw, t.dpsm, t.dsax, t.dsay, t.rrw, t.rrh,
+                            [&](std::uint32_t page) { same = same && g_pageUpload[page] <= u.at; });
+                g_uploadsWhole++;
+                if (same) {
+                    g_uploadsSkipped++;
+                    t.active = false;
+                    return;
+                }
+                Touch(t.bb, t.pos, t.reg);
+                u.bb = t.bb >> 32;
+                u.pos = t.pos >> 32;
+                u.reg = t.reg;
+                u.hash = hash;
+                u.at = g_uploads;
+            } else {
+                g_uploadsOther++;
+                Touch(t.bb, t.pos, t.reg);
+            }
+        }
+        std::uint32_t block = ~0u, base = 0;   // the block the last pixel was in, and its start
         for (std::uint32_t k = 0; k < pixels; k++) {
             std::uint32_t px = (t.dsax + x) & 2047, py = (t.dsay + y) & 2047;
             if (t.dpsm == PSMT8) {
-                g_local[Addr8(bp, bw, px, py)] = b[k];
+                std::uint32_t at = (px >> 4) | (py >> 4) << 16;
+                if (at != block) {
+                    block = at;
+                    base = Addr8(bp, bw, px & ~15u, py & ~15u);
+                }
+                g_local[base + g_blocks.in8[(py & 15) << 4 | (px & 15)]] = b[k];
             } else if (t.dpsm == PSMCT32) {
-                std::memcpy(g_local + Addr32(bp, bw, px, py), b + k * 4, 4);
+                std::uint32_t at = (px >> 3) | (py >> 3) << 16;
+                if (at != block) {
+                    block = at;
+                    base = Addr32(bp, bw, px & ~7u, py & ~7u);
+                }
+                std::memcpy(g_local + base + g_blocks.in32[(py & 7) << 3 | (px & 7)], b + k * 4, 4);
             } else {
-                std::uint32_t n = Addr4(bp, bw, px, py), v = (b[k >> 1] >> ((k & 1) * 4)) & 0xF;
+                std::uint32_t at = (px >> 5) | (py >> 4) << 16;
+                if (at != block) {
+                    block = at;
+                    base = Addr4(bp, bw, px & ~31u, py & ~15u);
+                }
+                std::uint32_t n = base + g_blocks.in4[(py & 15) << 5 | (px & 31)], v = (b[k >> 1] >> ((k & 1) * 4)) & 0xF;
                 std::uint8_t& o = g_local[n >> 1];
                 o = (n & 1) ? (std::uint8_t)((o & 0x0F) | v << 4) : (std::uint8_t)((o & 0xF0) | v);
             }
@@ -1580,6 +1691,13 @@ void SetFrameDump(const std::string& dir, int every)
 
 std::uint64_t FramesShown() { return g_framesShown; }
 
+void UploadCounts(std::uint64_t* whole, std::uint64_t* skipped, std::uint64_t* other)
+{
+    *whole = g_uploadsWhole;
+    *skipped = g_uploadsSkipped;
+    *other = g_uploadsOther;
+}
+
 void SurveyReport()
 {
     Hold hold;
@@ -1608,14 +1726,22 @@ void DecodeTexture(const DrawState& state, std::vector<std::uint32_t>& rgba, int
     std::uint32_t* out = rgba.data();
     if (t.psm == PSMT8 && t.cpsm == PSMCT32) {          // the game's formats without Texel's cases
         for (std::uint32_t y = 0; y < t.th; y++)
-            for (std::uint32_t x = 0; x < t.tw; x++)
-                *out++ = g_clut[g_local[Addr8(t.tbp, t.tbw, x, y)]];
+            for (std::uint32_t x = 0; x < t.tw; x += 16) {
+                const std::uint8_t* block = g_local + Addr8(t.tbp, t.tbw, x, y & ~15u);
+                const std::uint16_t* in = &g_blocks.in8[(y & 15) << 4];
+                for (std::uint32_t k = 0; k < 16 && x + k < t.tw; k++)
+                    *out++ = g_clut[block[in[k]]];
+            }
     } else if (t.psm == PSMT4 && t.cpsm == PSMCT32) {
         std::uint32_t base = (t.csa & 15) * 16;
         for (std::uint32_t y = 0; y < t.th; y++)
-            for (std::uint32_t x = 0; x < t.tw; x++) {
-                std::uint32_t n = Addr4(t.tbp, t.tbw, x, y);
-                *out++ = g_clut[(base + ((g_local[n >> 1] >> ((n & 1) * 4)) & 0xF)) & 255];
+            for (std::uint32_t x = 0; x < t.tw; x += 32) {
+                std::uint32_t block = Addr4(t.tbp, t.tbw, x, y & ~15u);
+                const std::uint16_t* in = &g_blocks.in4[(y & 15) << 5];
+                for (std::uint32_t k = 0; k < 32 && x + k < t.tw; k++) {
+                    std::uint32_t n = block + in[k];
+                    *out++ = g_clut[(base + ((g_local[n >> 1] >> ((n & 1) * 4)) & 0xF)) & 255];
+                }
             }
     } else if (t.psm == PSMCT32) {
         for (std::uint32_t y = 0; y < t.th; y++)
@@ -1625,6 +1751,20 @@ void DecodeTexture(const DrawState& state, std::vector<std::uint32_t>& rgba, int
         for (std::uint32_t y = 0; y < t.th; y++)
             for (std::uint32_t x = 0; x < t.tw; x++)
                 *out++ = Texel(t, (int)x, (int)y);
+    }
+    static const bool check = std::getenv("SLY1_GS_CHECK") != nullptr;
+    if (check) {   // SLY1_GS_CHECK: against Texel, a texel at a time
+        static std::uint64_t decodes, differed;
+        decodes++;
+        bool same = true;
+        for (std::uint32_t y = 0; same && y < t.th; y++)
+            for (std::uint32_t x = 0; same && x < t.tw; x++)
+                same = rgba[(std::size_t)y * t.tw + x] == Texel(t, (int)x, (int)y);
+        if (!same && differed++ < 8)
+            std::fprintf(stderr, "gs check: a texture decoded otherwise (format 0x%02X, %u by %u)\n", t.psm, t.tw, t.th);
+        if ((decodes & (decodes - 1)) == 0)
+            std::fprintf(stderr, "gs check: %llu textures decoded, %llu differed\n", (unsigned long long)decodes,
+                         (unsigned long long)differed);
     }
 }
 

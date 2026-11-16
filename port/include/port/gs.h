@@ -59,6 +59,10 @@ std::uint64_t FramesShown();
 // SLY1_GS_SURVEY: the drawing states the game uses, counted by primitive: their report.
 void SurveyReport();
 
+// The uploads so far: those whose data came in one run, how many of them were not written
+// again (the same data to the same place with nothing uploaded there since), and the others.
+void UploadCounts(std::uint64_t* whole, std::uint64_t* skipped, std::uint64_t* other);
+
 // The primitives drawn so far.
 std::uint64_t PrimitivesDrawn();
 
