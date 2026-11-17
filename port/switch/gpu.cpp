@@ -173,6 +173,7 @@ private:
     std::uint64_t frames_ = 0, runs_ = 0, vertices_ = 0, uploads_ = 0, decodes_ = 0, hashes_ = 0, otherTargets_ = 0, cacheResets_ = 0,
                   sends_ = 0, destinationAlpha_ = 0, unsupportedBlends_ = 0;
     long captureAt_ = -1;
+    std::uint64_t indexNs_ = 0, copyNs_ = 0, copiedBytes_ = 0;
     std::uint64_t drawNs_ = 0, textureNs_ = 0, presentNs_ = 0, waitNs_ = 0, acquireNs_ = 0;
 
     // what the commands so far last bound, to bind only what changes
@@ -583,6 +584,7 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
         Submit(s, src);
         return true;
     }
+    std::uint64_t t0 = NowNs();
     batchIndex_.clear();
     for (std::uint32_t k = 2; k < b.count; k++) {
         if (b.quads[(k * b.stride + b.positionAt) * 4 + 3] & gs::kStripStart)
@@ -591,6 +593,7 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
         batchIndex_.push_back((k & 1) ? k - 1 : k - 2);
         batchIndex_.push_back(k);
     }
+    indexNs_ += NowNs() - t0;
     batches_++;
     batchVertices_ += b.count;
     if (batchIndex_.empty())
@@ -802,8 +805,10 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
 
     frameUsed_ = (frameUsed_ + src.vertexSize - 1) / src.vertexSize * src.vertexSize;
     std::uint32_t first = frameUsed_ / src.vertexSize;
+    std::uint64_t c0 = NowNs();
     std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(frameMem_) + frameUsed_, src.vertices, bytes);
     frameUsed_ += bytes;
+    copiedBytes_ += bytes + indexBytes;
     if (captureAt_ >= 0 && (long)frames_ + 1 == captureAt_ && drawInFrame_ >= 2796 && drawInFrame_ <= 2803)
         std::fprintf(stderr, "gpustop: draw %ld: %s, vertices %u bytes of %u each at %u (first %u), %u indices at %u, sends %llu, texture %d\n",
                      drawInFrame_, src.batch ? "batch" : "run", bytes, src.vertexSize, frameUsed_ - bytes, first, indices, frameUsed_,
@@ -814,6 +819,7 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     std::uint32_t firstIndex = frameUsed_ / 4;
     std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(frameMem_) + frameUsed_, src.index, indexBytes);
     frameUsed_ = Align(frameUsed_ + indexBytes, 4);
+    copyNs_ += NowNs() - c0;
     static const DkPrimitive kPrimitive[3] = {DkPrimitive_Points, DkPrimitive_Lines, DkPrimitive_Triangles};
     DkPrimitive primitive = kPrimitive[s.kind < 3 ? s.kind : 2];
 
@@ -1177,8 +1183,9 @@ void Renderer::Report()
     std::fprintf(stderr, "gpu: %llu frames, %llu runs of primitives (%llu vertices), %llu command lists sent\n",
                  (unsigned long long)frames_, (unsigned long long)runs_, (unsigned long long)vertices_,
                  (unsigned long long)sends_);
-    std::fprintf(stderr, "gpu: %llu batches transformed by the GPU (%llu vertices)\n", (unsigned long long)batches_,
-                 (unsigned long long)batchVertices_);
+    std::fprintf(stderr, "gpu: %llu batches transformed by the GPU (%llu vertices); %.3f s making their triangles' indices\n",
+                 (unsigned long long)batches_, (unsigned long long)batchVertices_, indexNs_ / 1e9);
+    std::fprintf(stderr, "gpu: %.3f s copying %.1f MB of vertices and indices to the GPU's memory\n", copyNs_ / 1e9, copiedBytes_ / 1e6);
     std::fprintf(stderr, "gpu: %zu textures held (%u KB), %llu checked after uploads, %llu decoded, %llu uploaded, %llu times the cache "
                  "was emptied\n", textures_.size(), textureUsed_ >> 10, (unsigned long long)hashes_, (unsigned long long)decodes_, (unsigned long long)uploads_,
                  (unsigned long long)cacheResets_);

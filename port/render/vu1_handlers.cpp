@@ -563,7 +563,7 @@ bool KickDeferred(Runner& r, std::uint16_t top, std::uint16_t tag)
 
 // What the transform leaves in registers for later programs (the matrix, the viewport, the last
 // vertices' sets, the edges, the clip codes), without the batch transformed: the program's loop
-// over the batch's last eight vertices alone (a multiple of four fewer keeps each vertex in the
+// over the batch's last four to seven vertices alone (a multiple of four fewer keeps each vertex in the
 // register set and on the side of the strip it has in the whole batch), their memory and the
 // batch's header put back afterwards.
 void LeaveRegisters(Runner& r, std::uint16_t top, int stride, Test test, std::uint32_t endPc)
@@ -571,7 +571,7 @@ void LeaveRegisters(Runner& r, std::uint16_t top, int stride, Test test, std::ui
     V hdr = Load(r, top + 11);
     std::uint16_t first = (std::uint16_t)(top + Half(hdr.x)), end = (std::uint16_t)(top + Half(hdr.y));
     int n = (std::uint16_t)(end - first) / stride;
-    int tail = n > 11 ? 8 + (n & 3) : n;   // the same count modulo 4, so the same sets and sides
+    int tail = n > 7 ? 4 + (n & 3) : n;   // the same count modulo 4, so the same sets and sides
     std::uint16_t from = (std::uint16_t)(end - tail * stride);
     V saved[12 * 4], mark = Load(r, top + 13);
     for (int k = 0; k < tail * stride; k++)
@@ -606,7 +606,8 @@ bool BatchTransform(Runner& r, const int stride, const Test test, const std::uin
         std::uint16_t span = (std::uint16_t)(Half(hdr.y) - Half(hdr.x));
         if (span != 0 && span % stride == 0 && span / stride <= 256 && Half(Load(r, top + 13).z) == 0 &&
             ViewportAsExpected(r)) {
-            if (std::getenv("SLY1_VU1_SEQ"))
+            static const bool seqTrace = std::getenv("SLY1_VU1_SEQ") != nullptr;
+            if (seqTrace)
                 std::fprintf(stderr, "seq   deferred top %u first %u end %u stride %d%s\n", top, top + Half(hdr.x), top + Half(hdr.y), stride,
                              g_deferred.on ? " (the one before never done)" : "");
             g_deferred.on = true;
@@ -712,6 +713,22 @@ inline float Ftoi0(float x)
 
 void SetVf(State& st, int reg, const V& x) { std::memcpy(st.vf[reg], &x, 16); }
 
+// ITOF0 and FTOI0 four fields at a time, by the same rules: the integer converted in the thread's
+// rounding (toward zero); the float as the VU reads it (In), truncated, past the 32-bit range the
+// largest integer of its sign.
+inline F4 Itof4(F4 x) { return __builtin_convertvector((I4)x, F4); }
+inline F4 Ftoi4(F4 x)
+{
+    x = Fix4(x);
+    const F4 hi = Splat(2147483648.0f), lo = Splat(-2147483648.0f);
+    I4 over = (I4)(x >= hi), under = (I4)(x < lo);
+    F4 safe = (F4)(((U4)x & ~(U4)(over | under)));   // out-of-range fields made 0 before converting
+    I4 n = __builtin_convertvector(safe, I4);
+    n = (n & ~over) | ((I4)Splat(0.0f) + 0x7FFFFFFF & over);
+    n = (n & ~under) | ((I4){(std::int32_t)0x80000000, (std::int32_t)0x80000000, (std::int32_t)0x80000000, (std::int32_t)0x80000000} & under);
+    return (F4)n;
+}
+
 // Whether x - 1 is zero (SUBw with vf00w; the Z flag FSAND reads four instructions later).
 bool IsOne(float x) { return Sub(x, 1.0f) == 0.0f; }
 
@@ -746,8 +763,7 @@ void Colours4C1(Runner& r, std::uint16_t top, int n)
         float w = r.Qword(at + 1)[3];
         if (!one) {
             V x = Load(r, at + 2);
-            for (int j = 0; j < 3; j++)
-                x[j] = Ftoi0(Mul(Itof0(x[j]), scale));
+            x.v = Ftoi4(Mul4(Itof4(x.v), Splat(scale)));
             c[0] = x[0];
             c[1] = x[1];
             c[2] = x[2];
@@ -770,11 +786,10 @@ void Colours4DD(Runner& r, std::uint16_t top, int n)
     st.vf[11][3] = scale;
     bool one = IsOne(scale);
     for (int k = 0; k < n; k++) {
-        float x[3];
-        std::memcpy(x, r.Qword(from + k), 12);
+        V v = Load(r, (std::uint16_t)(from + k));
         if (!one)
-            for (int j = 0; j < 3; j++)
-                x[j] = Ftoi0(Mul(Itof0(x[j]), scale));
+            v.v = Ftoi4(Mul4(Itof4(v.v), Splat(scale)));
+        float x[3] = {v[0], v[1], v[2]};
         std::memcpy(r.Qword(first + 4 * k + 1), x, 12);
         if (k == n - 1)
             std::memcpy(st.vf[12], x, 12);
@@ -1294,11 +1309,7 @@ bool Scale4A9(Runner& r, std::uint16_t top)
     for (int k = 0; k < count; k++) {
         std::uint16_t at = (std::uint16_t)(first + step * k + 1);
         x = Load(r, at);
-        for (int j = 0; j < 4; j++)
-            x[j] = Itof0(x[j]);
-        x.v = Mul4(x.v, factor.v);
-        for (int j = 0; j < 4; j++)
-            x[j] = Ftoi0(x[j]);
+        x.v = Ftoi4(Mul4(Itof4(x.v), factor.v));
         Store(r, at, x);
     }
     SetVf(st, 4, x);
@@ -3317,6 +3328,12 @@ void DataWritten(std::uint32_t qaddr, std::uint32_t count, std::uint32_t cycle, 
     // the header is kept (Materialise)
     const std::uint32_t stride = (std::uint32_t)d.stride, span = (std::uint16_t)(d.end - d.first);
     bool skipping = write != 0 && cycle > write;
+    {   // an upload wholly outside the batch (most of them): nothing to look at
+        std::uint32_t reach = skipping ? ((count + write - 1) / write) * cycle : count;
+        std::uint32_t from = (qaddr - d.first) & 0x3FF;
+        if (from >= span && from + reach <= 1024)
+            return;
+    }
     for (std::uint32_t k = 0; k < count; k++) {
         std::uint32_t at = skipping ? qaddr + (k / write) * cycle + (k % write) : qaddr + k;
         std::uint32_t rel = (at - d.first) & 0x3FF;
