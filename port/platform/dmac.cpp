@@ -1191,6 +1191,7 @@ struct DirectSink {
     void OnVif(const std::uint32_t* w, int n) { vif->Words(w, n); }
     void OnGif(const std::uint32_t* q) { gif->Qword(q); }
     void OnTagDone(std::uint32_t) {}
+    bool SkipData(std::uint32_t) { return false; }
     bool SkipCall(std::uint32_t) { return false; }
     bool Direct() const { return true; }
 };
@@ -1200,6 +1201,7 @@ struct CountSink {
     void OnVif(const std::uint32_t*, int n) { words += (std::size_t)n; }
     void OnGif(const std::uint32_t*) { words += 4; }
     void OnTagDone(std::uint32_t) {}
+    bool SkipData(std::uint32_t qwc) { words += (std::size_t)qwc * 4; return true; }   // counted, not looked at
     bool SkipCall(std::uint32_t) { return false; }
     bool Direct() const { return false; }
 };
@@ -1278,10 +1280,10 @@ void PartRecordItem(const GsItem& item)
 // A hash of the packet called at target, to the tag that returns: its tags and, as VIF1 would
 // take them, the words that follow a tag or that a tag refers to: every VIFcode, and every code's
 // data whole, but for an unpack of more than 64 words (a mesh's vertices), of which one quadword in
-// eight is taken unless whole is set. So a register's value set in a mesh's data (a texture's
+// 32 is taken unless whole is set. So a register's value set in a mesh's data (a texture's
 // place, which the game writes anew when it moves the texture) always counts, and vertices that
 // move (a flag in the wind) are found by the whole hash: a part is hashed whole the first times
-// it is drawn again and now and then after, and one found changed where the eighths were not is
+// it is drawn again and now and then after, and one found changed where those quadwords were not is
 // marked as moving and run as ever from then on.
 struct PartHasher {
     std::uint64_t h = 0xCBF29CE484222325ull;
@@ -1336,13 +1338,13 @@ struct PartHasher {
                 for (; i < take; i++)
                     Mix(w[k + i]);
             } else {
-                for (std::size_t i = 0; i < take;) {   // four words of every 32
-                    const std::uint32_t in = (at + (std::uint32_t)i) & 31;
+                for (std::size_t i = 0; i < take;) {   // four words of every 128
+                    const std::uint32_t in = (at + (std::uint32_t)i) & 127;
                     if (in < 4) {
                         Mix(w[k + i]);
                         i++;
                     } else {
-                        i += std::min<std::size_t>(take - i, 32 - in);
+                        i += std::min<std::size_t>(take - i, 128 - in);
                     }
                 }
             }
@@ -1623,6 +1625,7 @@ struct LiveSink {
         count = n;
     }
     void OnGif(const std::uint32_t*) {}
+    bool SkipData(std::uint32_t) { return false; }
     bool Direct() const { return true; }
     ~LiveSink() { Flush(); }
 
@@ -1708,6 +1711,7 @@ struct CaptureSink {
     void OnVif(const std::uint32_t* w, int n) { out.insert(out.end(), w, w + n); }
     void OnGif(const std::uint32_t* q) { out.insert(out.end(), q, q + 4); }
     void OnTagDone(std::uint32_t) {}
+    bool SkipData(std::uint32_t) { return false; }
     bool SkipCall(std::uint32_t) { return false; }
     bool Direct() const { return false; }
 };
@@ -1776,7 +1780,7 @@ void WalkChain(std::uint32_t regs, std::uint32_t tadr, Sink& sink)
             break;
         case 7: end = true; break;                                       // end
         }
-        for (std::uint32_t i = 0; i < qwc; i++) {
+        for (std::uint32_t i = sink.SkipData(qwc) ? qwc : 0; i < qwc; i++) {
             const std::uint32_t* q = At(data + i * 16, dataSpr);
             if (toSpr) {
                 std::memcpy(Spr(sadr), q, 16);

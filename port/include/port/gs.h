@@ -62,6 +62,9 @@ void SurveyReport();
 // The uploads so far: those whose data came in one run, how many of them were not written
 // again (the same data to the same place with nothing uploaded there since), and the others.
 void UploadCounts(std::uint64_t* whole, std::uint64_t* skipped, std::uint64_t* other);
+// The uploads whose pages were put back as kept (ImageRun), and with SLY1_UPLOAD_VERIFY=1 how many
+// of them were not what writing them gave.
+void UploadsRestored(std::uint64_t* restored, std::uint64_t* wrong);
 
 // The primitives drawn so far.
 std::uint64_t PrimitivesDrawn();

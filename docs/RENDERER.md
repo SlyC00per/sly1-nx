@@ -675,3 +675,15 @@ particles.
 A frame is two vertical blanks because its stages come one after another: the list's hand-over,
 the render thread's 15 ms, the GS thread's tail and its wait for the GPU, the game's packets
 after the list. For one blank they must come to under 16.7 ms together.
+
+### The stages' fixed costs (2026-11-17)
+
+- An upload that fills whole pages of local memory, and that has been written before with the
+  same bytes, has its pages put back as that writing left them (`gs::ImageRun`; 16 MB of such
+  pages kept), in place of its pixels one by one. The scene with the title uploads two sets of
+  textures over each other every frame (above), 280 KB written a frame. `SLY1_UPLOAD_VERIFY=1`
+  writes all the same and compares: over 3,000 frames of the opening 6,313 uploads were put
+  back, none of them other than writing gave; the same over the 46 levels.
+- The parts' hash takes one quadword in 32 of the vertices (it took one in eight): the whole
+  hash is what finds vertices that move.
+- The walk that finds a list's length counts a tag's data without going through it.

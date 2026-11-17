@@ -1095,7 +1095,19 @@ struct Uploaded {
     std::uint32_t at;
 };
 std::unordered_map<std::uint64_t, Uploaded> g_uploaded;
-std::uint64_t g_uploadsWhole, g_uploadsSkipped, g_uploadsOther;
+std::uint64_t g_uploadsWhole, g_uploadsSkipped, g_uploadsOther, g_uploadsRestored;
+// The pages of local memory as an upload of whole pages left them, by where it went and its
+// bytes' hash (ImageRun): 16 MB of them at most.
+struct UploadSnapshot {
+    std::vector<std::uint32_t> pages;
+    std::vector<std::uint8_t> bytes;
+};
+std::unordered_map<std::uint64_t, UploadSnapshot> g_snapshots;
+std::size_t g_snapshotBytes;
+std::vector<std::uint32_t> g_snapshotPages;   // of the upload in hand
+std::uint64_t g_snapshotKey;                  // not 0: its pages are to be kept when it is done
+bool g_snapshotVerify;
+std::uint64_t g_uploadsRestoredWrong;
 
 void StartTransfer()
 {
@@ -1265,6 +1277,34 @@ void ImageRun(const std::uint32_t* q, std::uint32_t count)
                 u.reg = t.reg;
                 u.hash = hash;
                 u.at = g_uploads;
+                // An upload that fills whole pages and has been written before with these very
+                // bytes: the pages put back as they were then, in place of the pixels one by one.
+                // (Two sets of textures that the game uploads over each other every frame are
+                // neither of them "the same as last time".)
+                g_snapshotPages.clear();
+                g_snapshotKey = 0;
+                if (t.dsax == 0 && t.dsay == 0 && t.dbp % 32 == 0) {
+                    PagesOf(t.dbp, t.dbw, t.dpsm, 0, 0, t.rrw, t.rrh, [&](std::uint32_t page) { g_snapshotPages.push_back(page); });
+                    std::sort(g_snapshotPages.begin(), g_snapshotPages.end());
+                    g_snapshotPages.erase(std::unique(g_snapshotPages.begin(), g_snapshotPages.end()), g_snapshotPages.end());
+                    if (g_snapshotPages.size() * 8192 == bytes) {
+                        g_snapshotKey = (key ^ (hash * 0xD6E8FEB86659FD93ull)) | 1;
+                        auto found = g_snapshots.find(g_snapshotKey);
+                        // SLY1_UPLOAD_VERIFY=1: written all the same, and compared with what was kept
+                        static const bool verify = std::getenv("SLY1_UPLOAD_VERIFY") != nullptr;
+                        if (found != g_snapshots.end() && found->second.pages == g_snapshotPages) {
+                            g_uploadsRestored++;
+                            if (!verify) {
+                                for (std::size_t p = 0; p < g_snapshotPages.size(); p++)
+                                    std::memcpy(g_local + (std::size_t)g_snapshotPages[p] * 8192, found->second.bytes.data() + p * 8192, 8192);
+                                g_snapshotKey = 0;
+                                t.active = false;
+                                return;
+                            }
+                            g_snapshotVerify = true;
+                        }
+                    }
+                }
             } else {
                 g_uploadsOther++;
                 Touch(t.bb, t.pos, t.reg);
@@ -1308,6 +1348,29 @@ void ImageRun(const std::uint32_t* q, std::uint32_t count)
         }
         t.x = x;
         t.y = y;
+        if (g_snapshotVerify && g_snapshotKey != 0 && !t.active) {
+            const UploadSnapshot& snap = g_snapshots[g_snapshotKey];
+            for (std::size_t p = 0; p < g_snapshotPages.size(); p++)
+                if (std::memcmp(snap.bytes.data() + p * 8192, g_local + (std::size_t)g_snapshotPages[p] * 8192, 8192) != 0) {
+                    g_uploadsRestoredWrong++;
+                    break;
+                }
+        }
+        g_snapshotVerify = false;
+        if (g_snapshotKey != 0 && !t.active) {   // written whole: its pages kept for the next time
+            if (g_snapshotBytes + g_snapshotPages.size() * 8192 > (16u << 20)) {
+                g_snapshots.clear();
+                g_snapshotBytes = 0;
+            }
+            UploadSnapshot& snap = g_snapshots[g_snapshotKey];
+            g_snapshotBytes -= std::min(g_snapshotBytes, snap.bytes.size());
+            snap.pages = g_snapshotPages;
+            snap.bytes.resize(g_snapshotPages.size() * 8192);
+            for (std::size_t p = 0; p < g_snapshotPages.size(); p++)
+                std::memcpy(snap.bytes.data() + p * 8192, g_local + (std::size_t)g_snapshotPages[p] * 8192, 8192);
+            g_snapshotBytes += snap.bytes.size();
+        }
+        g_snapshotKey = 0;
         return;
     }
     for (std::uint32_t k = 0; k < count; k++)
@@ -1823,6 +1886,12 @@ void SetFrameDump(const std::string& dir, int every)
 }
 
 std::uint64_t FramesShown() { return g_framesShown; }
+
+void UploadsRestored(std::uint64_t* restored, std::uint64_t* wrong)
+{
+    *restored = g_uploadsRestored;
+    *wrong = g_uploadsRestoredWrong;
+}
 
 void UploadCounts(std::uint64_t* whole, std::uint64_t* skipped, std::uint64_t* other)
 {

@@ -108,8 +108,11 @@ void Report()
     {
         std::uint64_t whole, skipped, other;
         port::gs::UploadCounts(&whole, &skipped, &other);
-        std::fprintf(stderr, "gs: %llu uploads in one run of data, %llu of them the same as last time and not written; %llu others\n",
-                     (unsigned long long)whole, (unsigned long long)skipped, (unsigned long long)other);
+        std::uint64_t restored, wrong;
+        port::gs::UploadsRestored(&restored, &wrong);
+        std::fprintf(stderr, "gs: %llu uploads in one run of data, %llu of them the same as last time and not written, %llu put back from the pages kept of "
+                     "an earlier time (%llu of them wrong); %llu others\n", (unsigned long long)whole, (unsigned long long)skipped, (unsigned long long)restored,
+                     (unsigned long long)wrong, (unsigned long long)other);
     }
     port::gpu::Report();
     if (std::getenv("SLY1_GS_SURVEY"))
