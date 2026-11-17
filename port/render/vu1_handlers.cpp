@@ -390,6 +390,7 @@ struct Deferred {
     bool overwritten = false;      // VIF1 has unpacked over the batch's vertices since
     std::uint16_t first = 0, end = 0;   // the batch's quadwords
     V header[10], viewport[2];     // what the transform reads of TOP + 8 to 17 and of 0 and 1, as they were
+    std::uint32_t serial = 0;      // counts the batches deferred (gs::Batch::id)
     std::uint16_t top = 0;
     int stride = 0;
     Test test = Test::Guard274;
@@ -523,6 +524,7 @@ bool KickDeferred(Runner& r, std::uint16_t top, std::uint16_t tag)
     b.fogScale = params.y;
     b.wMax = params.z;
     b.cull = Half(Load(r, top + 9).z) != 0;
+    b.id = g_deferred.overwritten ? 0 : g_deferred.serial;
     static const bool check = std::getenv("SLY1_GPU_BATCH_CHECK") != nullptr;
     if (check) {
         // SLY1_GPU_BATCH_CHECK: the renderer's arithmetic on the vertices as they are, against what
@@ -611,6 +613,7 @@ bool BatchTransform(Runner& r, const int stride, const Test test, const std::uin
                 std::fprintf(stderr, "seq   deferred top %u first %u end %u stride %d%s\n", top, top + Half(hdr.x), top + Half(hdr.y), stride,
                              g_deferred.on ? " (the one before never done)" : "");
             g_deferred.on = true;
+            g_deferred.serial++;
             g_deferred.kicked = false;
             g_deferred.overwritten = false;
             g_deferred.first = (std::uint16_t)(top + Half(hdr.x));

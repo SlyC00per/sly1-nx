@@ -47,6 +47,8 @@ struct Batch {
     float fogScale, wMax;         // fog: the control word's low 12 bits plus fogScale times min(w, wMax) / w, over 16
     bool cull;
     int ofx, ofy;                 // XYOFFSET (12.4), the odd field's half line dropped
+    std::uint32_t id = 0;         // the same for the kicks of one batch (their positions and STQ the
+                                  // same, the colours not): a renderer may keep what it took of the first
 };
 constexpr std::uint32_t kStripStart = 0x8000, kCullable = 0x4000;   // bits of a vertex's control word
 

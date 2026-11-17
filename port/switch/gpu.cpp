@@ -70,6 +70,10 @@ struct Source {
     const std::uint32_t* index;
     std::uint32_t indices;
     const gs::Batch* batch;   // null for the GS's
+    // a batch's, put in the frame's memory already (DrawBatch): its positions and STQ (32 bytes a
+    // vertex), its colours (16), its indices, as offsets in the frame's memory
+    bool placed = false;
+    std::uint32_t vertexAt = 0, colourAt = 0, indexAt = 0;
 };
 
 struct FragmentParams {
@@ -130,6 +134,13 @@ private:
     bool batchSet_ = false;
     BatchParams lastBatch_;
     std::vector<std::uint32_t> batchIndex_;
+    struct BatchCache {   // the last batch put in the frame's memory (DrawBatch)
+        std::uint32_t id = 0;
+        std::uint64_t sends = 0;
+        const std::uint32_t* quads = nullptr;
+        std::uint32_t count = 0, stride = 0, positionAt = 0, stqAt = 0;
+        std::uint32_t vertexAt = 0, indexAt = 0, indices = 0;
+    } batchCache_;
     std::uint64_t batches_ = 0, batchVertices_ = 0;
     float cullFront_ = 1.0f;
     int batchInFrame_ = 0;
@@ -354,22 +365,24 @@ void Renderer::BindSource(const Source& src)
     DkGpuAddr data = dkMemBlockGetGpuAddr(dataMem_);
     const gs::Batch* b = src.batch;
     int source = b ? 1 : 0;
-    std::uint32_t layout = b ? b->stride | b->positionAt << 4 | b->stqAt << 8 | b->colourAt << 12 : 0;
+    std::uint32_t layout = b ? 1 : 0;
     if (source != source_ || layout != layout_) {
         const DkShader* shaders[2] = {b ? &batchShader_ : &vertexShader_, &fragmentShader_};
         dkCmdBufBindShaders(cmd_, DkStageFlag_GraphicsMask, shaders, 2);
         DkBufExtents ubo = {data + (b ? batchUbo_ : vertexUbo_), (std::uint32_t)(b ? sizeof(BatchParams) : sizeof(VertexParams))};
         dkCmdBufBindUniformBuffers(cmd_, DkStage_Vertex, 0, &ubo, 1);
         if (b) {
-            const DkVtxAttribState attribs[4] = {
-                {0, 0, b->positionAt * 16, DkVtxAttribSize_3x32, DkVtxAttribType_Float, 0},
-                {0, 0, b->positionAt * 16 + 12, DkVtxAttribSize_1x32, DkVtxAttribType_Uint, 0},
-                {0, 0, b->stqAt * 16, DkVtxAttribSize_3x32, DkVtxAttribType_Float, 0},
-                {0, 0, b->colourAt * 16, DkVtxAttribSize_4x32, DkVtxAttribType_Uint, 0},
+            // DrawBatch's layout: a vertex's position and control word, then its STQ, in one stream;
+            // its colour in a second
+            static const DkVtxAttribState attribs[4] = {
+                {0, 0, 0, DkVtxAttribSize_3x32, DkVtxAttribType_Float, 0},
+                {0, 0, 12, DkVtxAttribSize_1x32, DkVtxAttribType_Uint, 0},
+                {0, 0, 16, DkVtxAttribSize_3x32, DkVtxAttribType_Float, 0},
+                {1, 0, 0, DkVtxAttribSize_4x32, DkVtxAttribType_Uint, 0},
             };
-            const DkVtxBufferState buffer = {b->stride * 16, 0};
+            static const DkVtxBufferState buffers[2] = {{32, 0}, {16, 0}};
             dkCmdBufBindVtxAttribState(cmd_, attribs, 4);
-            dkCmdBufBindVtxBufferState(cmd_, &buffer, 1);
+            dkCmdBufBindVtxBufferState(cmd_, buffers, 2);
         } else {
             static const DkVtxAttribState attribs[5] = {
                 {0, 0, offsetof(gs::DrawVertex, x), DkVtxAttribSize_2x32, DkVtxAttribType_Float, 0},
@@ -584,21 +597,97 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
         Submit(s, src);
         return true;
     }
-    std::uint64_t t0 = NowNs();
-    batchIndex_.clear();
-    for (std::uint32_t k = 2; k < b.count; k++) {
-        if (b.quads[(k * b.stride + b.positionAt) * 4 + 3] & gs::kStripStart)
-            continue;
-        batchIndex_.push_back((k & 1) ? k - 2 : k - 1);
-        batchIndex_.push_back((k & 1) ? k - 1 : k - 2);
-        batchIndex_.push_back(k);
+    if (recording_ && !replaying_) {   // SLY1_GPU_REPLAY: the batch kept with its vertices as they are
+        Recorded rec;
+        rec.s = s;
+        const std::uint8_t* q = reinterpret_cast<const std::uint8_t*>(b.quads);
+        rec.vertices.assign(q, q + (std::size_t)b.count * b.stride * 16);
+        rec.vertexSize = b.stride * 16;
+        rec.isBatch = true;
+        rec.batch = b;
+        rec.batch.id = 0;
+        rec.texture = texture_;
+        record_.push_back(std::move(rec));
     }
-    indexNs_ += NowNs() - t0;
+    if (TargetOf(s.frame & 0x1FF) < 0) {
+        otherTargets_++;
+        return true;
+    }
     batches_++;
     batchVertices_ += b.count;
-    if (batchIndex_.empty())
+    // The batch's positions and STQ, and its triangles' indices, put in the frame's memory at its
+    // first kick; its later kicks (the second pass's), with the same id, add only their colours.
+    BatchCache& c = batchCache_;
+    bool same = b.id != 0 && b.id == c.id && c.sends == sends_ && c.quads == b.quads && c.count == b.count &&
+                c.stride == b.stride && c.positionAt == b.positionAt && c.stqAt == b.stqAt;
+    const std::uint32_t colourBytes = b.count * 16;
+    std::uint32_t need = colourBytes + 64 + (same ? 0 : b.count * 32 + 64 + b.count * 12);
+    if (frameUsed_ + need > kFrameMemory || draws_ >= kMaxDraws) {
+        Send(true);
+        same = false;
+        need = colourBytes + 64 + b.count * 32 + 64 + b.count * 12;
+        if (need > kFrameMemory)
+            return true;
+    }
+    std::uint8_t* mem = static_cast<std::uint8_t*>(dkMemBlockGetCpuAddr(frameMem_));
+    if (!same) {
+        std::uint64_t t0 = NowNs();
+        // the triangles: one for each vertex from the third that does not start a strip, wound the
+        // same way round along the strip, the vertex that closes it last
+        frameUsed_ = Align(frameUsed_, 4);
+        std::uint32_t* index = reinterpret_cast<std::uint32_t*>(mem + frameUsed_);
+        std::uint32_t n = 0;
+        const std::uint32_t controlAt = b.positionAt * 4 + 3, step = b.stride * 4;
+        for (std::uint32_t k = 2; k < b.count; k++) {
+            if (b.quads[k * step + controlAt] & gs::kStripStart)
+                continue;
+            index[n] = (k & 1) ? k - 2 : k - 1;
+            index[n + 1] = (k & 1) ? k - 1 : k - 2;
+            index[n + 2] = k;
+            n += 3;
+        }
+        c.indexAt = frameUsed_;
+        c.indices = n;
+        frameUsed_ += n * 4;
+        indexNs_ += NowNs() - t0;
+        std::uint64_t c0 = NowNs();
+        frameUsed_ = Align(frameUsed_, 64);
+        c.vertexAt = frameUsed_;
+        std::uint8_t* out = mem + frameUsed_;
+        for (std::uint32_t k = 0; k < b.count; k++, out += 32) {
+            const std::uint32_t* v = b.quads + k * step;
+            std::memcpy(out, v + b.positionAt * 4, 16);
+            std::memcpy(out + 16, v + b.stqAt * 4, 16);
+        }
+        frameUsed_ += b.count * 32;
+        copiedBytes_ += b.count * 32 + n * 4;
+        copyNs_ += NowNs() - c0;
+        c.id = b.id;
+        c.sends = sends_;
+        c.quads = b.quads;
+        c.count = b.count;
+        c.stride = b.stride;
+        c.positionAt = b.positionAt;
+        c.stqAt = b.stqAt;
+        if (b.id == 0)
+            c.id = 0;   // nothing to share with the next kick
+    }
+    if (c.indices == 0)
         return true;
-    Source src = {b.quads, b.count * b.stride * 16, b.stride * 16, batchIndex_.data(), (std::uint32_t)batchIndex_.size(), &b};
+    std::uint64_t c0 = NowNs();
+    frameUsed_ = Align(frameUsed_, 64);
+    std::uint32_t colourAt = frameUsed_;
+    std::uint8_t* out = mem + frameUsed_;
+    for (std::uint32_t k = 0; k < b.count; k++, out += 16)
+        std::memcpy(out, b.quads + k * b.stride * 4 + b.colourAt * 4, 16);
+    frameUsed_ += colourBytes;
+    copiedBytes_ += colourBytes;
+    copyNs_ += NowNs() - c0;
+    Source src = {nullptr, 0, 32, nullptr, c.indices, &b};
+    src.placed = true;
+    src.vertexAt = c.vertexAt;
+    src.colourAt = colourAt;
+    src.indexAt = c.indexAt;
     Submit(s, src);
     return true;
 }
@@ -656,7 +745,7 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         }
     }
     allDraws_++;
-    if (recording_ && !replaying_) {   // SLY1_GPU_REPLAY: the frame's draws kept as they are submitted
+    if (recording_ && !replaying_ && !src.placed) {   // SLY1_GPU_REPLAY: the frame's draws kept as they are submitted (batches: DrawBatch)
         Recorded rec;
         rec.s = s;
         rec.vertices.assign((const std::uint8_t*)src.vertices, (const std::uint8_t*)src.vertices + src.vertexBytes);
@@ -669,21 +758,24 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         record_.push_back(std::move(rec));
     }
     std::uint32_t bytes = src.vertexBytes, indexBytes = indices * 4;
-    if (bytes + indexBytes + 256 > kFrameMemory)
-        return;
-    if (frameUsed_ + bytes + indexBytes + 256 > kFrameMemory || draws_ >= kMaxDraws)
-        Send(true);
+    if (!src.placed) {
+        if (bytes + indexBytes + 256 > kFrameMemory)
+            return;
+        if (frameUsed_ + bytes + indexBytes + 256 > kFrameMemory || draws_ >= kMaxDraws)
+            Send(true);
+    }
     const Texture* texture = texture_;
     bool fresh = !last_.any;
     last_.any = true;
     if (listAt_ >= 0 && (long)frames_ + 1 == listAt_ && listed_ < 60) {   // SLY1_GPU_LIST=N: frame N's first draws
         listed_++;
         std::uint32_t t = (std::uint32_t)s.test;
-        const float* p = (const float*)src.vertices;
+        static const float none[2] = {0, 0};
+        const float* p = src.vertices ? (const float*)src.vertices : none;
         std::fprintf(stderr, "gpulist: %s %u indices, %u bytes at %u, target %d, fresh %d, ZTST %u ZMSK %u ATE %u ATST %u AFAIL %u ABE %u "
                      "tme %u scissor %016llX first %g %g %08X\n", src.batch ? "batch" : "run", indices, src.vertexBytes, frameUsed_,
                      target, (int)!last_.any, (t >> 17) & 3, (unsigned)((s.zbuf >> 32) & 1), t & 1, (t >> 1) & 7, (t >> 12) & 3,
-                     s.abe, s.tme, (unsigned long long)s.scissor, p[0], p[1], ((const std::uint32_t*)src.vertices)[2]);
+                     s.abe, s.tme, (unsigned long long)s.scissor, p[0], p[1], src.vertices ? ((const std::uint32_t*)src.vertices)[2] : 0u);
     }
     BindTarget(target);
     BindSource(src);
@@ -803,9 +895,16 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     if (fresh)
         last_.colour = last_.write = last_.depth = last_.aref = ~0u;
 
-    frameUsed_ = (frameUsed_ + src.vertexSize - 1) / src.vertexSize * src.vertexSize;
-    std::uint32_t first = frameUsed_ / src.vertexSize;
+    std::uint32_t first = 0, firstIndex = 0;
     std::uint64_t c0 = NowNs();
+    if (src.placed) {   // the batch's two streams where DrawBatch put them
+        DkGpuAddr base = dkMemBlockGetGpuAddr(frameMem_);
+        DkBufExtents streams[2] = {{base + src.vertexAt, kFrameMemory - src.vertexAt}, {base + src.colourAt, kFrameMemory - src.colourAt}};
+        dkCmdBufBindVtxBuffers(cmd_, 0, streams, 2);
+        firstIndex = src.indexAt / 4;
+    } else {
+    frameUsed_ = (frameUsed_ + src.vertexSize - 1) / src.vertexSize * src.vertexSize;
+    first = frameUsed_ / src.vertexSize;
     std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(frameMem_) + frameUsed_, src.vertices, bytes);
     frameUsed_ += bytes;
     copiedBytes_ += bytes + indexBytes;
@@ -816,9 +915,10 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     if (captureAt_ >= 0 && (long)frames_ + 1 == captureAt_ && (drawInFrame_ <= 2 || (drawInFrame_ >= 2796 && drawInFrame_ <= 2803) || drawInFrame_ % 500 == 0))
         std::fprintf(stderr, "gpustop: draw %ld target %d frame %016llX test %08X zbuf %llX\n", drawInFrame_, target, (unsigned long long)s.frame,
                      (unsigned)s.test, (unsigned long long)s.zbuf);
-    std::uint32_t firstIndex = frameUsed_ / 4;
+    firstIndex = frameUsed_ / 4;
     std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(frameMem_) + frameUsed_, src.index, indexBytes);
     frameUsed_ = Align(frameUsed_ + indexBytes, 4);
+    }
     copyNs_ += NowNs() - c0;
     static const DkPrimitive kPrimitive[3] = {DkPrimitive_Points, DkPrimitive_Lines, DkPrimitive_Triangles};
     DkPrimitive primitive = kPrimitive[s.kind < 3 ? s.kind : 2];
@@ -949,10 +1049,13 @@ void Renderer::Replay(long count, bool capture)
     for (long k = 0; k < count; k++) {
         Recorded& r = record_[(std::size_t)k];
         texture_ = r.texture;
-        Source src = {r.vertices.data(), (std::uint32_t)r.vertices.size(), r.vertexSize, r.index.data(),
-                      (std::uint32_t)r.index.size(), r.isBatch ? &r.batch : nullptr};
-        if (r.isBatch)
+        if (r.isBatch) {
             r.batch.quads = reinterpret_cast<const std::uint32_t*>(r.vertices.data());
+            DrawBatch(r.s, r.batch);
+            continue;
+        }
+        Source src = {r.vertices.data(), (std::uint32_t)r.vertices.size(), r.vertexSize, r.index.data(),
+                      (std::uint32_t)r.index.size(), nullptr};
         Submit(r.s, src);
     }
     replaying_ = false;
