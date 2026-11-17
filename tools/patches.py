@@ -451,6 +451,26 @@ PATCHES = [
      'extern "C" f32 ConvertDoubleToFloat(u64 bits);',
      'extern "C" f32 ConvertDoubleToFloat(double a);\nstatic inline f32 port_DoubleBitsToFloat(u64 bits)\n{\n    double d;\n    __builtin_memcpy(&d, &bits, 8);\n    return ConvertDoubleToFloat(d);\n}',
      "a double's bits, as a word slot holds them, made the double the conversion takes in its FP register"),
+    # The other side of the same: UpdateSixEntryBlendWeights declares ConvertFloatToDouble as giving
+    # the double's bits (u64), which here it gives as a double in a floating-point register; read
+    # from a general register the three blend factors were whatever that register held (zeros: the
+    # player's blend stayed on its slowest clip, the opening's run a creep).
+    ('src/main/player_request.cpp',
+     'extern "C" u64 ConvertFloatToDouble(f32 x);',
+     'extern "C" double ConvertFloatToDouble(f32 x);\nstatic inline u64 port_FloatToDoubleBits(f32 x)\n{\n    double d = ConvertFloatToDouble(x);\n    u64 bits;\n    __builtin_memcpy(&bits, &d, 8);\n    return bits;\n}',
+     "a float made a double in its FP register, then the double's bits as the word slot holds them"),
+    ('src/main/player_request.cpp',
+     'u64 hv = ConvertFloatToDouble(hi);',
+     'u64 hv = port_FloatToDoubleBits(hi);',
+     "a float made a double in its FP register, then the double's bits as the word slot holds them"),
+    ('src/main/player_request.cpp',
+     'u64 lv = ConvertFloatToDouble(lo);',
+     'u64 lv = port_FloatToDoubleBits(lo);',
+     "a float made a double in its FP register, then the double's bits as the word slot holds them"),
+    ('src/main/player_request.cpp',
+     'u64 tv = ConvertFloatToDouble(t);',
+     'u64 tv = port_FloatToDoubleBits(t);',
+     "a float made a double in its FP register, then the double's bits as the word slot holds them"),
     ('src/main/player_request.cpp',
      'rows[i] = ConvertDoubleToFloat(ap[-1]);',
      'rows[i] = port_DoubleBitsToFloat(ap[-1]);',

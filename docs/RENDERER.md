@@ -175,8 +175,9 @@ the night of 2026-11-16 found.
   deterministic.
 - **Exactness.** `SLY1_GS_COUNT=1` (host) gives the GS a renderer that only counts; with
   `SLY1_GS_HASH=1` it also hashes everything drawn. Normal mode, 900 vblanks: 768 frames, 1,529,944
-  runs, 62,603,051 vertices, 57,461,178 indices. With `SLY1_GS_COUNT_BATCHES=1 SLY1_GPU_TRANSFORM=1`,
-  1,200 vblanks: hash `6E52FB08D049299D`. A change that draws the same keeps these.
+  runs, 64,483,238 vertices, 60,053,966 indices (1,898,403 runs). With `SLY1_GS_COUNT_BATCHES=1`,
+  1,200 vblanks: hash `394B8B349B637BFA`. A change that draws the same keeps these. (Since the
+  opening's run was fixed on 2026-11-17; before it 1,529,944 runs and `6E52FB08D049299D`.)
 - **The Switch's code.** Ryujinx on an Apple Silicon Mac runs the Switch build's code on the host's
   cores (its hypervisor), so lockstep runs there compare builds' work on the code GCC made for the
   Switch. A read of the clock leaves the guest there, so the per-call timers are opt-in
