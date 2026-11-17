@@ -344,3 +344,45 @@ wrong, found at frame 620 of the opening under lockstep:
   and as the retail video does not show him. So something of the volumes is still not understood
   (in the software GS too), and the picture the GPU renderer gives now, with the volumes mostly
   without effect, is the one closer to retail.
+
+## Frame rate on the Switch: what limits it (2026-11-17)
+
+Measured on a Switch Lite (handheld clocks) in the opening, 30 s after the first 10.
+
+- The game overlaps its own update with the drawing: it builds one frame while the one before is
+  drawn, and waits for the GS's FINISH of that one before it starts a third. So a frame takes as
+  long as the render thread takes for it, rounded up to a vertical blank. (Telling the game
+  FINISH when the drawing is queued was tried: the game's VIF1 interrupt handler, which packs
+  colours from the frame's record while the frame is drawn, then ran on a record the game had
+  taken back, and crashed.)
+- `SLY1_GPU_AB=1` measures in one run: every 30 frames the next of six ways of drawing (as it
+  is; the long pixel shader for every run; no destination alpha test; no batches; none of the
+  GS's runs into the frame; everything cut to a sixteenth of the picture), and for each the mean
+  frame time and the mean wait for the GPU. Without the GS's runs, or with a sixteenth of the
+  picture, the wait is 0; without the batches it is as before. So the GPU's time goes to the
+  GS's runs (sprites, particles, outlines), by the pixel.
+- `SLY1_GPU_AREA=1` prints how many screens the GS's triangles cover each frame. The roof with
+  the three steaming vents: 21 screens of blended, textured sprites a frame, at 960 by 720 where
+  the GS drew 640 by 224.
+
+What was done, each with captures of frames 501 to 506 and 620 to 625 under lockstep in Ryujinx
+byte for byte as before:
+
+- A character's outline is some 500 lines, each sent as two runs: the line, then the line again
+  for its depth alone (ATST NEVER, AFAIL ZB_ONLY, the depth test GREATER) for the pixels the GS's
+  antialiasing leaves without depth. Here the first run writes its depth everywhere, so the
+  second can change nothing and is left out, and the first runs, now one after another with the
+  same state, are put together into one draw (`SLY1_GPU_NO_MERGE=1`: neither).
+- Three sets of a frame's memory in place of two, so that the render thread does not wait at a
+  frame's end for the GPU to finish the frame before.
+- A short pixel shader (gs_lite_fsh.glsl) for the GS's runs without the destination alpha test:
+  no discard, none of the tests such a run never needs (`SLY1_GPU_NO_LITE=1`: the long one).
+
+| build | frames a second | render thread waiting for the GPU |
+| --- | --- | --- |
+| before | 23.0 to 24.3 | 8 to 11 ms a frame |
+| outlines as one draw, three sets | 24.5 | 7 ms |
+| and the short pixel shader | 28.2 | under 4 ms |
+
+Left: the render thread's own work, 21 ms a frame for VIF1's data (the VU1 handlers and their
+kicks), which is now most of a frame.

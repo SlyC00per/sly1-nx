@@ -29,6 +29,7 @@
 #include "port/system.h"
 #include "gs_vsh_dksh.h"
 #include "gs_fsh_dksh.h"
+#include "gs_lite_fsh_dksh.h"
 #include "batch_vsh_dksh.h"
 
 namespace port {
@@ -41,6 +42,12 @@ constexpr std::uint32_t kWidth = 960, kHeight = 720;     // a frame buffer's ima
 constexpr float kFieldWidth = 640.0f, kFieldHeight = 224.0f;
 constexpr std::uint32_t kFrameMemory = 24u << 20;        // a frame's vertices and texture uploads
 constexpr std::uint32_t kCommandMemory = 16u << 20;
+// The sets of a frame's memory (its vertices and its commands), used in turn. A set is taken again
+// once the GPU has done with the frame recorded in it. With two the render thread waited at each
+// frame's end for the GPU to finish the frame before (5 to 8 ms of the Switch's 32 a frame, which
+// the GPU spent on that frame while the thread did nothing); with three it waits for the frame
+// before that, which is done unless the GPU is slower than the thread.
+constexpr int kSets = 3;
 constexpr std::uint32_t kTextureMemory = 64u << 20;
 constexpr std::uint32_t kMaxTextures = 2048;
 constexpr int kSmallTargets = 8;                      // the buffers other than the frame's two the game draws into (a shadow's picture)
@@ -121,6 +128,26 @@ private:
     void BindTarget(int target);
     void BindSource(const Source& src);
     void Submit(const gs::DrawState& s, const Source& src);
+    void FlushPending();
+    // The GS's run held back: the next is added to it when its state and texture are the same
+    // (the game sends a character's outline as hundreds of runs of one line each, the registers
+    // written again between them), and the whole is one draw.
+    gs::DrawState pendState_;
+    std::vector<gs::DrawVertex> pendVertices_;
+    std::vector<std::uint32_t> pendIndex_;
+    const Texture* pendTexture_ = nullptr;
+    bool pending_ = false;
+    std::size_t lastCount_ = 0, lastIndices_ = 0;   // of the last run added
+    double area_[4] = {};
+    int areaRuns_[4] = {};
+    // SLY1_GPU_AB=1: a measurement in one run. Every 30 frames the next of six ways of drawing: 0 as it
+    // is, 1 the long pixel shader for every run, 2 no destination alpha test, 3 no batches, 4 none of the GS's
+    // runs into the frame, 5 everything cut to a sixteenth of the picture. For each, the mean time
+    // from one frame's end to the next and the mean wait for the GPU (the picture is not to look at).
+    int ab_ = 0;
+    bool abOn_ = false;
+    std::uint64_t abAt_ = 0, abNs_[6] = {}, abWaitNs_[6] = {}, abFrames_[6] = {};
+    std::uint64_t merged_ = 0, dropped_ = 0;
     const Texture* TextureFor(const gs::DrawState& state);
     void Capture(int target);
     static int TargetOf(std::uint64_t fbp);
@@ -152,14 +179,16 @@ private:
     DkCmdBuf cmd_ = nullptr;
     // a frame's vertices, uploads and commands: two sets in turn, so that a frame is recorded while
     // the GPU draws the one before
-    DkMemBlock frameMems_[2] = {nullptr, nullptr}, commandMems_[2] = {nullptr, nullptr};
-    DkFence fences_[2];
-    bool fenced_[2] = {false, false};
+    DkMemBlock frameMems_[kSets] = {}, commandMems_[kSets] = {};
+    DkFence fences_[kSets];
+    bool fenced_[kSets] = {};
     int set_ = 0;
     DkMemBlock imageMem_ = nullptr, frameMem_ = nullptr, commandMem_ = nullptr, codeMem_ = nullptr, dataMem_ = nullptr,
                textureMem_ = nullptr;
     DkImage screen_[2], colour_[2], depth_;
-    DkShader vertexShader_, fragmentShader_, batchShader_;
+    DkShader vertexShader_, fragmentShader_, batchShader_, liteShader_;
+    bool liteBound_ = false;   // gs_lite_fsh.glsl in place of gs_fsh.glsl
+    std::uint64_t liteRuns_ = 0;
     std::uint32_t batchUbo_ = 0;
     // what the commands so far draw with: whose vertices, their layout, the viewport's depths
     int source_ = -1;
@@ -312,6 +341,10 @@ bool Renderer::Create()
     dkShaderInitialize(&fragmentShader_, &shaderMaker);
     dkShaderMakerDefaults(&shaderMaker, codeMem_, batchAt);
     dkShaderInitialize(&batchShader_, &shaderMaker);
+    std::uint32_t liteAt = Align(batchAt + (std::uint32_t)batch_vsh_dksh_size, DK_SHADER_CODE_ALIGNMENT);
+    std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(codeMem_) + liteAt, gs_lite_fsh_dksh, gs_lite_fsh_dksh_size);
+    dkShaderMakerDefaults(&shaderMaker, codeMem_, liteAt);
+    dkShaderInitialize(&liteShader_, &shaderMaker);
     if (std::getenv("SLY1_GPU_CULL_FLIP"))
         cullFront_ = 0.0f;
 
@@ -336,7 +369,7 @@ bool Renderer::Create()
 
     textureMem_ = Block(kTextureMemory, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image);
     targetMem_ = Block(kTargetMemory, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image);
-    for (int k = 0; k < 2; k++) {
+    for (int k = 0; k < kSets; k++) {
         frameMems_[k] = Block(kFrameMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
         commandMems_[k] = Block(kCommandMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
         if (!frameMems_[k] || !commandMems_[k])
@@ -413,6 +446,7 @@ void Renderer::BindSource(const Source& src)
     if (source != source_ || layout != layout_) {
         const DkShader* shaders[2] = {b ? &batchShader_ : &vertexShader_, &fragmentShader_};
         dkCmdBufBindShaders(cmd_, DkStageFlag_GraphicsMask, shaders, 2);
+        liteBound_ = false;
         DkBufExtents ubo = {data + (b ? batchUbo_ : vertexUbo_), (std::uint32_t)(b ? sizeof(BatchParams) : sizeof(VertexParams))};
         dkCmdBufBindUniformBuffers(cmd_, DkStage_Vertex, 0, &ubo, 1);
         if (b) {
@@ -624,6 +658,7 @@ const Texture* Renderer::TextureFor(const gs::DrawState& state)
         it->second.generation = generation;
         return &it->second;
     }
+    FlushPending();   // what was drawn before, with the textures as they were
     int w, h;
     gs::DecodeTexture(state, pixels_, w, h);
     decodes_++;
@@ -695,8 +730,71 @@ void Renderer::Begin(const gs::DrawState& s)
 void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t count, const std::uint32_t* index,
                     std::size_t indices)
 {
-    Source src = {v, (std::uint32_t)(count * sizeof(gs::DrawVertex)), sizeof(gs::DrawVertex), index, (std::uint32_t)indices, nullptr};
-    Submit(s, src);
+    static const bool noMerge = std::getenv("SLY1_GPU_NO_MERGE") != nullptr;
+    if (noMerge || !index || indices == 0) {
+        FlushPending();
+        Source src = {v, (std::uint32_t)(count * sizeof(gs::DrawVertex)), sizeof(gs::DrawVertex), index, (std::uint32_t)indices, nullptr};
+        Submit(s, src);
+        return;
+    }
+    const gs::DrawState& p = pendState_;
+    // A run that can change nothing is left out: the same vertices as the run before, which wrote
+    // its depth wherever it drew, drawn again for the depth alone (ATST NEVER, AFAIL ZB_ONLY) under
+    // the same test, GREATER, which the depth just written does not pass. The game draws each line
+    // of a character's outline twice so (the second for the pixels the GS's antialiasing leaves
+    // without depth, which is not done here).
+    if (pending_ && s.kind == p.kind && s.frame == p.frame && s.zbuf == p.zbuf && s.scissor == p.scissor && !(s.zbuf >> 32 & 1) &&
+        (s.test & 0x7F00F) == 0x72001 && (p.test & 0x74001) == 0x70000 && count == lastCount_ && indices == lastIndices_) {
+        const gs::DrawVertex* was = pendVertices_.data() + pendVertices_.size() - count;
+        const std::uint32_t* wasIndex = pendIndex_.data() + pendIndex_.size() - indices;
+        const std::uint32_t base = (std::uint32_t)(pendVertices_.size() - count);
+        bool equal = true;
+        for (std::size_t k = 0; k < count && equal; k++)
+            equal = v[k].x == was[k].x && v[k].y == was[k].y && v[k].z == was[k].z;
+        for (std::size_t k = 0; k < indices && equal; k++)
+            equal = index[k] + base == wasIndex[k];
+        if (equal) {
+            dropped_++;
+            return;
+        }
+    }
+    const bool same = pending_ && texture_ == pendTexture_ && pendVertices_.size() + count <= 32768 && s.kind == p.kind &&
+                      s.tme == p.tme && s.fge == p.fge && s.abe == p.abe && s.fba == p.fba && s.tex0 == p.tex0 && s.tex1 == p.tex1 &&
+                      s.clamp == p.clamp && s.alpha == p.alpha && s.test == p.test && s.frame == p.frame && s.zbuf == p.zbuf &&
+                      s.scissor == p.scissor && s.texa == p.texa && s.fogcol == p.fogcol;
+    if (!same) {
+        FlushPending();
+        pendState_ = s;
+        pendTexture_ = texture_;
+        pendVertices_.clear();
+        pendIndex_.clear();
+        pending_ = true;
+    } else {
+        merged_++;
+    }
+    lastCount_ = count;
+    lastIndices_ = indices;
+    const std::uint32_t base = (std::uint32_t)pendVertices_.size();
+    pendVertices_.insert(pendVertices_.end(), v, v + count);
+    const std::size_t at = pendIndex_.size();
+    pendIndex_.resize(at + indices);
+    for (std::size_t k = 0; k < indices; k++)
+        pendIndex_[at + k] = index[k] + base;
+}
+
+// The run held back, drawn: before anything else that goes to the GPU (a batch, a texture's
+// upload, the frame's end), so that everything is drawn in the game's order.
+void Renderer::FlushPending()
+{
+    if (!pending_)
+        return;
+    pending_ = false;
+    const Texture* now = texture_;
+    texture_ = pendTexture_;
+    Source src = {pendVertices_.data(), (std::uint32_t)(pendVertices_.size() * sizeof(gs::DrawVertex)), sizeof(gs::DrawVertex),
+                  pendIndex_.data(), (std::uint32_t)pendIndex_.size(), nullptr};
+    Submit(pendState_, src);
+    texture_ = now;
 }
 
 // A batch's strip as triangles: one for each vertex from the third that does not start a strip,
@@ -704,6 +802,7 @@ void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t
 // that closes it last (its control word says whether a backface is dropped).
 bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
 {
+    FlushPending();
     static const bool asRuns = std::getenv("SLY1_GPU_BATCH_AS_RUNS") != nullptr;
     if (asRuns) {   // diagnosis: the batch made the GS's vertices here and drawn the GS's way (nothing cut:
                     // a triangle with a vertex outside the view is left out)
@@ -968,6 +1067,25 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
             }
         }
     }
+    // SLY1_GPU_AREA=1: how much of the frame the GS's runs cover, in screens, each frame (triangles
+    // with their corners brought inside the picture: near enough), by kind of run.
+    static const bool area = std::getenv("SLY1_GPU_AREA") != nullptr;
+    if (area && !src.batch && src.vertices && src.index && s.kind == 2 && target < 2) {
+        const gs::DrawVertex* v = static_cast<const gs::DrawVertex*>(src.vertices);
+        double sum = 0;
+        for (std::uint32_t k = 0; k + 2 < src.indices; k += 3) {
+            float x[3], y[3];
+            for (int c = 0; c < 3; c++) {
+                x[c] = std::min(std::max(v[src.index[k + c]].x, 0.0f), kFieldWidth);
+                y[c] = std::min(std::max(v[src.index[k + c]].y, 0.0f), kFieldHeight);
+            }
+            sum += std::fabs((x[1] - x[0]) * (y[2] - y[0]) - (x[2] - x[0]) * (y[1] - y[0])) * 0.5;
+        }
+        const bool date = (s.test >> 14) & 1;
+        int kind = date ? 3 : !s.abe ? 0 : s.tme ? 1 : 2;
+        area_[kind] += sum / (kFieldWidth * kFieldHeight);
+        areaRuns_[kind]++;
+    }
     allDraws_++;
     if (recording_ && !replaying_ && !src.placed) {   // SLY1_GPU_REPLAY: the frame's draws kept as they are submitted (batches: DrawBatch)
         Recorded rec;
@@ -1021,7 +1139,9 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     // first: right, but a depth buffer with a stencil is twice the size, and a dozen copies a frame
     // took the Switch from 24 to 17 frames a second.) SLY1_GPU_NO_DATE leaves the test out.
     static const bool noDate = std::getenv("SLY1_GPU_NO_DATE") != nullptr;
-    const bool dateRun = date && !noDate && target < 2;
+    const bool dateRun = date && !noDate && target < 2 && ab_ != 2;
+    if ((ab_ == 3 && src.batch) || (ab_ == 4 && !src.batch && target < 2))
+        return;
     if (date)
         destinationAlpha_++;
     if (dateRun) {
@@ -1129,6 +1249,16 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         fsView = 6;
     }
     fp.blend[3] = (float)fsView;
+    {   // the pixel shader: the short one where the run needs no more (gs_lite_fsh.glsl)
+        static const bool noLite = std::getenv("SLY1_GPU_NO_LITE") != nullptr;
+        const bool lite = !noLite && ab_ != 1 && !src.batch && !dateRun && fsView == 0 && view_ == 0 && fp.coef[0] == 99.0f;
+        if (lite != liteBound_) {
+            const DkShader* shader[1] = {lite ? &liteShader_ : &fragmentShader_};
+            dkCmdBufBindShaders(cmd_, DkStageFlag_Fragment, shader, 1);
+            liteBound_ = lite;
+        }
+        liteRuns_ += lite ? 1 : 0;
+    }
     fp.mode[0] = s.tme;
     fp.mode[1] = (std::int32_t)((s.tex0 >> 35) & 3);
     fp.mode[2] = (std::int32_t)((s.tex0 >> 34) & 1);
@@ -1163,6 +1293,10 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         sc.y = std::min((std::uint32_t)(y0 * sy), kHeight);
         sc.width = std::min((std::uint32_t)(x1 * sx + 0.5f), kWidth) - sc.x;
         sc.height = std::min((std::uint32_t)(y1 * sy + 0.5f), kHeight) - sc.y;
+        if (ab_ == 5) {
+            sc.width /= 4;
+            sc.height /= 4;
+        }
         if (fresh || std::memcmp(&sc, &last_.scissor, sizeof sc) != 0) {
             dkCmdBufSetScissors(cmd_, 0, &sc, 1);
             last_.scissor = sc;
@@ -1437,6 +1571,19 @@ void Renderer::DumpDraw(long k)
 
 void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
 {
+    FlushPending();
+    if (std::getenv("SLY1_GPU_AREA")) {
+        if (frames_ % 20 == 0)
+            std::fprintf(stderr, "gpuarea: frame %llu: opaque %.1f screens in %d runs, blended textured %.1f in %d, blended plain %.1f in %d, "
+                         "with the destination alpha test %.1f in %d\n", (unsigned long long)frames_, area_[0], areaRuns_[0], area_[1], areaRuns_[1],
+                         area_[2], areaRuns_[2], area_[3], areaRuns_[3]);
+        for (int k = 0; k < 4; k++) {
+            area_[k] = 0;
+            areaRuns_[k] = 0;
+        }
+    }
+    static const bool abAsked = std::getenv("SLY1_GPU_AB") != nullptr;
+    abOn_ = abAsked;
     {
         static const long replayHeavy = std::getenv("SLY1_GPU_REPLAY") ? std::atol(std::getenv("SLY1_GPU_REPLAY")) : 0;
         if (replayHeavy > 0) {
@@ -1566,13 +1713,23 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
     dkQueueSignalFence(queue_, &fences_[set_], false);
     fenced_[set_] = true;
     dkQueuePresentImage(queue_, swapchain_, slot);
-    // the other set, once the GPU has done with the frame recorded in it
-    set_ ^= 1;
+    // the next set, once the GPU has done with the frame recorded in it
+    set_ = (set_ + 1) % kSets;
     std::uint64_t t1 = NowNs();
     if (fenced_[set_])
         dkFenceWait(&fences_[set_], -1);
     fenced_[set_] = false;
     waitNs_ += NowNs() - t1;
+    if (abOn_) {
+        const std::uint64_t now = NowNs();
+        if (frames_ % 30 >= 6 && abAt_) {   // the first frames after a change left out
+            abNs_[ab_] += now - abAt_;
+            abWaitNs_[ab_] += now - t1;
+            abFrames_[ab_]++;
+        }
+        abAt_ = now;
+        ab_ = (int)(frames_ / 30 % 6);
+    }
     frameMem_ = frameMems_[set_];
     commandMem_ = commandMems_[set_];
     BeginCommands();
@@ -1584,6 +1741,14 @@ void Renderer::Report()
     std::fprintf(stderr, "gpu: %llu frames, %llu runs of primitives (%llu vertices), %llu command lists sent\n",
                  (unsigned long long)frames_, (unsigned long long)runs_, (unsigned long long)vertices_,
                  (unsigned long long)sends_);
+    std::fprintf(stderr, "gpu: %llu runs added to the run before (the same state and texture) and drawn with it; %llu left out (the run before again, for its depth alone)\n",
+                 (unsigned long long)merged_, (unsigned long long)dropped_);
+    static const char* const kAb[6] = {"as it is", "the long pixel shader", "no destination alpha test", "no batches", "no runs into the frame",
+                                       "a sixteenth of the picture"};
+    for (int k = 0; abOn_ && k < 6; k++)
+        std::fprintf(stderr, "gpuab: %-26s %4llu frames, %6.2f ms a frame, %6.2f ms of it waiting for the GPU\n", kAb[k], (unsigned long long)abFrames_[k],
+                     abFrames_[k] ? abNs_[k] / 1e6 / abFrames_[k] : 0.0, abFrames_[k] ? abWaitNs_[k] / 1e6 / abFrames_[k] : 0.0);
+    std::fprintf(stderr, "gpu: %llu runs with the short pixel shader\n", (unsigned long long)liteRuns_);
     std::fprintf(stderr, "gpu: %llu batches transformed by the GPU (%llu vertices); %.3f s making their triangles' indices\n",
                  (unsigned long long)batches_, (unsigned long long)batchVertices_, indexNs_ / 1e9);
     std::fprintf(stderr, "gpu: %.3f s copying %.1f MB of vertices and indices to the GPU's memory\n", copyNs_ / 1e9, copiedBytes_ / 1e6);
