@@ -1931,6 +1931,12 @@ namespace {
 bool (*g_batchSink)(std::uint32_t, const Batch&);
 }
 void SetBatchSink(bool (*sink)(std::uint32_t, const Batch&)) { g_batchSink = sink; }
+void ForgetKept(std::uint64_t first, std::uint64_t count)
+{
+    Guard lk;
+    if (g_backend)
+        g_backend->ForgetKept(first, count);
+}
 namespace {
 bool g_partOpen;
 std::uint64_t g_partIn[2], g_partOut[2], g_parts;

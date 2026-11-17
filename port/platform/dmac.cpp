@@ -253,12 +253,22 @@ Gif g_path2{2};
 // A path-1 packet is copied out of VU1's data memory when it is kicked (the microcode writes the
 // next one over it), VIF1's DIRECT data and the GIF channel's items are passed on as they come,
 // all in one queue, in order, so the GS sees what it would have seen.
+// A packet or a batch kept of a model part (PartReplay): a path's words, or for path 4 a batch's
+// tag word, record and vertices as QueueBatch lays them out.
+struct PartKept {
+    std::uint8_t path;
+    std::shared_ptr<const std::vector<std::uint32_t>> words;
+};
+
 struct GsItem {
-    std::uint8_t path = 0;   // 1-3, 4 a batch, or 0: a call
+    std::uint8_t path = 0;   // 1-3, 4 a batch, 5 a part drawn again, or 0: a call
     std::vector<std::uint32_t> words;
     // a model part drawn again (PartReplay): the words kept from the first time, for a path's
     // packet all of them, for a batch its vertices (words has its tag word and record, this frame's)
     std::shared_ptr<const std::vector<std::uint32_t>> kept;
+    // path 5, a whole part drawn again: everything kept of it (words has this frame's matrix, the
+    // viewport's scale and offset, the first id for its batches and the first id they were kept with)
+    std::shared_ptr<const std::vector<PartKept>> part;
     void (*fn)(std::uint64_t, std::uint64_t) = nullptr;
     std::uint64_t a = 0, b = 0;
 };
@@ -1221,12 +1231,12 @@ struct PartRecord {
     bool moving = false;                 // its vertices change where the hash does not look: never drawn again
     std::uint32_t header[44] = {};       // the part's header, 11 quadwords at TOPS
     Vif::Regs before, after;
-    struct Item {
-        std::uint8_t path;
-        std::shared_ptr<const std::vector<std::uint32_t>> words;
-    };
-    std::vector<Item> items;
+    std::vector<PartKept> items;                          // while it is recorded
+    std::shared_ptr<const std::vector<PartKept>> kept;    // once it is kept: what the GS thread is given
     std::uint64_t words = 0;             // what its items hold, counted in g_partWords
+    std::uint64_t keyFirst = 0, keys = 0;   // its batches' keys (gs::Batch::keep)
+    std::uint32_t stale = 0;             // the times running it was found changed
+    std::uint64_t notBefore = 0;         // a part that keeps changing is not kept again before this frame
     std::uint32_t ids = 0;               // the batches' ids run from firstId for this many
     std::uint32_t firstId = 0;
     // while it is recorded
@@ -1234,7 +1244,7 @@ struct PartRecord {
     bool bad = false;
 };
 std::unordered_map<std::uint32_t, PartRecord> g_parts;   // by the hook's packet and half
-std::uint64_t g_partsReplayed, g_partsRecorded, g_partsRefused, g_partsStale, g_partItemsReplayed, g_partsMoving, g_partsStaleBy[3], g_partHashNs, g_partWords, g_partsCleared;
+std::uint64_t g_partsReplayed, g_partsRecorded, g_partsRefused, g_partsStale, g_partItemsReplayed, g_partsMoving, g_partsStaleBy[3], g_partHashNs, g_partWords, g_partsCleared, g_partKey, g_partsFickle;
 constexpr std::size_t kBatchHead = 1 + (sizeof(gs::Batch) + 3) / 4;
 
 bool PartReplayOn()
@@ -1246,11 +1256,20 @@ bool PartReplayOn()
 void PartRecordItem(const GsItem& item)
 {
     PartRecord& r = *g_partRecording;
-    if (item.path == 0 || item.path == 3 || item.kept) {   // a call, the GIF channel's: not a part's
+    if (item.path == 0 || item.path == 3 || item.path == 5 || item.kept) {   // a call, the GIF channel's: not a part's
         r.bad = true;
         return;
     }
-    r.items.push_back({item.path, std::make_shared<const std::vector<std::uint32_t>>(item.words)});
+    if (item.path == 4) {   // a batch: a key of its own, for the renderer to keep its vertices by
+        std::vector<std::uint32_t> words = item.words;
+        gs::Batch b;
+        std::memcpy(&b, &words[1], sizeof b);
+        b.keep = ++g_partKey;
+        std::memcpy(&words[1], &b, sizeof b);
+        r.items.push_back({item.path, std::make_shared<const std::vector<std::uint32_t>>(std::move(words))});
+    } else {
+        r.items.push_back({item.path, std::make_shared<const std::vector<std::uint32_t>>(item.words)});
+    }
     r.words += item.words.size();
     g_partWords += item.words.size();
 }
@@ -1390,6 +1409,20 @@ void PartHeader(std::uint32_t tops, std::uint32_t out[44])
         std::memcpy(out + k * 4, d + ((tops + (std::uint32_t)k) & 0x3FF) * 16, 16);
 }
 
+// The renderer told, in turn with what is queued, that a record's batches will not come again.
+void PartForget(PartRecord& r)
+{
+    if (r.keys == 0)
+        return;
+    GsItem item;
+    item.path = 0;
+    item.fn = [](std::uint64_t first, std::uint64_t count) { gs::ForgetKept(first, count); };
+    item.a = r.keyFirst;
+    item.b = r.keys;
+    g_gsPending.push_back(std::move(item));
+    r.keys = 0;
+}
+
 // Whether two headers are the same in what the packet's programs take from them, the matrix
 // apart: quadwords 8 (the fog) and 9 (the alpha's scale, the lighting's mode and count, the cull
 // flag) and 10's w (the colours' scale). A part drawn from its cache is unlit or lit by the cache
@@ -1428,7 +1461,8 @@ bool PartCall(std::uint32_t marker, std::uint32_t target)
                 r.verified++;
             } else {
                 r.moving = true;
-                r.items.clear();
+                r.kept.reset();
+                PartForget(r);
                 g_partWords -= std::min<std::uint64_t>(g_partWords, r.words);
                 r.words = 0;
                 g_partsMoving++;
@@ -1436,33 +1470,27 @@ bool PartCall(std::uint32_t marker, std::uint32_t target)
             }
         }
         if (same) {
-            float matrix[16], viewport[8];
+            // one item for the part: the GS thread goes through what was kept (an item a packet and
+            // a batch, each with memory of its own, cost the Switch as much as running the part)
+            GsItem item;
+            item.path = 5;
+            item.part = r.kept;
+            item.words = GsSpare();
+            item.words.resize(26);
+            float matrix[16];
             vu1::PartMatrix(regs.tops, matrix);
-            std::memcpy(viewport, vu1::Data(), 32);
-            const std::uint32_t firstId = vu1::TakeBatchIds(r.ids);
-            for (const PartRecord::Item& kept : r.items) {
-                GsItem item;
-                item.path = kept.path;
-                item.kept = kept.words;
-                if (kept.path == 4) {   // the batch's record with this frame's matrix and viewport
-                    item.words.assign(kept.words->begin(), kept.words->begin() + (std::ptrdiff_t)kBatchHead);
-                    gs::Batch b;
-                    std::memcpy(&b, &item.words[1], sizeof b);
-                    std::memcpy(b.matrix, matrix, sizeof b.matrix);
-                    std::memcpy(b.scale, viewport, 16);
-                    std::memcpy(b.offset, viewport + 4, 16);
-                    if (b.id != 0)
-                        b.id = firstId + (b.id - r.firstId);
-                    std::memcpy(&item.words[1], &b, sizeof b);
-                }
-                g_gsPending.push_back(std::move(item));
-                if (g_gsPending.size() >= 24)
-                    GsPassOn();
-            }
+            std::memcpy(&item.words[0], matrix, sizeof matrix);
+            std::memcpy(&item.words[16], vu1::Data(), 32);
+            item.words[24] = vu1::TakeBatchIds(r.ids);
+            item.words[25] = r.firstId;
+            g_gsPending.push_back(std::move(item));
+            if (g_gsPending.size() >= 24)
+                GsPassOn();
             g_vif1.SetRegs(r.after);
             vu1::PartSkipped();
+            r.stale = 0;
             g_partsReplayed++;
-            g_partItemsReplayed += r.items.size();
+            g_partItemsReplayed += r.kept->size();
             return true;
         }
         g_partsStale++;
@@ -1472,13 +1500,31 @@ bool PartCall(std::uint32_t marker, std::uint32_t target)
     // kept from this time on; everything kept is let go first when it has grown past 48 MB (another
     // level's parts stay kept until then)
     if (g_partWords > (48u << 20) / 4) {
+        for (auto& kv : g_parts)
+            PartForget(kv.second);
         g_parts.clear();
         g_partWords = 0;
         g_partsCleared++;
     }
     PartRecord& r = g_parts[key];
+    // A part found changed three times running (one that fades, its header's scales other each
+    // frame) is run as ever for the next 30 frames: keeping it each frame costs more than it saves.
+    const std::uint32_t stale = r.ok ? r.stale + 1 : r.stale;
+    if (r.notBefore > gs::FramesShown()) {
+        g_partsFickle++;
+        return false;
+    }
     g_partWords -= std::min<std::uint64_t>(g_partWords, r.words);   // what it held before is let go
+    PartForget(r);
     r = PartRecord();
+    r.stale = stale;
+    if (stale >= 3) {
+        r.stale = 0;
+        r.notBefore = gs::FramesShown() + 30;
+        g_partsFickle++;
+        return false;
+    }
+    r.keyFirst = g_partKey + 1;
     r.hash = hash;
     r.hashWhole = PartHash(target, true, regs.cl, regs.wl);
     std::memcpy(r.header, header, sizeof header);
@@ -1529,11 +1575,16 @@ void PartDone()
     r->after = g_vif1.GetRegs();
     r->firstId = minId == ~0u ? 0 : minId;
     r->ids = minId == ~0u ? 0 : maxId - minId + 1;
+    r->keys = g_partKey + 1 - r->keyFirst;
     r->ok = ok;
+    if (ok)
+        r->kept = std::make_shared<const std::vector<PartKept>>(std::move(r->items));
+    r->items.clear();
     if (!ok) {
-        r->items.clear();
         g_partWords -= std::min<std::uint64_t>(g_partWords, r->words);
         r->words = 0;
+        r->keys = 0;   // the renderer never saw them
+        r->notBefore = gs::FramesShown() + 30;   // not tried again at once
     }
     (ok ? g_partsRecorded : g_partsRefused)++;
 }
@@ -1871,6 +1922,38 @@ void GsThreadMain()
         } busy{gsStarted};
         if (item.path == 0) {
             item.fn(item.a, item.b);
+        } else if (item.path == 5) {   // a part drawn again: its kept packets and batches in turn
+            float matrix[16], viewport[8];
+            std::memcpy(matrix, &item.words[0], sizeof matrix);
+            std::memcpy(viewport, &item.words[16], sizeof viewport);
+            const std::uint32_t firstId = item.words[24], keptFirstId = item.words[25];
+            const std::size_t head = 1 + (sizeof(gs::Batch) + 3) / 4;
+            for (const PartKept& kept : *item.part) {
+                const std::vector<std::uint32_t>& w = *kept.words;
+                if (kept.path == 4) {
+                    gs::Batch b;
+                    std::memcpy(&b, &w[1], sizeof b);
+                    std::memcpy(b.matrix, matrix, sizeof b.matrix);
+                    std::memcpy(b.scale, viewport, 16);
+                    std::memcpy(b.offset, viewport + 4, 16);
+                    if (b.id != 0)
+                        b.id = firstId + (b.id - keptFirstId);
+                    b.quads = w.data() + head;
+                    if (!gs::DrawBatch(w[0], b))
+                        g_batchesRefused++;
+                } else {
+                    Gif& gif = kept.path == 1 ? g_path1 : g_path2;
+                    gs::Hold hold;
+                    for (std::size_t k = 0; k + 4 <= w.size();) {
+                        std::uint32_t taken = gif.Left() ? gif.Run(&w[k], (std::uint32_t)((w.size() - k) / 4)) : 0;
+                        if (taken == 0) {
+                            gif.Qword(&w[k]);
+                            taken = 1;
+                        }
+                        k += (std::size_t)taken * 4;
+                    }
+                }
+            }
         } else if (item.path == 4) {   // a batch (QueueBatch)
             gs::Batch b;
             const std::size_t head = 1 + (sizeof(gs::Batch) + 3) / 4;
@@ -2035,8 +2118,8 @@ void DmacDump()
                      (unsigned long long)g_partsMoving);
     if (g_partsRecorded || g_partsRefused)
         std::fprintf(stderr, "dmac: parts kept anew because of the hash %llu, VIF1's registers %llu, the header %llu; %.2f s hashing packets; %.1f MB kept, "
-                     "all let go %llu times\n", (unsigned long long)g_partsStaleBy[0], (unsigned long long)g_partsStaleBy[1], (unsigned long long)g_partsStaleBy[2],
-                     g_partHashNs / 1e9, g_partWords * 4 / 1e6, (unsigned long long)g_partsCleared);
+                     "all let go %llu times; run as ever %llu times because they kept changing\n", (unsigned long long)g_partsStaleBy[0], (unsigned long long)g_partsStaleBy[1],
+                     (unsigned long long)g_partsStaleBy[2], g_partHashNs / 1e9, g_partWords * 4 / 1e6, (unsigned long long)g_partsCleared, (unsigned long long)g_partsFickle);
     if (g_liveLists.load())
         std::fprintf(stderr, "dmac: %llu lists of VIF1's walked where they lie (a frame's, or one with interrupts), %llu from their copies\n",
                      (unsigned long long)g_liveLists.load(), (unsigned long long)g_copiedLists.load());

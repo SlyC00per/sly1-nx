@@ -49,6 +49,9 @@ struct Batch {
     int ofx, ofy;                 // XYOFFSET (12.4), the odd field's half line dropped
     std::uint32_t id = 0;         // the same for the kicks of one batch (their positions and STQ the
                                   // same, the colours not): a renderer may keep what it took of the first
+    std::uint64_t keep = 0;       // not 0: the same for as long as the batch's vertices and colours are
+                                  // (a model part drawn again, port/platform/dmac.cpp): a renderer may keep
+                                  // them in memory of its own from frame to frame, until ForgetKept
 };
 constexpr std::uint32_t kStripStart = 0x8000, kCullable = 0x4000;   // bits of a vertex's control word
 
@@ -92,6 +95,8 @@ public:
     // false when the renderer does not take batches (the caller has VU1's program do it).
     virtual bool TakesBatches() const { return false; }
     virtual bool DrawBatch(const DrawState&, const Batch&) { return false; }
+    // The batches with keep from first on, count of them, will not come again.
+    virtual void ForgetKept(std::uint64_t, std::uint64_t) {}
     // The game swapped its double buffer: DISPFB's buffer is the one to show.
     virtual void Present(std::uint64_t dispfb, std::uint64_t display) = 0;
 };
@@ -114,6 +119,9 @@ bool KickBatch(std::uint32_t tagWord1, Batch& batch);
 // outside them, and the parts, so far.
 void PartOpen(bool open, std::uint32_t packet, std::uint32_t half);
 void PartCounts(std::uint64_t in[2], std::uint64_t out[2], std::uint64_t* parts);
+// Batch::keep's keys from first on, count of them, will not come again (the backend may let go of
+// what it kept for them).
+void ForgetKept(std::uint64_t first, std::uint64_t count);
 void SetBatchSink(bool (*sink)(std::uint32_t tagWord1, const Batch& batch));
 
 // Whether the renderer set takes batches.

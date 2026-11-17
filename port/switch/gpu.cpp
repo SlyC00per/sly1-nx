@@ -54,6 +54,9 @@ constexpr int kSmallTargets = 8;                      // the buffers other than 
 constexpr std::uint32_t kSmallScale = 1;               // an image's pixels to one of such a buffer's, each way (1: the game's
                                                        // own, so that its blur of a shadow's picture spreads as on the GS)
 constexpr std::uint32_t kTargetMemory = 8u << 20;
+// Memory for the batches that come again unchanged (gs::Batch::keep): their positions and STQ,
+// colours and indices, written once and drawn from each frame after.
+constexpr std::uint32_t kKeepMemory = 64u << 20;
 constexpr std::uint32_t kMaxDraws = 12000;               // a frame's draws before its commands are sent
 
 std::uint32_t Align(std::uint32_t v, std::uint32_t a) { return (v + a - 1) & ~(a - 1); }
@@ -92,6 +95,7 @@ struct Source {
     // a batch's, put in the frame's memory already (DrawBatch): its positions and STQ (32 bytes a
     // vertex), its colours (16), its indices, as offsets in the frame's memory
     bool placed = false;
+    bool kept = false;        // placed in keepMem_, not in the frame's memory
     std::uint32_t vertexAt = 0, colourAt = 0, indexAt = 0;
 };
 
@@ -209,6 +213,26 @@ private:
     std::uint64_t retired_ = 0;
     BatchParams lastBatch_;
     std::vector<std::uint32_t> batchIndex_;
+    // Batches kept from frame to frame (gs::Batch::keep), each a block of keepMem_: its indices,
+    // its positions and STQ, its colours. A block let go (ForgetKept) is taken again once three
+    // more frames have been shown: the GPU may still be drawing from it till then.
+    struct Kept {
+        std::uint32_t at = 0, bytes = 0, indexAt = 0, vertexAt = 0, colourAt = 0, indices = 0, count = 0;
+    };
+    struct FreeBlock {
+        std::uint32_t at, bytes;
+        std::uint64_t frame;
+    };
+    DkMemBlock keepMem_ = nullptr;
+    std::uint32_t keepUsed_ = 0;
+    std::unordered_map<std::uint64_t, Kept> kept_;
+    std::vector<FreeBlock> keepFree_;
+    bool indexKeep_ = false;   // the index buffer bound is keepMem_, not the frame's memory
+    bool keepFull_ = false;    // a batch found no room: keepMem_ is emptied at the frame's end
+    std::uint64_t keepResets_ = 0;
+    std::uint64_t keptDraws_ = 0, keptPlaced_ = 0, keptBytes_ = 0, keptNoRoom_ = 0, keptForgotten_ = 0;
+    bool KeepRoom(std::uint32_t bytes, std::uint32_t* at, std::uint32_t* got);
+    void ForgetKept(std::uint64_t first, std::uint64_t count) override;
     struct BatchCache {   // the last batch put in the frame's memory (DrawBatch)
         std::uint32_t id = 0;
         std::uint64_t sends = 0;
@@ -376,6 +400,8 @@ bool Renderer::Create()
 
     textureMem_ = Block(kTextureMemory, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image);
     targetMem_ = Block(kTargetMemory, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image);
+    if (!std::getenv("SLY1_GPU_NO_KEEP"))   // without it, a kept batch is copied each frame like any other
+        keepMem_ = Block(kKeepMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
     for (int k = 0; k < kSets; k++) {
         frameMems_[k] = Block(kFrameMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
         commandMems_[k] = Block(kCommandMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
@@ -434,6 +460,7 @@ void Renderer::BeginCommands()
     DkBufExtents vertices = {dkMemBlockGetGpuAddr(frameMem_), kFrameMemory};
     dkCmdBufBindVtxBuffers(cmd_, 0, &vertices, 1);
     dkCmdBufBindIdxBuffer(cmd_, DkIdxFormat_Uint32, dkMemBlockGetGpuAddr(frameMem_));
+    indexKeep_ = false;
     dkCmdBufSetLineWidth(cmd_, 1.5f);
     dkCmdBufSetPointSize(cmd_, 2.0f);
     // window pixels to clip space: x right, y up, the image's first row at the top
@@ -484,6 +511,7 @@ void Renderer::BindSource(const Source& src)
         DkBufExtents vertices = {dkMemBlockGetGpuAddr(frameMem_), kFrameMemory};
         dkCmdBufBindVtxBuffers(cmd_, 0, &vertices, 1);
         dkCmdBufBindIdxBuffer(cmd_, DkIdxFormat_Uint32, dkMemBlockGetGpuAddr(frameMem_));
+    indexKeep_ = false;
         if (!b) {
             // A small target is drawn as the GS draws: it takes a pixel's values at the pixel's corner
             // (x, y), the GPU at its centre, so everything is put half a pixel right and down. The
@@ -918,6 +946,71 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
     }
     batches_++;
     batchVertices_ += b.count;
+    if (b.keep != 0 && keepMem_) {   // a batch that comes again unchanged: from keepMem_, where it is written once
+        auto it = kept_.find(b.keep);
+        if (it == kept_.end()) {
+            staging_.resize((std::size_t)b.count * 3 + 8);
+            std::uint32_t* index = staging_.data();
+            std::uint32_t n = 0;
+            const std::uint32_t controlAt = b.positionAt * 4 + 3, step = b.stride * 4;
+            for (std::uint32_t k = 2; k < b.count; k++) {   // as below
+                if (b.quads[k * step + controlAt] & gs::kStripStart)
+                    continue;
+                index[n] = (k & 1) ? k - 2 : k - 1;
+                index[n + 1] = (k & 1) ? k - 1 : k - 2;
+                index[n + 2] = k;
+                n += 3;
+            }
+            Kept k;
+            k.indices = n;
+            k.count = b.count;
+            const std::uint32_t indexBytes = Align(n * 4, 64), vertexBytes = Align(b.count * 32, 64), colourBytes = Align(b.count * 16, 64);
+            std::uint32_t at = 0, got = 0;
+            if (KeepRoom(indexBytes + vertexBytes + colourBytes, &at, &got)) {
+                k.at = at;
+                k.bytes = got;
+                k.indexAt = at;
+                k.vertexAt = at + indexBytes;
+                k.colourAt = k.vertexAt + vertexBytes;
+                std::uint8_t* mem = static_cast<std::uint8_t*>(dkMemBlockGetCpuAddr(keepMem_));
+                std::memcpy(mem + k.indexAt, index, (std::size_t)n * 4);
+                staging_.resize((std::size_t)b.count * 8);
+                std::uint8_t* out = reinterpret_cast<std::uint8_t*>(staging_.data());
+                for (std::uint32_t v = 0; v < b.count; v++, out += 32) {
+                    const std::uint32_t* q = b.quads + v * step;
+                    std::memcpy(out, q + b.positionAt * 4, 16);
+                    std::memcpy(out + 16, q + b.stqAt * 4, 16);
+                }
+                std::memcpy(mem + k.vertexAt, staging_.data(), (std::size_t)b.count * 32);
+                staging_.resize((std::size_t)b.count * 4);
+                for (std::uint32_t v = 0; v < b.count; v++)
+                    std::memcpy(staging_.data() + v * 4, b.quads + v * step + b.colourAt * 4, 16);
+                std::memcpy(mem + k.colourAt, staging_.data(), (std::size_t)b.count * 16);
+                keptPlaced_++;
+                keptBytes_ += got;
+                it = kept_.emplace(b.keep, k).first;
+            } else {
+                keptNoRoom_++;
+                keepFull_ = true;   // everything kept is let go at the frame's end (Present)
+            }
+        }
+        if (it != kept_.end()) {
+            const Kept& k = it->second;
+            if (k.indices == 0)
+                return true;
+            if (draws_ >= kMaxDraws)
+                Send(true);
+            keptDraws_++;
+            Source src = {nullptr, 0, 32, nullptr, k.indices, &b};
+            src.placed = true;
+            src.kept = true;
+            src.vertexAt = k.vertexAt;
+            src.colourAt = k.colourAt;
+            src.indexAt = k.indexAt;
+            Submit(s, src);
+            return true;
+        }
+    }
     // The batch's positions and STQ, and its triangles' indices, put in the frame's memory at its
     // first kick; its later kicks (the second pass's), with the same id, add only their colours.
     BatchCache& c = batchCache_;
@@ -1001,6 +1094,40 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
     src.indexAt = c.indexAt;
     Submit(s, src);
     return true;
+}
+
+// Room in keepMem_ for a block of bytes: one let go at least three frames ago that is big enough
+// and not over twice the size, or new room at the end.
+bool Renderer::KeepRoom(std::uint32_t bytes, std::uint32_t* at, std::uint32_t* got)
+{
+    for (std::size_t k = 0; k < keepFree_.size(); k++) {
+        const FreeBlock f = keepFree_[k];
+        if (f.bytes >= bytes && f.bytes <= bytes * 2 && f.frame + 3 <= frames_) {
+            keepFree_[k] = keepFree_.back();
+            keepFree_.pop_back();
+            *at = f.at;
+            *got = f.bytes;
+            return true;
+        }
+    }
+    if (keepUsed_ + bytes > kKeepMemory)
+        return false;
+    *at = keepUsed_;
+    *got = bytes;
+    keepUsed_ += bytes;
+    return true;
+}
+
+void Renderer::ForgetKept(std::uint64_t first, std::uint64_t count)
+{
+    for (std::uint64_t key = first; key < first + count; key++) {
+        auto it = kept_.find(key);
+        if (it == kept_.end())
+            continue;
+        keepFree_.push_back({it->second.at, it->second.bytes, frames_});
+        kept_.erase(it);
+        keptForgotten_++;
+    }
 }
 
 void Renderer::Submit(const gs::DrawState& s, const Source& src)
@@ -1366,8 +1493,12 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
 
     std::uint32_t first = 0, firstIndex = 0;
     std::uint64_t c0 = Tick();
+    if (src.kept != indexKeep_) {   // the indices are where the vertices are
+        dkCmdBufBindIdxBuffer(cmd_, DkIdxFormat_Uint32, dkMemBlockGetGpuAddr(src.kept ? keepMem_ : frameMem_));
+        indexKeep_ = src.kept;
+    }
     if (src.placed) {   // the batch's two streams where DrawBatch put them
-        DkGpuAddr base = dkMemBlockGetGpuAddr(frameMem_);
+        DkGpuAddr base = dkMemBlockGetGpuAddr(src.kept ? keepMem_ : frameMem_);
         const std::uint32_t count = src.batch->count;   // the streams' sizes exactly (an emulator tracks what is bound)
         DkBufExtents streams[2] = {{base + src.vertexAt, count * 32}, {base + src.colourAt, count * 16}};
         dkCmdBufBindVtxBuffers(cmd_, 0, streams, 2);
@@ -1810,6 +1941,17 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
     }
     frameMem_ = frameMems_[set_];
     commandMem_ = commandMems_[set_];
+    if (keepFull_) {
+        // keepMem_ has no room left (another level's batches, or blocks let go that fit nothing):
+        // once the GPU has drawn all it was given, everything kept is let go, and each batch is
+        // written again when it next comes
+        dkQueueWaitIdle(queue_);
+        kept_.clear();
+        keepFree_.clear();
+        keepUsed_ = 0;
+        keepFull_ = false;
+        keepResets_++;
+    }
     BeginCommands();
     presentNs_ += NowNs() - t0;
 }
@@ -1830,6 +1972,9 @@ void Renderer::Report()
     std::fprintf(stderr, "gpu: frames after the 600th by the vertical blanks each took: under one %llu, one %llu, two %llu, three %llu, four %llu, more %llu\n",
                  (unsigned long long)held_[0], (unsigned long long)held_[1], (unsigned long long)held_[2], (unsigned long long)held_[3],
                  (unsigned long long)held_[4], (unsigned long long)held_[5]);
+    std::fprintf(stderr, "gpu: batches kept from frame to frame: %llu draws from %llu written once (%.1f MB), %llu let go, %llu with no room; %.1f MB of %u in use, "
+                 "%zu blocks free, emptied %llu times\n", (unsigned long long)keptDraws_, (unsigned long long)keptPlaced_, keptBytes_ / 1e6, (unsigned long long)keptForgotten_,
+                 (unsigned long long)keptNoRoom_, keepUsed_ / 1e6, kKeepMemory >> 20, keepFree_.size(), (unsigned long long)keepResets_);
     std::fprintf(stderr, "gpu: %llu runs with the short pixel shader\n", (unsigned long long)liteRuns_);
     std::fprintf(stderr, "gpu: %llu batches transformed by the GPU (%llu vertices); %.3f s making their triangles' indices\n",
                  (unsigned long long)batches_, (unsigned long long)batchVertices_, indexNs_ / 1e9);

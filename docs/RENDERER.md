@@ -626,3 +626,32 @@ levels loaded and ran 60 frames" (586,918 parts drawn again, no batch refused).
 Not yet: the renderer still copies a kept batch's vertices to the GPU's memory every frame, and
 the hash is a walk of each part's packet every frame, which a hook where the game writes a
 cache's packet would spare.
+
+### On the Switch, and the two things it needed
+
+The first build with `SLY1_PART_REPLAY=1` gained nothing on a Switch Lite (26.6 frames a second
+against 27.0), though 279,019 parts were drawn again. The render thread queued each kept packet
+and batch as an item of its own, some 3,000 a frame, each with memory of its own: that cost as
+much there as running the parts. A part drawn again is now one item, and the GS thread goes
+through what was kept. With that: 29.7 frames a second, the render thread 15 to 25 ms a frame
+where it took 17 to 33, and frames of three vertical blanks after the 600th down from 250 to 100.
+
+The GS thread was then the longer of the two (16 to 31 ms), and `SLY1_SAMPLE=1` showed 22% of its
+time in the renderer's `DrawBatch`, copying each batch's vertices to the GPU's memory. So:
+
+- A kept batch has a key (`gs::Batch::keep`), the same for as long as its vertices and colours
+  are. The Switch's renderer writes such a batch's indices, positions and STQ, and colours once,
+  into memory of their own (`keepMem_`, 64 MB), and draws from there each frame after. The render
+  thread tells it, in turn with what is queued, when a record's batches will not come again
+  (`gs::ForgetKept`); a block let go is taken again three frames later. When a batch finds no
+  room, everything is let go at the frame's end and written again as it comes.
+  `SLY1_GPU_NO_KEEP=1`: copied each frame, as before.
+- A part found changed three times running (one that fades: its header's scales are other each
+  frame) is run as ever for the next 30 frames, and one that could not be kept is not tried
+  again for 30.
+
+Verified: the Mac's 899 frames with the counting renderer, every frame's hash as without it;
+Ryujinx's captures of frames 501 to 506 and 620 to 625 byte for byte as without it (975,456
+draws from 9,534 batches written once); Ryujinx's --verify-levels with it, "all 46 levels loaded
+and ran 60 frames" (4,336,729 draws from 152,932 written, the memory emptied once, the GS
+thread's time 22 s where it was 40.5 s).
