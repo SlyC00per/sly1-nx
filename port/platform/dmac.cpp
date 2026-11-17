@@ -370,6 +370,28 @@ public:
     {
         int k = 0;
         while (k < n) {
+            if (left_ != 0 && direct_ && !keep_ && filled_ == 0 && n - k >= 4 && !(!vu0_ && GsAsync())) {
+                // DIRECT's data a quadword at a time from where it is (whole runs of a GIF tag's loops at
+                // once), not gathered a word at a time
+                std::uint32_t quads = std::min<std::uint32_t>(left_ / 4, (std::uint32_t)(n - k) / 4);
+                if (quads > 0) {
+                    std::uint32_t done = 0;
+                    while (done < quads) {
+                        const std::uint32_t* q = w + k + done * 4;
+                        std::uint32_t taken = gif_.Left() ? gif_.Run(q, quads - done) : 0;
+                        if (taken == 0) {
+                            gif_.Qword(q);
+                            taken = 1;
+                        }
+                        done += taken;
+                    }
+                    k += (int)(quads * 4);
+                    left_ -= quads * 4;
+                    if (left_ == 0)
+                        End();
+                    continue;
+                }
+            }
             if (left_ != 0 && keep_ && !direct_) {
                 if (data_.empty() && (cmd_ & 0x60) == 0x60 && (std::uint32_t)(n - k) >= left_) {
                     // an unpack whose data is all here: unpacked from where it is, not copied first
@@ -421,11 +443,13 @@ public:
         char buf[64];
         std::snprintf(buf, sizeof buf, "%s, %u words owed", left_ ? "inside a VIFcode's data" : "between VIFcodes", left_);
         std::string s = buf;
-        for (auto& kv : seen_) {
-            std::snprintf(buf, sizeof buf, " %02X:%u", kv.first, kv.second);
+        for (std::uint32_t c = 0; c < 128; c++) {
+            if (!seen_[c])
+                continue;
+            std::snprintf(buf, sizeof buf, " %02X:%u", c, seen_[c]);
             s += buf;
+            seen_[c] = 0;
         }
-        seen_.clear();
         return s;
     }
 
@@ -433,7 +457,7 @@ private:
     void Code(std::uint32_t w)
     {
         std::uint32_t cmd = (w >> 24) & 0x7F, imm = w & 0xFFFF, num = (w >> 16) & 0xFF;
-        seen_[(cmd & 0x60) == 0x60 ? 0x60 : cmd]++;
+        seen_[(cmd & 0x60) == 0x60 ? 0x60 : cmd]++;   // an array: a map here cost a tree lookup a code
         irq_ = (w >> 31) != 0;
         direct_ = false;
         cmd_ = cmd;
@@ -916,7 +940,7 @@ private:
     bool irq_ = false, direct_ = false;
     std::vector<std::uint32_t> directData_;   // a DIRECT's quadwords for the GS thread
     Gif gif_{2};
-    std::map<std::uint32_t, unsigned> seen_;
+    unsigned seen_[128] = {};   // the VIFcodes seen since the trace's last call, by command
 };
 
 Vif g_vif0(kCauseVif0, true), g_vif1(kCauseVif1, false);
