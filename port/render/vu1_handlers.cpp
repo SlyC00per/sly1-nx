@@ -99,13 +99,16 @@ void Store(Runner& r, std::uint32_t qaddr, const V& v) { std::memcpy(r.Qword(qad
 std::uint16_t Half(float f) { return (std::uint16_t)Bits(f); }
 
 // A position through the matrix rows m[0..3] (MULAx, MADDAy, MADDAz, MADDw with vf00w).
-V Transform(const V* m, const V& p)
+// A point through the matrix (rows times x, y, z and 1), the rows fixed already (FixIn4): the point
+// fixed once, then the host's arithmetic, which on fixed operands and results is Mul4's and Add4's.
+V TransformFixed(const F4* mf, const V& p)
 {
-    V o;
-    F4 acc = Mul4(m[0].v, Splat(p.x));
-    acc = Add4(acc, Mul4(m[1].v, Splat(p.y)));
-    acc = Add4(acc, Mul4(m[2].v, Splat(p.z)));
-    o.v = Add4(acc, Mul4(m[3].v, Splat(1.0f)));
+    V pf, o;
+    pf.v = FixIn4(p.v);
+    F4 acc = mf[0] * Splat(pf.x);
+    acc = acc + mf[1] * Splat(pf.y);
+    acc = acc + mf[2] * Splat(pf.z);
+    o.v = acc + mf[3] * Splat(1.0f);
     return o;
 }
 
@@ -2037,7 +2040,8 @@ bool Outlines(Runner& r)
     V zero;
     zero.v = F4{Sub(0.0f, 0.0f), Sub(0.0f, 0.0f), Sub(0.0f, 0.0f), Sub(1.0f, 1.0f)};
     V m[4] = {Load(r, top + 14), Load(r, top + 15), Load(r, top + 16), Load(r, top + 17)};
-    auto project = [&](const V& p) { return Transform(m, p); };
+    const F4 mf[4] = {FixIn4(m[0].v), FixIn4(m[1].v), FixIn4(m[2].v), FixIn4(m[3].v)};
+    auto project = [&](const V& p) { return TransformFixed(mf, p); };
     V v08, v09, v10, v19, v20 = zero, v21 = zero, v22, v23, v24;
     v09 = Load(r, base);
     v23 = project(v09);
