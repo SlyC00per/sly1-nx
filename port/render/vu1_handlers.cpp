@@ -9,12 +9,14 @@
 // rest: the software pipelining, the reads ahead past the buffer's end, the scratch registers.
 #include "vu1_handlers.h"
 #include "port/gs.h"
+#include "port/system.h"
 #include "port/gs_backend.h"
 
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <cstdio>
+#include <map>
 #include <vector>
 #include <algorithm>
 
@@ -393,6 +395,8 @@ struct Deferred {
     Test test = Test::Guard274;
     std::uint32_t endPc = 0;
 } g_deferred;
+std::map<std::uint64_t, std::uint64_t> g_lateBy;   // late transforms by program (hash << 12 | entry)
+std::uint64_t g_lateNs, g_lateVertices, g_skippedOverwritten;
 
 bool BatchTransformNow(Runner& r, const int stride, const Test test, const std::uint32_t endPc);
 
@@ -421,11 +425,24 @@ void Materialise(Runner& r, bool always = false)
     static const bool seq = std::getenv("SLY1_VU1_SEQ") != nullptr;
     if (seq)
         std::fprintf(stderr, "seq   materialise top %u (batch's top %u, overwritten %d)\n", r.ctx.top, d.top, (int)d.overwritten);
-    if (d.overwritten)
+    if (d.overwritten) {
+        g_skippedOverwritten++;
         return;
+    }
     (void)always;
     // the batch's own half of the data memory (TOP), which need not be the program's now: a program
     // may read the batch the half before held (0x6DA does); the registers as they are
+    {   // counted by the program it is done for, for the report (BatchCounts)
+        std::uint32_t hash, entry;
+        CurrentProgram(&hash, &entry);
+        g_lateBy[(std::uint64_t)hash << 12 | entry]++;
+        g_lateVertices += (std::uint16_t)(d.end - d.first) / (std::uint32_t)d.stride;
+    }
+    std::uint64_t lateStart = NowNs();
+    struct LateTime {
+        std::uint64_t start;
+        ~LateTime() { g_lateNs += NowNs() - start; }
+    } lateTime{lateStart};
     Context ctx = r.ctx;
     ctx.top = d.top;
     Runner late(ctx);
@@ -3316,6 +3333,21 @@ void BatchCounts(std::uint64_t* taken, std::uint64_t* notTaken)
 {
     *taken = g_taken;
     *notTaken = g_notTaken;
+    if (!g_lateBy.empty() || g_skippedOverwritten) {
+        std::uint64_t all = 0;
+        for (const auto& kv : g_lateBy)
+            all += kv.second;
+        std::fprintf(stderr, "vu1: %llu batches transformed late in memory (%llu vertices, %.3f s), %llu not (overwritten first); for:\n",
+                     (unsigned long long)all, (unsigned long long)g_lateVertices, g_lateNs / 1e9, (unsigned long long)g_skippedOverwritten);
+        for (const auto& kv : g_lateBy) {
+            std::uint32_t hash = (std::uint32_t)(kv.first >> 12), entry = (std::uint32_t)(kv.first & 0xFFF);
+            const char* name = "(on the microcode)";
+            for (std::size_t k = 0; k < kHandlerCount; k++)
+                if (kHandlers[k].chunkHash == hash && kHandlers[k].entry == entry)
+                    name = kHandlers[k].name;
+            std::fprintf(stderr, "vu1:   %08X 0x%03X %s: %llu\n", hash, entry, name, (unsigned long long)kv.second);
+        }
+    }
 }
 
 const HandlerEntry kHandlers[] = {
