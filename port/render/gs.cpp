@@ -180,6 +180,12 @@ std::uint32_t Expand24(std::uint32_t c)
 // palette's 16 by 16 entries with index bits 3 and 4 exchanged; a 4-bit palette's 8 by 2 at
 // CSA's place).
 
+extern std::uint32_t g_uploads;
+extern std::uint32_t g_pageUpload[kLocalBytes / 8192];
+template <typename F>
+void PagesOf(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, std::uint32_t x0, std::uint32_t y0, std::uint32_t w,
+             std::uint32_t h, F f);
+
 void LoadClut(std::uint64_t tex)
 {
     std::uint32_t cld = (std::uint32_t)Bits(tex, 61, 3), cbp = (std::uint32_t)Bits(tex, 37, 14);
@@ -196,6 +202,39 @@ void LoadClut(std::uint64_t tex)
         return;
     std::uint32_t psm = (std::uint32_t)Bits(tex, 20, 6), cpsm = (std::uint32_t)Bits(tex, 51, 4);
     std::uint32_t csm = (std::uint32_t)Bits(tex, 55, 1), csa = (std::uint32_t)Bits(tex, 56, 5);
+    {   // the load before was this one, and nothing uploaded over the palette since: the buffer holds
+        // what this load would write (not with the reference drawing, which writes local memory)
+        bool eight = psm == PSMT8 || psm == PSMT8H;
+        std::uint64_t key = (std::uint64_t)cbp | (std::uint64_t)cpsm << 14 | (std::uint64_t)csm << 18 | (std::uint64_t)csa << 19 |
+                            (std::uint64_t)eight << 24 | (csm ? (g_regs.texclut & 0x3FFFFF) << 25 : 0);
+        std::uint32_t latest = 0;
+        PagesOf(cbp, csm ? (std::uint32_t)Bits(g_regs.texclut, 0, 6) : 1, cpsm, 0, 0, csm ? 1024 : 16, csm ? 1024 : 16,
+                [&](std::uint32_t page) { latest = std::max(latest, g_pageUpload[page]); });
+        static std::uint64_t lastKey = ~0ull;
+        static std::uint32_t lastAt;
+        static const bool check = std::getenv("SLY1_GS_CHECK") != nullptr;
+        if (!g_rasterise && key == lastKey && latest <= lastAt) {
+            if (!check)
+                return;
+            // SLY1_GS_CHECK: the load done all the same, the buffer compared with what it held
+            static std::uint32_t before[256];
+            static std::uint64_t skips, differed;
+            std::memcpy(before, g_clut, sizeof before);
+            std::uint32_t psmBefore = g_clutPsm;
+            lastKey = ~0ull;
+            LoadClut(tex);
+            lastKey = key;
+            skips++;
+            if ((std::memcmp(before, g_clut, sizeof before) != 0 || psmBefore != g_clutPsm) && differed++ < 8)
+                std::fprintf(stderr, "gs check: a palette load skipped would have changed the buffer\n");
+            if ((skips & (skips - 1)) == 0)
+                std::fprintf(stderr, "gs check: %llu palette loads skipped, %llu would have changed it\n", (unsigned long long)skips,
+                             (unsigned long long)differed);
+            return;
+        }
+        lastKey = key;
+        lastAt = g_uploads;
+    }
     g_clutPsm = cpsm;
     bool c16 = cpsm == PSMCT16 || cpsm == PSMCT16S;
     auto fetch = [&](std::uint32_t x, std::uint32_t y) -> std::uint32_t {
