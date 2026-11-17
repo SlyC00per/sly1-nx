@@ -531,3 +531,26 @@ by 128). Each set writes over the other every frame, so neither is "the same as 
 both are written (some 280 KB a frame). Elsewhere in the opening the set before the list is
 found unchanged and skipped. A fix would keep an upload's data and write it into local memory
 only when something reads those pages; not done, since it is one scene.
+
+## How much of a frame the frame before had (2026-11-17)
+
+`SLY1_GS_REUSE=1` with the counting renderer taking batches (`SLY1_GS_COUNT=1
+SLY1_GS_COUNT_BATCHES=1`): of a frame's batches, how many are the same as a batch of the frame
+before, by a hash of their vertices. The opening under lockstep, 3,000 frames, by stretches of 240:
+
+| the same in | least | most |
+| --- | --- | --- |
+| x y z, the control words, S and T | 84.1% | 95.5% |
+| the colours | 88.2% | 99.0% |
+| all of those | 81.5% | 94.4% |
+| the matrix | 0.0% | 18.7% |
+
+A batch's vertices are as VU1 was given them (the renderer transforms them), so a mesh that does
+not change is the same whatever the camera does: four batches in five to nineteen in twenty are
+drawn again from the same vertices and colours, with another matrix. (Q and the word after it
+are left out of the hash: they hold what was last in VU1's memory there, and with them only one
+batch in ten matched.)
+
+Every one of those is unpacked by the VIF, taken through VU1's handlers, copied to the GS thread
+and copied to the GPU's memory again each frame. That is the work a renderer that kept a
+batch's vertices from one frame to the next would not do.

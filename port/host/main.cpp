@@ -22,6 +22,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include <set>
 #include <vector>
 
 #include <pthread.h>
@@ -542,10 +543,62 @@ int main(int argc, char** argv)
                              what, n, (unsigned)(s.frame & 0x1FF), (test >> 16) & 1, (test >> 17) & 3, (unsigned)((s.zbuf >> 32) & 1),
                              test & 1, (test >> 1) & 7, (test >> 12) & 3, s.abe, (unsigned)(s.alpha & 0xFF), s.tme, zmin, zmax);
             }
+            // SLY1_GS_REUSE=1: how much of what a frame draws the frame before drew too. Every 240
+            // frames: of the batches, how many are the same as a batch of the frame before in their
+            // vertices' x y z, control words, S and T (by a hash; not Q and the word after it,
+            // which hold what was left there), in their colours, in both, and in their matrix.
+            static std::uint64_t HashOf(const void* p, std::size_t n, std::uint64_t h)
+            {
+                const unsigned char* b = static_cast<const unsigned char*>(p);
+                for (std::size_t k = 0; k + 8 <= n; k += 8) {
+                    std::uint64_t w;
+                    std::memcpy(&w, b + k, 8);
+                    h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+                    h ^= h >> 31;
+                }
+                return h;
+            }
+            void NoteReuse(const port::gs::Batch& b)
+            {
+                std::uint64_t shape = b.count * 1000003ull + b.stride, colour = 7;
+                for (std::uint32_t k = 0; k < b.count; k++) {
+                    const std::uint32_t* q = b.quads + k * b.stride * 4;
+                    shape = HashOf(q + b.positionAt * 4, 16, shape);
+                    shape = HashOf(q + b.stqAt * 4, 8, shape);
+                    colour = HashOf(q + b.colourAt * 4, 16, colour);
+                }
+                static std::set<std::uint64_t> was[4], now[4];
+                static std::uint64_t same[4], all, vertices, frame;
+                const std::uint64_t part[4] = {shape, colour, shape ^ (colour * 0xC2B2AE3D27D4EB4Full), HashOf(b.matrix, sizeof b.matrix, 19)};
+                if (frame != frames) {   // a new frame
+                    frame = frames;
+                    for (int c = 0; c < 4; c++) {
+                        was[c].swap(now[c]);
+                        now[c].clear();
+                    }
+                    if (frames % 240 == 0 && all) {
+                        std::fprintf(stderr, "reuse: frames to %llu: %.0f batches a frame (%.0f vertices); the same as one of the frame before in x y z, the control "
+                                     "words, S and T %.1f%%, in the colours %.1f%%, in all of those %.1f%%, in the matrix %.1f%%\n", (unsigned long long)frames,
+                                     all / 240.0, vertices / 240.0, 100.0 * same[0] / all, 100.0 * same[1] / all, 100.0 * same[2] / all, 100.0 * same[3] / all);
+                        all = vertices = 0;
+                        for (auto& x : same)
+                            x = 0;
+                    }
+                }
+                all++;
+                vertices += b.count;
+                for (int c = 0; c < 4; c++) {
+                    same[c] += was[c].count(part[c]);
+                    now[c].insert(part[c]);
+                }
+            }
             bool DrawBatch(const port::gs::DrawState& s, const port::gs::Batch& b) override
             {
                 batches++;
                 vertices += b.count;
+                static const bool reuseOn = std::getenv("SLY1_GS_REUSE") != nullptr;
+                if (reuseOn)
+                    NoteReuse(b);
                 Mix(&s, sizeof s);
                 Mix(b.quads, (std::size_t)b.count * b.stride * 16);
                 Mix(b.matrix, sizeof b.matrix);
