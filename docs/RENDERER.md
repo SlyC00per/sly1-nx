@@ -186,8 +186,8 @@ the night of 2026-11-16 found.
   platform is `HOST_ASAN`) sampled with `sample` and the leaves resolved with `atos -i`.
 
 Results, Ryujinx, lockstep 1,200 vblanks, the build before the night against after (both with the
-clock fixes): with `SLY1_GPU_TRANSFORM` the render thread's VIF1 time 4.78 s and 5.05 s to 2.76 s and
-2.71 s; without it 5.91 s to 3.59 s. What did it, by the host's measure:
+clock fixes): with `SLY1_GPU_TRANSFORM` the render thread's VIF1 time 4.78 s and 5.05 s to 2.61 s and
+2.55 s; without it 5.91 s to 3.37 s and 3.35 s. What did it, by the host's measure:
 
 | Change | Effect |
 | --- | --- |
@@ -196,6 +196,11 @@ clock fixes): with `SLY1_GPU_TRANSFORM` the render thread's VIF1 time 4.78 s and
 | The transform's fast path unless a vertex field has the largest exponent | the transform 0.32 s to 0.12 s |
 | A batch's positions and indices given to the GPU once, its colours per kick | 5.2 to 2.3 MB a frame |
 | Unpacks specialised and done in place; VIF codes counted in an array | about 5% |
+| Skinning, skinned normals, the lights and the outlines' projection on operands fixed once, then the host's arithmetic; conversions four fields at a time | skinning 4×, the outlines' own work halved |
+
+Every change was checked by `SLY1_VU1_CHECK` (all 46 levels: 10,232,894 checks, 0 differed),
+`SLY1_GS_CHECK`, `SLY1_UNPACK_CHECK` and the hashes above; the Switch build ran all 46 levels in
+Ryujinx with `SLY1_GPU_TRANSFORM`.
 
 Tried and not kept: a GS state change only on a changed value (the hash changed); dropping the
 registers a deferred transform leaves (they reach the picture, `SLY1_NO_LEAVE`).
