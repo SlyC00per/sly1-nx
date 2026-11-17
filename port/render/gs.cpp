@@ -1705,6 +1705,95 @@ void SurveyReport()
         std::fprintf(stderr, "gs survey: %10llu  %s\n", (unsigned long long)kv.second, kv.first.c_str());
 }
 
+namespace {
+// SLY1_GS_SOFT_BATCH: with the reference drawing (--dump-fb), batches are taken and drawn here
+// by VertexOf's arithmetic, the renderer's, to see on the host what a GPU renderer is given.
+// Triangles with a vertex outside the view are left out (nothing is cut).
+bool SoftBatches()
+{
+    static const bool on = std::getenv("SLY1_GS_SOFT_BATCH") != nullptr;
+    return on && g_rasterise;
+}
+
+void SoftBatch(const Batch& b)
+{
+    Draw d = DrawOf(g_regs.prim);
+    std::vector<Vertex> v(b.count);
+    std::vector<bool> inside(b.count);
+    for (std::uint32_t k = 0; k < b.count; k++) {
+        BatchVertex bv = VertexOf(b, k);
+        float w = bv.clip[3];
+        inside[k] = w > 0.0f && std::fabs(bv.clip[0]) <= w && std::fabs(bv.clip[1]) <= w && std::fabs(bv.clip[2]) <= w;
+        if (!inside[k])
+            continue;
+        const std::uint32_t* q = b.quads + k * b.stride * 4;
+        Vertex& o = v[k];
+        o.x = (std::int32_t)bv.x;
+        o.y = (std::int32_t)bv.y;
+        o.z = (std::uint32_t)bv.z;
+        o.f = (std::uint8_t)bv.fog;
+        const std::uint32_t* c = q + b.colourAt * 4;
+        o.r = (std::uint8_t)c[0]; o.g = (std::uint8_t)c[1]; o.b = (std::uint8_t)c[2]; o.a = (std::uint8_t)c[3];
+        float stq[3];
+        std::memcpy(stq, q + b.stqAt * 4, 12);
+        o.s = stq[0] / w; o.t = stq[1] / w; o.q = stq[2] / w;
+        o.u = o.v = 0;
+    }
+    for (std::uint32_t k = 2; k < b.count; k++) {
+        std::uint32_t control = b.quads[(k * b.stride + b.positionAt) * 4 + 3];
+        if ((control & kStripStart) || !inside[k] || !inside[k - 1] || !inside[k - 2])
+            continue;
+        if (b.cull && (control & kCullable)) {
+            float e1x = (float)(v[k - 1].x - v[k - 2].x), e1y = (float)(v[k - 1].y - v[k - 2].y);
+            float e2x = (float)(v[k].x - v[k - 1].x), e2y = (float)(v[k].y - v[k - 1].y);
+            float cross = e1x * e2y - e2x * e1y;
+            if ((k & 1) ? cross < 0 : cross > 0)
+                continue;
+        }
+        g_drawn++;
+        Triangle(d, v[k - 2], v[k - 1], v[k]);
+    }
+}
+}  // namespace
+
+bool TakesBatches() { return SoftBatches() || (g_backend && !g_rasterise && g_backend->TakesBatches()); }
+
+namespace {
+std::atomic<int> g_firstBatchesKept{0};
+}
+void SetFirstBatchesKept(int count) { g_firstBatchesKept = count; }
+int FirstBatchesKept() { return g_firstBatchesKept; }
+
+bool DrawBatch(std::uint32_t tagWord1, Batch& batch)
+{
+    Guard lk;
+    if (SoftBatches()) {
+        if ((tagWord1 >> 14) & 1)
+            Write(0x00, (tagWord1 >> 15) & 0x7FF);
+        if ((g_regs.prim & 7) != 4)
+            return false;
+        SoftBatch(batch);
+        g_queued = 0;
+        return true;
+    }
+    if (!g_backend || g_rasterise || Surveying())
+        return false;
+    if ((tagWord1 >> 14) & 1)   // PRE: the tag sets PRIM
+        Write(0x00, (tagWord1 >> 15) & 0x7FF);
+    if ((g_regs.prim & 7) != 4)
+        return false;
+    const Draw& d = RunState(g_regs.prim, 4);
+    if (!d.iip || d.fst)
+        return false;
+    FlushRun();
+    batch.ofx = d.ofx;
+    batch.ofy = d.ofy & ~15;
+    if (!g_backend->DrawBatch(g_runState, batch))
+        return false;
+    g_queued = 0;   // the strip's last vertices are not known here: the next primitive starts anew
+    return true;
+}
+
 void SetBackend(Backend* backend)
 {
     Guard lk;

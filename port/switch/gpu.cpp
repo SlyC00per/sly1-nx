@@ -28,6 +28,7 @@
 #include "port/system.h"
 #include "gs_vsh_dksh.h"
 #include "gs_fsh_dksh.h"
+#include "batch_vsh_dksh.h"
 
 namespace port {
 namespace gpu {
@@ -38,7 +39,7 @@ constexpr std::uint32_t kScreenWidth = 1280, kScreenHeight = 720;
 constexpr std::uint32_t kWidth = 960, kHeight = 720;     // a frame buffer's image (4:3)
 constexpr float kFieldWidth = 640.0f, kFieldHeight = 224.0f;
 constexpr std::uint32_t kFrameMemory = 24u << 20;        // a frame's vertices and texture uploads
-constexpr std::uint32_t kCommandMemory = 8u << 20;
+constexpr std::uint32_t kCommandMemory = 16u << 20;
 constexpr std::uint32_t kTextureMemory = 64u << 20;
 constexpr std::uint32_t kMaxTextures = 2048;
 constexpr std::uint32_t kMaxDraws = 12000;               // a frame's draws before its commands are sent
@@ -52,6 +53,22 @@ void Debug(void*, const char* context, DkResult result, const char* message)
 
 struct VertexParams {
     float toClip[4];
+};
+
+struct BatchParams {   // batch_vsh.glsl's
+    float matrix[16];
+    float toClip[4];
+    float depth[4];
+    float fog[4];
+};
+
+// What a draw's vertices are: the GS's (gs_vsh.glsl) or a batch's (batch_vsh.glsl).
+struct Source {
+    const void* vertices;
+    std::uint32_t vertexBytes, vertexSize;
+    const std::uint32_t* index;
+    std::uint32_t indices;
+    const gs::Batch* batch;   // null for the GS's
 };
 
 struct FragmentParams {
@@ -74,6 +91,8 @@ public:
     void Begin(const gs::DrawState& state) override;
     void Draw(const gs::DrawState& state, const gs::DrawVertex* v, std::size_t vertices, const std::uint32_t* index,
               std::size_t indices) override;
+    bool TakesBatches() const override { return true; }
+    bool DrawBatch(const gs::DrawState& state, const gs::Batch& batch) override;
     void Present(std::uint64_t dispfb, std::uint64_t display) override;
     void Report();
 
@@ -82,6 +101,8 @@ private:
     void BeginCommands();
     void Send(bool wait);
     void BindTarget(int target);
+    void BindSource(const Source& src);
+    void Submit(const gs::DrawState& s, const Source& src);
     const Texture* TextureFor(const gs::DrawState& state);
     void Capture(int target);
     static int TargetOf(std::uint64_t fbp);
@@ -99,7 +120,25 @@ private:
     DkMemBlock imageMem_ = nullptr, frameMem_ = nullptr, commandMem_ = nullptr, codeMem_ = nullptr, dataMem_ = nullptr,
                textureMem_ = nullptr;
     DkImage screen_[2], colour_[2], depth_;
-    DkShader vertexShader_, fragmentShader_;
+    DkShader vertexShader_, fragmentShader_, batchShader_;
+    std::uint32_t batchUbo_ = 0;
+    // what the commands so far draw with: whose vertices, their layout, the viewport's depths
+    int source_ = -1;
+    std::uint32_t layout_ = 0;
+    float near_ = -1.0f, far_ = -1.0f;
+    bool batchSet_ = false;
+    BatchParams lastBatch_;
+    std::vector<std::uint32_t> batchIndex_;
+    std::uint64_t batches_ = 0, batchVertices_ = 0;
+    float cullFront_ = 1.0f;
+    int batchInFrame_ = 0;
+    long drawInFrame_ = 0;
+    bool stopped_ = true, paintLast_ = false;
+    long allDraws_ = 0;
+    long listAt_ = -1;
+    int listed_ = 0;
+    int view_ = 0;   // SLY1_GPU_CAPTURE's views of the batches, a frame each after the first: 1 no depth test,
+                    // 2 divided by w in the shader, 3 depths clamped, 4 no backface dropped, 5 facing
     std::uint32_t frameUsed_ = 0, draws_ = 0, textureUsed_ = 0, nextTexture_ = 0;
     int bound_ = -1;
     const Texture* texture_ = nullptr;   // the run's, from Begin
@@ -143,7 +182,7 @@ bool Renderer::Create()
 
     DkQueueMaker queueMaker;
     dkQueueMakerDefaults(&queueMaker, device_);
-    queueMaker.flags = DkQueueFlags_Graphics;
+    queueMaker.flags = DkQueueFlags_Graphics | (std::getenv("SLY1_GPU_NO_ZCULL") ? DkQueueFlags_DisableZcull : 0);
     queue_ = dkQueueCreate(&queueMaker);
 
     // the screen's two images, the two frame buffers and the depth buffer
@@ -187,18 +226,25 @@ bool Renderer::Create()
     // the shaders
     codeMem_ = Block(64u << 10, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Code);
     std::uint32_t fragmentAt = Align((std::uint32_t)gs_vsh_dksh_size, DK_SHADER_CODE_ALIGNMENT);
+    std::uint32_t batchAt = Align(fragmentAt + (std::uint32_t)gs_fsh_dksh_size, DK_SHADER_CODE_ALIGNMENT);
     std::memcpy(dkMemBlockGetCpuAddr(codeMem_), gs_vsh_dksh, gs_vsh_dksh_size);
     std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(codeMem_) + fragmentAt, gs_fsh_dksh, gs_fsh_dksh_size);
+    std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(codeMem_) + batchAt, batch_vsh_dksh, batch_vsh_dksh_size);
     DkShaderMaker shaderMaker;
     dkShaderMakerDefaults(&shaderMaker, codeMem_, 0);
     dkShaderInitialize(&vertexShader_, &shaderMaker);
     dkShaderMakerDefaults(&shaderMaker, codeMem_, fragmentAt);
     dkShaderInitialize(&fragmentShader_, &shaderMaker);
+    dkShaderMakerDefaults(&shaderMaker, codeMem_, batchAt);
+    dkShaderInitialize(&batchShader_, &shaderMaker);
+    if (std::getenv("SLY1_GPU_CULL_FLIP"))
+        cullFront_ = 0.0f;
 
     // the uniform buffers, the descriptor sets and a frame's capture
     vertexUbo_ = 0;
     fragmentUbo_ = Align(sizeof(VertexParams), DK_UNIFORM_BUF_ALIGNMENT);
-    imageSet_ = Align(fragmentUbo_ + sizeof(FragmentParams), DK_UNIFORM_BUF_ALIGNMENT);
+    batchUbo_ = Align(fragmentUbo_ + sizeof(FragmentParams), DK_UNIFORM_BUF_ALIGNMENT);
+    imageSet_ = Align(batchUbo_ + sizeof(BatchParams), DK_UNIFORM_BUF_ALIGNMENT);
     samplerSet_ = imageSet_ + kMaxTextures * sizeof(DkImageDescriptor);
     capture_ = Align(samplerSet_ + 8 * sizeof(DkSamplerDescriptor), 0x1000);
     dataMem_ = Block(capture_ + kWidth * kHeight * 4, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
@@ -227,6 +273,8 @@ bool Renderer::Create()
     cmd_ = dkCmdBufCreate(&cmdMaker);
     if (!queue_ || !swapchain_ || !imageMem_ || !dataMem_ || !textureMem_ || !frameMem_ || !commandMem_ || !cmd_)
         return false;
+    if (const char* at = std::getenv("SLY1_GPU_LIST"))
+        listAt_ = std::atol(at);
     if (const char* at = std::getenv("SLY1_GPU_CAPTURE"))
         captureAt_ = std::atol(at);
 
@@ -251,28 +299,20 @@ void Renderer::BeginCommands()
     draws_ = 0;
     bound_ = -1;
     last_.any = false;
+    source_ = -1;
+    near_ = far_ = -1.0f;
+    batchSet_ = false;
     DkGpuAddr data = dkMemBlockGetGpuAddr(dataMem_);
-    const DkShader* shaders[2] = {&vertexShader_, &fragmentShader_};
-    dkCmdBufBindShaders(cmd_, DkStageFlag_GraphicsMask, shaders, 2);
-    DkBufExtents vertexUbo = {data + vertexUbo_, sizeof(VertexParams)}, fragmentUbo = {data + fragmentUbo_, sizeof(FragmentParams)};
-    dkCmdBufBindUniformBuffers(cmd_, DkStage_Vertex, 0, &vertexUbo, 1);
+    DkBufExtents fragmentUbo = {data + fragmentUbo_, sizeof(FragmentParams)};
     dkCmdBufBindUniformBuffers(cmd_, DkStage_Fragment, 0, &fragmentUbo, 1);
     dkCmdBufBindImageDescriptorSet(cmd_, data + imageSet_, kMaxTextures);
     dkCmdBufBindSamplerDescriptorSet(cmd_, data + samplerSet_, 8);
     DkRasterizerState raster;
     dkRasterizerStateDefaults(&raster);
-    raster.cullMode = DkFace_None;
+    raster.depthClampEnable = 0;
+    raster.cullMode = DkFace_None;   // a batch's backfaces are the fragment shader's to drop, triangle by triangle
+    raster.provokingVertex = DkProvokingVertex_Last;
     dkCmdBufBindRasterizerState(cmd_, &raster);
-    static const DkVtxAttribState attribs[5] = {
-        {0, 0, offsetof(gs::DrawVertex, x), DkVtxAttribSize_2x32, DkVtxAttribType_Float, 0},
-        {0, 0, offsetof(gs::DrawVertex, z), DkVtxAttribSize_1x32, DkVtxAttribType_Uint, 0},
-        {0, 0, offsetof(gs::DrawVertex, r), DkVtxAttribSize_4x8, DkVtxAttribType_Unorm, 0},
-        {0, 0, offsetof(gs::DrawVertex, s), DkVtxAttribSize_3x32, DkVtxAttribType_Float, 0},
-        {0, 0, offsetof(gs::DrawVertex, fog), DkVtxAttribSize_1x32, DkVtxAttribType_Float, 0},
-    };
-    static const DkVtxBufferState buffer = {sizeof(gs::DrawVertex), 0};
-    dkCmdBufBindVtxAttribState(cmd_, attribs, 5);
-    dkCmdBufBindVtxBufferState(cmd_, &buffer, 1);
     DkBufExtents vertices = {dkMemBlockGetGpuAddr(frameMem_), kFrameMemory};
     dkCmdBufBindVtxBuffers(cmd_, 0, &vertices, 1);
     dkCmdBufBindIdxBuffer(cmd_, DkIdxFormat_Uint32, dkMemBlockGetGpuAddr(frameMem_));
@@ -283,10 +323,93 @@ void Renderer::BeginCommands()
     dkCmdBufPushConstants(cmd_, data + vertexUbo_, sizeof vp, 0, sizeof vp, &vp);
 }
 
+// The shaders, the vertices' layout, the vertex shader's parameters and the viewport's depths for
+// the GS's vertices or a batch's, bound when they change.
+void Renderer::BindSource(const Source& src)
+{
+    DkGpuAddr data = dkMemBlockGetGpuAddr(dataMem_);
+    const gs::Batch* b = src.batch;
+    int source = b ? 1 : 0;
+    std::uint32_t layout = b ? b->stride | b->positionAt << 4 | b->stqAt << 8 | b->colourAt << 12 : 0;
+    if (source != source_ || layout != layout_) {
+        const DkShader* shaders[2] = {b ? &batchShader_ : &vertexShader_, &fragmentShader_};
+        dkCmdBufBindShaders(cmd_, DkStageFlag_GraphicsMask, shaders, 2);
+        DkBufExtents ubo = {data + (b ? batchUbo_ : vertexUbo_), (std::uint32_t)(b ? sizeof(BatchParams) : sizeof(VertexParams))};
+        dkCmdBufBindUniformBuffers(cmd_, DkStage_Vertex, 0, &ubo, 1);
+        if (b) {
+            const DkVtxAttribState attribs[4] = {
+                {0, 0, b->positionAt * 16, DkVtxAttribSize_3x32, DkVtxAttribType_Float, 0},
+                {0, 0, b->positionAt * 16 + 12, DkVtxAttribSize_1x32, DkVtxAttribType_Uint, 0},
+                {0, 0, b->stqAt * 16, DkVtxAttribSize_3x32, DkVtxAttribType_Float, 0},
+                {0, 0, b->colourAt * 16, DkVtxAttribSize_4x32, DkVtxAttribType_Uint, 0},
+            };
+            const DkVtxBufferState buffer = {b->stride * 16, 0};
+            dkCmdBufBindVtxAttribState(cmd_, attribs, 4);
+            dkCmdBufBindVtxBufferState(cmd_, &buffer, 1);
+        } else {
+            static const DkVtxAttribState attribs[5] = {
+                {0, 0, offsetof(gs::DrawVertex, x), DkVtxAttribSize_2x32, DkVtxAttribType_Float, 0},
+                {0, 0, offsetof(gs::DrawVertex, z), DkVtxAttribSize_1x32, DkVtxAttribType_Uint, 0},
+                {0, 0, offsetof(gs::DrawVertex, r), DkVtxAttribSize_4x8, DkVtxAttribType_Unorm, 0},
+                {0, 0, offsetof(gs::DrawVertex, s), DkVtxAttribSize_3x32, DkVtxAttribType_Float, 0},
+                {0, 0, offsetof(gs::DrawVertex, fog), DkVtxAttribSize_1x32, DkVtxAttribType_Float, 0},
+            };
+            static const DkVtxBufferState buffer = {sizeof(gs::DrawVertex), 0};
+            dkCmdBufBindVtxAttribState(cmd_, attribs, 5);
+            dkCmdBufBindVtxBufferState(cmd_, &buffer, 1);
+        }
+        // everything of the vertices' source again, in the order a list's start binds it
+        DkBufExtents vertices = {dkMemBlockGetGpuAddr(frameMem_), kFrameMemory};
+        dkCmdBufBindVtxBuffers(cmd_, 0, &vertices, 1);
+        dkCmdBufBindIdxBuffer(cmd_, DkIdxFormat_Uint32, dkMemBlockGetGpuAddr(frameMem_));
+        if (!b) {
+            VertexParams vp = {{2.0f / kFieldWidth, -2.0f / kFieldHeight, -1.0f, 1.0f}};
+            dkCmdBufPushConstants(cmd_, data + vertexUbo_, sizeof vp, 0, sizeof vp, &vp);
+        }
+        batchSet_ = false;
+        source_ = source;
+        layout_ = layout;
+    }
+    float near = 0.0f, far = 1.0f;
+    if (b) {
+        // VertexOf's arithmetic as clip coordinates: the GS's x and y (in pixels, XYOFFSET taken
+        // off) to the image's, and the depths the near and far planes come to
+        const float base = 8589934592.0f, k = 1.0f / 16384.0f;
+        BatchParams bp;
+        std::memcpy(bp.matrix, b->matrix, sizeof bp.matrix);
+        bp.toClip[0] = b->scale[0] * k * (2.0f / kFieldWidth);
+        bp.toClip[1] = -b->scale[1] * k * (2.0f / kFieldHeight);
+        bp.toClip[2] = ((b->offset[0] - base) * k - b->ofx / 16.0f) * (2.0f / kFieldWidth) - 1.0f;
+        bp.toClip[3] = 1.0f - ((b->offset[1] - base) * k - b->ofy / 16.0f) * (2.0f / kFieldHeight);
+        bp.depth[0] = bp.depth[1] = bp.depth[2] = bp.depth[3] = 0.0f;
+        // the depths the program's far and near planes (z of -w and w) come to
+        float depth = (b->offset[2] - base) * k, range = b->scale[2] * k;
+        near = (depth - range) / 4294967296.0f;
+        far = (depth + range) / 4294967296.0f;
+        bp.fog[0] = b->fogScale;
+        bp.fog[1] = b->wMax;
+        bp.fog[2] = b->cull ? 1.0f : 0.0f;
+        bp.fog[3] = 0.0f;
+        if (!batchSet_ || std::memcmp(&bp, &lastBatch_, sizeof bp) != 0) {
+            dkCmdBufPushConstants(cmd_, data + batchUbo_, sizeof bp, 0, sizeof bp, &bp);
+            lastBatch_ = bp;
+            batchSet_ = true;
+        }
+    }
+    if (near != near_ || far != far_) {
+        DkViewport viewport = {0.0f, 0.0f, (float)kWidth, (float)kHeight, near, far};
+        dkCmdBufSetViewports(cmd_, 0, &viewport, 1);
+        near_ = near;
+        far_ = far;
+    }
+}
+
 // The commands so far sent to the GPU; with wait, done before the return (the frame's memory
 // is free again).
 void Renderer::Send(bool wait)
 {
+    if (listAt_ >= 0 && (long)frames_ + 1 == listAt_)
+        std::fprintf(stderr, "gpulist: send (wait %d) after %u draws\n", (int)wait, draws_);
     dkQueueSubmitCommands(queue_, dkCmdBufFinishList(cmd_));
     sends_++;
     if (wait) {
@@ -305,8 +428,6 @@ void Renderer::BindTarget(int target)
     dkImageViewDefaults(&depth, &depth_);
     const DkImageView* colours[1] = {&colour};
     dkCmdBufBindRenderTargets(cmd_, colours, 1, &depth);
-    DkViewport viewport = {0.0f, 0.0f, (float)kWidth, (float)kHeight, 0.0f, 1.0f};
-    dkCmdBufSetViewports(cmd_, 0, &viewport, 1);
 }
 
 // The game's two frame buffers (FBP 0 and 70, 640 wide); -1 for any other.
@@ -392,6 +513,35 @@ void Renderer::Begin(const gs::DrawState& s)
 void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t count, const std::uint32_t* index,
                     std::size_t indices)
 {
+    Source src = {v, (std::uint32_t)(count * sizeof(gs::DrawVertex)), sizeof(gs::DrawVertex), index, (std::uint32_t)indices, nullptr};
+    Submit(s, src);
+}
+
+// A batch's strip as triangles: one for each vertex from the third that does not start a strip,
+// wound the same way round along the strip (the program's backface test alternates), the vertex
+// that closes it last (its control word says whether a backface is dropped).
+bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
+{
+    batchIndex_.clear();
+    for (std::uint32_t k = 2; k < b.count; k++) {
+        if (b.quads[(k * b.stride + b.positionAt) * 4 + 3] & gs::kStripStart)
+            continue;
+        batchIndex_.push_back((k & 1) ? k - 2 : k - 1);
+        batchIndex_.push_back((k & 1) ? k - 1 : k - 2);
+        batchIndex_.push_back(k);
+    }
+    batches_++;
+    batchVertices_ += b.count;
+    if (batchIndex_.empty())
+        return true;
+    Source src = {b.quads, b.count * b.stride * 16, b.stride * 16, batchIndex_.data(), (std::uint32_t)batchIndex_.size(), &b};
+    Submit(s, src);
+    return true;
+}
+
+void Renderer::Submit(const gs::DrawState& s, const Source& src)
+{
+    const std::uint32_t indices = src.indices;
     struct Timed {
         std::uint64_t& total;
         std::uint64_t start = NowNs();
@@ -402,15 +552,65 @@ void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t
         otherTargets_++;
         return;
     }
-    std::uint32_t bytes = (std::uint32_t)(count * sizeof(gs::DrawVertex)), indexBytes = (std::uint32_t)(indices * 4);
-    if (bytes + indexBytes + 64 > kFrameMemory)
+    {   // SLY1_GPU_SKIP: kinds of draw left out, to find which one a fault comes with (bits: 1 batches,
+        // 2 the GS's untextured, 4 the GS's textured, 8 depth-only, 16 the GS's lines and points)
+        static const int skip = std::getenv("SLY1_GPU_SKIP") ? std::atoi(std::getenv("SLY1_GPU_SKIP")) : 0;
+        std::uint32_t t = (std::uint32_t)s.test;
+        bool depthOnly = (t & 1) && ((t >> 1) & 7) == 0 && ((t >> 12) & 3) == 2;
+        if ((skip & 1 && src.batch) || (skip & 2 && !src.batch && !s.tme && !depthOnly) || (skip & 4 && !src.batch && s.tme) ||
+            (skip & 8 && depthOnly && s.kind == 2 && ((t >> 17) & 3) != 1) || (skip & 16 && !src.batch && s.kind != 2))
+            return;
+    }
+    {   // SLY1_GPU_STOP_AFTER=n: in the captured frame, only its first n draws
+        static const long stopAfter = std::getenv("SLY1_GPU_STOP_AFTER") ? std::atol(std::getenv("SLY1_GPU_STOP_AFTER")) : -1;
+        static const long omit = std::getenv("SLY1_GPU_OMIT") ? std::atol(std::getenv("SLY1_GPU_OMIT")) : -1;
+        if (omit >= 0 && stopAfter < 0 && captureAt_ >= 0 && (long)frames_ + 1 == captureAt_ && ++drawInFrame_ == omit)
+            return;   // SLY1_GPU_OMIT=n: the captured frame without its n-th draw
+        if (stopAfter >= 0 && captureAt_ >= 0 && (long)frames_ + 1 == captureAt_) {
+            if (drawInFrame_++ >= stopAfter && stopped_)
+                return;
+            paintLast_ = drawInFrame_ == stopAfter && std::getenv("SLY1_GPU_PAINT_LAST") != nullptr;
+            if (drawInFrame_ == stopAfter)
+                std::fprintf(stderr, "gpustop: the last draw kept: %s, %u indices, test %08X, zbuf mask %u, abe %u, tme %u, kind %u\n",
+                             src.batch ? "batch" : "run", indices, (unsigned)s.test, (unsigned)((s.zbuf >> 32) & 1), s.abe, s.tme, s.kind);
+            if (drawInFrame_ == stopAfter && src.batch) {
+                const gs::Batch& b = *src.batch;
+                std::fprintf(stderr, "gpustop: alpha %016llX tex0 %016llX fge %u fogcol %06llX; count %u stride %u at %u/%u/%u cull %d fog %g wMax %g\n",
+                             (unsigned long long)s.alpha, (unsigned long long)s.tex0, s.fge, (unsigned long long)s.fogcol, b.count, b.stride,
+                             b.positionAt, b.stqAt, b.colourAt, (int)b.cull, b.fogScale, b.wMax);
+                std::fprintf(stderr, "gpustop: scale %g %g %g offset %g %g %g\n", b.scale[0], b.scale[1], b.scale[2], b.offset[0], b.offset[1], b.offset[2]);
+                for (std::uint32_t k = 0; k < b.count && k < 14; k++) {
+                    const std::uint32_t* q = b.quads + k * b.stride * 4;
+                    gs::BatchVertex v = gs::VertexOf(b, k);
+                    const float* p = (const float*)(q + b.positionAt * 4);
+                    const std::uint32_t* c = q + b.colourAt * 4;
+                    std::fprintf(stderr, "gpustop: v%u pos %g %g %g ctl %08X colour %X %X %X %X clip %g %g %g %g -> x %g y %g z %g fog %g\n", k, p[0], p[1],
+                                 p[2], q[b.positionAt * 4 + 3], c[0], c[1], c[2], c[3], v.clip[0], v.clip[1], v.clip[2], v.clip[3], v.x / 16 - b.ofx / 16,
+                                 v.y / 16 - b.ofy / 16, v.z, v.fog);
+                }
+            }
+        }
+    }
+    allDraws_++;
+    std::uint32_t bytes = src.vertexBytes, indexBytes = indices * 4;
+    if (bytes + indexBytes + 256 > kFrameMemory)
         return;
-    if (frameUsed_ + bytes + indexBytes + 64 > kFrameMemory || draws_ >= kMaxDraws)
+    if (frameUsed_ + bytes + indexBytes + 256 > kFrameMemory || draws_ >= kMaxDraws)
         Send(true);
     const Texture* texture = texture_;
     bool fresh = !last_.any;
     last_.any = true;
+    if (listAt_ >= 0 && (long)frames_ + 1 == listAt_ && listed_ < 60) {   // SLY1_GPU_LIST=N: frame N's first draws
+        listed_++;
+        std::uint32_t t = (std::uint32_t)s.test;
+        const float* p = (const float*)src.vertices;
+        std::fprintf(stderr, "gpulist: %s %u indices, %u bytes at %u, target %d, fresh %d, ZTST %u ZMSK %u ATE %u ATST %u AFAIL %u ABE %u "
+                     "tme %u scissor %016llX first %g %g %08X\n", src.batch ? "batch" : "run", indices, src.vertexBytes, frameUsed_,
+                     target, (int)!last_.any, (t >> 17) & 3, (unsigned)((s.zbuf >> 32) & 1), t & 1, (t >> 1) & 7, (t >> 12) & 3,
+                     s.abe, s.tme, (unsigned long long)s.scissor, p[0], p[1], ((const std::uint32_t*)src.vertices)[2]);
+    }
     BindTarget(target);
+    BindSource(src);
     runs_++;
     vertices_ += indices;
     draws_++;
@@ -468,6 +668,25 @@ void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t
         last_.blend = blend;
     }
 
+    fp.blend[2] = cullFront_;
+    // SLY1_GPU_CAPTURE's views: 1 a batch's triangles that reach outside the program's clip volume
+    // left out, 2 those triangles red and the others green, 3 depths cut and not clamped, 4 the depth-only draws (the game's clear of Z)
+    // flat-coloured, 5 the frame's first three batches flat-coloured without the depth test
+    bool always = false, shown = false;
+    int fsView = 0;
+    if (src.batch) {
+        batchInFrame_++;
+        always = view_ == 5 && batchInFrame_ <= 3;
+        fsView = always ? 6 : view_ == 1 ? 8 : view_ == 2 ? 9 : 0;
+    } else if (view_ == 4 && ate && atst == 0 && afail == 2) {
+        shown = true;
+        fsView = 6;
+    }
+    if (paintLast_) {   // SLY1_GPU_STOP_AFTER's last draw flat-coloured, whatever its depth
+        always = true;
+        fsView = 6;
+    }
+    fp.blend[3] = (float)fsView;
     fp.mode[0] = s.tme;
     fp.mode[1] = (std::int32_t)((s.tex0 >> 35) & 3);
     fp.mode[2] = (std::int32_t)((s.tex0 >> 34) & 1);
@@ -508,14 +727,20 @@ void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t
     if (fresh)
         last_.colour = last_.write = last_.depth = last_.aref = ~0u;
 
-    std::uint32_t first = frameUsed_ / sizeof(gs::DrawVertex);
-    frameUsed_ = Align(frameUsed_, sizeof(gs::DrawVertex));
-    first = frameUsed_ / sizeof(gs::DrawVertex);
-    std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(frameMem_) + frameUsed_, v, bytes);
+    frameUsed_ = (frameUsed_ + src.vertexSize - 1) / src.vertexSize * src.vertexSize;
+    std::uint32_t first = frameUsed_ / src.vertexSize;
+    std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(frameMem_) + frameUsed_, src.vertices, bytes);
     frameUsed_ += bytes;
+    if (captureAt_ >= 0 && (long)frames_ + 1 == captureAt_ && drawInFrame_ >= 2796 && drawInFrame_ <= 2803)
+        std::fprintf(stderr, "gpustop: draw %ld: %s, vertices %u bytes of %u each at %u (first %u), %u indices at %u, sends %llu, texture %d\n",
+                     drawInFrame_, src.batch ? "batch" : "run", bytes, src.vertexSize, frameUsed_ - bytes, first, indices, frameUsed_,
+                     (unsigned long long)sends_, texture ? (int)texture->id : -1);
+    if (captureAt_ >= 0 && (long)frames_ + 1 == captureAt_ && (drawInFrame_ <= 2 || (drawInFrame_ >= 2796 && drawInFrame_ <= 2803) || drawInFrame_ % 500 == 0))
+        std::fprintf(stderr, "gpustop: draw %ld target %d frame %016llX test %08X zbuf %llX\n", drawInFrame_, target, (unsigned long long)s.frame,
+                     (unsigned)s.test, (unsigned long long)s.zbuf);
     std::uint32_t firstIndex = frameUsed_ / 4;
-    std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(frameMem_) + frameUsed_, index, indexBytes);
-    frameUsed_ += indexBytes;
+    std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(frameMem_) + frameUsed_, src.index, indexBytes);
+    frameUsed_ = Align(frameUsed_ + indexBytes, 4);
     static const DkPrimitive kPrimitive[3] = {DkPrimitive_Points, DkPrimitive_Lines, DkPrimitive_Triangles};
     DkPrimitive primitive = kPrimitive[s.kind < 3 ? s.kind : 2];
 
@@ -546,6 +771,8 @@ void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t
         ds.depthTestEnable = 1;
         ds.depthWriteEnable = depthWrite && !zmsk;
         ds.depthCompareOp = !zte || ztst == 1 ? DkCompareOp_Always : ztst == 2 ? DkCompareOp_Gequal : DkCompareOp_Greater;
+        if (always)
+            ds.depthCompareOp = DkCompareOp_Always;
         std::uint32_t depthKey = (std::uint32_t)ds.depthWriteEnable | (std::uint32_t)ds.depthCompareOp << 1;
         if (depthKey != last_.depth) {
             dkCmdBufBindDepthStencilState(cmd_, &ds);
@@ -568,12 +795,12 @@ void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t
     if (afail == 1)
         pass(kFails[atst], true, true, false);
     else if (afail == 2)
-        pass(kFails[atst], false, false, true);
+        pass(kFails[atst], shown, false, true);
     else if (afail == 3)
         pass(kFails[atst], true, false, false);
 }
 
-// The frame buffer's image read back, halved each way and printed as lines of hexadecimal RGB
+// The frame buffer's image read back, quartered each way and printed as lines of hexadecimal RGB
 // (tools/gpu_capture.py makes a PNG of them).
 void Renderer::Capture(int target)
 {
@@ -584,14 +811,14 @@ void Renderer::Capture(int target)
     dkCmdBufCopyImageToBuffer(cmd_, &view, &rect, &to, 0);
     Send(true);
     const std::uint8_t* p = (const std::uint8_t*)dkMemBlockGetCpuAddr(dataMem_) + capture_;
-    std::uint32_t w = kWidth / 2, h = kHeight / 2;
+    std::uint32_t w = kWidth / 4, h = kHeight / 4;
     std::fprintf(stderr, "gpucap: begin %u %u frame %llu\n", w, h, (unsigned long long)frames_);
     std::vector<char> line(w * 6 + 1);
     static const char kHex[] = "0123456789abcdef";
     for (std::uint32_t y = 0; y < h; y++) {
         for (std::uint32_t x = 0; x < w; x++)
             for (int c = 0; c < 3; c++) {
-                const std::uint8_t* q = p + ((y * 2) * kWidth + x * 2) * 4 + c;
+                const std::uint8_t* q = p + ((y * 4 + 1) * kWidth + x * 4 + 1) * 4 + c;
                 unsigned v = (q[0] + q[4] + q[kWidth * 4] + q[kWidth * 4 + 4] + 2) / 4;
                 line[(x * 3 + c) * 2] = kHex[v >> 4];
                 line[(x * 3 + c) * 2 + 1] = kHex[v & 15];
@@ -604,12 +831,78 @@ void Renderer::Capture(int target)
 
 void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
 {
+    {   // SLY1_GPU_CAPTURE_HEAVY=n: the capture two frames after the first frame of n draws or more (the
+        // same scene in every run, which a frame's number is not: the game keeps real time)
+        static const long heavy = std::getenv("SLY1_GPU_CAPTURE_HEAVY") ? std::atol(std::getenv("SLY1_GPU_CAPTURE_HEAVY")) : 0;
+        static bool set;
+        if (heavy > 0 && !set && allDraws_ >= heavy) {
+            set = true;
+            captureAt_ = (long)frames_ + 3;
+            std::fprintf(stderr, "gpustop: a frame of %ld draws: capture at %ld\n", allDraws_, captureAt_);
+        }
+        allDraws_ = 0;
+    }
+    if (listAt_ >= 0 && ((long)frames_ + 1 == listAt_ || (long)frames_ + 2 == listAt_))
+        std::fprintf(stderr, "gpulist: present %llu, DISPFB %llX, %llu other-target draws so far\n", (unsigned long long)frames_ + 1, (unsigned long long)dispfb, (unsigned long long)otherTargets_);
     frames_++;
     int target = TargetOf(dispfb & 0x1FF);
     if (target < 0)
         target = 0;
-    if (captureAt_ >= 0 && (long)frames_ == captureAt_)
+    // SLY1_GPU_CAPTURE's last view: the depth buffer as the frame left it, as bands of colour (each
+    // pixel the colour of the smallest of eight depths that is not below its own)
+    static const long stepEarly = std::getenv("SLY1_GPU_CAPTURE_STEP") ? 1 : 0;
+    static const bool zmap = std::getenv("SLY1_GPU_ZMAP") != nullptr;   // frame N, then its depths, in one run
+    paintLast_ = false;
+    if (zmap && captureAt_ >= 0 && (long)frames_ == captureAt_) {
+        stopped_ = false;
         Capture(target);
+    }
+    if ((view_ == 5 && !stepEarly) || (zmap && captureAt_ >= 0 && (long)frames_ == captureAt_)) {
+        static const std::uint32_t kDepth[8] = {0xFFFFFFFFu, 16777215, 524288, 131072, 32768, 8192, 2048, 0};
+        static const std::uint8_t kColour[8][3] = {{255, 0, 255}, {255, 0, 0}, {255, 128, 0}, {255, 255, 0},
+                                                   {0, 255, 0}, {0, 255, 255}, {0, 0, 255}, {64, 64, 64}};
+        gs::DrawState st;
+        std::memset(&st, 0, sizeof st);
+        st.kind = 2;
+        st.frame = target == 1 ? 70 : 0;
+        st.test = (1u << 16) | (2u << 17);          // ZTE, GEQUAL
+        st.zbuf = 1ull << 32;                        // no depth written
+        st.scissor = 0x00DF0000027F0000ull;
+        for (int k = 0; k < 8; k++) {
+            gs::DrawVertex v[4];
+            std::memset(v, 0, sizeof v);
+            const float xs[4] = {0, 640, 0, 640}, ys[4] = {0, 0, 224, 224};
+            for (int c = 0; c < 4; c++) {
+                v[c].x = xs[c]; v[c].y = ys[c]; v[c].z = kDepth[k];
+                v[c].r = kColour[k][0]; v[c].g = kColour[k][1]; v[c].b = kColour[k][2]; v[c].a = 128;
+                v[c].q = 1.0f;
+            }
+            static const std::uint32_t index[6] = {0, 1, 2, 1, 3, 2};
+            int keep = view_;
+            view_ = 0;
+            Source src = {v, sizeof v, sizeof(gs::DrawVertex), index, 6, nullptr};
+            Submit(st, src);
+            view_ = keep;
+        }
+    }
+    // SLY1_GPU_CAPTURE: frame N as it is, then five frames with the batches shown otherwise
+    if (zmap && captureAt_ >= 0 && (long)frames_ == captureAt_)
+        Capture(target);
+    if (zmap)
+        captureAt_ = (long)frames_ == captureAt_ ? -2 : captureAt_;
+    static const long step = std::getenv("SLY1_GPU_CAPTURE_STEP") ? std::atol(std::getenv("SLY1_GPU_CAPTURE_STEP")) : 0;
+    if (step > 0) {   // six frames, step apart, each as it is
+        if (captureAt_ >= 0 && (long)frames_ >= captureAt_ && (long)frames_ <= captureAt_ + 5 * step &&
+            ((long)frames_ - captureAt_) % step == 0)
+            Capture(target);
+    } else if (captureAt_ >= 0 && (long)frames_ >= captureAt_ && (long)frames_ <= captureAt_ + 5)
+        Capture(target);
+    if (captureAt_ == -2 || (captureAt_ >= 0 && frames_ + 1 >= (std::uint64_t)captureAt_ && frames_ <= (std::uint64_t)captureAt_ + 1))
+        std::fprintf(stderr, "gpustop: at present %llu: %ld draws counted, captureAt %ld, showing target %d (DISPFB %llX)\n", (unsigned long long)frames_, drawInFrame_, captureAt_, target, (unsigned long long)dispfb);
+    batchInFrame_ = 0;
+    drawInFrame_ = 0;
+    stopped_ = true;
+    view_ = step == 0 && captureAt_ >= 0 && (long)frames_ >= captureAt_ && (long)frames_ < captureAt_ + 5 ? (int)(frames_ - captureAt_) + 1 : 0;
     std::uint64_t t0 = NowNs();
     int slot = dkQueueAcquireImage(queue_, swapchain_);
     acquireNs_ += NowNs() - t0;
@@ -646,6 +939,8 @@ void Renderer::Report()
     std::fprintf(stderr, "gpu: %llu frames, %llu runs of primitives (%llu vertices), %llu command lists sent\n",
                  (unsigned long long)frames_, (unsigned long long)runs_, (unsigned long long)vertices_,
                  (unsigned long long)sends_);
+    std::fprintf(stderr, "gpu: %llu batches transformed by the GPU (%llu vertices)\n", (unsigned long long)batches_,
+                 (unsigned long long)batchVertices_);
     std::fprintf(stderr, "gpu: %zu textures held (%u KB), %llu checked after uploads, %llu decoded, %llu uploaded, %llu times the cache "
                  "was emptied\n", textures_.size(), textureUsed_ >> 10, (unsigned long long)hashes_, (unsigned long long)decodes_, (unsigned long long)uploads_,
                  (unsigned long long)cacheResets_);

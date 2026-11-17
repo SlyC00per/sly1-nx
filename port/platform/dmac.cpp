@@ -644,6 +644,8 @@ private:
         std::uint32_t addr = imm_ & 0x3FF;
         if (!vu0_ && ((imm_ >> 15) & 1))
             addr += tops_;
+        if (!vu0_)   // the quadwords written, with those a cycle longer than its writes skips
+            vu1::DataWritten(addr & 0x3FF, cl_ > wl_ && wl_ ? n * ((cl_ + wl_ - 1) / wl_) : n);
         // every format's fields are 8, 16 or 32 bits (V4-5 a 16-bit colour): read them as such
         const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(data_.data());
         std::size_t have = data_.size() * 4, at = 0;

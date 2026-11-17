@@ -4,9 +4,13 @@
 // blend equation's As or FIX over 0x80, which the blend state reads as the second source).
 #version 460
 
-layout (location = 0) in vec4 inColour;   // 0 to 255
+// Colour and fog go across the screen as the GS takes them, whatever w the vertices have (a
+// batch's are in clip coordinates, batch_vsh.glsl); S, T and Q with the GPU's perspective.
+layout (location = 0) noperspective in vec4 inColour;   // 0 to 255
 layout (location = 1) in vec3 inStq;
-layout (location = 2) in float inFog;
+layout (location = 2) noperspective in float inFog;
+layout (location = 4) noperspective in float inOutside;   // above 0 in a triangle with a vertex outside the clip volume
+layout (location = 3) flat in int inFlags;   // 1: dropped when the triangle faces away (a batch's backfaces)
 
 layout (location = 0, index = 0) out vec4 outColour;
 layout (location = 0, index = 1) out vec4 outFactor;
@@ -16,11 +20,27 @@ layout (binding = 0) uniform sampler2D texture0;
 layout (std140, binding = 0) uniform FragmentParams {
     ivec4 mode;       // TME, TFX, TCC, FGE
     vec4 fogColour;   // 0 to 255
-    vec4 blend;       // x: 1 for As, 0 for FIX; y: FIX over 0x80
+    vec4 blend;       // x: 1 for As, 0 for FIX; y: FIX over 0x80; z: 1 when the front faces are the ones facing away;
+                      // w: SLY1_GPU_CAPTURE's views (6 a flat colour, 7 the depth)
 } u;
 
 void main()
 {
+    int view = int(u.blend.w);
+    if (inFlags != 0 && gl_FrontFacing == (u.blend.z != 0.0))
+        discard;
+    if (view == 8 && inOutside > 0.0)   // triangles reaching outside the clip volume left out
+        discard;
+    if (view == 9) {   // or shown
+        outColour = vec4(inOutside > 0.0 ? vec3(1.0, 0.0, 0.0) : vec3(0.0, 1.0, 0.0), 0.5);
+        outFactor = vec4(1.0);
+        return;
+    }
+    if (view == 6 || view == 7) {   // a flat colour, or the depth (the whole of a batch's range white)
+        outColour = view == 6 ? vec4(1.0, 0.0, 1.0, 0.5) : vec4(vec3(gl_FragCoord.z * 8192.0), 0.5);
+        outFactor = vec4(1.0);
+        return;
+    }
     vec3 rgb = inColour.rgb;
     float a = inColour.a;
     if (u.mode.x != 0) {

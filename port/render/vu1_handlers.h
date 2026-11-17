@@ -30,6 +30,15 @@ struct HandlerEntry {
     const char* leaves;
 };
 
+// Before a program runs (fn its handler, or null) and when a handler left its entry to the
+// microcode: a batch's transform noted for the GPU renderer is done now if what follows is not
+// one of the batch's kicks (port/render/vu1_handlers.cpp, "left to the GPU").
+void BeforeProgram(Handler fn, core::Runner& r);
+void LeftToMicrocode(core::Runner& r);
+
+// The batches' kicks the GPU renderer took, and those it did not (done by the program after all).
+void BatchCounts(std::uint64_t* taken, std::uint64_t* notTaken);
+
 extern const HandlerEntry kHandlers[];
 extern const std::size_t kHandlerCount;
 

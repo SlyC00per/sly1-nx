@@ -111,3 +111,36 @@ due.
    runs through its check without a difference.
 4. Then move its per-vertex work to the GPU where that pays (a vertex shader computing what it
    computes), checked the same way through the packets.
+
+## The Switch's GPU renderer (2026-11-16)
+
+`port/switch/gpu.cpp` draws what the GS is given with deko3d (`port/gs_backend.h`): runs of the
+GS's own vertices (`gs_vsh.glsl`), textures decoded from local memory, the tests and the blend as
+GPU state, the fields as whole 960 by 720 pictures. On the Switch, 30 s of the opening: about 17
+frames a second, the picture the host's reference draws.
+
+`SLY1_GPU_TRANSFORM` (off unless set) leaves a batch's transform to the GPU: the transform's
+handler only notes the batch, and each of its kicks hands the vertices as VIF1 unpacked them, the
+matrix and the viewport to `batch_vsh.glsl` (`gs::Batch`). The arithmetic is checked on the host
+against the program's (`SLY1_GPU_BATCH_CHECK`: 23.6 million vertices in view, none further than
+1/16 pixel, 1 of depth, 1 of fog), and the host draws the batches right in software
+(`SLY1_GS_SOFT_BATCH` with `--dump-fb`). On the Switch and in Ryujinx it halves VU1's time, but
+from the opening's second scene on most of the picture is black (the sky and the buildings
+missing). Not found yet. What is known:
+
+- the renderer is handed the right draws in the right order (`SLY1_GPU_LIST`);
+- the first scene (the flag) is drawn right, the later ones are not, in the emulator as on the
+  Switch, so the emulator can be used to look for it (`tools/run_ryujinx.py`, `SLY1_GPU_CAPTURE`
+  and `tools/gpu_capture.py`);
+- not the cause, each tried alone: the depth range of the viewport, depths clamped or cut, which
+  side is the front, triangles that reach outside the clip volume, Zcull, the bindings at a change
+  between the two kinds of draw, the size of the command memory, the registers the transform
+  leaves, the outlines' programs reading a batch after it is drawn (that one is a real dependency:
+  a drawn batch is transformed after all when another program follows, `Materialise`);
+- a frame's number is not the same moment in every run (the game keeps real time):
+  `SLY1_GPU_CAPTURE_HEAVY` starts the capture at the first frame of that many draws instead.
+
+Diagnosis switches in the renderer: `SLY1_GPU_CAPTURE` (frames printed, with views of the batches
+on the five frames after), `SLY1_GPU_CAPTURE_STEP`, `SLY1_GPU_ZMAP` (the depth buffer as bands),
+`SLY1_GPU_STOP_AFTER` and `SLY1_GPU_OMIT` (a frame's draws cut short or one left out),
+`SLY1_GPU_SKIP` (kinds of draw left out), `SLY1_GPU_LIST`, `SLY1_GPU_NO_ZCULL`, `SLY1_GPU_CULL_FLIP`.

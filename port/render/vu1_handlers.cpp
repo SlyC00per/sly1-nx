@@ -8,9 +8,15 @@
 // state a later program reads (port/render/vu1_live.h) as the microcode leaves it, and skips the
 // rest: the software pipelining, the reads ahead past the buffer's end, the scratch registers.
 #include "vu1_handlers.h"
+#include "port/gs.h"
+#include "port/gs_backend.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <cstdio>
+#include <vector>
+#include <algorithm>
 
 namespace port {
 namespace vu1 {
@@ -364,7 +370,217 @@ bool BatchTransformT(Runner& r, const int stride, const Test test, const std::ui
     return true;
 }
 
+void SetVf(State& st, int reg, const V& x);
+void Kick(Runner& r, std::uint32_t qaddr);
+
+// --- The batch's transform left to the GPU (port/gs_backend.h's Batch).
+//
+// With a renderer that takes batches, the transform does nothing but note itself: the vertices
+// stay as VIF1 unpacked them, and each kick of the batch that follows (the finish's, the second
+// pass's) hands them over with the matrix and the viewport instead of a packet. The renderer cuts
+// triangles at the view's edges itself, so nothing is marked for the clipper. Should anything
+// other than those kicks come next, or a kick the renderer does not take, the transform is done
+// then, late, on the same data (Materialise). What the loop leaves in registers for a later
+// program (the edges, the vertices read ahead) is then not what the microcode leaves: this way is
+// for showing the game, not for SLY1_VU1_CHECK, which keeps it off.
+struct Deferred {
+    bool on = false, kicked = false;
+    bool overwritten = false;      // VIF1 has unpacked over the batch or its header since
+    std::uint16_t first = 0, end = 0;   // the batch's quadwords
+    std::uint16_t top = 0;
+    int stride = 0;
+    Test test = Test::Guard274;
+    std::uint32_t endPc = 0;
+} g_deferred;
+
+bool BatchTransformNow(Runner& r, const int stride, const Test test, const std::uint32_t endPc);
+
+bool DeferredFor(std::uint16_t top) { return g_deferred.on && g_deferred.top == top; }
+void DeferredKicked() { g_deferred.kicked = true; }
+
+bool DeferTransforms()
+{
+    // SLY1_GPU_TRANSFORM: off unless asked for. With it some scenes of the opening lose their sky and
+    // their lighting passes on the Switch's GPU and in the emulator (docs/RENDERER.md), though each
+    // batch's arithmetic agrees with the program's (SLY1_GPU_BATCH_CHECK) and the host draws them right.
+    static const bool on = std::getenv("SLY1_GPU_TRANSFORM") && !std::getenv("SLY1_VU1_CHECK");
+    return on && gs::TakesBatches();
+}
+
+// The transform noted before, done now: a program other than the batch's kicks may read what the
+// transform leaves in memory (the outlines' programs read the screen positions of a batch already
+// drawn). Not when VIF1 has unpacked over the batch since: the memory is the next batch's.
+void Materialise(Runner& r, bool always = false)
+{
+    if (!g_deferred.on)
+        return;
+    Deferred d = g_deferred;
+    g_deferred.on = false;
+    if (d.overwritten || (std::uint16_t)r.ctx.top != d.top)
+        return;
+    (void)always;
+    std::uint32_t pc = r.s.pc;
+    BatchTransformNow(r, d.stride, d.test, d.endPc);
+    r.s.pc = pc;
+}
+
+// The viewport's offsets between 2 to the 33rd and 2 to the 34th, and its depths staying there:
+// what makes the screen position's bits the GS's numbers (and the renderer's arithmetic the same).
+bool ViewportAsExpected(Runner& r)
+{
+    V scale = Load(r, 0), offset = Load(r, 1);
+    const float lo = 8589934592.0f, hi = 17179869184.0f;
+    if (!(offset.x >= lo && offset.x < hi && offset.y >= lo && offset.y < hi && offset.z >= lo && offset.z < hi))
+        return false;
+    float depth = std::fabs(scale.z);
+    return offset.z - depth >= lo && offset.z + depth < hi;
+}
+
+// A deferred batch's kick: the tag's packet as KickBatch sends it, then the batch itself to the
+// renderer. False, with only the tag's packet sent, when the renderer does not take it.
+bool KickDeferred(Runner& r, std::uint16_t top, std::uint16_t tag)
+{
+    const Deferred& d = g_deferred;
+    std::uint16_t at = (std::uint16_t)(top + tag);
+    V t = Load(r, at);
+    V hdr = Load(r, top + 11);
+    std::uint16_t first = (std::uint16_t)(top + Half(hdr.x)), end = (std::uint16_t)(top + Half(hdr.y));
+    std::uint32_t count = (std::uint32_t)((std::uint16_t)(end - first) / d.stride);
+    std::uint32_t word0 = Bits(t.x), word1 = Bits(t.y), nreg = (word1 >> 28) & 0xF, flg = (word1 >> 26) & 3;
+    std::uint64_t regs = Bits(t.z) | (std::uint64_t)Bits(t.w) << 32;
+    gs::Batch b;
+    b.stride = (std::uint32_t)d.stride;
+    b.count = count;
+    b.positionAt = (std::uint32_t)d.stride - 1;
+    int stqAt = -1, colourAt = -1;
+    bool ok = flg == 0 && (int)nreg == d.stride && (word0 & 0x7FFF) == count && first + count * d.stride <= 1024 &&
+              ((regs >> (4 * (nreg - 1))) & 0xF) == 4;
+    for (std::uint32_t k = 0; ok && k + 1 < nreg; k++) {
+        unsigned reg = (unsigned)(regs >> (4 * k)) & 0xF;
+        if (reg == 2 && stqAt < 0)
+            stqAt = (int)k;
+        else if (reg == 1 && colourAt < 0)
+            colourAt = (int)k;
+        else if (reg != 0xF)
+            ok = false;
+    }
+    ok = ok && stqAt >= 0 && colourAt >= 0;
+    SetVf(r.s, 3, t);
+    Kick(r, at + 1);
+    Store(r, first - 1, t);
+    if (!ok)
+        return false;
+    b.stqAt = (std::uint32_t)stqAt;
+    b.colourAt = (std::uint32_t)colourAt;
+    b.quads = reinterpret_cast<const std::uint32_t*>(r.Qword(first));
+    for (int c = 0; c < 4; c++)
+        std::memcpy(&b.matrix[c * 4], r.Qword((std::uint16_t)(top + 14 + c)), 16);
+    std::memcpy(b.scale, r.Qword(0), 16);
+    std::memcpy(b.offset, r.Qword(1), 16);
+    V params = Load(r, top + 8);
+    b.fogScale = params.y;
+    b.wMax = params.z;
+    b.cull = Half(Load(r, top + 9).z) != 0;
+    static const bool check = std::getenv("SLY1_GPU_BATCH_CHECK") != nullptr;
+    if (check) {
+        // SLY1_GPU_BATCH_CHECK: the renderer's arithmetic on the vertices as they are, against what
+        // the program makes of them (done now, and the batch then kicked as a packet): the GS's
+        // x, y, depth and fog of each vertex inside the view.
+        static std::vector<std::uint32_t> raw;
+        static std::uint64_t vertices, far;
+        static double worst[4];
+        raw.assign(b.quads, b.quads + count * b.stride * 4);
+        Materialise(r, true);
+        gs::Batch c = b;
+        c.quads = raw.data();
+        for (std::uint32_t k = 0; k < count; k++) {
+            gs::BatchVertex v = gs::VertexOf(c, k);
+            float w = v.clip[3];
+            if (!(w > 0.0f && std::fabs(v.clip[0]) <= w && std::fabs(v.clip[1]) <= w && std::fabs(v.clip[2]) <= w))
+                continue;
+            const std::uint32_t* out = b.quads + (k * b.stride + b.positionAt) * 4;
+            double d[4] = {std::fabs(v.x - (double)(out[0] & 0xFFFF)), std::fabs(v.y - (double)(out[1] & 0xFFFF)),
+                           std::fabs(v.z - (double)((out[2] >> 4) & 0xFFFFFF)), std::fabs(v.fog - (double)((out[3] >> 4) & 0xFF))};
+            vertices++;
+            if (d[0] > 2 || d[1] > 2 || d[2] > 64 || d[3] > 1)
+                far++;
+            for (int j = 0; j < 4; j++)
+                worst[j] = std::max(worst[j], d[j]);
+        }
+        static std::uint64_t batches;
+        batches++;
+        if ((batches & (batches - 1)) == 0)
+            std::fprintf(stderr, "batch check: %llu batches, %llu vertices in view, %llu further than 2/16 pixel, 64 of depth "
+                         "or 1 of fog; the furthest %.2f %.2f (x, y in sixteenths), %.1f (depth of 16,777,216), %.0f (fog)\n",
+                         (unsigned long long)batches, (unsigned long long)vertices, (unsigned long long)far, worst[0], worst[1],
+                         worst[2], worst[3]);
+        return false;
+    }
+    return gs::DrawBatch(word1, b);
+}
+
+// What the transform leaves in registers for later programs (the matrix, the viewport, the last
+// vertices' sets, the edges, the clip codes), without the batch transformed: the program's loop
+// over the batch's last eight vertices alone (a multiple of four fewer keeps each vertex in the
+// register set and on the side of the strip it has in the whole batch), their memory and the
+// batch's header put back afterwards.
+void LeaveRegisters(Runner& r, std::uint16_t top, int stride, Test test, std::uint32_t endPc)
+{
+    V hdr = Load(r, top + 11);
+    std::uint16_t first = (std::uint16_t)(top + Half(hdr.x)), end = (std::uint16_t)(top + Half(hdr.y));
+    int n = (std::uint16_t)(end - first) / stride;
+    int tail = n > 11 ? 8 + (n & 3) : n;   // the same count modulo 4, so the same sets and sides
+    std::uint16_t from = (std::uint16_t)(end - tail * stride);
+    V saved[12 * 4], mark = Load(r, top + 13);
+    for (int k = 0; k < tail * stride; k++)
+        saved[k] = Load(r, (std::uint16_t)(from + k));
+    V h = hdr;
+    h.x = FromBits((Bits(hdr.x) & 0xFFFF0000u) | (std::uint16_t)(from - top));
+    Store(r, top + 11, h);
+    BatchTransformNow(r, stride, test, endPc);
+    Store(r, top + 11, hdr);
+    Store(r, top + 13, mark);
+    for (int k = 0; k < tail * stride; k++)
+        Store(r, (std::uint16_t)(from + k), saved[k]);
+}
+
 bool BatchTransform(Runner& r, const int stride, const Test test, const std::uint32_t endPc)
+{
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    // (the far-plane test's batches stay the program's: it draws what lies wholly beyond the far
+    // plane uncut, the sky, which a renderer cutting at the far plane would leave out)
+    bool kept = false;   // one of a frame's first batches a diagnosis keeps for the program
+    if (int keep = gs::FirstBatchesKept()) {
+        static std::uint64_t frame;
+        static int count;
+        if (gs::FramesShown() != frame) {
+            frame = gs::FramesShown();
+            count = 0;
+        }
+        kept = count++ < keep;
+    }
+    if (test == Test::Guard274 && !kept && DeferTransforms()) {
+        V hdr = Load(r, top + 11);
+        std::uint16_t span = (std::uint16_t)(Half(hdr.y) - Half(hdr.x));
+        if (span != 0 && span % stride == 0 && span / stride <= 256 && Half(Load(r, top + 13).z) == 0 &&
+            ViewportAsExpected(r)) {
+            g_deferred.on = true;
+            g_deferred.kicked = false;
+            g_deferred.overwritten = false;
+            g_deferred.first = (std::uint16_t)(top + Half(hdr.x));
+            g_deferred.end = (std::uint16_t)(top + Half(hdr.y));
+            g_deferred.top = top;
+            g_deferred.stride = stride;
+            g_deferred.test = test;
+            g_deferred.endPc = endPc;
+            LeaveRegisters(r, top, stride, test, endPc);
+            return true;
+        }
+    }
+    return BatchTransformNow(r, stride, test, endPc);
+}
+
+bool BatchTransformNow(Runner& r, const int stride, const Test test, const std::uint32_t endPc)
 {
     std::uint16_t top = (std::uint16_t)r.ctx.top;
     V hdr = Load(r, top + 11);
@@ -473,8 +689,26 @@ void Colours4DD(Runner& r, std::uint16_t top, int n)
 
 // The kick of a batch: the GIF tag at `tag` copied before the vertices (11.x), the packet after
 // the tag kicked, then the vertices.
+bool KickDeferred(Runner& r, std::uint16_t top, std::uint16_t tag);
+void Materialise(Runner& r, bool always);
+std::uint64_t g_notTaken, g_taken;
+bool DeferredFor(std::uint16_t top);
+void DeferredKicked();
+
 void KickBatch(Runner& r, std::uint16_t top, std::uint16_t tag)
 {
+    if (DeferredFor(top)) {   // the batch's transform is the renderer's
+        if (KickDeferred(r, top, tag)) {
+            DeferredKicked();
+            g_taken++;
+            return;
+        }
+        // not taken: the transform now, then the vertices' packet (the tag's is sent)
+        g_notTaken++;
+        Materialise(r, true);
+        Kick(r, (std::uint16_t)(top + Half(Load(r, top + 11).x)) - 1);
+        return;
+    }
     std::uint16_t at = (std::uint16_t)(top + tag);
     V t = Load(r, at);
     SetVf(r.s, 3, t);
@@ -2957,6 +3191,33 @@ bool OffsetXy(Runner& r)
 #define VF_20_TO_31 "vf20.xyzw vf21.xyzw vf22.xyzw vf23.xyzw vf24.xyzw vf25.xyzw vf26.xyzw vf27.xyzw vf28.xyzw vf29.xyzw " \
                     "vf30.xyzw vf31.xyzw "
 const char kAllVfAndP[] = VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "P";
+
+void BeforeProgram(Handler fn, core::Runner& r)
+{
+    if (g_deferred.on && fn != BatchFinish && fn != BatchSecond && fn != UnlitFinish)
+        Materialise(r);
+}
+
+void LeftToMicrocode(core::Runner& r) { Materialise(r); }
+
+void DataWritten(std::uint32_t qaddr, std::uint32_t count)
+{
+    Deferred& d = g_deferred;
+    if (!d.on || d.overwritten)
+        return;
+    // the batch's vertices (with the four read ahead) or what the transform reads of its header
+    std::uint32_t end = qaddr + count;
+    std::uint32_t lo = d.first, hi = (std::uint32_t)d.end + 4u * (std::uint32_t)d.stride;
+    std::uint32_t hlo = d.top + 8u, hhi = d.top + 18u;
+    if ((qaddr < hi && end > lo) || (qaddr < hhi && end > hlo))
+        d.overwritten = true;
+}
+
+void BatchCounts(std::uint64_t* taken, std::uint64_t* notTaken)
+{
+    *taken = g_taken;
+    *notTaken = g_notTaken;
+}
 
 const HandlerEntry kHandlers[] = {
     {0x79A6F5FB, 0x356, LitBatchTransform, "lit batch transform",

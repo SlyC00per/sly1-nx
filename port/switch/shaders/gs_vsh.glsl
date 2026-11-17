@@ -13,6 +13,8 @@ layout (location = 4) in float inFog;
 layout (location = 0) out vec4 outColour;   // 0 to 255
 layout (location = 1) out vec3 outStq;
 layout (location = 2) out float outFog;
+layout (location = 3) flat out int outFlags;
+layout (location = 4) out float outOutside;
 
 layout (std140, binding = 0) uniform VertexParams {
     vec4 toClip;   // x and y scales, then the offsets
@@ -24,4 +26,6 @@ void main()
     outColour = inColour * 255.0;
     outStq = inStq;
     outFog = inFog;
+    outFlags = 0;
+    outOutside = 0.0;
 }

@@ -466,6 +466,32 @@ int main(int argc, char** argv)
     if (std::getenv("SLY1_GS_COUNT")) {
         struct Counting : port::gs::Backend {
             std::uint64_t runs = 0, vertices = 0, indices = 0, frames = 0;
+            std::uint64_t batches = 0;
+            bool TakesBatches() const override { return std::getenv("SLY1_GS_COUNT_BATCHES") != nullptr; }
+            // SLY1_GS_LIST=N: frame N's runs and batches, with their depth test and depths
+            long listAt = std::getenv("SLY1_GS_LIST") ? std::atol(std::getenv("SLY1_GS_LIST")) : -1;
+            void List(const char* what, const port::gs::DrawState& s, std::size_t n, double zmin, double zmax)
+            {
+                if ((long)frames + 1 != listAt)
+                    return;
+                unsigned test = (unsigned)s.test;
+                std::fprintf(stderr, "list: %-5s %5zu  FBP %3u  ZTE %u ZTST %u ZMSK %u  ATE %u ATST %u AFAIL %u  ABE %u ALPHA %02X  tme %u  z %.0f..%.0f\n",
+                             what, n, (unsigned)(s.frame & 0x1FF), (test >> 16) & 1, (test >> 17) & 3, (unsigned)((s.zbuf >> 32) & 1),
+                             test & 1, (test >> 1) & 7, (test >> 12) & 3, s.abe, (unsigned)(s.alpha & 0xFF), s.tme, zmin, zmax);
+            }
+            bool DrawBatch(const port::gs::DrawState& s, const port::gs::Batch& b) override
+            {
+                batches++;
+                vertices += b.count;
+                double zmin = 1e30, zmax = -1e30;
+                if ((long)frames + 1 == listAt)
+                    for (std::uint32_t k = 0; k < b.count; k++) {
+                        port::gs::BatchVertex v = port::gs::VertexOf(b, k);
+                        if (v.clip[3] > 0) { zmin = std::min<double>(zmin, v.z); zmax = std::max<double>(zmax, v.z); }
+                    }
+                List("batch", s, b.count, zmin, zmax);
+                return true;
+            }
             std::vector<std::uint32_t> pixels;
             void Begin(const port::gs::DrawState& s) override
             {
@@ -473,8 +499,21 @@ int main(int argc, char** argv)
                 if (s.tme && std::getenv("SLY1_GS_CHECK"))   // the decoder exercised (and checked)
                     port::gs::DecodeTexture(s, pixels, w, h);
             }
-            void Draw(const port::gs::DrawState&, const port::gs::DrawVertex*, std::size_t v, const std::uint32_t*,
-                      std::size_t i) override { runs++; vertices += v; indices += i; }
+            void Draw(const port::gs::DrawState& st, const port::gs::DrawVertex* vv, std::size_t v, const std::uint32_t*,
+                      std::size_t i) override
+            {
+                runs++; vertices += v; indices += i;
+                double zmin = 1e30, zmax = -1e30, xmin = 1e30, xmax = -1e30, ymin = 1e30, ymax = -1e30;
+                for (std::size_t k = 0; k < v; k++) {
+                    zmin = std::min<double>(zmin, vv[k].z); zmax = std::max<double>(zmax, vv[k].z);
+                    xmin = std::min<double>(xmin, vv[k].x); xmax = std::max<double>(xmax, vv[k].x);
+                    ymin = std::min<double>(ymin, vv[k].y); ymax = std::max<double>(ymax, vv[k].y);
+                }
+                List("run", st, i / 3, zmin, zmax);
+                if ((long)frames + 1 == listAt)
+                    std::fprintf(stderr, "list:       x %.1f..%.1f y %.1f..%.1f scissor %016llX kind %u\n", xmin, xmax, ymin, ymax,
+                                 (unsigned long long)st.scissor, st.kind);
+            }
             void Present(std::uint64_t, std::uint64_t) override
             {
                 if ((++frames & 255) == 0)

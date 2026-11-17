@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace port {
@@ -30,6 +31,51 @@ struct DrawState {
     std::uint64_t tex0, tex1, clamp, alpha, test, frame, zbuf, scissor, texa, fogcol;
 };
 
+// A batch of the game's vertices as VU1 was given them (port/render/vu1_handlers.cpp), for a
+// renderer that transforms them itself in place of VU1's program: a triangle strip of count
+// vertices, each stride quadwords of VU1's data memory, with what the program transforms them by.
+// The renderer does what the program does to each vertex (the matrix, the divide by w, the
+// viewport's scale and offset, the fog from w) and what the program and the clipper after it do
+// to each triangle (those outside the view cut or dropped, a backface dropped when cull is set
+// and the triangle's last vertex has kCullable in its control word).
+struct Batch {
+    const std::uint32_t* quads;   // count * stride quadwords
+    std::uint32_t count, stride;
+    std::uint32_t positionAt, stqAt, colourAt;   // quadwords of a vertex: x y z and the control word; S T Q; R G B A
+    float matrix[16];             // four columns
+    float scale[4], offset[4];    // of x, y, z over w, to the GS's coordinates times 1,024 (z times 16,384), past 2 to the 33rd
+    float fogScale, wMax;         // fog: the control word's low 12 bits plus fogScale times min(w, wMax) / w, over 16
+    bool cull;
+    int ofx, ofy;                 // XYOFFSET (12.4), the odd field's half line dropped
+};
+constexpr std::uint32_t kStripStart = 0x8000, kCullable = 0x4000;   // bits of a vertex's control word
+
+// What a renderer's vertex shader computes of a batch's vertex k (port/switch/shaders/
+// batch_vsh.glsl is this arithmetic): its clip coordinates, and from them the GS's x and y (12.4,
+// before XYOFFSET), depth (24 bits) and fog. SLY1_GPU_BATCH_CHECK compares these with what VU1's
+// program leaves (port/render/vu1_handlers.cpp).
+struct BatchVertex {
+    float clip[4];
+    float x, y, z, fog;
+};
+inline BatchVertex VertexOf(const Batch& b, std::uint32_t k)
+{
+    const std::uint32_t* q = b.quads + (k * b.stride + b.positionAt) * 4;
+    float p[3];
+    std::memcpy(p, q, 12);
+    BatchVertex v;
+    for (int c = 0; c < 4; c++)
+        v.clip[c] = b.matrix[c] * p[0] + b.matrix[4 + c] * p[1] + b.matrix[8 + c] * p[2] + b.matrix[12 + c];
+    const float base = 8589934592.0f;   // 2 to the 33rd
+    float w = v.clip[3], over = w != 0.0f ? 1.0f / w : 0.0f;
+    v.x = v.clip[0] * over * (b.scale[0] / 1024.0f) + (b.offset[0] - base) / 1024.0f;
+    v.y = v.clip[1] * over * (b.scale[1] / 1024.0f) + (b.offset[1] - base) / 1024.0f;
+    v.z = v.clip[2] * over * (b.scale[2] / 16384.0f) + (b.offset[2] - base) / 16384.0f;
+    float near = w < b.wMax ? w : b.wMax;
+    v.fog = (float)(((int)((float)(q[3] & 0xFFF) + b.fogScale * near * over) >> 4) & 0xFF);
+    return v;
+}
+
 class Backend {
 public:
     virtual ~Backend() {}
@@ -40,12 +86,29 @@ public:
     // another). Called with the GS held.
     virtual void Draw(const DrawState& state, const DrawVertex* v, std::size_t vertices, const std::uint32_t* index,
                       std::size_t indices) = 0;
+    // A batch for the renderer to transform, drawn by state after everything handed over before;
+    // false when the renderer does not take batches (the caller has VU1's program do it).
+    virtual bool TakesBatches() const { return false; }
+    virtual bool DrawBatch(const DrawState&, const Batch&) { return false; }
     // The game swapped its double buffer: DISPFB's buffer is the one to show.
     virtual void Present(std::uint64_t dispfb, std::uint64_t display) = 0;
 };
 
 // The renderer the GS draws through, or none (the reference drawing, when --dump-fb asks).
 void SetBackend(Backend* backend);
+
+// A batch after a GIF tag (its PRE and PRIM as tagWord1 has them): given to the renderer as the
+// tag's vertices would have been, in order with everything else. False, with nothing drawn, when
+// there is no renderer that takes it or the primitive is not a smooth-shaded strip with S, T, Q.
+bool DrawBatch(std::uint32_t tagWord1, Batch& batch);
+
+// Whether the renderer set takes batches.
+bool TakesBatches();
+
+// SLY1_GPU_CAPTURE's views: how many of a frame's first batches the renderer asks the program to
+// transform after all (a diagnosis of the renderer's own drawing of them).
+void SetFirstBatchesKept(int count);
+int FirstBatchesKept();
 
 // For a backend, inside Begin. The state's texture as 32-bit RGBA (the GS's alpha, 0x80 for 1),
 // tw by th, through the palette loaded now.

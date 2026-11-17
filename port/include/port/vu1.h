@@ -27,6 +27,11 @@ State& Vu1();
 std::uint32_t* Micro();
 std::uint8_t* Data();
 
+// VIF1 unpacked count quadwords at qaddr of the data memory (port/platform/dmac.cpp): a batch whose
+// transform was left to the GPU renderer is no longer the one in memory when they are its own
+// (port/render/vu1_handlers.cpp).
+void DataWritten(std::uint32_t qaddr, std::uint32_t count);
+
 // VIF1's TOP and ITOP, which XTOP and XITOP read, and where XGKICK sends a packet (the quadword
 // address of its first GIF tag in data memory).
 struct Context {

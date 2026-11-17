@@ -291,13 +291,21 @@ std::uint64_t Run(std::uint32_t start, const Context& ctx)
     static const bool off = std::getenv("SLY1_VU1_NO_HANDLERS") != nullptr;
     const HandlerEntry* h = live::Enabled() || off ? nullptr : HandlerFor(start);
     static const bool check = std::getenv("SLY1_VU1_CHECK") != nullptr;
+    if (!check) {   // a transform noted for the GPU renderer, done now unless its kicks follow
+        Runner r(ctx);
+        BeforeProgram(h ? h->fn : nullptr, r);
+    }
     if (!h)
         return Interpret(start, ctx);
     if (!check) {
         Runner r(ctx);
         static const bool profile = std::getenv("SLY1_VU1_PROFILE") != nullptr;
-        if (!profile)
-            return h->fn(r) ? 0 : Interpret(start, ctx);
+        if (!profile) {
+            if (h->fn(r))
+                return 0;
+            LeftToMicrocode(r);
+            return Interpret(start, ctx);
+        }
         TimedKick tk{&ctx, &g_handlerKickNs[h - kHandlers]};
         Context timed = ctx;
         timed.kick = KickTimed;
@@ -305,8 +313,10 @@ std::uint64_t Run(std::uint32_t start, const Context& ctx)
         Runner rt(timed);
         std::uint64_t t0 = NowNs();
         bool done = h->fn(rt);
-        if (!done)
+        if (!done) {
             g_fallbacks[h - kHandlers]++;
+            LeftToMicrocode(rt);
+        }
         g_handlerNs[h - kHandlers] += NowNs() - t0;
         g_handlerCalls[h - kHandlers]++;
         return done ? 0 : Interpret(start, ctx);
@@ -357,6 +367,13 @@ std::uint64_t HandlerChecks(std::uint64_t* failures)
 
 void ReportLive()
 {
+    {
+        std::uint64_t taken, notTaken;
+        BatchCounts(&taken, &notTaken);
+        if (taken || notTaken)
+            std::fprintf(stderr, "vu1: %llu kicks of batches taken by the GPU renderer, %llu not taken (transformed by the program)\n",
+                         (unsigned long long)taken, (unsigned long long)notTaken);
+    }
     if (live::Enabled())
         live::Report();
     std::vector<std::pair<std::uint64_t, std::pair<std::uint32_t, std::uint32_t>>> rows;
