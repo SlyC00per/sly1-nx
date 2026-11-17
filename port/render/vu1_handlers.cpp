@@ -2634,11 +2634,18 @@ bool SkinNormals(Runner& r)
             y[c] = x[(c + 1) & 3];
         p(k, y, XYZW);
     };
+    // The matrices (vf04-vf19, not written in the loop) fixed once, a normal and its weights once
+    // each: Mul4 and Add4 on fixed operands are the host's arithmetic (see SkinLoop).
+    F4 mf[16];
+    for (int k = 0; k < 16; k++)
+        mf[k] = FixIn4(g(4 + k).v);
     auto turn = [&](int row, const V& n) {
-        F4 acc = Mul4(g(row).v, Splat(n.x));
-        acc = Add4(acc, Mul4(g(row + 1).v, Splat(n.y)));
+        V nf;
+        nf.v = FixIn4(n.v);
+        F4 acc = mf[row - 4] * Splat(nf.x);
+        acc = acc + mf[row - 3] * Splat(nf.y);
         V o;
-        o.v = Add4(acc, Mul4(g(row + 2).v, Splat(n.z)));
+        o.v = acc + mf[row - 2] * Splat(nf.z);
         return o;
     };
     do {
@@ -2658,12 +2665,13 @@ bool SkinNormals(Runner& r)
             p(2, o, XYZ);
         }
         vi09--;
-        V w = g(3);
-        F4 acc = Mul4(g(20).v, Splat(w.x));
-        acc = Add4(acc, Mul4(g(21).v, Splat(w.y)));
-        acc = Add4(acc, Mul4(g(22).v, Splat(w.z)));
+        V w;
+        w.v = FixIn4(g(3).v);   // vf20-vf23 are results: fixed already
+        F4 acc = g(20).v * Splat(w.x);
+        acc = acc + g(21).v * Splat(w.y);
+        acc = acc + g(22).v * Splat(w.z);
         V blend;
-        blend.v = Add4(acc, Mul4(g(23).v, Splat(w.w)));
+        blend.v = acc + g(23).v * Splat(w.w);
         p(30, g(29), XYZW);
         p(29, blend, XYZ);
         vf[25][3] = Add(vf[28][3], vf[2][0]);
