@@ -1432,32 +1432,40 @@ bool PointLight(Runner& r)
     const float one = st.vf[1][0];   // vf01.x
     V nrm, pos, dir, lit, q2, col, prod;
     float p1 = 0, p2 = 0, cosine = 0, cube = 0, fade = 0;
+    // The matrix and the light's values (constant in the loop) fixed once, a vertex's normal,
+    // position and colour once each: on fixed operands and results Mul4, Add4 and the subtraction
+    // below are the host's arithmetic (see SkinLoop).
+    const F4 mf[4] = {FixIn4(m[0].v), FixIn4(m[1].v), FixIn4(m[2].v), FixIn4(m[3].v)};
+    const F4 lightF = FixIn4(light.v), colourF = FixIn4(colour.v), ambientF = FixIn4(ambient.v), scaleF = FixIn4(scale.v);
     for (int k = 0; k < n; k++) {
         std::uint16_t at = (std::uint16_t)(first + 4 * k);
         nrm = Load(r, at);
         V p = Load(r, at + 3);
         pos = p;
-        F4 acc = Mul4(m[0].v, Splat(nrm.x));
-        acc = Add4(acc, Mul4(m[1].v, Splat(nrm.y)));
+        V nf, pf;
+        nf.v = FixIn4(nrm.v);
+        pf.v = FixIn4(p.v);
+        F4 acc = mf[0] * Splat(nf.x);
+        acc = acc + mf[1] * Splat(nf.y);
         V turned;
-        turned.v = Add4(acc, Mul4(m[2].v, Splat(nrm.z)));
-        acc = Mul4(m[0].v, Splat(p.x));
-        acc = Add4(acc, Mul4(m[1].v, Splat(p.y)));
-        acc = Add4(acc, Mul4(m[2].v, Splat(p.z)));
-        pos.v = Add4(acc, Mul4(m[3].v, Splat(1.0f)));
+        turned.v = acc + mf[2] * Splat(nf.z);
+        acc = mf[0] * Splat(pf.x);
+        acc = acc + mf[1] * Splat(pf.y);
+        acc = acc + mf[2] * Splat(pf.z);
+        pos.v = acc + mf[3] * Splat(1.0f);
         p1 = Erleng(turned);
         q2 = Load(r, at + 2);
-        dir.v = Fix4(Fix4(light.v) - Fix4(pos.v));
+        dir.v = lightF - pos.v;
         nrm.x = turned.x;
         nrm.y = turned.y;
         nrm.z = turned.z;
         V unit;
-        unit.v = Mul4(turned.v, Splat(p1));
+        unit.v = turned.v * Splat(FixIn(p1));
         nrm.x = unit.x;
         nrm.y = unit.y;
         nrm.z = unit.z;
         p2 = Erleng(dir);
-        prod.v = Mul4(unit.v, dir.v);
+        prod.v = unit.v * dir.v;
         col = Load(r, (std::uint16_t)(colours + k));
         float a = Add(prod.x, prod.y);
         cosine = Add(a, Mul(one, prod.z));
@@ -1465,18 +1473,18 @@ bool PointLight(Runner& r)
         cube = Mul(cosine, cosine);
         a = Add(cosine, 0.0f);
         cosine = Add(a, Mul(cube, cosine));
-        acc = Add4(Splat(0.0f), ambient.v);
-        lit.v = Add4(acc, Mul4(scale.v, Splat(cosine)));
+        acc = Splat(0.0f) + ambientF;
+        lit.v = acc + scaleF * Splat(cosine);
         for (int c = 0; c < 3; c++)
             lit[c] = Mini(Max(lit[c], 0.0f), 1.0f);
         a = Add(0.0f, atten.x);
         fade = Add(a, Mul(p2, atten.y));
         fade = Mini(Max(fade, 0.0f), 1.0f);
-        lit.v = Mul4(lit.v, Splat(fade));
+        lit.v = lit.v * Splat(fade);
         q2.x = Add(q2.x, lit.x);
         q2.y = Add(q2.y, lit.y);
-        acc = Add4(Splat(0.0f), col.v);
-        col.v = Add4(acc, Mul4(colour.v, Splat(lit.z)));
+        acc = Splat(0.0f) + FixIn4(col.v);
+        col.v = acc + colourF * Splat(lit.z);
         float* out = r.Qword(at + 2);
         out[0] = q2.x;
         out[1] = q2.y;
