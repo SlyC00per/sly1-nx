@@ -25,13 +25,27 @@ namespace vu1 {
 
 namespace {
 
-using core::Add;
 using core::Bits;
 using core::FromBits;
 using core::In;
-using core::Mul;
 using core::Runner;
-using core::Sub;
+
+// The VU's scalar arithmetic as core::Add, Sub and Mul, with the same reasoning as Mul4 below:
+// only an operand with the largest exponent needs fixing on the render thread (denormals flushed,
+// rounding toward zero).
+inline float FixIn(float x)
+{
+    std::uint32_t b;
+    std::memcpy(&b, &x, 4);
+    if ((b & 0x7F800000u) == 0x7F800000u) {
+        b = (b & 0x80000000u) | 0x7F7FFFFFu;
+        std::memcpy(&x, &b, 4);
+    }
+    return x;
+}
+inline float Add(float a, float b) { return FixIn(a) + FixIn(b); }
+inline float Sub(float a, float b) { return FixIn(a) - FixIn(b); }
+inline float Mul(float a, float b) { return FixIn(a) * FixIn(b); }
 
 // The VU's arithmetic four fields at a time (the same rules as core::Add, Sub, Mul field by
 // field: operands and results with the largest exponent made the largest finite float, denormals
