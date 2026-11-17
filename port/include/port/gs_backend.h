@@ -104,6 +104,12 @@ void SetBackend(Backend* backend);
 // there is no renderer that takes it or the primitive is not a smooth-shaded strip with S, T, Q.
 bool DrawBatch(std::uint32_t tagWord1, Batch& batch);
 
+// A batch from VU1's handlers: DrawBatch at once, or handed to whoever SetBatchSink named (the GS
+// thread's queue, port/platform/dmac.cpp: the batch is then drawn later, in order with the GS's
+// packets, and counts as taken).
+bool KickBatch(std::uint32_t tagWord1, Batch& batch);
+void SetBatchSink(bool (*sink)(std::uint32_t tagWord1, const Batch& batch));
+
 // Whether the renderer set takes batches.
 bool TakesBatches();
 

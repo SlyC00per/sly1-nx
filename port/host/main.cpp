@@ -103,6 +103,7 @@ void Report()
     }
     port::KernelDump();
     port::DmacDump();
+    port::SamplerReport();
     {
         std::uint64_t whole, skipped, other;
         port::gs::UploadCounts(&whole, &skipped, &other);
@@ -642,6 +643,7 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "sly1: cannot start the GS thread on its stack in game memory\n");
         return 1;
     }
+    port::StartSampler();
     if (port::StartThread(&render, g_renderStack, sizeof g_renderStack,
                           [](void*) -> void* {
                               port::PlaceThread(port::ThreadRole::Render);

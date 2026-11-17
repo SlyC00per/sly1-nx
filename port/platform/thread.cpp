@@ -3,6 +3,14 @@
 #include "port/thread.h"
 
 #include <cstdint>
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <vector>
+
+#include "port/ptr32.h"
 
 #if defined(__SWITCH__)
 #include <switch.h>
@@ -73,8 +81,68 @@ int StartThread(pthread_t* thread, void* stack, std::size_t size, void* (*entry)
     return r;
 }
 
+namespace {
+Handle g_sampled[2];   // the render thread's and the GS thread's
+std::vector<std::uint32_t> g_samples[2];
+std::atomic<bool> g_sampling;
+Thread g_sampler;
+
+void Sampler(void*)
+{
+    svcSleepThread(12000000000ll);
+    const std::uint64_t base = (std::uint64_t)ImageBase();
+    while (g_sampling.load()) {
+        svcSleepThread(1000000);
+        for (int k = 0; k < 2; k++) {
+            if (!g_sampled[k] || g_samples[k].size() >= 120000)
+                continue;
+            ThreadContext ctx;
+            if (R_FAILED(svcSetThreadActivity(g_sampled[k], ThreadActivity_Paused)))
+                continue;
+            const bool got = R_SUCCEEDED(svcGetThreadContext3(&ctx, g_sampled[k]));
+            svcSetThreadActivity(g_sampled[k], ThreadActivity_Runnable);
+            if (got)
+                g_samples[k].push_back((std::uint32_t)std::min<std::uint64_t>(ctx.pc.x - base, 0xFFFFFFFFu));
+        }
+    }
+}
+}  // namespace
+
+void StartSampler()
+{
+    if (!std::getenv("SLY1_SAMPLE"))
+        return;
+    for (auto& v : g_samples)
+        v.reserve(120000);
+    g_sampling.store(true);
+    if (R_SUCCEEDED(threadCreate(&g_sampler, Sampler, nullptr, nullptr, 0x8000, 0x2A, 0)))
+        threadStart(&g_sampler);
+}
+
+void SamplerReport()
+{
+    if (!g_sampling.exchange(false))
+        return;
+    svcSleepThread(5000000);
+    static const char* const kName[2] = {"render", "gs"};
+    for (int k = 0; k < 2; k++) {
+        std::map<std::uint32_t, std::uint32_t> count;   // by 64 bytes of code
+        for (std::uint32_t at : g_samples[k])
+            count[at >> 6]++;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> top;
+        for (auto& c : count)
+            top.push_back({c.second, c.first});
+        std::sort(top.rbegin(), top.rend());
+        std::fprintf(stderr, "sample: %s thread, %zu samples\n", kName[k], g_samples[k].size());
+        for (std::size_t i = 0; i < top.size() && i < 400; i++)
+            std::fprintf(stderr, "sample: %s %08X %u\n", kName[k], top[i].second << 6, top[i].first);
+    }
+}
+
 void PlaceThread(ThreadRole role)
 {
+    if (role == ThreadRole::Render || role == ThreadRole::Gs)
+        g_sampled[role == ThreadRole::Gs ? 1 : 0] = threadGetCurHandle();
     int core = role == ThreadRole::Game ? 0 : role == ThreadRole::Clock || role == ThreadRole::Gs ? 1 : 2;
     svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core);
     s32 prio = 0x2C;
@@ -88,6 +156,8 @@ void PlaceThread(ThreadRole role)
 #else
 
 void PlaceThread(ThreadRole) {}
+void StartSampler() {}
+void SamplerReport() {}
 
 int StartThread(pthread_t* thread, void* stack, std::size_t size, void* (*entry)(void*), void* arg,
                 bool detached)

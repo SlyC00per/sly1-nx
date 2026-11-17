@@ -32,6 +32,7 @@
 #include "port/vu0_micro.h"
 #include "port/vu1.h"
 #include "port/gs.h"
+#include "port/gs_backend.h"
 
 namespace port {
 
@@ -277,9 +278,6 @@ std::vector<std::uint32_t> GsSpare()
     return v;
 }
 
-// (on the render thread)
-void GsEnqueue(GsItem&& item) { g_gsPending.push_back(std::move(item)); }
-
 void GsPassOn()
 {
     if (g_gsPending.empty())
@@ -290,6 +288,34 @@ void GsPassOn()
     g_gsPending.clear();
     if (g_gsWaiting)
         g_gsWake.notify_one();
+}
+
+// (on the render thread) Passed on every 24 items, so that the GS thread draws a frame's first
+// batches while the render thread is still at its later ones (a frame is one item of VIF1's).
+void GsEnqueue(GsItem&& item)
+{
+    g_gsPending.push_back(std::move(item));
+    if (g_gsPending.size() >= 24)
+        GsPassOn();
+}
+
+// A batch from VU1's handlers for the GS thread (gs::SetBatchSink): the tag's word, the batch's
+// record, and its vertices copied (VU1's data memory is written over by the next batch).
+std::atomic<std::uint64_t> g_batchesQueued, g_batchesRefused, g_gsBusyNs;
+bool QueueBatch(std::uint32_t tagWord1, const gs::Batch& b)
+{
+    GsItem item;
+    item.path = 4;
+    item.words = GsSpare();
+    const std::size_t head = 1 + (sizeof(gs::Batch) + 3) / 4, quads = (std::size_t)b.count * b.stride * 4;
+    std::uint32_t record[1 + (sizeof(gs::Batch) + 3) / 4] = {tagWord1};
+    std::memcpy(&record[1], &b, sizeof b);
+    item.words.reserve(head + quads);
+    item.words.insert(item.words.end(), record, record + head);
+    item.words.insert(item.words.end(), b.quads, b.quads + quads);
+    GsEnqueue(std::move(item));
+    g_batchesQueued++;
+    return true;
 }
 
 // XGKICK: the GIF packet at quadword qaddr of VU1's data memory, tag by tag until a tag with
@@ -308,9 +334,14 @@ void KickPath1(std::uint32_t qaddr, void*)
             if (nreg == 0)
                 nreg = 16;
             std::uint32_t n = flg == 0 ? nloop * nreg : flg == 1 ? (nloop * nreg + 1) / 2 : nloop;
-            for (std::uint32_t k = 0; k <= n && k < 1024; k++) {
-                const std::uint32_t* q = reinterpret_cast<const std::uint32_t*>(d + ((qaddr + k) & 0x3FF) * 16);
-                item.words.insert(item.words.end(), q, q + 4);
+            // the tag and its data, in one piece or two (the data memory wraps)
+            const std::uint32_t total = std::min<std::uint32_t>(n, 1023) + 1, from = qaddr & 0x3FF;
+            const std::uint32_t first = std::min(total, 1024 - from);
+            const std::uint32_t* q = reinterpret_cast<const std::uint32_t*>(d + from * 16);
+            item.words.insert(item.words.end(), q, q + first * 4);
+            if (total > first) {
+                const std::uint32_t* q0 = reinterpret_cast<const std::uint32_t*>(d);
+                item.words.insert(item.words.end(), q0, q0 + (total - first) * 4);
             }
             qaddr += std::min<std::uint32_t>(n, 1023) + 1;
             if ((tag[0] >> 15) & 1)
@@ -1236,6 +1267,7 @@ void RenderFlush()
 
 void GsThreadMain()
 {
+    gs::SetBatchSink(QueueBatch);
     g_gsStarted.store(true, std::memory_order_release);
     for (;;) {
         GsItem item;
@@ -1252,13 +1284,32 @@ void GsThreadMain()
             g_gsQueue.pop_front();
             g_gsBusy = true;
         }
+        const std::uint64_t gsStarted = NowNs();
+        struct Busy {
+            std::uint64_t from;
+            ~Busy() { g_gsBusyNs += NowNs() - from; }
+        } busy{gsStarted};
         if (item.path == 0) {
             item.fn(item.a, item.b);
+        } else if (item.path == 4) {   // a batch (QueueBatch)
+            gs::Batch b;
+            const std::size_t head = 1 + (sizeof(gs::Batch) + 3) / 4;
+            std::memcpy(&b, &item.words[1], sizeof b);
+            b.quads = &item.words[head];
+            if (!gs::DrawBatch(item.words[0], b))
+                g_batchesRefused++;   // not a strip the renderer takes: nothing drawn of it
         } else {
+            // whole runs of a tag's loops at once where the data allows (Gif::Run), as without the thread
             Gif& gif = item.path == 1 ? g_path1 : item.path == 2 ? g_path2 : g_gif;
             gs::Hold hold;
-            for (std::size_t k = 0; k + 4 <= item.words.size(); k += 4)
-                gif.Qword(&item.words[k]);
+            for (std::size_t k = 0; k + 4 <= item.words.size();) {
+                std::uint32_t taken = gif.Left() ? gif.Run(&item.words[k], (std::uint32_t)((item.words.size() - k) / 4)) : 0;
+                if (taken == 0) {
+                    gif.Qword(&item.words[k]);
+                    taken = 1;
+                }
+                k += (std::size_t)taken * 4;
+            }
         }
         if (item.words.capacity()) {
             std::lock_guard<std::mutex> lk(g_gsLock);
@@ -1333,6 +1384,21 @@ void RenderThreadMain()
         }
         GsPassOn();
         g_renderNs[kind < 3 ? kind : 0] += NowNs() - started;
+        // SLY1_PERF_LOG=1: every 60 frames (a frame is one item of VIF1's), the mean time a frame took
+        // and the render thread's and the GS thread's share of it
+        static const bool perfLog = std::getenv("SLY1_PERF_LOG") != nullptr;
+        if (perfLog && kind == 0) {
+            static std::uint64_t frames, since, renderWas, gsWas;
+            if (++frames % 60 == 0) {
+                const std::uint64_t now = NowNs(), render = g_renderNs[0] + g_renderNs[1] + g_renderNs[2], gsNs = g_gsBusyNs.load();
+                if (since)
+                    std::fprintf(stderr, "perf: frames to %llu: %.1f ms a frame; render thread %.1f, GS thread %.1f\n", (unsigned long long)frames,
+                                 (now - since) / 60e6, (render - renderWas) / 60e6, (gsNs - gsWas) / 60e6);
+                since = now;
+                renderWas = render;
+                gsWas = gsNs;
+            }
+        }
         g_renderItems[kind < 3 ? kind : 0]++;
         if (item.words.capacity()) {
             std::lock_guard<std::mutex> lk(g_renderLock);
@@ -1356,6 +1422,9 @@ void DmacDump()
     std::fprintf(stderr, "dmac: chains took %.2f s on the game's thread%s; the render queue held at most %.1f MB\n",
                  g_counts.dmaNanoseconds.load() / 1e9, g_renderStarted ? " (VIF1 and GIF chains copied for the render thread)" : "",
                  g_renderMaxQueued.load() * 4 / 1e6);
+    if (g_batchesQueued.load())
+        std::fprintf(stderr, "dmac: %llu batches queued for the GS thread, %llu of them not taken by the renderer (not drawn); the GS thread took %.2f s\n",
+                     (unsigned long long)g_batchesQueued.load(), (unsigned long long)g_batchesRefused.load(), g_gsBusyNs.load() / 1e9);
     if (g_renderStarted)
         std::fprintf(stderr, "dmac: the render thread took %.2f s for VIF1's data (VU1 and its kicks among it), %.2f s for the "
                      "GIF's, %.2f s for calls (the swaps); %llu, %llu and %llu items\n", g_renderNs[0].load() / 1e9, g_renderNs[1].load() / 1e9,

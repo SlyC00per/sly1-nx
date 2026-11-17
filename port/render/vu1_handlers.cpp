@@ -625,7 +625,7 @@ bool KickDeferred(Runner& r, std::uint16_t top, std::uint16_t tag)
                          worst[2], worst[3]);
         return false;
     }
-    return gs::DrawBatch(word1, b);
+    return gs::KickBatch(word1, b);
 }
 
 // What the transform leaves in registers for later programs (the matrix, the viewport, the last

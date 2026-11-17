@@ -1270,34 +1270,35 @@ void ImageRun(const std::uint32_t* q, std::uint32_t count)
                 Touch(t.bb, t.pos, t.reg);
             }
         }
-        std::uint32_t block = ~0u, base = 0;   // the block the last pixel was in, and its start
-        for (std::uint32_t k = 0; k < pixels; k++) {
-            std::uint32_t px = (t.dsax + x) & 2047, py = (t.dsay + y) & 2047;
+        // A block's row at a time (8, 16 or 32 pixels, or what is left of the row or the data): the
+        // block's start once, then each pixel through the table's row.
+        const std::uint32_t bwPix = t.dpsm == PSMCT32 ? 8 : t.dpsm == PSMT8 ? 16 : 32, bhPix = t.dpsm == PSMCT32 ? 8 : 16;
+        for (std::uint32_t k = 0; k < pixels;) {
+            const std::uint32_t px = (t.dsax + x) & 2047, py = (t.dsay + y) & 2047;
+            const std::uint32_t inX = px & (bwPix - 1), inY = py & (bhPix - 1);
+            const std::uint32_t span = std::min(std::min(bwPix - inX, t.rrw - x), pixels - k);
             if (t.dpsm == PSMT8) {
-                std::uint32_t at = (px >> 4) | (py >> 4) << 16;
-                if (at != block) {
-                    block = at;
-                    base = Addr8(bp, bw, px & ~15u, py & ~15u);
-                }
-                g_local[base + g_blocks.in8[(py & 15) << 4 | (px & 15)]] = b[k];
+                std::uint8_t* base = g_local + Addr8(bp, bw, px - inX, py - inY);
+                const std::uint16_t* row = &g_blocks.in8[inY << 4 | inX];
+                for (std::uint32_t i = 0; i < span; i++)
+                    base[row[i]] = b[k + i];
             } else if (t.dpsm == PSMCT32) {
-                std::uint32_t at = (px >> 3) | (py >> 3) << 16;
-                if (at != block) {
-                    block = at;
-                    base = Addr32(bp, bw, px & ~7u, py & ~7u);
-                }
-                std::memcpy(g_local + base + g_blocks.in32[(py & 7) << 3 | (px & 7)], b + k * 4, 4);
+                std::uint8_t* base = g_local + Addr32(bp, bw, px - inX, py - inY);
+                const std::uint16_t* row = &g_blocks.in32[inY << 3 | inX];
+                for (std::uint32_t i = 0; i < span; i++)
+                    std::memcpy(base + row[i], b + (k + i) * 4, 4);
             } else {
-                std::uint32_t at = (px >> 5) | (py >> 4) << 16;
-                if (at != block) {
-                    block = at;
-                    base = Addr4(bp, bw, px & ~31u, py & ~15u);
+                const std::uint32_t base = Addr4(bp, bw, px - inX, py - inY);
+                const std::uint16_t* row = &g_blocks.in4[inY << 5 | inX];
+                for (std::uint32_t i = 0; i < span; i++) {
+                    const std::uint32_t n = base + row[i], j = k + i, v = (b[j >> 1] >> ((j & 1) * 4)) & 0xF;
+                    std::uint8_t& o = g_local[n >> 1];
+                    o = (n & 1) ? (std::uint8_t)((o & 0x0F) | v << 4) : (std::uint8_t)((o & 0xF0) | v);
                 }
-                std::uint32_t n = base + g_blocks.in4[(py & 15) << 5 | (px & 31)], v = (b[k >> 1] >> ((k & 1) * 4)) & 0xF;
-                std::uint8_t& o = g_local[n >> 1];
-                o = (n & 1) ? (std::uint8_t)((o & 0x0F) | v << 4) : (std::uint8_t)((o & 0xF0) | v);
             }
-            if (++x >= t.rrw) {
+            k += span;
+            x += span;
+            if (x >= t.rrw) {
                 x = 0;
                 if (++y >= t.rrh) {
                     t.active = false;
@@ -1925,6 +1926,12 @@ bool DrawBatch(std::uint32_t tagWord1, Batch& batch)
     g_queued = 0;   // the strip's last vertices are not known here: the next primitive starts anew
     return true;
 }
+
+namespace {
+bool (*g_batchSink)(std::uint32_t, const Batch&);
+}
+void SetBatchSink(bool (*sink)(std::uint32_t, const Batch&)) { g_batchSink = sink; }
+bool KickBatch(std::uint32_t tagWord1, Batch& batch) { return g_batchSink ? g_batchSink(tagWord1, batch) : DrawBatch(tagWord1, batch); }
 
 void SetBackend(Backend* backend)
 {

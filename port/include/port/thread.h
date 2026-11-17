@@ -28,4 +28,10 @@ int StartThread(pthread_t* thread, void* stack, std::size_t size, void* (*entry)
 enum class ThreadRole { Game, Clock, Watch, Render, Gs };
 void PlaceThread(ThreadRole role);
 
+// SLY1_SAMPLE=1 (the Switch): a thread that stops the render thread and the GS thread a thousand
+// times a second and notes where each is, from the 12th second; SamplerReport prints the places
+// counted, as offsets in the program's image (tools/sample_report.py names them from the ELF).
+void StartSampler();
+void SamplerReport();
+
 }  // namespace port

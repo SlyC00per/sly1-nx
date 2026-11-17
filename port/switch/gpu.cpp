@@ -138,6 +138,10 @@ private:
     const Texture* pendTexture_ = nullptr;
     bool pending_ = false;
     std::size_t lastCount_ = 0, lastIndices_ = 0;   // of the last run added
+    std::uint64_t lastPresent_ = 0, held_[6] = {};
+    const Texture* beginTexture_ = nullptr;   // Begin's last decoded texture, its TEX0, the uploads then, the frame base
+    std::uint64_t beginTex0_ = 0;
+    std::uint32_t beginSerial_ = 0, beginFbp_ = 0;
     double area_[4] = {};
     int areaRuns_[4] = {};
     // SLY1_GPU_AB=1: a measurement in one run. Every 30 frames the next of six ways of drawing: 0 as it
@@ -702,6 +706,7 @@ const Texture* Renderer::TextureFor(const gs::DrawState& state)
             // full: everything drawn with the old textures first, then all of them forgotten
             Send(true);
             textures_.clear();
+            beginTexture_ = nullptr;
             textureUsed_ = 0;
             nextTexture_ = 0;
             cacheResets_++;
@@ -737,6 +742,13 @@ const Texture* Renderer::TextureFor(const gs::DrawState& state)
 void Renderer::Begin(const gs::DrawState& s)
 {
     std::uint64_t t0 = Tick();
+    // The run before's texture again when it names the same one and nothing has been uploaded
+    // since: most runs follow one with their texture, and looking a texture up walks its pages.
+    if (s.tme && beginTexture_ && s.tex0 == beginTex0_ && gs::UploadSerial() == beginSerial_ && (s.frame & 0x1FF) == beginFbp_) {
+        texture_ = beginTexture_;
+        return;
+    }
+    beginTexture_ = nullptr;
     texture_ = nullptr;
     if (s.tme && TargetFor(s) >= 0) {
         const std::uint32_t tbp = (std::uint32_t)(s.tex0 & 0x3FFF);
@@ -762,8 +774,13 @@ void Renderer::Begin(const gs::DrawState& s)
                 serial = 0;
             other = serial != 0;
         }
-        if (!texture_ && !other && tbp != 0 && tbp != 70 * 32)
+        if (!texture_ && !other && tbp != 0 && tbp != 70 * 32) {
             texture_ = TextureFor(s);
+            beginTexture_ = texture_;   // a decoded one: kept for the next run (not a small target's, which changes hands)
+            beginTex0_ = s.tex0;
+            beginSerial_ = gs::UploadSerial();
+            beginFbp_ = (std::uint32_t)(s.frame & 0x1FF);
+        }
     }
     textureNs_ += Tick() - t0;
 }
@@ -1635,6 +1652,14 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
             areaRuns_[k] = 0;
         }
     }
+    {   // how long each frame was shown, in vertical blanks (of 16.68 ms), for the report
+        const std::uint64_t now = NowNs();
+        if (lastPresent_ && frames_ > 600) {
+            const std::uint64_t blanks = (now - lastPresent_ + 8341500) / 16683000;
+            held_[std::min<std::uint64_t>(blanks, 5)]++;
+        }
+        lastPresent_ = now;
+    }
     static const bool abAsked = std::getenv("SLY1_GPU_AB") != nullptr;
     abOn_ = abAsked;
     {
@@ -1802,6 +1827,9 @@ void Renderer::Report()
         std::fprintf(stderr, "gpuab: %-26s %4llu frames, %6.2f ms a frame, %6.2f ms of it waiting for the GPU\n", kAb[k], (unsigned long long)abFrames_[k],
                      abFrames_[k] ? abNs_[k] / 1e6 / abFrames_[k] : 0.0, abFrames_[k] ? abWaitNs_[k] / 1e6 / abFrames_[k] : 0.0);
     std::fprintf(stderr, "gpu: %llu small targets retired (the game put textures in their buffers)\n", (unsigned long long)retired_);
+    std::fprintf(stderr, "gpu: frames after the 600th by the vertical blanks each took: under one %llu, one %llu, two %llu, three %llu, four %llu, more %llu\n",
+                 (unsigned long long)held_[0], (unsigned long long)held_[1], (unsigned long long)held_[2], (unsigned long long)held_[3],
+                 (unsigned long long)held_[4], (unsigned long long)held_[5]);
     std::fprintf(stderr, "gpu: %llu runs with the short pixel shader\n", (unsigned long long)liteRuns_);
     std::fprintf(stderr, "gpu: %llu batches transformed by the GPU (%llu vertices); %.3f s making their triangles' indices\n",
                  (unsigned long long)batches_, (unsigned long long)batchVertices_, indexNs_ / 1e9);

@@ -410,3 +410,47 @@ it (the city behind it hardly shows).
 
 A capture's rows are printed 160 pixels a line: the emulator's log cut longer lines, so every
 capture before this was missing its right-hand third.
+
+## The GS on its own thread, with the batches (2026-11-17)
+
+`SLY1_GS_THREAD=1` (the GS's work on core 1, after the render thread's VIF1 and VU1 on core 2)
+drew nonsense once the renderer took batches: a batch went to the renderer at once from the
+render thread, ahead of the GS's packets still queued. A batch is now queued with them
+(`gs::KickBatch`, `gs::SetBatchSink`: its record and its vertices copied), the GS thread takes a
+packet's loops in whole runs as the render thread does without it, and the render thread passes
+its items on every 24, not once a frame, so that the two overlap within a frame. Ryujinx:
+frames 501 to 506 and 620 to 625 under lockstep byte for byte as without the thread, and all 46
+levels with it.
+
+Not the default yet. `SLY1_PERF_LOG=1` prints, every 60 frames, the mean frame time and each
+thread's share. The opening on a Switch Lite, the same stretches with and without the thread:
+
+| frames | without: frame, render thread | with: frame, render thread, GS thread |
+| --- | --- | --- |
+| to 120 | 50.7 ms, 42.2 | 50.1 ms, 28.5, 29.6 |
+| to 360 | 33.5 ms, 23.0 | 33.4 ms, 15.9, 14.3 |
+| to 540 | 16.7 ms, 14.2 | 16.7 ms, 11.0, 6.1 |
+| to 780 | 34.0 ms, 25.6 | 33.7 ms, 20.8, 17.7 |
+| to 1140 | 59.5 ms, 46.6 | 51.5 ms, 31.8, 31.3 |
+
+Each thread has less to do than the one did, but together they do more (the copies between
+them), and a frame is done only when the GS thread is done with it, which is after the render
+thread: in most stretches neither is yet short enough to gain a vertical blank.
+
+## A sampling profiler on the Switch (2026-11-17)
+
+`SLY1_SAMPLE=1`: a thread stops the render thread and the GS thread a thousand times a second
+from the 12th second and notes each one's program counter (`svcGetThreadContext3`); the report
+prints the counts by 64 bytes of code as offsets in the image, and
+`python3 tools/sample_report.py LOG build-switch/sly1.elf` names the functions (the ELF must be
+the build that ran). Ryujinx gives every sample the same place; it needs the hardware.
+
+The render thread without the GS thread, the opening, of the samples where it was not waiting:
+`gs::ImageRun` 11% (4-bit textures' uploads, a pixel at a time), the VIF's unpack 10%, GPU
+driver calls 10%, then nothing over 6%: the leave-registers transform, `Vif::Words`, the
+renderer's `DrawBatch` and `Submit`, the lit colours, `memmove`, a texture's lookup at each run
+(its pages walked for the latest upload).
+
+Done from it: an upload is written a block's row at a time (checked by `SLY1_GS_CHECK`: 0 image
+runs differed over the 46 levels); a run with the texture of the run before, and no upload
+since, takes that texture without the lookup.
