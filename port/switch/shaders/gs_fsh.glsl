@@ -18,7 +18,7 @@ layout (location = 0, index = 1) out vec4 outFactor;
 layout (binding = 0) uniform sampler2D texture0;
 
 layout (std140, binding = 0) uniform FragmentParams {
-    ivec4 mode;       // TME, TFX, TCC, FGE
+    ivec4 mode;       // TME (2: the texel under the pixel), TFX, TCC, FGE
     vec4 fogColour;   // 0 to 255
     vec4 blend;       // x: 1 for As, 0 for FIX; y: FIX over 0x80; z: 1 when the front faces are the ones facing away;
                       // w: SLY1_GPU_CAPTURE's views (6 a flat colour, 7 the depth)
@@ -44,7 +44,9 @@ void main()
     vec3 rgb = inColour.rgb;
     float a = inColour.a;
     if (u.mode.x != 0) {
-        vec4 t = texture(texture0, inStq.xy / inStq.z) * 255.0;
+        // 2: the texel under the pixel, for a frame buffer's image read over the whole of it (the
+        // destination alpha test's stencil, gpu.cpp's BuildStencil)
+        vec4 t = (u.mode.x == 2 ? texelFetch(texture0, ivec2(gl_FragCoord.xy), 0) : texture(texture0, inStq.xy / inStq.z)) * 255.0;
         if (u.mode.y == 0) {          // MODULATE
             rgb = min(t.rgb * rgb / 128.0, 255.0);
             if (u.mode.z != 0)

@@ -114,6 +114,7 @@ private:
     void BeginCommands();
     void Send(bool wait);
     void BindTarget(int target);
+    void BuildStencil(int target);
     void BindSource(const Source& src);
     void Submit(const gs::DrawState& s, const Source& src);
     const Texture* TextureFor(const gs::DrawState& state);
@@ -140,6 +141,8 @@ private:
     std::uint32_t layout_ = 0;
     float near_ = -1.0f, far_ = -1.0f;
     bool batchSet_ = false;
+    int stencilTarget_ = -1;   // the frame buffer whose alpha bit the stencil holds now, -1 for none
+    std::uint64_t stencilBuilds_ = 0;
     BatchParams lastBatch_;
     std::vector<std::uint32_t> batchIndex_;
     struct BatchCache {   // the last batch put in the frame's memory (DrawBatch)
@@ -246,7 +249,7 @@ bool Renderer::Create()
     dkImageLayoutInitialize(&colourLayout, &lm);
     dkImageLayoutMakerDefaults(&lm, device_);
     lm.flags = DkImageFlags_UsageRender;
-    lm.format = DkImageFormat_ZF32;
+    lm.format = DkImageFormat_ZF32_X24S8;   // the stencil holds the frame's alpha bit for the destination alpha test
     lm.dimensions[0] = kWidth;
     lm.dimensions[1] = kHeight;
     dkImageLayoutInitialize(&depthLayout, &lm);
@@ -346,6 +349,7 @@ void Renderer::BeginCommands()
     source_ = -1;
     near_ = far_ = -1.0f;
     batchSet_ = false;
+    stencilTarget_ = -1;
     DkGpuAddr data = dkMemBlockGetGpuAddr(dataMem_);
     DkBufExtents fragmentUbo = {data + fragmentUbo_, sizeof(FragmentParams)};
     dkCmdBufBindUniformBuffers(cmd_, DkStage_Fragment, 0, &fragmentUbo, 1);
@@ -476,6 +480,83 @@ void Renderer::BindTarget(int target)
     dkCmdBufBindRenderTargets(cmd_, colours, 1, &depth);
 }
 
+// The destination alpha test (TEST's DATE and DATM: a pixel is drawn only where the frame's alpha
+// has its top bit as DATM says). A GPU cannot test what is in the frame, so the bit is copied to
+// the stencil first: the stencil cleared, then the frame buffer's image drawn over the whole of it
+// as a texture with only the pixels of alpha 0x80 and more kept (the alpha test), setting the
+// stencil to 1 there. The draws with DATE then test the stencil. The game marks pixels so for its
+// darkening volumes and shadows (alpha 0x80 written where a volume's walls are in front, then a
+// dark polygon drawn where the bit is clear); without the test the polygon darkened everything.
+void Renderer::BuildStencil(int target)
+{
+    stencilBuilds_++;
+    DkGpuAddr data = dkMemBlockGetGpuAddr(dataMem_);
+    if (frameUsed_ + 1024 > kFrameMemory)
+        Send(true);
+    dkCmdBufBarrier(cmd_, DkBarrier_Full, DkInvalidateFlags_Image);   // what was drawn into the image, before it is read
+    DkImageView colour, depth;
+    dkImageViewDefaults(&colour, &colour_[target]);
+    dkImageViewDefaults(&depth, &depth_);
+    DkImageDescriptor d;
+    dkImageDescriptorInitialize(&d, &colour, false, false);
+    const std::uint32_t id = kMaxTextures - 2 + (std::uint32_t)target;
+    dkCmdBufPushData(cmd_, data + imageSet_ + id * sizeof d, &d, sizeof d);
+    dkCmdBufBindRenderTargets(cmd_, nullptr, 0, &depth);
+    bound_ = -1;
+    DkScissor all = {0, 0, kWidth, kHeight};
+    dkCmdBufSetScissors(cmd_, 0, &all, 1);
+    dkCmdBufClearDepthStencil(cmd_, false, 0.0f, 0xFF, 0);
+    Source whole = {};
+    BindSource(whole);
+    FragmentParams fp;
+    std::memset(&fp, 0, sizeof fp);
+    fp.mode[0] = 2;   // the texel under the pixel
+    fp.mode[1] = 1;   // DECAL
+    fp.mode[2] = 1;
+    dkCmdBufPushConstants(cmd_, data + fragmentUbo_, sizeof fp, 0, sizeof fp, &fp);
+    DkResHandle handle = dkMakeTextureHandle(id, 3);
+    dkCmdBufBindTextures(cmd_, DkStage_Fragment, 0, &handle, 1);
+    DkColorState cs;
+    dkColorStateDefaults(&cs);
+    cs.blendEnableMask = 0;
+    cs.alphaCompareOp = DkCompareOp_Gequal;
+    dkCmdBufBindColorState(cmd_, &cs);
+    dkCmdBufSetAlphaRef(cmd_, 127.5f / 255.0f);
+    DkColorWriteState write;
+    dkColorWriteStateDefaults(&write);
+    write.masks = 0;
+    dkCmdBufBindColorWriteState(cmd_, &write);
+    DkDepthStencilState ds;
+    dkDepthStencilStateDefaults(&ds);
+    ds.depthTestEnable = 0;
+    ds.depthWriteEnable = 0;
+    ds.stencilTestEnable = 1;
+    ds.stencilFrontFailOp = ds.stencilBackFailOp = DkStencilOp_Keep;
+    ds.stencilFrontDepthFailOp = ds.stencilBackDepthFailOp = DkStencilOp_Keep;
+    ds.stencilFrontPassOp = ds.stencilBackPassOp = DkStencilOp_Replace;
+    ds.stencilFrontCompareOp = ds.stencilBackCompareOp = DkCompareOp_Always;
+    dkCmdBufBindDepthStencilState(cmd_, &ds);
+    dkCmdBufSetStencil(cmd_, DkFace_FrontAndBack, 0xFF, 1, 0xFF);
+    gs::DrawVertex v[4];
+    std::memset(v, 0, sizeof v);
+    v[1].x = v[3].x = kFieldWidth;
+    v[2].y = v[3].y = kFieldHeight;
+    for (gs::DrawVertex& q : v)
+        q.q = 1.0f;
+    static const std::uint32_t index[6] = {0, 1, 2, 2, 1, 3};
+    frameUsed_ = (frameUsed_ + sizeof(gs::DrawVertex) - 1) / sizeof(gs::DrawVertex) * sizeof(gs::DrawVertex);
+    std::uint32_t first = frameUsed_ / sizeof(gs::DrawVertex);
+    std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(frameMem_) + frameUsed_, v, sizeof v);
+    frameUsed_ += sizeof v;
+    std::uint32_t firstIndex = frameUsed_ / 4;
+    std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(frameMem_) + frameUsed_, index, sizeof index);
+    frameUsed_ = Align(frameUsed_ + sizeof index, 4);
+    dkCmdBufDrawIndexed(cmd_, DkPrimitive_Triangles, 6, 1, firstIndex, (std::int32_t)first, 0);
+    draws_++;
+    last_.any = false;   // every state set again by the draw that follows
+    stencilTarget_ = target;
+}
+
 // The game's two frame buffers (FBP 0 and 70, 640 wide); -1 for any other.
 int Renderer::TargetOf(std::uint64_t fbp)
 {
@@ -513,7 +594,7 @@ const Texture* Renderer::TextureFor(const gs::DrawState& state)
         dkImageLayoutInitialize(&layout, &lm);
         std::uint32_t at = Align(textureUsed_, dkImageLayoutGetAlignment(&layout));
         std::uint32_t size = (std::uint32_t)dkImageLayoutGetSize(&layout);
-        if (at + size > kTextureMemory || nextTexture_ == kMaxTextures) {
+        if (at + size > kTextureMemory || nextTexture_ == kMaxTextures - 2) {   // the last two are the frame buffers' (BuildStencil)
             // full: everything drawn with the old textures first, then all of them forgotten
             Send(true);
             textures_.clear();
@@ -782,6 +863,15 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
             Send(true);
     }
     const Texture* texture = texture_;
+    // DATE: the frame's alpha bit in the stencil, made when a draw has changed the frame since
+    const bool dateDraw = ((std::uint32_t)s.test >> 14) & 1;
+    static const bool noDate = std::getenv("SLY1_GPU_NO_DATE") != nullptr;   // the test left out, as before, for comparison
+    if (dateDraw && !noDate) {
+        if (stencilTarget_ != target)
+            BuildStencil(target);
+    } else {
+        stencilTarget_ = -1;
+    }
     bool fresh = !last_.any;
     last_.any = true;
     if (listAt_ >= 0 && (long)frames_ + 1 == listAt_ && listed_ < 60) {   // SLY1_GPU_LIST=N: frame N's first draws
@@ -970,8 +1060,19 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         ds.depthCompareOp = !zte || ztst == 1 ? DkCompareOp_Always : ztst == 2 ? DkCompareOp_Gequal : DkCompareOp_Greater;
         if (always)
             ds.depthCompareOp = DkCompareOp_Always;
-        std::uint32_t depthKey = (std::uint32_t)ds.depthWriteEnable | (std::uint32_t)ds.depthCompareOp << 1;
+        const bool datm = (test >> 15) & 1;
+        if (dateDraw && !noDate) {   // only where the stencil (the frame's alpha bit) is DATM; the stencil kept
+            ds.stencilTestEnable = 1;
+            ds.stencilFrontFailOp = ds.stencilBackFailOp = DkStencilOp_Keep;
+            ds.stencilFrontDepthFailOp = ds.stencilBackDepthFailOp = DkStencilOp_Keep;
+            ds.stencilFrontPassOp = ds.stencilBackPassOp = DkStencilOp_Keep;
+            ds.stencilFrontCompareOp = ds.stencilBackCompareOp = DkCompareOp_Equal;
+        }
+        std::uint32_t depthKey = (std::uint32_t)ds.depthWriteEnable | (std::uint32_t)ds.depthCompareOp << 1 |
+                                 (dateDraw && !noDate ? 0x100u | (datm ? 0x200u : 0u) : 0u);
         if (depthKey != last_.depth) {
+            if (dateDraw && !noDate)
+                dkCmdBufSetStencil(cmd_, DkFace_FrontAndBack, 0x00, datm ? 1 : 0, 0xFF);
             dkCmdBufBindDepthStencilState(cmd_, &ds);
             last_.depth = depthKey;
         }
@@ -1312,9 +1413,10 @@ void Renderer::Report()
                  (unsigned long long)cacheResets_);
     std::fprintf(stderr, "gpu: %.3f s in draws (%.3f s of it textures), %.3f s in swaps (%.3f s for a screen image, %.3f s "
                  "for the GPU to finish)\n", drawNs_ / 1e9, textureNs_ / 1e9, presentNs_ / 1e9, acquireNs_ / 1e9, waitNs_ / 1e9);
-    std::fprintf(stderr, "gpu: not drawn as the GS would: %llu runs into other buffers, %llu with the destination alpha test, "
-                 "%llu blends approximated\n", (unsigned long long)otherTargets_, (unsigned long long)destinationAlpha_,
-                 (unsigned long long)unsupportedBlends_);
+    std::fprintf(stderr, "gpu: %llu runs with the destination alpha test, the frame's alpha bit copied to the stencil %llu times\n",
+                 (unsigned long long)destinationAlpha_, (unsigned long long)stencilBuilds_);
+    std::fprintf(stderr, "gpu: not drawn as the GS would: %llu runs into other buffers, %llu blends approximated\n",
+                 (unsigned long long)otherTargets_, (unsigned long long)unsupportedBlends_);
 }
 
 Renderer g_renderer;

@@ -210,3 +210,28 @@ What remains, host profile of the render thread: unpacking 22% (2.3 MB a frame i
 the GS's handling of the kicked packets 15%, the second pass 12%, the outlines 8%, the deferred
 transform's registers 8%, skinning and lighting about 25% together. The next large step is
 lighting and skinning in the shaders.
+
+## The destination alpha test (2026-11-17)
+
+The game darkens what stands inside a volume (a level's dark boxes, the shadows) with the frame's
+alpha as a mask: a volume's walls write alpha 0x80 where they are in front of the scene, then a
+dark polygon is drawn with TEST's DATE where the alpha's top bit is clear (program 0x6DA's three
+passes, and 0x076's shadow textures with DATM 1). Without the test the polygon darkens everything
+seen through the volume: with the camera inside one (the opening's rooftop shots) the sky and the
+buildings went black, on the Switch and on the host alike, for two reasons:
+
+- **The GPU renderer did not make the test.** A GPU cannot test the frame it draws into, so the
+  alpha bit is copied to the stencil (`BuildStencil`: the frame buffer's image drawn over the
+  whole stencil with the alpha test keeping alpha 0x80 and more) before a draw with DATE, when a
+  draw without it has come since; the draw then tests the stencil. The depth buffer is
+  `ZF32_X24S8` for it. `SLY1_GPU_NO_DATE=1` leaves the test out, as before, for comparison.
+- **The host's rasteriser truncated interpolated colours**, so the walls' constant 0x80 was
+  written 0x7F and marked nothing. It rounds to the nearest now.
+
+Found by leaving draws out of a frame of the host's rasteriser (temporary switches, not kept): the
+frame was right without the untextured fans, then without only the DATE ones; counting pixels by
+pass showed the walls' alpha written as 0x7F. In Ryujinx, lockstep, the rooftop shots are bright
+with the test and dark with `SLY1_GPU_NO_DATE`. Its cost there: about 16 copies a frame (nearly
+one a run with DATE, as other draws come between), the render thread's VIF1 time 2.6 s to 5.2 s
+over 1,200 vblanks; to be measured on the Switch, and reduced if it shows (a copy only of the
+part of the screen a run covers, or none when no draw since can have changed the bit).
