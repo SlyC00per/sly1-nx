@@ -52,6 +52,14 @@ void Debug(void*, const char* context, DkResult result, const char* message)
     std::fprintf(stderr, "gpu: deko3d: %s: %s (result %d)\n", context ? context : "?", message ? message : "?", (int)result);
 }
 
+// The renderer's own timers (SLY1_GPU_TIMERS): a read of the clock per draw costs little on the
+// Switch but much in an emulator, where it may leave the guest, so it is off unless asked for.
+inline std::uint64_t Tick()
+{
+    static const bool on = std::getenv("SLY1_GPU_TIMERS") != nullptr;
+    return on ? NowNs() : 0;
+}
+
 struct VertexParams {
     float toClip[4];
 };
@@ -141,6 +149,7 @@ private:
         std::uint32_t count = 0, stride = 0, positionAt = 0, stqAt = 0;
         std::uint32_t vertexAt = 0, indexAt = 0, indices = 0;
     } batchCache_;
+    std::vector<std::uint32_t> staging_;   // a batch's indices, positions or colours made before they are copied
     std::uint64_t batches_ = 0, batchVertices_ = 0;
     float cullFront_ = 1.0f;
     int batchInFrame_ = 0;
@@ -542,9 +551,9 @@ const Texture* Renderer::TextureFor(const gs::DrawState& state)
 
 void Renderer::Begin(const gs::DrawState& s)
 {
-    std::uint64_t t0 = NowNs();
+    std::uint64_t t0 = Tick();
     texture_ = s.tme && TargetOf(s.frame & 0x1FF) >= 0 ? TextureFor(s) : nullptr;
-    textureNs_ += NowNs() - t0;
+    textureNs_ += Tick() - t0;
 }
 
 void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t count, const std::uint32_t* index,
@@ -631,11 +640,14 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
     }
     std::uint8_t* mem = static_cast<std::uint8_t*>(dkMemBlockGetCpuAddr(frameMem_));
     if (!same) {
-        std::uint64_t t0 = NowNs();
+        std::uint64_t t0 = Tick();
         // the triangles: one for each vertex from the third that does not start a strip, wound the
         // same way round along the strip, the vertex that closes it last
+        // made in cached memory first and copied in one piece: the frame's memory is uncached, where
+        // small writes one by one cost far more than a copy
         frameUsed_ = Align(frameUsed_, 4);
-        std::uint32_t* index = reinterpret_cast<std::uint32_t*>(mem + frameUsed_);
+        staging_.resize((std::size_t)b.count * 3 + 8);
+        std::uint32_t* index = staging_.data();
         std::uint32_t n = 0;
         const std::uint32_t controlAt = b.positionAt * 4 + 3, step = b.stride * 4;
         for (std::uint32_t k = 2; k < b.count; k++) {
@@ -648,20 +660,23 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
         }
         c.indexAt = frameUsed_;
         c.indices = n;
+        std::memcpy(mem + frameUsed_, index, (std::size_t)n * 4);
         frameUsed_ += n * 4;
-        indexNs_ += NowNs() - t0;
-        std::uint64_t c0 = NowNs();
+        indexNs_ += Tick() - t0;
+        std::uint64_t c0 = Tick();
         frameUsed_ = Align(frameUsed_, 64);
         c.vertexAt = frameUsed_;
-        std::uint8_t* out = mem + frameUsed_;
+        staging_.resize((std::size_t)b.count * 8);
+        std::uint8_t* out = reinterpret_cast<std::uint8_t*>(staging_.data());
         for (std::uint32_t k = 0; k < b.count; k++, out += 32) {
             const std::uint32_t* v = b.quads + k * step;
             std::memcpy(out, v + b.positionAt * 4, 16);
             std::memcpy(out + 16, v + b.stqAt * 4, 16);
         }
+        std::memcpy(mem + frameUsed_, staging_.data(), (std::size_t)b.count * 32);
         frameUsed_ += b.count * 32;
         copiedBytes_ += b.count * 32 + n * 4;
-        copyNs_ += NowNs() - c0;
+        copyNs_ += Tick() - c0;
         c.id = b.id;
         c.sends = sends_;
         c.quads = b.quads;
@@ -674,15 +689,17 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
     }
     if (c.indices == 0)
         return true;
-    std::uint64_t c0 = NowNs();
+    std::uint64_t c0 = Tick();
     frameUsed_ = Align(frameUsed_, 64);
     std::uint32_t colourAt = frameUsed_;
-    std::uint8_t* out = mem + frameUsed_;
-    for (std::uint32_t k = 0; k < b.count; k++, out += 16)
-        std::memcpy(out, b.quads + k * b.stride * 4 + b.colourAt * 4, 16);
+    staging_.resize((std::size_t)b.count * 4);
+    std::uint32_t* colours = staging_.data();
+    for (std::uint32_t k = 0; k < b.count; k++)
+        std::memcpy(colours + k * 4, b.quads + k * b.stride * 4 + b.colourAt * 4, 16);
+    std::memcpy(mem + frameUsed_, colours, colourBytes);
     frameUsed_ += colourBytes;
     copiedBytes_ += colourBytes;
-    copyNs_ += NowNs() - c0;
+    copyNs_ += Tick() - c0;
     Source src = {nullptr, 0, 32, nullptr, c.indices, &b};
     src.placed = true;
     src.vertexAt = c.vertexAt;
@@ -697,8 +714,8 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     const std::uint32_t indices = src.indices;
     struct Timed {
         std::uint64_t& total;
-        std::uint64_t start = NowNs();
-        ~Timed() { total += NowNs() - start; }
+        std::uint64_t start = Tick();
+        ~Timed() { total += Tick() - start; }
     } timed{drawNs_};
     int target = TargetOf(s.frame & 0x1FF);
     if (target < 0) {
@@ -896,10 +913,11 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         last_.colour = last_.write = last_.depth = last_.aref = ~0u;
 
     std::uint32_t first = 0, firstIndex = 0;
-    std::uint64_t c0 = NowNs();
+    std::uint64_t c0 = Tick();
     if (src.placed) {   // the batch's two streams where DrawBatch put them
         DkGpuAddr base = dkMemBlockGetGpuAddr(frameMem_);
-        DkBufExtents streams[2] = {{base + src.vertexAt, kFrameMemory - src.vertexAt}, {base + src.colourAt, kFrameMemory - src.colourAt}};
+        const std::uint32_t count = src.batch->count;   // the streams' sizes exactly (an emulator tracks what is bound)
+        DkBufExtents streams[2] = {{base + src.vertexAt, count * 32}, {base + src.colourAt, count * 16}};
         dkCmdBufBindVtxBuffers(cmd_, 0, streams, 2);
         firstIndex = src.indexAt / 4;
     } else {
@@ -919,7 +937,7 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(frameMem_) + frameUsed_, src.index, indexBytes);
     frameUsed_ = Align(frameUsed_ + indexBytes, 4);
     }
-    copyNs_ += NowNs() - c0;
+    copyNs_ += Tick() - c0;
     static const DkPrimitive kPrimitive[3] = {DkPrimitive_Points, DkPrimitive_Lines, DkPrimitive_Triangles};
     DkPrimitive primitive = kPrimitive[s.kind < 3 ? s.kind : 2];
 
