@@ -1056,7 +1056,8 @@ void RunFromSprChain(std::uint32_t regs)
 // the buffer swap go through the queue too. SLY1_RENDER_SYNC runs everything on the game's
 // thread, as before.
 struct RenderItem {
-    enum Kind : std::uint8_t { Vif1, Gif, Call } kind = Vif1;
+    enum Kind : std::uint8_t { Vif1, Gif, Call, Vif1Live } kind = Vif1;
+    std::uint32_t regs = 0, tadr = 0;   // Vif1Live: the chain, walked where it is
     std::vector<std::uint32_t> words;
     void (*fn)(std::uint64_t, std::uint64_t) = nullptr;
     std::uint64_t a = 0, b = 0;
@@ -1113,6 +1114,57 @@ struct DirectSink {
     void OnGif(const std::uint32_t* q) { gif->Qword(q); }
     bool Direct() const { return true; }
 };
+// VIF1's list walked by the render thread where it lies (a RenderItem of kind Vif1Live).
+struct LiveSink {
+    void OnVif(const std::uint32_t* w, int n) { g_vif1.Words(w, n); }
+    void OnGif(const std::uint32_t*) {}
+    bool Direct() const { return true; }
+};
+
+// How many of VIF1's codes in a list have the interrupt bit: the list walked by its codes' lengths
+// (as Vif::Code has them), nothing done. The walk goes on from one list to the next, as the VIF's.
+struct InterruptScan {
+    std::uint32_t left = 0, cl = 1, wl = 1;
+    std::uint32_t Count(const std::uint32_t* w, std::size_t n)
+    {
+        std::uint32_t found = 0;
+        for (std::size_t k = 0; k < n;) {
+            if (left != 0) {
+                std::size_t skip = std::min<std::size_t>(left, n - k);
+                k += skip;
+                left -= (std::uint32_t)skip;
+                continue;
+            }
+            std::uint32_t code = w[k++], cmd = (code >> 24) & 0x7F, imm = code & 0xFFFF, num = (code >> 16) & 0xFF;
+            found += code >> 31;
+            if ((cmd & 0x60) == 0x60) {   // UNPACK
+                std::uint32_t vn = (cmd >> 2) & 3, vl = cmd & 3, count = num ? num : 256;
+                std::uint32_t vectors = count;
+                if (wl > cl)
+                    vectors = cl * (count / wl) + (count % wl < cl ? count % wl : cl);
+                std::uint32_t bits = (vn == 3 && vl == 3) ? 16 : (32u >> vl) * (vn + 1);
+                left = (vectors * bits + 31) / 32;
+            } else if (cmd == 0x01) {
+                cl = imm & 0xFF;
+                wl = (imm >> 8) & 0xFF;
+                if (wl == 0)
+                    wl = 256;
+            } else if (cmd == 0x20) {
+                left = 1;
+            } else if (cmd == 0x30 || cmd == 0x31) {
+                left = 4;
+            } else if (cmd == 0x4A) {
+                left = (num ? num : 256) * 2;
+            } else if (cmd == 0x50 || cmd == 0x51) {
+                left = (imm ? imm : 65536) * 4;
+            }
+        }
+        return found;
+    }
+};
+InterruptScan g_interruptScan;
+std::atomic<std::uint64_t> g_liveLists, g_copiedLists;
+
 struct CaptureSink {
     std::vector<std::uint32_t>& out;
     void OnVif(const std::uint32_t* w, int n) { out.insert(out.end(), w, w + n); }
@@ -1214,6 +1266,28 @@ void RunDmaChain(std::uint32_t regs, std::uint32_t tadr)
         item.words = SpareBuffer();
         CaptureSink sink{item.words};
         WalkChain(regs, tadr, sink);
+        // A list of VIF1's with interrupts is not drawn from the copy. The interrupt's handler (the
+        // decompilation's PackFrameColors) packs the colours VU1 has just lit a mesh with into the
+        // mesh's cache, in the game's memory, and the list goes on to call the cache's packets:
+        // the copy, made before the handler ran, has them as they were (frame 848 of the opening
+        // drew 24 meshes with no colour so). The render thread walks such a list where it lies,
+        // as VIF1 does on the PS2; the game waits for its FINISH before it touches the frame's
+        // packets again. SLY1_COPY_LISTS=1: every list from its copy, as before.
+        static const bool copyAll = std::getenv("SLY1_COPY_LISTS") != nullptr;
+        if (regs == kVif1 && g_interruptScan.Count(item.words.data(), item.words.size()) != 0 && !copyAll) {
+            {
+                std::lock_guard<std::mutex> lk(g_renderLock);
+                if (g_renderSpare.size() < 64)
+                    g_renderSpare.push_back(std::move(item.words));
+            }
+            item.words = {};
+            item.kind = RenderItem::Vif1Live;
+            item.regs = regs;
+            item.tadr = tadr;
+            g_liveLists++;
+        } else if (regs == kVif1) {
+            g_copiedLists++;
+        }
         Enqueue(std::move(item));
     } else {
         DirectSink sink(regs == kVif0 ? &g_vif0 : regs == kVif1 ? &g_vif1 : nullptr, regs == kGif ? &g_gif : nullptr);
@@ -1352,6 +1426,14 @@ void RenderThreadMain()
             g_vif1.Words(item.words.data(), (int)item.words.size());
             break;
         }
+        case RenderItem::Vif1Live: {
+            std::optional<gs::Hold> hold;
+            if (!gsThread)
+                hold.emplace();
+            LiveSink sink;
+            WalkChain(item.regs, item.tadr, sink);
+            break;
+        }
         case RenderItem::Gif:
             if (gsThread) {
                 GsItem g;
@@ -1384,16 +1466,19 @@ void RenderThreadMain()
         }
         GsPassOn();
         g_renderNs[kind < 3 ? kind : 0] += NowNs() - started;
-        // SLY1_PERF_LOG=1: every 60 frames (a frame is one item of VIF1's), the mean time a frame took
-        // and the render thread's and the GS thread's share of it
+        // SLY1_PERF_LOG=1: every 60 frames shown, the mean time a frame took and the render thread's
+        // and the GS thread's share of it
         static const bool perfLog = std::getenv("SLY1_PERF_LOG") != nullptr;
-        if (perfLog && kind == 0) {
-            static std::uint64_t frames, since, renderWas, gsWas;
-            if (++frames % 60 == 0) {
+        if (perfLog) {
+            static std::uint64_t shownWas, since, renderWas, gsWas;
+            const std::uint64_t shown = gs::FramesShown();
+            if (shown >= shownWas + 60) {
                 const std::uint64_t now = NowNs(), render = g_renderNs[0] + g_renderNs[1] + g_renderNs[2], gsNs = g_gsBusyNs.load();
+                const double n = (double)(shown - shownWas) * 1e6;
                 if (since)
-                    std::fprintf(stderr, "perf: frames to %llu: %.1f ms a frame; render thread %.1f, GS thread %.1f\n", (unsigned long long)frames,
-                                 (now - since) / 60e6, (render - renderWas) / 60e6, (gsNs - gsWas) / 60e6);
+                    std::fprintf(stderr, "perf: frames to %llu: %.1f ms a frame; render thread %.1f, GS thread %.1f\n", (unsigned long long)shown,
+                                 (now - since) / n, (render - renderWas) / n, (gsNs - gsWas) / n);
+                shownWas = shown;
                 since = now;
                 renderWas = render;
                 gsWas = gsNs;
@@ -1422,6 +1507,9 @@ void DmacDump()
     std::fprintf(stderr, "dmac: chains took %.2f s on the game's thread%s; the render queue held at most %.1f MB\n",
                  g_counts.dmaNanoseconds.load() / 1e9, g_renderStarted ? " (VIF1 and GIF chains copied for the render thread)" : "",
                  g_renderMaxQueued.load() * 4 / 1e6);
+    if (g_liveLists.load())
+        std::fprintf(stderr, "dmac: %llu lists of VIF1's walked where they lie (they have interrupts), %llu from their copies\n",
+                     (unsigned long long)g_liveLists.load(), (unsigned long long)g_copiedLists.load());
     if (g_batchesQueued.load())
         std::fprintf(stderr, "dmac: %llu batches queued for the GS thread, %llu of them not taken by the renderer (not drawn); the GS thread took %.2f s\n",
                      (unsigned long long)g_batchesQueued.load(), (unsigned long long)g_batchesRefused.load(), g_gsBusyNs.load() / 1e9);

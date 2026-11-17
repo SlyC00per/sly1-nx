@@ -581,6 +581,21 @@ int main(int argc, char** argv)
                       std::size_t i) override
             {
                 runs++; vertices += v; indices += i;
+                // SLY1_GS_HASH_RUNS=N: frame N's runs, each with the hashes of its state, vertices and indices alone
+                static const long runsOf = std::getenv("SLY1_GS_HASH_RUNS") ? std::atol(std::getenv("SLY1_GS_HASH_RUNS")) : -1;
+                if ((long)frames + 1 == runsOf) {
+                    const std::uint64_t was = hash;
+                    std::uint64_t part[3];
+                    hash = 1; Mix(&st, sizeof st); part[0] = hash;
+                    hash = 1; Mix(vv, v * sizeof *vv); part[1] = hash;
+                    hash = 1; Mix(ii, i * sizeof *ii); part[2] = hash;
+                    hash = was;
+                    std::fprintf(stderr, "gsrun: %llu state %016llX vertices %016llX (%zu) indices %016llX (%zu) tex0 %016llX test %llX alpha %llX; first %.2f %.2f %08X %02X%02X%02X%02X %g %g %g fog %g\n",
+                                 (unsigned long long)runs, (unsigned long long)part[0], (unsigned long long)part[1], v, (unsigned long long)part[2], i,
+                                 (unsigned long long)st.tex0, (unsigned long long)st.test, (unsigned long long)st.alpha, v ? vv[0].x : 0.0f, v ? vv[0].y : 0.0f,
+                                 v ? (unsigned)vv[0].z : 0u, v ? vv[0].r : 0, v ? vv[0].g : 0, v ? vv[0].b : 0, v ? vv[0].a : 0, v ? vv[0].s : 0.0f,
+                                 v ? vv[0].t : 0.0f, v ? vv[0].q : 0.0f, v ? vv[0].fog : 0.0f);
+                }
                 Mix(&st, sizeof st);
                 Mix(vv, v * sizeof *vv);
                 Mix(ii, i * sizeof *ii);
@@ -617,6 +632,13 @@ int main(int argc, char** argv)
             }
             void Present(std::uint64_t, std::uint64_t) override
             {
+                // SLY1_GS_HASH_FRAMES=N: each of the first N frames' own hash, and the runs so far, at its end
+                static const long each = std::getenv("SLY1_GS_HASH_FRAMES") ? std::atol(std::getenv("SLY1_GS_HASH_FRAMES")) : 0;
+                if ((long)frames < each) {   // the hash started again at each frame, so that one frame's difference shows as one line
+                    std::fprintf(stderr, "gshash: frame %llu: %016llX after %llu runs\n", (unsigned long long)frames + 1, (unsigned long long)hash,
+                                 (unsigned long long)runs);
+                    hash = 1469598103934665603ull;
+                }
                 if ((++frames & 255) == 0)
                     std::fprintf(stderr, "gs count: %llu frames, %llu runs, %llu vertices, %llu indices, all drawn hashed %016llX\n",
                                  (unsigned long long)frames, (unsigned long long)runs, (unsigned long long)vertices,

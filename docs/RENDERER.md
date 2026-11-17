@@ -454,3 +454,35 @@ renderer's `DrawBatch` and `Submit`, the lit colours, `memmove`, a texture's loo
 Done from it: an upload is written a block's row at a time (checked by `SLY1_GS_CHECK`: 0 image
 runs differed over the 46 levels); a run with the texture of the run before, and no upload
 since, takes that texture without the lookup.
+
+## Lists with interrupts walked where they lie (2026-11-17)
+
+The render thread drew every list of VIF1's from a copy made when the game started the chain. A
+list can hold VIFcodes with the interrupt bit: VIF1 stops there, between two of VU1's programs,
+and the game's handler (the decompilation's PackFrameColors) packs the colours VU1 has just lit
+a mesh with into the mesh's cache, in the game's memory. The list then calls the cache's
+packets. The copy had them as they were before the handler ran: at frame 848 of the opening
+under lockstep, 24 meshes were drawn with no colour for a frame (72 runs of the counting
+renderer's stream, against the same run without the render thread).
+
+Such a list is now walked by the render thread where it lies, as VIF1 walks it on the PS2
+(`SLY1_COPY_LISTS=1`: from its copy, as before); the others still go by their copies. The game
+waits for a list's FINISH before it gives the frame's packets to anything else.
+
+Compared frame by frame (`SLY1_GS_HASH_FRAMES=N` prints each frame's own hash; `SLY1_GS_HASH_RUNS=N`
+a frame's runs) with `SLY1_RENDER_SYNC=1`, 899 frames of the opening, eight runs: all frames the
+same but frame 40, where 12 runs differ by a depth step and a sixteenth of a pixel (a mesh's
+matrix a tick newer, read after the game went on), and in two runs of the eight a stretch of 15
+frames. Those stretches come and go from run to run, in the copies' day too (two runs of eight):
+not explained.
+
+Tried and taken out again: FINISH given to the game when a list is queued, so that the game
+would compute the next frame while the list is drawn. It gained nothing (25.8 frames a second
+against 25.4 on the Switch Lite), because the game does that already: its own render thread
+waits for FINISH while its main thread builds the next frame, two frames' packets in turn. What
+a frame costs is the longer of the two, to the next vertical blank. (`SLY1_PERF_LOG=1` shows
+it: stretches at 16.7 ms a frame with the render thread at 14.)
+
+Not found: the first frame of the opening's close shot of the police sign (frame 1426 under
+lockstep in Ryujinx) lacks the building on the right, in every mode, without the render thread
+too; retail's video has it from the first frame.
