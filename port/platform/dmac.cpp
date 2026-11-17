@@ -505,10 +505,14 @@ private:
                     c.kick = KickPath1;
                     dbf_ = !dbf_;
                     tops_ = (base_ + (dbf_ ? ofst_ : 0)) & 0x3FF;
-                    std::uint64_t t0 = NowNs();
+                    // VU1's time (SLY1_VU1_TIMES, or with SLY1_VU1_PROFILE): two reads of the clock a
+                    // program, which in an emulator may each leave the guest
+                    static const bool timed = std::getenv("SLY1_VU1_TIMES") || std::getenv("SLY1_VU1_PROFILE");
+                    std::uint64_t t0 = timed ? NowNs() : 0;
                     std::uint64_t n = vu1::Run(cmd == 0x17 ? vu1::Vu1().pc : (imm & 0x7FF), c);
                     g_counts.vu1Instructions += n;
-                    g_counts.vu1Nanoseconds += NowNs() - t0;
+                    if (timed)
+                        g_counts.vu1Nanoseconds += NowNs() - t0;
                 }
                 break;
             case 0x01:   // STCYCL
