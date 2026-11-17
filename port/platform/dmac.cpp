@@ -1206,8 +1206,8 @@ struct CountSink {
 constexpr std::size_t kLiveListWords = 16384;   // 64 KiB: a frame's list is ten times that and more
 
 // VIF1's list walked by the render thread where it lies (a RenderItem of kind Vif1Live).
-// --- A model part drawn again from what was kept of its packet (SLY1_PART_REPLAY=1; with the GS
-// thread).
+// --- A model part drawn again from what was kept of its packet (with the GS thread;
+// SLY1_PART_REPLAY=0: not).
 //
 // A part whose lighting has not changed is drawn by a call of its light cache's packet
 // (tools/patches.py's hook says which): the part's meshes, unpacked into VU1's memory, with VU1's
@@ -1249,8 +1249,9 @@ constexpr std::size_t kBatchHead = 1 + (sizeof(gs::Batch) + 3) / 4;
 
 bool PartReplayOn()
 {
-    static const bool on = std::getenv("SLY1_PART_REPLAY") != nullptr;
-    return on && GsAsync();
+    // on with the GS thread (the Switch); SLY1_PART_REPLAY=0: every part run as ever
+    static const bool off = std::getenv("SLY1_PART_REPLAY") && std::getenv("SLY1_PART_REPLAY")[0] == '0';
+    return !off && GsAsync();
 }
 
 void PartRecordItem(const GsItem& item)
@@ -1325,7 +1326,14 @@ struct PartHasher {
             }
             const std::size_t take = std::min<std::size_t>(left, n - k);
             if (!sampled) {
-                for (std::size_t i = 0; i < take; i++)
+                std::size_t i = 0;
+                for (; i + 2 <= take; i += 2) {   // two words at a time
+                    std::uint64_t v;
+                    std::memcpy(&v, w + k + i, 8);
+                    h = (h ^ v) * 0x9E3779B97F4A7C15ull;
+                    h ^= h >> 29;
+                }
+                for (; i < take; i++)
                     Mix(w[k + i]);
             } else {
                 for (std::size_t i = 0; i < take;) {   // four words of every 32

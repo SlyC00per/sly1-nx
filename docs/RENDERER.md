@@ -655,3 +655,23 @@ Ryujinx's captures of frames 501 to 506 and 620 to 625 byte for byte as without 
 draws from 9,534 batches written once); Ryujinx's --verify-levels with it, "all 46 levels loaded
 and ran 60 frames" (4,336,729 draws from 152,932 written, the memory emptied once, the GS
 thread's time 22 s where it was 40.5 s).
+
+### On by default (2026-11-17)
+
+With the batches kept on the GPU the opening on the Switch Lite holds 29.9 frames a second: two
+vertical blanks a frame nearly throughout (741 frames of two after the 600th, 85 of three, none
+of four), the render thread 14 to 16 ms a frame in most stretches and the GS thread 12 to 21.
+The user found the picture right, and it is on wherever the GS thread is
+(`SLY1_PART_REPLAY=0`: not). The hash takes two words at a time where it takes every word.
+
+`SLY1_SAMPLE=1` in that run. The render thread, of the time it was not waiting: the parts' hash
+15%, the lit colours and the lights 14%, the unpacks 6%, the registers left by the transform 5%,
+the chain's walk 5%, the outlines 4%. The GS thread: waiting on the GPU's driver 28% of its busy
+time, the uploads 12% (4-bit textures the game uploads every frame), `DrawBatch` 9%. With the
+parts drawn again, what VU1's handlers still do (the Mac, `SLY1_VU1_PROFILE=1`) is what changes
+every frame: the characters' outlines first, then skinned and newly lit meshes, sprites,
+particles.
+
+A frame is two vertical blanks because its stages come one after another: the list's hand-over,
+the render thread's 15 ms, the GS thread's tail and its wait for the GPU, the game's packets
+after the list. For one blank they must come to under 16.7 ms together.
