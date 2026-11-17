@@ -515,7 +515,10 @@ void Materialise(Runner& r, bool always = false)
     // since (its finish, whose clipper the GPU's clipping stands in for), the flag is as that
     // clipper leaves it: cleared, and set again only when a clipped polygon is left to draw. The
     // clipper is run here for that, its kicks going nowhere.
-    if (d.kicked && Half(Load(late, (std::uint16_t)(d.top + 13)).z) != 0 && Clippable(late, d.top, d.stride))
+    // (a lit batch's only: the clipper is the lit programs', four quadwords a vertex; over another
+    // batch its loop does not end)
+    if (d.kicked && d.stride == 4 && d.test == Test::Guard274 && Half(Load(late, (std::uint16_t)(d.top + 13)).z) != 0 &&
+        Clippable(late, d.top, d.stride))
         ClipIfMarked(late, d.top, 1);   // late's kicks go nowhere
     std::uint32_t clipFlag;
     std::memcpy(&clipFlag, reinterpret_cast<const std::uint32_t*>(late.Qword((std::uint16_t)(d.top + 13))) + 2, 4);
