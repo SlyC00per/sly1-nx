@@ -44,7 +44,8 @@ constexpr std::uint32_t kCommandMemory = 16u << 20;
 constexpr std::uint32_t kTextureMemory = 64u << 20;
 constexpr std::uint32_t kMaxTextures = 2048;
 constexpr int kSmallTargets = 8;                      // the buffers other than the frame's two the game draws into (a shadow's picture)
-constexpr std::uint32_t kSmallScale = 4;               // an image's pixels to one of such a buffer's, each way
+constexpr std::uint32_t kSmallScale = 1;               // an image's pixels to one of such a buffer's, each way (1: the game's
+                                                       // own, so that its blur of a shadow's picture spreads as on the GS)
 constexpr std::uint32_t kTargetMemory = 8u << 20;
 constexpr std::uint32_t kMaxDraws = 12000;               // a frame's draws before its commands are sent
 
@@ -124,8 +125,11 @@ private:
     static int TargetOf(std::uint64_t fbp);
     int TargetFor(const gs::DrawState& s);
     struct Small {
-        DkImage image;
-        Texture texture;            // the buffer as a texture (its id among the descriptors, its size)
+        // two images: a run that reads the buffer it draws into (the game's blur of a shadow's
+        // picture) reads the current one and draws the other, which becomes the current
+        DkImage image[2];
+        Texture texture[2];         // each as a texture (its id among the descriptors, its size)
+        int cur = 0;
         std::uint32_t fbp = ~0u;
         std::uint32_t width = 0, height = 0;   // in the GS's pixels
         bool drawn = false;         // drawn into since it was last read as a texture
@@ -137,10 +141,9 @@ private:
     // the bound target's size: in the GS's pixels (a field of the frame) and in the image's
     float fieldWidth_ = kFieldWidth, fieldHeight_ = kFieldHeight;
     std::uint32_t imageWidth_ = kWidth, imageHeight_ = kHeight;
-    std::uint64_t smallRuns_ = 0, smallTextured_ = 0, smallSelf_ = 0;
-    std::uint64_t biasedRuns_ = 0;
-    int biasOn_ = -1;   // whether the rasteriser's depth bias is on in this command list
-    int smallTrace_ = 0;
+    std::uint64_t smallRuns_ = 0, smallTextured_ = 0, smallSelf_ = 0, smallSteps_ = 0;
+    bool inSelf_ = false;       // drawing one step of such a run: the target is the buffer's other image
+    int smallTrace_ = 0, smallSelfTrace_ = 0, smallIntoTrace_ = 0;
 
     DkDevice device_ = nullptr;
     DkQueue queue_ = nullptr;
@@ -376,7 +379,6 @@ void Renderer::BeginCommands()
     batchSet_ = false;
     frameRead_ = false;
     frameBound_ = -1;
-    biasOn_ = -1;
     DkGpuAddr data = dkMemBlockGetGpuAddr(dataMem_);
     DkBufExtents fragmentUbo = {data + fragmentUbo_, sizeof(FragmentParams)};
     dkCmdBufBindUniformBuffers(cmd_, DkStage_Fragment, 0, &fragmentUbo, 1);
@@ -505,7 +507,7 @@ void Renderer::BindTarget(int target)
     std::uint32_t iw = kWidth, ih = kHeight;
     if (target >= 2) {   // a small target: no depth buffer (the game draws into it without one)
         const Small& t = small_[target - 2];
-        dkImageViewDefaults(&colour, &t.image);
+        dkImageViewDefaults(&colour, &t.image[inSelf_ ? t.cur ^ 1 : t.cur]);
         const DkImageView* colours[1] = {&colour};
         dkCmdBufBindRenderTargets(cmd_, colours, 1, nullptr);
         fw = (float)t.width;
@@ -539,9 +541,8 @@ int Renderer::TargetFor(const gs::DrawState& s)
     int target = TargetOf(fbp);
     if (target >= 0)
         return target;
-    // Off unless SLY1_GPU_SMALL_TARGETS is set: the shadows it gives are not retail's yet (see
-    // docs/RENDERER.md), and without it a run textured from such a buffer is left out.
-    static const bool off = std::getenv("SLY1_GPU_SMALL_TARGETS") == nullptr;
+    // SLY1_GPU_NO_SMALL_TARGETS=1: none, as before them (a run textured from such a buffer is then left out).
+    static const bool off = std::getenv("SLY1_GPU_NO_SMALL_TARGETS") != nullptr;
     const std::uint32_t fbw = (std::uint32_t)((s.frame >> 16) & 0x3F), psm = (std::uint32_t)((s.frame >> 24) & 0x3F);
     if (off || fbw == 0 || fbw > 4 || psm != 0)
         return -1;
@@ -559,28 +560,38 @@ int Renderer::TargetFor(const gs::DrawState& s)
     lm.dimensions[0] = fbw * 64 * kSmallScale;
     lm.dimensions[1] = fbw * 64 * kSmallScale;
     dkImageLayoutInitialize(&layout, &lm);
-    std::uint32_t at = Align(targetUsed_, dkImageLayoutGetAlignment(&layout));
     std::uint32_t size = (std::uint32_t)dkImageLayoutGetSize(&layout);
-    if (at + size > kTargetMemory)
+    std::uint32_t at0 = Align(targetUsed_, dkImageLayoutGetAlignment(&layout));
+    std::uint32_t at1 = Align(at0 + size, dkImageLayoutGetAlignment(&layout));
+    if (at1 + size > kTargetMemory)
         return -1;
-    dkImageInitialize(&t.image, &layout, targetMem_, at);
-    targetUsed_ = at + size;
+    targetUsed_ = at1 + size;
     t.fbp = fbp;
     t.width = t.height = fbw * 64;
-    t.texture.id = kMaxTextures - 2 - kSmallTargets + (std::uint32_t)smallCount_;
-    t.texture.width = (int)t.width;
-    t.texture.height = (int)t.height;
-    DkImageView view;
-    dkImageViewDefaults(&view, &t.image);
-    DkImageDescriptor d;
-    dkImageDescriptorInitialize(&d, &view, false, false);
-    dkCmdBufPushData(cmd_, dkMemBlockGetGpuAddr(dataMem_) + imageSet_ + t.texture.id * sizeof d, &d, sizeof d);
+    t.cur = 0;
+    for (int i = 0; i < 2; i++) {
+        dkImageInitialize(&t.image[i], &layout, targetMem_, i ? at1 : at0);
+        t.texture[i].id = kMaxTextures - 2 - 2 * kSmallTargets + 2 * (std::uint32_t)smallCount_ + (std::uint32_t)i;
+        t.texture[i].width = (int)t.width;
+        t.texture[i].height = (int)t.height;
+        DkImageView view;
+        dkImageViewDefaults(&view, &t.image[i]);
+        DkImageDescriptor d;
+        dkImageDescriptorInitialize(&d, &view, false, false);
+        dkCmdBufPushData(cmd_, dkMemBlockGetGpuAddr(dataMem_) + imageSet_ + t.texture[i].id * sizeof d, &d, sizeof d);
+    }
     smallCount_++;
-    BindTarget(2 + (smallCount_ - 1));   // empty to start with
-    DkScissor all = {0, 0, t.width * kSmallScale, t.height * kSmallScale};
-    dkCmdBufSetScissors(cmd_, 0, &all, 1);
-    float none[4] = {0, 0, 0, 0};
-    dkCmdBufClearColor(cmd_, 0, DkColorMask_RGBA, none);
+    for (int i = 0; i < 2; i++) {   // both empty to start with
+        t.cur = i;
+        bound_ = -1;
+        BindTarget(2 + (smallCount_ - 1));
+        DkScissor all = {0, 0, t.width * kSmallScale, t.height * kSmallScale};
+        dkCmdBufSetScissors(cmd_, 0, &all, 1);
+        float none[4] = {0, 0, 0, 0};
+        dkCmdBufClearColor(cmd_, 0, DkColorMask_RGBA, none);
+    }
+    t.cur = 0;
+    bound_ = -1;
     last_.any = false;
     return 2 + (smallCount_ - 1);
 }
@@ -622,7 +633,7 @@ const Texture* Renderer::TextureFor(const gs::DrawState& state)
         dkImageLayoutInitialize(&layout, &lm);
         std::uint32_t at = Align(textureUsed_, dkImageLayoutGetAlignment(&layout));
         std::uint32_t size = (std::uint32_t)dkImageLayoutGetSize(&layout);
-        if (at + size > kTextureMemory || nextTexture_ == kMaxTextures - 2 - kSmallTargets) {   // the last are the frame buffers' and the small targets'
+        if (at + size > kTextureMemory || nextTexture_ == kMaxTextures - 2 - 2 * kSmallTargets) {   // the last are the frame buffers' and the small targets'
             // full: everything drawn with the old textures first, then all of them forgotten
             Send(true);
             textures_.clear();
@@ -666,7 +677,7 @@ void Renderer::Begin(const gs::DrawState& s)
         const std::uint32_t tbp = (std::uint32_t)(s.tex0 & 0x3FFF);
         for (int k = 0; k < smallCount_ && !texture_; k++)   // a small target the game drew into, read as a texture
             if (small_[k].fbp * 32 == tbp)
-                texture_ = &small_[k].texture;
+                texture_ = &small_[k].texture[0];   // which of its two images is decided when the run is drawn
         if (!texture_ && !(tbp % 32 == 0 && otherTarget_[(tbp / 32) & 0x1FF]) && tbp != 0 && tbp != 70 * 32)
             texture_ = TextureFor(s);
     }
@@ -848,48 +859,54 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     if (target >= 2) {
         small_[target - 2].drawn = true;
         smallRuns_++;
+        if (std::getenv("SLY1_GPU_SHADOW_TRACE") && frames_ > 500 && smallIntoTrace_ < 14) {
+            smallIntoTrace_++;
+            std::fprintf(stderr, "gpuinto: frame %llu: %s %u indices kind %u tme %u abe %u alpha %llX test %llX fba %u frame %llX", (unsigned long long)frames_, src.batch ? "batch" : "run",
+                         (unsigned)src.indices, s.kind, s.tme, s.abe, (unsigned long long)s.alpha, (unsigned long long)s.test, s.fba, (unsigned long long)s.frame);
+            if (src.batch) {
+                const std::uint32_t* c = src.batch->quads + src.batch->colourAt * 4;
+                std::fprintf(stderr, " | batch of %u, first colour %u %u %u %u", src.batch->count, c[0], c[1], c[2], c[3]);
+            } else if (src.vertices) {
+                const gs::DrawVertex* dv = static_cast<const gs::DrawVertex*>(src.vertices);
+                std::fprintf(stderr, " | first vertex (%.1f,%.1f) rgba %02X%02X%02X%02X", dv[0].x, dv[0].y, dv[0].r, dv[0].g, dv[0].b, dv[0].a);
+            }
+            std::fprintf(stderr, "\n");
+        }
     }
+    const Texture* smallTexture = nullptr;
     for (int k = 0; k < smallCount_; k++)
-        if (texture_ == &small_[k].texture) {
-            if (target == 2 + k) {
+        if (texture_ == &small_[k].texture[0]) {
+            Small& t = small_[k];
+            if (target == 2 + k && !inSelf_) {
+                // A run that reads the buffer it draws into: the game's blur of a shadow's picture,
+                // sprites over the whole buffer that copy it onto itself half a texel aside with the
+                // bilinear filter, six in a run. Each is drawn by itself, from the current image into
+                // the other, which is then the current one. (Any other such run is left out.)
                 smallSelf_++;
+                if (s.abe || s.kind != 2 || src.batch || !src.index || src.indices == 0 || src.indices % 6 != 0)
+                    return;
+                inSelf_ = true;
+                for (std::uint32_t at = 0; at < src.indices; at += 6) {
+                    Source step = src;
+                    step.index = src.index + at;
+                    step.indices = 6;
+                    bound_ = -1;
+                    Submit(s, step);
+                    t.cur ^= 1;
+                    t.drawn = true;
+                    smallSteps_++;
+                }
+                inSelf_ = false;
+                bound_ = -1;
                 return;
             }
-            if (small_[k].drawn) {
+            if (t.drawn) {
                 dkCmdBufBarrier(cmd_, DkBarrier_Fragments, DkInvalidateFlags_Image);
-                small_[k].drawn = false;
+                t.drawn = false;
             }
+            smallTexture = &t.texture[t.cur];
             smallTextured_++;
-            if (std::getenv("SLY1_GPU_SHADOW_TRACE") && frames_ > 500 && smallTrace_ < 10 && src.vertices && !src.batch) {   // the first runs' triangles, for diagnosis
-                smallTrace_++;
-                const gs::DrawVertex* dv = static_cast<const gs::DrawVertex*>(src.vertices);
-                std::uint32_t n = src.vertexBytes / sizeof(gs::DrawVertex);
-                std::fprintf(stderr, "gpushadow: frame %llu target %d, %u vertices %u indices kind %u test %llX alpha %llX tex0 %llX clamp %llX scissor %llX abe %u |", (unsigned long long)frames_, target, n,
-                             (unsigned)src.indices, s.kind, (unsigned long long)s.test, (unsigned long long)s.alpha, (unsigned long long)s.tex0, (unsigned long long)s.clamp, (unsigned long long)s.scissor, s.abe);
-                for (std::uint32_t q = 0; q + 2 < src.indices && q < 36; q += 3) {
-                    std::fprintf(stderr, " [");
-                    for (int c = 0; c < 3; c++) {
-                        const gs::DrawVertex& v = dv[src.index[q + c]];
-                        std::fprintf(stderr, "(%.0f,%.0f z %u uv %.2f %.2f)", v.x, v.y, v.z, v.q != 0 ? v.s / v.q : 0, v.q != 0 ? v.t / v.q : 0);
-                    }
-                    std::fprintf(stderr, "]");
-                }
-                std::fprintf(stderr, "\n");
-            } else if (std::getenv("SLY1_GPU_SHADOW_TRACE") && frames_ > 500 && smallTrace_ < 10) {
-                smallTrace_++;
-                std::fprintf(stderr, "gpushadow: frame %llu target %d: a batch of %u vertices\n", (unsigned long long)frames_, target, src.batch ? src.batch->count : 0);
-            }
         }
-    // A texture that is such a buffer (the 64 by 64 picture of a character the game draws first and
-    // then lays on the ground as its shadow): nothing was drawn into it here, and what the GS's
-    // memory holds at its address is whatever was last uploaded there, which the shadow's run laid
-    // on the roofs as black. Left out until the renderer draws into such buffers.
-    if (s.tme && otherTarget_[(std::uint32_t)((s.tex0 & 0x3FFF) / 32) & 0x1FF] && ((s.tex0 & 0x3FFF) % 32) == 0) {
-        targetTextured_++;
-        static const bool keep = std::getenv("SLY1_GPU_KEEP_TARGET_TEXTURES") != nullptr;   // as before, to compare
-        if (!keep)
-            return;
-    }
     // The game's motion blur: each frame ends with a sprite textured from the other frame buffer
     // (the frame before), blended over the new one at FIX 0x30. A frame buffer is not a texture
     // here (its image is the GPU's, not the GS's memory the textures are decoded from), so the
@@ -963,7 +980,7 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         if (frameUsed_ + bytes + indexBytes + 256 > kFrameMemory || draws_ >= kMaxDraws)
             Send(true);
     }
-    const Texture* texture = texture_;
+    const Texture* texture = smallTexture ? smallTexture : texture_;
     bool fresh = !last_.any;
     last_.any = true;
     if (listAt_ >= 0 && (long)frames_ + 1 == listAt_ && listed_ < 60) {   // SLY1_GPU_LIST=N: frame N's first draws
@@ -1153,32 +1170,6 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     static const DkPrimitive kPrimitive[3] = {DkPrimitive_Points, DkPrimitive_Lines, DkPrimitive_Triangles};
     DkPrimitive primitive = kPrimitive[s.kind < 3 ? s.kind : 2];
 
-    // ZTST GEQUAL (not farther than what is there) on a run of the GS's vertices: the game draws
-    // over a surface again with it (a shadow's picture on the ground, a light's pass on polygons a
-    // clipper cut), at depths the GS, with whole numbers, finds equal to the surface's. Here the
-    // surface was mostly placed by the shader (a batch) and the run by the program, and the two
-    // depths differ in their last places: the run failed the test (no shadow at all; before that,
-    // the roofs' black flicker). Such a run is drawn a little nearer: the bias is in the depth
-    // buffer's smallest steps at the polygon's depth, a few of the GS's units.
-    {
-        // only with the small targets, until the shadows are right: without them nothing is known to need it
-        static const float units = std::getenv("SLY1_GPU_EQUAL_BIAS") ? (float)std::atof(std::getenv("SLY1_GPU_EQUAL_BIAS"))
-                                   : std::getenv("SLY1_GPU_SMALL_TARGETS") ? 512.0f : 0.0f;
-        const int want = zte && ztst == 2 && !src.batch && target < 2 && units != 0.0f ? 1 : 0;
-        if (want != biasOn_) {
-            DkRasterizerState raster;
-            dkRasterizerStateDefaults(&raster);
-            raster.depthClampEnable = 0;
-            raster.cullMode = DkFace_None;
-            raster.provokingVertex = DkProvokingVertex_Last;
-            raster.depthBiasEnableMask = want ? 7 : 0;
-            dkCmdBufBindRasterizerState(cmd_, &raster);
-            if (want)
-                dkCmdBufSetDepthBias(cmd_, units, 0.0f, 0.0f);
-            biasOn_ = want;
-        }
-        biasedRuns_ += want;
-    }
     // one pass of the pixels an alpha comparison lets through, writing colour, alpha and depth or not
     auto pass = [&](DkCompareOp alphaOp, bool rgb, bool alpha, bool depthWrite) {
         DkColorState colour;
@@ -1262,7 +1253,7 @@ void Renderer::Capture(int target)
     DkImageRect rect = {0, 0, 0, kWidth, kHeight, 1};
     if (std::getenv("SLY1_GPU_CAPTURE_SMALL") && smallCount_ > 0) {   // the first small target, over the frame's top left corner
         DkImageView from;
-        dkImageViewDefaults(&from, &small_[0].image);
+        dkImageViewDefaults(&from, &small_[0].image[small_[0].cur]);
         DkImageRect src = {0, 0, 0, small_[0].width * kSmallScale, small_[0].height * kSmallScale, 1}, dst = {0, 0, 0, 512, 512, 1};
         dkCmdBufBlitImage(cmd_, &from, &src, &view, &dst, 0, 0);
     }
@@ -1565,8 +1556,9 @@ void Renderer::Report()
                  "for the GPU to finish)\n", drawNs_ / 1e9, textureNs_ / 1e9, presentNs_ / 1e9, acquireNs_ / 1e9, waitNs_ / 1e9);
     std::fprintf(stderr, "gpu: %llu runs with the destination alpha test, %llu barriers before them\n",
                  (unsigned long long)destinationAlpha_, (unsigned long long)dateBarriers_);
-    std::fprintf(stderr, "gpu: %d small targets, %llu runs into them, %llu textured from them (%llu more left out: a target read as it is drawn)\n",
-                 smallCount_, (unsigned long long)smallRuns_, (unsigned long long)smallTextured_, (unsigned long long)smallSelf_);
+    std::fprintf(stderr, "gpu: %d small targets, %llu runs into them, %llu textured from them, %llu that read the target they draw (%llu steps)\n",
+                 smallCount_, (unsigned long long)smallRuns_, (unsigned long long)smallTextured_, (unsigned long long)smallSelf_,
+                 (unsigned long long)smallSteps_);
     std::fprintf(stderr, "gpu: not drawn as the GS would: %llu runs into other buffers and %llu textured from them (the shadows' pictures, left "
                  "out), %llu textured from a frame buffer (the motion blur, left out), %llu blends approximated\n", (unsigned long long)otherTargets_,
                  (unsigned long long)targetTextured_, (unsigned long long)frameTextured_, (unsigned long long)unsupportedBlends_);

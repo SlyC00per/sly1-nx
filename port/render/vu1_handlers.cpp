@@ -428,6 +428,7 @@ void Kick(Runner& r, std::uint32_t qaddr);
 struct Deferred {
     bool on = false, kicked = false;
     bool overwritten = false;      // VIF1 has unpacked over the batch's vertices since
+    bool header13Written = false;  // VIF1 has unpacked over TOP + 13 since (the transform's clip flag is in it)
     std::uint16_t first = 0, end = 0;   // the batch's quadwords
     V header[10], viewport[2];     // what the transform reads of TOP + 8 to 17 and of 0 and 1, as they were
     std::uint32_t serial = 0;      // counts the batches deferred (gs::Batch::id)
@@ -440,6 +441,8 @@ std::map<std::uint64_t, std::uint64_t> g_lateBy;   // late transforms by program
 std::uint64_t g_lateNs, g_lateVertices, g_skippedOverwritten;
 
 bool BatchTransformNow(Runner& r, const int stride, const Test test, const std::uint32_t endPc);
+void ClipIfMarked(Runner& r, std::uint16_t top, std::uint16_t colour);
+bool Clippable(Runner& r, std::uint16_t top, int stride);
 
 bool DeferredFor(std::uint16_t top) { return g_deferred.on && g_deferred.top == top; }
 void DeferredKicked() { g_deferred.kicked = true; }
@@ -489,6 +492,7 @@ void Materialise(Runner& r, bool always = false)
     } lateTime{lateStart};
     Context ctx = r.ctx;
     ctx.top = d.top;
+    ctx.kick = nullptr;   // nothing done here is drawn
     Runner late(ctx);
     State saved = r.s;
     // the header and the viewport as the batch had them (a later upload may have replaced them:
@@ -503,8 +507,23 @@ void Materialise(Runner& r, bool always = false)
         Store(late, (std::uint16_t)k, d.viewport[k]);
     }
     BatchTransformNow(late, d.stride, d.test, d.endPc);
+    // What the transform itself leaves in the header: 13.z, set when a triangle of the batch
+    // reaches outside the guard band (the programs after it clip the batch then: the shadows' 0x076
+    // goes by it, and without it laid a character's shadow on the wrong triangles). It is kept,
+    // unless an upload has replaced that quadword since the batch's own (the upload came after the
+    // transform, and its value is the one a program then finds). When the batch has been kicked
+    // since (its finish, whose clipper the GPU's clipping stands in for), the flag is as that
+    // clipper leaves it: cleared, and set again only when a clipped polygon is left to draw. The
+    // clipper is run here for that, its kicks going nowhere.
+    if (d.kicked && Half(Load(late, (std::uint16_t)(d.top + 13)).z) != 0 && Clippable(late, d.top, d.stride))
+        ClipIfMarked(late, d.top, 1);   // late's kicks go nowhere
+    std::uint32_t clipFlag;
+    std::memcpy(&clipFlag, reinterpret_cast<const std::uint32_t*>(late.Qword((std::uint16_t)(d.top + 13))) + 2, 4);
+    const bool sameHeader13 = std::memcmp(&header[5], &d.header[5], 16) == 0;
     for (int k = 0; k < 10; k++)
         Store(late, (std::uint16_t)(d.top + 8 + k), header[k]);
+    if (sameHeader13)
+        std::memcpy(reinterpret_cast<std::uint32_t*>(late.Qword((std::uint16_t)(d.top + 13))) + 2, &clipFlag, 4);
     for (int k = 0; k < 2; k++)
         Store(late, (std::uint16_t)k, viewport[k]);
     r.s = saved;
@@ -659,6 +678,7 @@ bool BatchTransform(Runner& r, const int stride, const Test test, const std::uin
             g_deferred.serial++;
             g_deferred.kicked = false;
             g_deferred.overwritten = false;
+            g_deferred.header13Written = false;
             g_deferred.first = (std::uint16_t)(top + Half(hdr.x));
             g_deferred.end = (std::uint16_t)(top + Half(hdr.y));
             for (int k = 0; k < 10; k++)
