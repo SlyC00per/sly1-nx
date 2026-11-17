@@ -180,6 +180,7 @@ std::uint32_t Expand24(std::uint32_t c)
 // palette's 16 by 16 entries with index bits 3 and 4 exchanged; a 4-bit palette's 8 by 2 at
 // CSA's place).
 
+bool Surveying();
 extern std::uint32_t g_uploads;
 extern std::uint32_t g_pageUpload[kLocalBytes / 8192];
 template <typename F>
@@ -216,16 +217,25 @@ void LoadClut(std::uint64_t tex)
         std::uint32_t at = 0, first = 0, count = 0, psm = 0, used = 0;
         std::uint32_t entries[256];
     };
-    static Cached cache[16];
+    // 256 palettes, two places for each key (by a hash of it), the one used longer ago replaced
+    static Cached cache[256];
     static std::uint32_t uses;
     static const bool check = std::getenv("SLY1_GS_CHECK") != nullptr;
+    const std::uint32_t slot0 = (std::uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 57) * 2;
     Cached* hit = nullptr;
     if (!g_rasterise)
-        for (Cached& c : cache)
-            if (c.key == key && latest <= c.at) {
-                hit = &c;
+        for (std::uint32_t k = slot0; k < slot0 + 2; k++)
+            if (cache[k].key == key && latest <= cache[k].at) {
+                hit = &cache[k];
                 break;
             }
+    {   // SLY1_GS_SURVEY: the palette loads from the cache and read
+        static std::uint64_t hits, misses;
+        (hit ? hits : misses)++;
+        if (Surveying() && ((hits + misses) & 0xFFFF) == 0)
+            std::fprintf(stderr, "gs survey: palette loads, %llu from the cache, %llu read\n", (unsigned long long)hits,
+                         (unsigned long long)misses);
+    }
     std::uint32_t before[256], psmBefore = g_clutPsm;
     if (hit) {
         hit->used = ++uses;
@@ -271,10 +281,11 @@ void LoadClut(std::uint64_t tex)
             }
             if (g_rasterise)
                 return;
-            Cached* slot = &cache[0];
-            for (Cached& c : cache)
-                if (c.used < slot->used)
-                    slot = &c;
+            Cached* slot = &cache[slot0];
+            if (slot->key == key || (cache[slot0 + 1].key != key && cache[slot0 + 1].used < slot->used))
+                slot = slot->key == key ? slot : &cache[slot0 + 1];
+            if (cache[slot0 + 1].key == key)
+                slot = &cache[slot0 + 1];
             slot->key = key;
             slot->at = at;
             slot->first = first;
@@ -284,7 +295,8 @@ void LoadClut(std::uint64_t tex)
             for (std::uint32_t k = 0; k < count; k++)
                 slot->entries[k] = g_clut[(first + k) & 255];
         }
-    } store{key, g_uploads, first, count, hit, before, psmBefore};
+        std::uint32_t slot0;
+    } store{key, g_uploads, first, count, hit, before, psmBefore, slot0};
     g_clutPsm = cpsm;
     bool c16 = cpsm == PSMCT16 || cpsm == PSMCT16S;
     auto fetch = [&](std::uint32_t x, std::uint32_t y) -> std::uint32_t {

@@ -3361,6 +3361,17 @@ void DataWritten(std::uint32_t qaddr, std::uint32_t count, std::uint32_t cycle, 
         std::uint32_t from = (qaddr - d.first) & 0x3FF;
         if (from >= span && from + reach <= 1024)
             return;
+        // one block a vertex (a cycle of the batch's stride): the same quadwords of every vertex,
+        // none of them its STQ or position (the colours' uploads)
+        if (skipping && cycle == stride && from + reach <= 1024) {
+            bool touches = false;
+            for (std::uint32_t q = 0; q < write; q++) {
+                std::uint32_t slot = (from + q) % stride;
+                touches = touches || slot == 0 || slot == stride - 1;
+            }
+            if (!touches)
+                return;
+        }
     }
     for (std::uint32_t k = 0; k < count; k++) {
         std::uint32_t at = skipping ? qaddr + (k / write) * cycle + (k % write) : qaddr + k;
