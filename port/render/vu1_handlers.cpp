@@ -2467,9 +2467,8 @@ bool Particles(Runner& r)
         vi01 = (std::uint16_t)(top - vi11);
         lq(24, (std::uint16_t)(vi01 + 47), XYZW);
         if (vi08 & 1) {
-            V c24 = g(24);
-            for (int k = 0; k < 4; k++)
-                c24[k] = Itof0(c24[k]);
+            V c24;
+            c24.v = Itof4(g(24).v);
             p(24, c24, XYZW);
             quadratic(8);
             clamp01();
@@ -2477,12 +2476,8 @@ bool Particles(Runner& r)
             vi01 = (std::uint16_t)(vi01 - 1);
             F4 acc = Mul4(g(24).v, Splat(vf[22][0]));
             lq(24, (std::uint16_t)(vi01 + 47), XYZW);
-            V n = g(24);
-            for (int k = 0; k < 4; k++)
-                n[k] = Itof0(n[k]);
-            n.v = Add4(acc, Mul4(n.v, Splat(vf[21][0])));
-            for (int k = 0; k < 4; k++)
-                n[k] = Ftoi0(n[k]);
+            V n;
+            n.v = Ftoi4(Add4(acc, Mul4(Itof4(g(24).v), Splat(vf[21][0]))));
             p(24, n, XYZW);
         }
         quadratic(5);
