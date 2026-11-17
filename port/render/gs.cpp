@@ -209,9 +209,14 @@ void LoadClut(std::uint64_t tex)
     bool eight = psm == PSMT8 || psm == PSMT8H;
     std::uint64_t key = (std::uint64_t)cbp | (std::uint64_t)cpsm << 14 | (std::uint64_t)csm << 18 | (std::uint64_t)csa << 19 |
                         (std::uint64_t)eight << 24 | (csm ? (g_regs.texclut & 0x3FFFFF) << 25 : 0);
-    std::uint32_t latest = 0;
-    PagesOf(cbp, csm ? (std::uint32_t)Bits(g_regs.texclut, 0, 6) : 1, cpsm, 0, 0, csm ? 1024 : 16, csm ? 1024 : 16,
-            [&](std::uint32_t page) { latest = std::max(latest, g_pageUpload[page]); });
+    // the latest upload to the palette's pages, looked for only when a candidate was cached before
+    // some upload (with none since, nothing can have changed)
+    auto latestUpload = [&]() {
+        std::uint32_t latest = 0;
+        PagesOf(cbp, csm ? (std::uint32_t)Bits(g_regs.texclut, 0, 6) : 1, cpsm, 0, 0, csm ? 1024 : 16, csm ? 1024 : 16,
+                [&](std::uint32_t page) { latest = std::max(latest, g_pageUpload[page]); });
+        return latest;
+    };
     struct Cached {
         std::uint64_t key = ~0ull;
         std::uint32_t at = 0, first = 0, count = 0, psm = 0, used = 0;
@@ -225,7 +230,7 @@ void LoadClut(std::uint64_t tex)
     Cached* hit = nullptr;
     if (!g_rasterise)
         for (std::uint32_t k = slot0; k < slot0 + 2; k++)
-            if (cache[k].key == key && latest <= cache[k].at) {
+            if (cache[k].key == key && (cache[k].at == g_uploads || latestUpload() <= cache[k].at)) {
                 hit = &cache[k];
                 break;
             }
