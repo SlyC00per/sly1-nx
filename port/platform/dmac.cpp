@@ -635,22 +635,145 @@ private:
         }
     }
 
+    // The same unpack a quadword at a time, field type and sign fixed: a vertex's fields widened
+    // four at a time, the destination walked straight when no cycle skips and the memory does not
+    // wrap (most unpacks).
+    template <std::uint32_t Fields, std::uint32_t Bits, bool Usn>
+    static void UnpackFast(std::uint8_t* mem, std::uint32_t qmask, std::uint32_t addr, std::uint32_t n, std::uint32_t wl,
+                           std::uint32_t cl, const std::uint8_t* bytes)
+    {
+        typedef std::uint32_t W4 __attribute__((vector_size(16)));
+        typedef std::int32_t I4v __attribute__((vector_size(16)));
+        typedef std::uint8_t B4 __attribute__((vector_size(4)));
+        typedef std::int8_t S4 __attribute__((vector_size(4)));
+        typedef std::uint16_t H4 __attribute__((vector_size(8)));
+        typedef std::int16_t T4 __attribute__((vector_size(8)));
+        constexpr std::uint32_t kIn = Fields * (Bits / 8);
+        auto one = [&](std::uint32_t* out, const std::uint8_t* in) {
+            if (Fields == 4 && Bits == 32) {
+                std::memcpy(out, in, 16);
+            } else if (Fields == 4 && Bits == 8) {
+                W4 v;
+                if (Usn) {
+                    B4 b;
+                    std::memcpy(&b, in, 4);
+                    v = __builtin_convertvector(b, W4);
+                } else {
+                    S4 b;
+                    std::memcpy(&b, in, 4);
+                    v = (W4)__builtin_convertvector(b, I4v);
+                }
+                std::memcpy(out, &v, 16);
+            } else if (Fields == 4 && Bits == 16) {
+                W4 v;
+                if (Usn) {
+                    H4 h;
+                    std::memcpy(&h, in, 8);
+                    v = __builtin_convertvector(h, W4);
+                } else {
+                    T4 h;
+                    std::memcpy(&h, in, 8);
+                    v = (W4)__builtin_convertvector(h, I4v);
+                }
+                std::memcpy(out, &v, 16);
+            } else if (Bits == 32) {
+                if (Fields == 1) {
+                    std::uint32_t x;
+                    std::memcpy(&x, in, 4);
+                    out[0] = out[1] = out[2] = out[3] = x;
+                } else {
+                    std::memcpy(out, in, Fields * 4);
+                }
+            } else {
+                std::uint32_t v[4];
+                for (std::uint32_t f = 0; f < Fields; f++) {
+                    const std::uint8_t* b = in + f * (Bits / 8);
+                    if (Bits == 16) {
+                        std::uint16_t h;
+                        std::memcpy(&h, b, 2);
+                        v[f] = Usn ? h : (std::uint32_t)(std::int32_t)(std::int16_t)h;
+                    } else {
+                        v[f] = Usn ? b[0] : (std::uint32_t)(std::int32_t)(std::int8_t)b[0];
+                    }
+                }
+                if (Fields == 1)
+                    out[0] = out[1] = out[2] = out[3] = v[0];
+                else
+                    for (std::uint32_t f = 0; f < Fields; f++)
+                        out[f] = v[f];
+            }
+        };
+        if ((wl >= cl || wl == 0) && (addr & qmask) + n <= qmask + 1) {
+            std::uint8_t* out = mem + (addr & qmask) * 16;
+            for (std::uint32_t i = 0; i < n; i++, out += 16, bytes += kIn)
+                one(reinterpret_cast<std::uint32_t*>(out), bytes);
+            return;
+        }
+        std::uint32_t cyc = 0, base = addr;
+        for (std::uint32_t i = 0; i < n; i++, bytes += kIn) {
+            one(reinterpret_cast<std::uint32_t*>(mem + ((base + cyc) & qmask) * 16), bytes);
+            if (++cyc == wl) {
+                cyc = 0;
+                base += cl;
+            }
+        }
+    }
+
+    template <std::uint32_t Fields, std::uint32_t Bits>
+    void UnpackSign(std::uint8_t* mem, std::uint32_t qmask, std::uint32_t addr, std::uint32_t n, bool usn, const std::uint8_t* bytes)
+    {
+        if (usn || Bits == 32)
+            UnpackFast<Fields, Bits, true>(mem, qmask, addr, n, wl_, cl_, bytes);
+        else
+            UnpackFast<Fields, Bits, false>(mem, qmask, addr, n, wl_, cl_, bytes);
+    }
+
     void UnpackPlain(std::uint8_t* mem, std::uint32_t qmask, std::uint32_t addr, std::uint32_t n, std::uint32_t fields,
                      std::uint32_t bits, bool usn, const std::uint8_t* bytes)
     {
+        static const bool check = std::getenv("SLY1_UNPACK_CHECK") != nullptr;
+        static thread_local std::vector<std::uint8_t> before, fast;
+        std::size_t size = (std::size_t)(qmask + 1) * 16;
+        if (check) {
+            before.assign(mem, mem + size);
+        }
         switch (fields * 100 + bits) {
-        case 132: UnpackFields<1, 32>(mem, qmask, addr, n, usn, bytes); break;
-        case 116: UnpackFields<1, 16>(mem, qmask, addr, n, usn, bytes); break;
-        case 108: UnpackFields<1, 8>(mem, qmask, addr, n, usn, bytes); break;
-        case 232: UnpackFields<2, 32>(mem, qmask, addr, n, usn, bytes); break;
-        case 216: UnpackFields<2, 16>(mem, qmask, addr, n, usn, bytes); break;
-        case 208: UnpackFields<2, 8>(mem, qmask, addr, n, usn, bytes); break;
-        case 332: UnpackFields<3, 32>(mem, qmask, addr, n, usn, bytes); break;
-        case 316: UnpackFields<3, 16>(mem, qmask, addr, n, usn, bytes); break;
-        case 308: UnpackFields<3, 8>(mem, qmask, addr, n, usn, bytes); break;
-        case 432: UnpackFields<4, 32>(mem, qmask, addr, n, usn, bytes); break;
-        case 416: UnpackFields<4, 16>(mem, qmask, addr, n, usn, bytes); break;
-        default: UnpackFields<4, 8>(mem, qmask, addr, n, usn, bytes); break;
+        case 132: UnpackSign<1, 32>(mem, qmask, addr, n, usn, bytes); break;
+        case 116: UnpackSign<1, 16>(mem, qmask, addr, n, usn, bytes); break;
+        case 108: UnpackSign<1, 8>(mem, qmask, addr, n, usn, bytes); break;
+        case 232: UnpackSign<2, 32>(mem, qmask, addr, n, usn, bytes); break;
+        case 216: UnpackSign<2, 16>(mem, qmask, addr, n, usn, bytes); break;
+        case 208: UnpackSign<2, 8>(mem, qmask, addr, n, usn, bytes); break;
+        case 332: UnpackSign<3, 32>(mem, qmask, addr, n, usn, bytes); break;
+        case 316: UnpackSign<3, 16>(mem, qmask, addr, n, usn, bytes); break;
+        case 308: UnpackSign<3, 8>(mem, qmask, addr, n, usn, bytes); break;
+        case 432: UnpackSign<4, 32>(mem, qmask, addr, n, usn, bytes); break;
+        case 416: UnpackSign<4, 16>(mem, qmask, addr, n, usn, bytes); break;
+        default: UnpackSign<4, 8>(mem, qmask, addr, n, usn, bytes); break;
+        }
+        if (check) {   // SLY1_UNPACK_CHECK: the same unpack the field-by-field way, on the memory as it was
+            fast.assign(mem, mem + size);
+            std::memcpy(mem, before.data(), size);
+            switch (fields * 100 + bits) {
+            case 132: UnpackFields<1, 32>(mem, qmask, addr, n, usn, bytes); break;
+            case 116: UnpackFields<1, 16>(mem, qmask, addr, n, usn, bytes); break;
+            case 108: UnpackFields<1, 8>(mem, qmask, addr, n, usn, bytes); break;
+            case 232: UnpackFields<2, 32>(mem, qmask, addr, n, usn, bytes); break;
+            case 216: UnpackFields<2, 16>(mem, qmask, addr, n, usn, bytes); break;
+            case 208: UnpackFields<2, 8>(mem, qmask, addr, n, usn, bytes); break;
+            case 332: UnpackFields<3, 32>(mem, qmask, addr, n, usn, bytes); break;
+            case 316: UnpackFields<3, 16>(mem, qmask, addr, n, usn, bytes); break;
+            case 308: UnpackFields<3, 8>(mem, qmask, addr, n, usn, bytes); break;
+            case 432: UnpackFields<4, 32>(mem, qmask, addr, n, usn, bytes); break;
+            case 416: UnpackFields<4, 16>(mem, qmask, addr, n, usn, bytes); break;
+            default: UnpackFields<4, 8>(mem, qmask, addr, n, usn, bytes); break;
+            }
+            static std::atomic<std::uint64_t> unpacks, differed;
+            std::uint64_t u = ++unpacks;
+            if (std::memcmp(mem, fast.data(), size) != 0 && differed++ < 8)
+                std::fprintf(stderr, "unpack check: V%u-%u (%u at %u, cycle %u/%u, usn %d) differs\n", fields, bits, n, addr, cl_, wl_, (int)usn);
+            if ((u & (u - 1)) == 0)
+                std::fprintf(stderr, "unpack check: %llu unpacks, %llu differed\n", (unsigned long long)u, (unsigned long long)differed.load());
         }
     }
 
@@ -687,6 +810,24 @@ private:
         };
         bool filling = wl_ > cl_;
         // the common case (no mask, no addition, no filling, not V4-5): the fields copied straight
+        {   // SLY1_UNPACK_SURVEY: the quadwords unpacked by format (diagnosis)
+            static const bool survey = std::getenv("SLY1_UNPACK_SURVEY") != nullptr;
+            if (survey) {
+                static std::map<std::uint32_t, std::uint64_t> counts;
+                static std::uint64_t all;
+                std::uint32_t key = fields << 16 | bits << 8 | (masked ? 1 : 0) | (mode_ ? 2 : 0) | (filling ? 4 : 0) |
+                                    (wl_ != cl_ ? 8 : 0) | (v45 ? 16 : 0);
+                counts[key] += n;
+                if (((all += n) & 0xFFFFF) < n) {
+                    std::fprintf(stderr, "unpack survey: %llu quadwords;", (unsigned long long)all);
+                    for (auto& kv : counts)
+                        std::fprintf(stderr, " V%u-%u%s%s%s%s%s %llu", kv.first >> 16, (kv.first >> 8) & 0xFF, kv.first & 1 ? " masked" : "",
+                                     kv.first & 2 ? " mode" : "", kv.first & 4 ? " fill" : "", kv.first & 8 ? " cycle" : "",
+                                     kv.first & 16 ? " (5551)" : "", (unsigned long long)kv.second);
+                    std::fprintf(stderr, "\n");
+                }
+            }
+        }
         if (!masked && mode_ == 0 && !filling && !v45 && have >= (std::size_t)n * fields * (bits / 8)) {
             UnpackPlain(mem, qmask, addr, n, fields, bits, usn, bytes);
             return;
