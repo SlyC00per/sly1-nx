@@ -1240,7 +1240,7 @@ void GsThreadMain()
 }
 
 // The render thread's time in each kind of item (VIF1 data, GIF data, calls), for the report.
-std::atomic<std::uint64_t> g_renderNs[3];
+std::atomic<std::uint64_t> g_renderNs[3], g_renderItems[3];
 
 void RenderThreadMain()
 {
@@ -1304,6 +1304,7 @@ void RenderThreadMain()
         }
         GsPassOn();
         g_renderNs[kind < 3 ? kind : 0] += NowNs() - started;
+        g_renderItems[kind < 3 ? kind : 0]++;
         if (item.words.capacity()) {
             std::lock_guard<std::mutex> lk(g_renderLock);
             if (g_renderSpare.size() < 64)
@@ -1328,8 +1329,9 @@ void DmacDump()
                  g_renderMaxQueued.load() * 4 / 1e6);
     if (g_renderStarted)
         std::fprintf(stderr, "dmac: the render thread took %.2f s for VIF1's data (VU1 and its kicks among it), %.2f s for the "
-                     "GIF's, %.2f s for calls (the swaps)\n", g_renderNs[0].load() / 1e9, g_renderNs[1].load() / 1e9,
-                     g_renderNs[2].load() / 1e9);
+                     "GIF's, %.2f s for calls (the swaps); %llu, %llu and %llu items\n", g_renderNs[0].load() / 1e9, g_renderNs[1].load() / 1e9,
+                     g_renderNs[2].load() / 1e9, (unsigned long long)g_renderItems[0].load(), (unsigned long long)g_renderItems[1].load(),
+                     (unsigned long long)g_renderItems[2].load());
     vu1::ReportLive();
     std::uint64_t failures = 0, checked = vu1::HandlerChecks(&failures);
     if (checked)
