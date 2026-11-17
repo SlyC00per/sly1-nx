@@ -143,6 +143,7 @@ private:
     bool frameRead_ = false;       // the frame's alpha has been read by a run with DATE since a run without it
     int frameBound_ = -1;          // the frame buffer bound as the test's texture in this command list
     std::uint64_t dateBarriers_ = 0;
+    std::uint64_t frameTextured_ = 0;
     BatchParams lastBatch_;
     std::vector<std::uint32_t> batchIndex_;
     struct BatchCache {   // the last batch put in the frame's memory (DrawBatch)
@@ -726,6 +727,20 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     if (target < 0) {
         otherTargets_++;
         return;
+    }
+    // The game's motion blur: each frame ends with a sprite textured from the other frame buffer
+    // (the frame before), blended over the new one at FIX 0x30. A frame buffer is not a texture
+    // here (its image is the GPU's, not the GS's memory the textures are decoded from), so the
+    // sprite drew that memory's black at 37.5% over every frame: a picture darker than retail's
+    // throughout. Left out: the port has no motion blur (a setting, off, if it ever has).
+    if (s.tme) {
+        const std::uint32_t tbp = (std::uint32_t)(s.tex0 & 0x3FFF);
+        if (tbp == 0 || tbp == 70 * 32) {
+            frameTextured_++;
+            static const bool keep = std::getenv("SLY1_GPU_KEEP_BLUR") != nullptr;   // as before, to compare
+            if (!keep)
+                return;
+        }
     }
     {   // SLY1_GPU_SKIP: kinds of draw left out, to find which one a fault comes with (bits: 1 batches,
         // 2 the GS's untextured, 4 the GS's textured, 8 depth-only, 16 the GS's lines and points)
@@ -1348,8 +1363,9 @@ void Renderer::Report()
                  "for the GPU to finish)\n", drawNs_ / 1e9, textureNs_ / 1e9, presentNs_ / 1e9, acquireNs_ / 1e9, waitNs_ / 1e9);
     std::fprintf(stderr, "gpu: %llu runs with the destination alpha test, %llu barriers before them\n",
                  (unsigned long long)destinationAlpha_, (unsigned long long)dateBarriers_);
-    std::fprintf(stderr, "gpu: not drawn as the GS would: %llu runs into other buffers, %llu blends approximated\n",
-                 (unsigned long long)otherTargets_, (unsigned long long)unsupportedBlends_);
+    std::fprintf(stderr, "gpu: not drawn as the GS would: %llu runs into other buffers, %llu textured from a frame buffer (the motion blur, "
+                 "left out), %llu blends approximated\n", (unsigned long long)otherTargets_, (unsigned long long)frameTextured_,
+                 (unsigned long long)unsupportedBlends_);
 }
 
 Renderer g_renderer;

@@ -248,3 +248,13 @@ a copy clears and fills it. Two ways with a stencil and no copies drew Sly black
 run and are not kept: the bit written to the stencil by the runs that mark pixels (a darkening
 polygon also covers pixels its volume did not mark, where the frame's own bit decides), and the bit
 guessed from each run's vertices (a texture's alpha takes part).
+
+## The motion blur left out (2026-11-17)
+
+The game ends each frame with a sprite textured from the other frame buffer (the frame before),
+blended over the new one at FIX 0x30 (37.5%). A frame buffer is not a texture in the GPU renderer
+(its image is the GPU's; textures are decoded from the GS's memory, which the GPU's drawing never
+reaches), so the sprite drew that memory's black at 37.5% over every frame, and the whole picture
+was darker than retail's. The run is left out (`SLY1_GPU_KEEP_BLUR=1` draws it as before, to
+compare): the port has no motion blur, by the user's decision; if it ever has, as a setting that is
+off. In Ryujinx six moments of the opening are then as bright as a recording of retail.
