@@ -258,3 +258,17 @@ reaches), so the sprite drew that memory's black at 37.5% over every frame, and 
 was darker than retail's. The run is left out (`SLY1_GPU_KEEP_BLUR=1` draws it as before, to
 compare): the port has no motion blur, by the user's decision; if it ever has, as a setting that is
 off. In Ryujinx six moments of the opening are then as bright as a recording of retail.
+
+## Shadows' pictures left out (2026-11-17)
+
+The game draws a 64 by 64 picture of a character into a buffer of its own (FBP 294) at the start
+of a frame and then lays it on the ground under the character, as a texture, for its shadow
+(program 0x076, with DATE). The GPU renderer does not draw into such buffers yet, so the texture
+was whatever the GS's memory held at that address: the shadow's run laid it on the roofs as black,
+all over with the vertex work on the CPU and now and then on the Switch (a roof flickering black).
+A run textured from a buffer the game draws into and the renderer does not is left out
+(`SLY1_GPU_KEEP_TARGET_TEXTURES=1` draws it as before): characters have no shadow until the
+renderer draws into such buffers, which is the next step for them. Found with the vertex work on
+the CPU (`SLY1_GPU_TRANSFORM=0`), where the roof was black in every frame: not the destination
+alpha test, not the volumes' depths, not the depth test of the light's passes (each tried).
+`SLY1_GPU_CAPTURE_ALPHA=1` makes a capture show the frame's alpha (green where its top bit is set).

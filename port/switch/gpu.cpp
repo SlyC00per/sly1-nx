@@ -143,7 +143,8 @@ private:
     bool frameRead_ = false;       // the frame's alpha has been read by a run with DATE since a run without it
     int frameBound_ = -1;          // the frame buffer bound as the test's texture in this command list
     std::uint64_t dateBarriers_ = 0;
-    std::uint64_t frameTextured_ = 0;
+    std::uint64_t frameTextured_ = 0, targetTextured_ = 0;
+    bool otherTarget_[512] = {};
     BatchParams lastBatch_;
     std::vector<std::uint32_t> batchIndex_;
     struct BatchCache {   // the last batch put in the frame's memory (DrawBatch)
@@ -726,7 +727,18 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     int target = TargetOf(s.frame & 0x1FF);
     if (target < 0) {
         otherTargets_++;
+        otherTarget_[(s.frame & 0x1FF)] = true;   // a buffer the game draws into and this renderer does not
         return;
+    }
+    // A texture that is such a buffer (the 64 by 64 picture of a character the game draws first and
+    // then lays on the ground as its shadow): nothing was drawn into it here, and what the GS's
+    // memory holds at its address is whatever was last uploaded there, which the shadow's run laid
+    // on the roofs as black. Left out until the renderer draws into such buffers.
+    if (s.tme && otherTarget_[(std::uint32_t)((s.tex0 & 0x3FFF) / 32) & 0x1FF] && ((s.tex0 & 0x3FFF) % 32) == 0) {
+        targetTextured_++;
+        static const bool keep = std::getenv("SLY1_GPU_KEEP_TARGET_TEXTURES") != nullptr;   // as before, to compare
+        if (!keep)
+            return;
     }
     // The game's motion blur: each frame ends with a sprite textured from the other frame buffer
     // (the frame before), blended over the new one at FIX 0x30. A frame buffer is not a texture
@@ -1082,8 +1094,15 @@ void Renderer::Capture(int target)
     for (std::uint32_t y = 0; y < h; y++) {
         for (std::uint32_t x = 0; x < w; x++)
             for (int c = 0; c < 3; c++) {
+                // SLY1_GPU_CAPTURE_ALPHA: the frame's alpha, red where its top bit is clear (0x60 to 0x7F
+                // brighter), green where it is set
+                static const bool alphaView = std::getenv("SLY1_GPU_CAPTURE_ALPHA") != nullptr;
                 const std::uint8_t* q = p + ((y * 4 + 1) * kWidth + x * 4 + 1) * 4 + c;
                 unsigned v = (q[0] + q[4] + q[kWidth * 4] + q[kWidth * 4 + 4] + 2) / 4;
+                if (alphaView) {
+                    const std::uint8_t al = (p + ((y * 4 + 1) * kWidth + x * 4 + 1) * 4)[3];
+                    v = c == 0 ? (al < 0x60 ? 0x50 : al < 0x80 ? 0xFF : 0) : c == 1 ? (al >= 0x80 ? (al == 0x80 ? 0x80 : 0xFF) : 0) : 0;
+                }
                 line[(x * 3 + c) * 2] = kHex[v >> 4];
                 line[(x * 3 + c) * 2 + 1] = kHex[v & 15];
             }
@@ -1363,9 +1382,9 @@ void Renderer::Report()
                  "for the GPU to finish)\n", drawNs_ / 1e9, textureNs_ / 1e9, presentNs_ / 1e9, acquireNs_ / 1e9, waitNs_ / 1e9);
     std::fprintf(stderr, "gpu: %llu runs with the destination alpha test, %llu barriers before them\n",
                  (unsigned long long)destinationAlpha_, (unsigned long long)dateBarriers_);
-    std::fprintf(stderr, "gpu: not drawn as the GS would: %llu runs into other buffers, %llu textured from a frame buffer (the motion blur, "
-                 "left out), %llu blends approximated\n", (unsigned long long)otherTargets_, (unsigned long long)frameTextured_,
-                 (unsigned long long)unsupportedBlends_);
+    std::fprintf(stderr, "gpu: not drawn as the GS would: %llu runs into other buffers and %llu textured from them (the shadows' pictures, left "
+                 "out), %llu textured from a frame buffer (the motion blur, left out), %llu blends approximated\n", (unsigned long long)otherTargets_,
+                 (unsigned long long)targetTextured_, (unsigned long long)frameTextured_, (unsigned long long)unsupportedBlends_);
 }
 
 Renderer g_renderer;
