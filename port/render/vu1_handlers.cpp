@@ -3460,6 +3460,54 @@ void DataWritten(std::uint32_t qaddr, std::uint32_t count, std::uint32_t cycle, 
     }
 }
 
+// --- For a model part drawn again from what was kept of its packet (port/platform/dmac.cpp).
+
+// The matrix the part's batches are kicked with: the one 0x31B (MatrixAt14) leaves at TOP + 14,
+// the matrix at 4-7 of data memory times the header's at top, by the same arithmetic.
+void PartMatrix(std::uint32_t top, float out[16])
+{
+    const std::uint8_t* d = Data();
+    V g[4], a[4];
+    for (int k = 0; k < 4; k++) {
+        std::memcpy(&g[k], d + ((top + (std::uint32_t)k) & 0x3FF) * 16, 16);
+        std::memcpy(&a[k], d + (4 + k) * 16, 16);
+    }
+    for (int k = 0; k < 4; k++) {
+        F4 acc = Mul4(a[0].v, Splat(g[k].x));
+        acc = Add4(acc, Mul4(a[1].v, Splat(g[k].y)));
+        acc = Add4(acc, Mul4(a[2].v, Splat(g[k].z)));
+        V res;
+        res.v = Add4(acc, Mul4(a[3].v, Splat(g[k].w)));
+        std::memcpy(out + k * 4, &res, 16);
+    }
+}
+
+// What says a part's batches were not all handed over as they were unpacked: the batches
+// transformed late, those not taken, those written over first.
+std::uint64_t PartTrouble()
+{
+    std::uint64_t late = 0;
+    for (const auto& kv : g_lateBy)
+        late += kv.second;
+    return late + g_notTaken + g_skippedOverwritten;
+}
+
+// The part's packet was not run: no batch waits for its kicks.
+void PartSkipped()
+{
+    g_deferred.on = false;
+    g_deferred.kicked = false;
+}
+
+// The next batch's id (gs::Batch::id), and that many more passed over (a part drawn again gives
+// its batches ids of their own).
+std::uint32_t TakeBatchIds(std::uint32_t count)
+{
+    std::uint32_t first = g_deferred.serial + 1;
+    g_deferred.serial += count;
+    return first;
+}
+
 void BatchCounts(std::uint64_t* taken, std::uint64_t* notTaken)
 {
     *taken = g_taken;

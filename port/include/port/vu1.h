@@ -34,6 +34,15 @@ std::uint8_t* Data();
 // not below cycle), VIF1's CYCLE.
 void DataWritten(std::uint32_t qaddr, std::uint32_t count, std::uint32_t cycle, std::uint32_t write);
 
+// For a model part drawn again from what was kept of its packet (port/platform/dmac.cpp; the
+// functions are in port/render/vu1_handlers.cpp): the matrix its batches are kicked with, from
+// the header at top and the matrix at 4-7 of data memory; a count that grows when a batch was
+// not handed over as it was unpacked; the packet not run; ids for count batches.
+void PartMatrix(std::uint32_t top, float out[16]);
+std::uint64_t PartTrouble();
+void PartSkipped();
+std::uint32_t TakeBatchIds(std::uint32_t count);
+
 // VIF1's TOP and ITOP, which XTOP and XITOP read, and where XGKICK sends a packet (the quadword
 // address of its first GIF tag in data memory).
 struct Context {

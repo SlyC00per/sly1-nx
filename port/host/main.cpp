@@ -599,8 +599,38 @@ int main(int argc, char** argv)
                 static const bool reuseOn = std::getenv("SLY1_GS_REUSE") != nullptr;
                 if (reuseOn)
                     NoteReuse(b);
+                static const long batchesOf = std::getenv("SLY1_GS_HASH_RUNS") ? std::atol(std::getenv("SLY1_GS_HASH_RUNS")) : -1;
+                if ((long)frames + 1 == batchesOf) {   // SLY1_GS_HASH_RUNS=N: frame N's batches too, each with its parts' hashes
+                    const std::uint64_t was = hash;
+                    std::uint64_t part[4];
+                    hash = 1; Mix(&s, sizeof s); part[0] = hash;
+                    hash = 1;
+                    for (std::uint32_t k = 0; k < b.count; k++) {
+                        const std::uint32_t* q = b.quads + k * b.stride * 4;
+                        Mix(q + b.positionAt * 4, 16);
+                        Mix(q + b.stqAt * 4, 8);
+                    }
+                    part[1] = hash;
+                    hash = 1;
+                    for (std::uint32_t k = 0; k < b.count; k++)
+                        Mix(b.quads + (k * b.stride + b.colourAt) * 4, 16);
+                    part[2] = hash;
+                    hash = 1; Mix(b.matrix, sizeof b.matrix); Mix(b.scale, sizeof b.scale); Mix(b.offset, sizeof b.offset); part[3] = hash;
+                    hash = was;
+                    std::fprintf(stderr, "gsbatch: %llu state %016llX shape %016llX colours %016llX matrix %016llX count %u cull %d fog %g %g tex0 %016llX test %llX alpha %llX\n",
+                                 (unsigned long long)batches, (unsigned long long)part[0], (unsigned long long)part[1], (unsigned long long)part[2],
+                                 (unsigned long long)part[3], b.count, (int)b.cull, b.fogScale, b.wMax, (unsigned long long)s.tex0, (unsigned long long)s.test,
+                                 (unsigned long long)s.alpha);
+                }
                 Mix(&s, sizeof s);
-                Mix(b.quads, (std::size_t)b.count * b.stride * 16);
+                // of a vertex, what is drawn: x y z and the control word, S and T, the colour (Q and
+                // the word after it hold what was last in VU1's memory there)
+                for (std::uint32_t k = 0; k < b.count; k++) {
+                    const std::uint32_t* q = b.quads + k * b.stride * 4;
+                    Mix(q + b.positionAt * 4, 16);
+                    Mix(q + b.stqAt * 4, 8);
+                    Mix(q + b.colourAt * 4, 16);
+                }
                 Mix(b.matrix, sizeof b.matrix);
                 Mix(b.scale, sizeof b.scale);
                 Mix(b.offset, sizeof b.offset);

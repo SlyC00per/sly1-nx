@@ -17,6 +17,8 @@
 #include <chrono>
 #include <cstdarg>
 #include <mutex>
+#include <unordered_map>
+#include <memory>
 #include <optional>
 #include <condition_variable>
 #include <deque>
@@ -252,8 +254,11 @@ Gif g_path2{2};
 // next one over it), VIF1's DIRECT data and the GIF channel's items are passed on as they come,
 // all in one queue, in order, so the GS sees what it would have seen.
 struct GsItem {
-    std::uint8_t path = 0;   // 1-3, or 0: a call
+    std::uint8_t path = 0;   // 1-3, 4 a batch, or 0: a call
     std::vector<std::uint32_t> words;
+    // a model part drawn again (PartReplay): the words kept from the first time, for a path's
+    // packet all of them, for a batch its vertices (words has its tag word and record, this frame's)
+    std::shared_ptr<const std::vector<std::uint32_t>> kept;
     void (*fn)(std::uint64_t, std::uint64_t) = nullptr;
     std::uint64_t a = 0, b = 0;
 };
@@ -307,8 +312,16 @@ void GsPassOn()
 
 // (on the render thread) Passed on every 24 items, so that the GS thread draws a frame's first
 // batches while the render thread is still at its later ones (a frame is one item of VIF1's).
+struct PartRecord;
+PartRecord* g_partRecording;   // the model part being recorded (PartReplay, below)
+void PartRecordItem(const GsItem& item);
+bool PartCall(std::uint32_t marker, std::uint32_t target);
+void PartDone();
+
 void GsEnqueue(GsItem&& item)
 {
+    if (g_partRecording)
+        PartRecordItem(item);
     g_gsPending.push_back(std::move(item));
     if (g_gsPending.size() >= 24)
         GsPassOn();
@@ -412,16 +425,41 @@ public:
     Vif(int cause, bool vu0) : cause_(cause), vu0_(vu0) {}
 
     // A quadword's words: the data of a kept VIFcode (an unpack, microcode) appended at once.
-    // The hook's NOP seen since the last call (LiveSink): the part is open from here to PartEnd.
-    bool TakePartBegin()
+    // The hook's NOP seen since the last call (LiveSink), 0 if none: the part is open from here to
+    // PartEnd.
+    std::uint32_t TakePartBegin()
     {
-        if (!partBegin_)
-            return false;
-        gs::PartOpen(true, (partBegin_ & 0x1FFFFF) << 4, (partBegin_ >> 22) & 1);
+        std::uint32_t w = partBegin_;
         partBegin_ = 0;
-        return true;
+        if (w)
+            gs::PartOpen(true, (w & 0x1FFFFF) << 4, (w >> 22) & 1);
+        return w;
     }
     void PartEnd() { gs::PartOpen(false, 0, 0); }
+
+    // The registers a part's packet finds and leaves (PartReplay).
+    struct Regs {
+        std::uint32_t cl, wl, row[4], col[4], mask, mode, base, ofst, tops, itops, dbf;
+        bool operator==(const Regs& o) const { return std::memcmp(this, &o, sizeof o) == 0; }
+    };
+    Regs GetRegs() const
+    {
+        Regs r;
+        std::memset(&r, 0, sizeof r);
+        r.cl = cl_; r.wl = wl_; r.mask = mask_; r.mode = mode_; r.base = base_; r.ofst = ofst_; r.tops = tops_; r.itops = itops_;
+        r.dbf = dbf_ ? 1 : 0;
+        std::memcpy(r.row, row_, sizeof r.row);
+        std::memcpy(r.col, col_, sizeof r.col);
+        return r;
+    }
+    void SetRegs(const Regs& r)
+    {
+        cl_ = r.cl; wl_ = r.wl; mask_ = r.mask; mode_ = r.mode; base_ = r.base; ofst_ = r.ofst; tops_ = r.tops; itops_ = r.itops;
+        dbf_ = r.dbf != 0;
+        std::memcpy(row_, r.row, sizeof r.row);
+        std::memcpy(col_, r.col, sizeof r.col);
+    }
+    bool BetweenCodes() const { return left_ == 0; }
 
     void Words(const std::uint32_t* w, int n)
     {
@@ -1143,6 +1181,7 @@ struct DirectSink {
     void OnVif(const std::uint32_t* w, int n) { vif->Words(w, n); }
     void OnGif(const std::uint32_t* q) { gif->Qword(q); }
     void OnTagDone(std::uint32_t) {}
+    bool SkipCall(std::uint32_t) { return false; }
     bool Direct() const { return true; }
 };
 // A list's length, its tags walked and nothing else.
@@ -1151,11 +1190,355 @@ struct CountSink {
     void OnVif(const std::uint32_t*, int n) { words += (std::size_t)n; }
     void OnGif(const std::uint32_t*) { words += 4; }
     void OnTagDone(std::uint32_t) {}
+    bool SkipCall(std::uint32_t) { return false; }
     bool Direct() const { return false; }
 };
 constexpr std::size_t kLiveListWords = 16384;   // 64 KiB: a frame's list is ten times that and more
 
 // VIF1's list walked by the render thread where it lies (a RenderItem of kind Vif1Live).
+// --- A model part drawn again from what was kept of its packet (SLY1_PART_REPLAY=1; with the GS
+// thread).
+//
+// A part whose lighting has not changed is drawn by a call of its light cache's packet
+// (tools/patches.py's hook says which): the part's meshes, unpacked into VU1's memory, with VU1's
+// programs that set them up and kick them. What comes of that for the GS is the same each frame
+// but for the matrix: packets that set registers, and batches (their vertices as they were
+// unpacked, for the renderer to transform). So the first time, what the part queues for the GS
+// thread is kept. After that, while the packet's own words and the part's header are what they
+// were (the header's first four quadwords, its matrix, apart), the call is not followed: the
+// kept packets and batches are queued again, the batches with the matrix made of this frame's
+// header and VU1's matrix at 4, and VIF1's registers are set as the packet left them. Neither
+// the VIF's unpacks nor VU1's programs run for it.
+//
+// A part is not kept (and is run as ever) when anything but that came of it: a batch not handed
+// over as unpacked, a batch whose matrix is not the header's times VU1's, a packet with vertices
+// in it, an interrupt, a FINISH.
+namespace {
+struct PartRecord {
+    bool ok = false;
+    std::uint64_t hash = 0, hashWhole = 0;   // PartHash, and with every piece whole
+    std::uint32_t verified = 0;          // the times it has been drawn again with the whole hash the same
+    bool moving = false;                 // its vertices change where the hash does not look: never drawn again
+    std::uint32_t header[44] = {};       // the part's header, 11 quadwords at TOPS
+    Vif::Regs before, after;
+    struct Item {
+        std::uint8_t path;
+        std::shared_ptr<const std::vector<std::uint32_t>> words;
+    };
+    std::vector<Item> items;
+    std::uint64_t words = 0;             // what its items hold, counted in g_partWords
+    std::uint32_t ids = 0;               // the batches' ids run from firstId for this many
+    std::uint32_t firstId = 0;
+    // while it is recorded
+    std::uint64_t troubleWas = 0, interruptsWas = 0, finishesWas = 0;
+    bool bad = false;
+};
+std::unordered_map<std::uint32_t, PartRecord> g_parts;   // by the hook's packet and half
+std::uint64_t g_partsReplayed, g_partsRecorded, g_partsRefused, g_partsStale, g_partItemsReplayed, g_partsMoving, g_partsStaleBy[3], g_partHashNs, g_partWords, g_partsCleared;
+constexpr std::size_t kBatchHead = 1 + (sizeof(gs::Batch) + 3) / 4;
+
+bool PartReplayOn()
+{
+    static const bool on = std::getenv("SLY1_PART_REPLAY") != nullptr;
+    return on && GsAsync();
+}
+
+void PartRecordItem(const GsItem& item)
+{
+    PartRecord& r = *g_partRecording;
+    if (item.path == 0 || item.path == 3 || item.kept) {   // a call, the GIF channel's: not a part's
+        r.bad = true;
+        return;
+    }
+    r.items.push_back({item.path, std::make_shared<const std::vector<std::uint32_t>>(item.words)});
+    r.words += item.words.size();
+    g_partWords += item.words.size();
+}
+
+// A hash of the packet called at target, to the tag that returns: its tags and, as VIF1 would
+// take them, the words that follow a tag or that a tag refers to: every VIFcode, and every code's
+// data whole, but for an unpack of more than 64 words (a mesh's vertices), of which one quadword in
+// eight is taken unless whole is set. So a register's value set in a mesh's data (a texture's
+// place, which the game writes anew when it moves the texture) always counts, and vertices that
+// move (a flag in the wind) are found by the whole hash: a part is hashed whole the first times
+// it is drawn again and now and then after, and one found changed where the eighths were not is
+// marked as moving and run as ever from then on.
+struct PartHasher {
+    std::uint64_t h = 0xCBF29CE484222325ull;
+    std::uint32_t left = 0, cl = 1, wl = 1, at = 0;
+    bool whole = false, sampled = false;
+    void Mix(std::uint32_t w)
+    {
+        h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 29;
+    }
+    void Feed(const std::uint32_t* w, std::size_t n)
+    {
+        for (std::size_t k = 0; k < n;) {
+            if (left == 0) {
+                std::uint32_t code = w[k++], cmd = (code >> 24) & 0x7F, imm = code & 0xFFFF, num = (code >> 16) & 0xFF;
+                Mix(code);
+                sampled = false;
+                at = 0;
+                if ((cmd & 0x60) == 0x60) {   // UNPACK, as Vif::Code has it
+                    std::uint32_t vn = (cmd >> 2) & 3, vl = cmd & 3, count = num ? num : 256;
+                    std::uint32_t vectors = count;
+                    if (wl > cl)
+                        vectors = cl * (count / wl) + (count % wl < cl ? count % wl : cl);
+                    std::uint32_t bits = (vn == 3 && vl == 3) ? 16 : (32u >> vl) * (vn + 1);
+                    left = (vectors * bits + 31) / 32;
+                    sampled = !whole && left > 64;
+                } else if (cmd == 0x01) {
+                    cl = imm & 0xFF;
+                    wl = (imm >> 8) & 0xFF;
+                    if (wl == 0)
+                        wl = 256;
+                } else if (cmd == 0x20) {
+                    left = 1;
+                } else if (cmd == 0x30 || cmd == 0x31) {
+                    left = 4;
+                } else if (cmd == 0x4A) {
+                    left = (num ? num : 256) * 2;
+                } else if (cmd == 0x50 || cmd == 0x51) {
+                    left = (imm ? imm : 65536) * 4;
+                }
+                continue;
+            }
+            const std::size_t take = std::min<std::size_t>(left, n - k);
+            if (!sampled) {
+                for (std::size_t i = 0; i < take; i++)
+                    Mix(w[k + i]);
+            } else {
+                for (std::size_t i = 0; i < take;) {   // four words of every 32
+                    const std::uint32_t in = (at + (std::uint32_t)i) & 31;
+                    if (in < 4) {
+                        Mix(w[k + i]);
+                        i++;
+                    } else {
+                        i += std::min<std::size_t>(take - i, 32 - in);
+                    }
+                }
+            }
+            k += take;
+            at += (std::uint32_t)take;
+            left -= (std::uint32_t)take;
+        }
+    }
+};
+
+std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl)
+{
+    PartHasher hasher;
+    hasher.whole = whole;
+    hasher.cl = cl;
+    hasher.wl = wl;
+    const bool tte = (static_cast<volatile std::uint32_t*>(Native(kVif1))[0] & 0x40) != 0;
+    auto data = [&](std::uint32_t addr, bool spr, std::uint32_t qwc) {
+        if (!spr) {
+            hasher.Feed(At(addr, false), (std::size_t)qwc * 4);
+        } else {
+            for (std::uint32_t i = 0; i < qwc; i++)
+                hasher.Feed(At(addr + i * 16, true), 4);
+        }
+    };
+    std::uint32_t tadr = target, stack[2];
+    int depth = 0;
+    for (int guard = 0; guard < 4096; guard++) {
+        const bool tagSpr = (tadr & 0x80000000u) != 0;
+        const std::uint32_t* tag = At(tadr & 0x7FFFFFFFu, tagSpr);
+        std::uint32_t qwc = tag[0] & 0xFFFF, id = (tag[0] >> 28) & 7, addr = tag[1] & 0x7FFFFFF0;
+        bool spr = (tag[1] >> 31) != 0;
+        hasher.Mix(tag[0]);
+        hasher.Mix(tag[1]);
+        if (tte)
+            hasher.Feed(tag + 2, 2);
+        std::uint32_t after = (tadr & 0x7FFFFFFFu) + 16;
+        switch (id) {
+        case 1:
+            data(after, tagSpr, qwc);
+            tadr = (after + qwc * 16) | (tagSpr ? 0x80000000u : 0);
+            break;
+        case 2: tadr = addr | (spr ? 0x80000000u : 0); break;
+        case 3: case 4:
+            data(addr, spr, qwc);
+            tadr = after | (tagSpr ? 0x80000000u : 0);
+            break;
+        case 5:
+            if (depth >= 2)
+                return 0;
+            data(after, tagSpr, qwc);
+            stack[depth++] = (after + qwc * 16) | (tagSpr ? 0x80000000u : 0);
+            tadr = addr | (spr ? 0x80000000u : 0);
+            break;
+        case 6:
+            data(after, tagSpr, qwc);
+            if (depth == 0)
+                return hasher.left == 0 ? (hasher.h | 1) : 0;   // it must end between VIFcodes
+            tadr = stack[--depth];
+            break;
+        default: return 0;   // refe, end: not a called packet's
+        }
+    }
+    return 0;
+}
+
+// The part's header as it is in VU1's memory now.
+void PartHeader(std::uint32_t tops, std::uint32_t out[44])
+{
+    const std::uint8_t* d = vu1::Data();
+    for (int k = 0; k < 11; k++)
+        std::memcpy(out + k * 4, d + ((tops + (std::uint32_t)k) & 0x3FF) * 16, 16);
+}
+
+// Whether two headers are the same in what the packet's programs take from them, the matrix
+// apart: quadwords 8 (the fog) and 9 (the alpha's scale, the lighting's mode and count, the cull
+// flag) and 10's w (the colours' scale). A part drawn from its cache is unlit or lit by the cache
+// alone, so the inverse matrix (4 to 7) is not read, and 10's x y z, the centre for a light, are
+// what was on the game's stack.
+bool PartHeaderSame(const std::uint32_t a[44], const std::uint32_t b[44])
+{
+    return std::memcmp(a + 32, b + 32, 32) == 0 && a[43] == b[43];
+}
+
+// The hook's NOP and then the call of target: true when the part has been drawn from what was
+// kept, and the call is not to be followed.
+bool PartCall(std::uint32_t marker, std::uint32_t target)
+{
+    if (!PartReplayOn() || !g_vif1.BetweenCodes())
+        return false;
+    const std::uint32_t key = marker & 0x7FFFFF;
+    const Vif::Regs regs = g_vif1.GetRegs();
+    std::uint32_t header[44];
+    PartHeader(regs.tops, header);
+    const std::uint64_t h0 = NowNs();
+    const std::uint64_t hash = PartHash(target, false, regs.cl, regs.wl);
+    g_partHashNs += NowNs() - h0;
+    auto it = g_parts.find(key);
+    if (it != g_parts.end() && it->second.moving && it->second.hash == hash) {
+        g_partsMoving++;
+        return false;   // run as ever, and not kept
+    }
+    if (it != g_parts.end() && it->second.ok) {
+        PartRecord& r = it->second;
+        bool same = hash != 0 && r.hash == hash && r.before == regs && PartHeaderSame(r.header, header);
+        if (!same)   // why, for the report: the hash, the registers, or the header
+            g_partsStaleBy[r.hash != hash ? 0 : !(r.before == regs) ? 1 : 2]++;
+        if (same && (r.verified < 8 || ((gs::FramesShown() + key) & 31) == 0)) {
+            if (PartHash(target, true, regs.cl, regs.wl) == r.hashWhole) {
+                r.verified++;
+            } else {
+                r.moving = true;
+                r.items.clear();
+                g_partWords -= std::min<std::uint64_t>(g_partWords, r.words);
+                r.words = 0;
+                g_partsMoving++;
+                return false;
+            }
+        }
+        if (same) {
+            float matrix[16], viewport[8];
+            vu1::PartMatrix(regs.tops, matrix);
+            std::memcpy(viewport, vu1::Data(), 32);
+            const std::uint32_t firstId = vu1::TakeBatchIds(r.ids);
+            for (const PartRecord::Item& kept : r.items) {
+                GsItem item;
+                item.path = kept.path;
+                item.kept = kept.words;
+                if (kept.path == 4) {   // the batch's record with this frame's matrix and viewport
+                    item.words.assign(kept.words->begin(), kept.words->begin() + (std::ptrdiff_t)kBatchHead);
+                    gs::Batch b;
+                    std::memcpy(&b, &item.words[1], sizeof b);
+                    std::memcpy(b.matrix, matrix, sizeof b.matrix);
+                    std::memcpy(b.scale, viewport, 16);
+                    std::memcpy(b.offset, viewport + 4, 16);
+                    if (b.id != 0)
+                        b.id = firstId + (b.id - r.firstId);
+                    std::memcpy(&item.words[1], &b, sizeof b);
+                }
+                g_gsPending.push_back(std::move(item));
+                if (g_gsPending.size() >= 24)
+                    GsPassOn();
+            }
+            g_vif1.SetRegs(r.after);
+            vu1::PartSkipped();
+            g_partsReplayed++;
+            g_partItemsReplayed += r.items.size();
+            return true;
+        }
+        g_partsStale++;
+    }
+    if (hash == 0)
+        return false;
+    // kept from this time on; everything kept is let go first when it has grown past 48 MB (another
+    // level's parts stay kept until then)
+    if (g_partWords > (48u << 20) / 4) {
+        g_parts.clear();
+        g_partWords = 0;
+        g_partsCleared++;
+    }
+    PartRecord& r = g_parts[key];
+    g_partWords -= std::min<std::uint64_t>(g_partWords, r.words);   // what it held before is let go
+    r = PartRecord();
+    r.hash = hash;
+    r.hashWhole = PartHash(target, true, regs.cl, regs.wl);
+    std::memcpy(r.header, header, sizeof header);
+    r.before = regs;
+    r.troubleWas = vu1::PartTrouble();
+    r.interruptsWas = g_counts.vifInterrupts;
+    r.finishesWas = g_counts.finishes;
+    g_partRecording = &r;
+    return false;
+}
+
+// The return from a part's call: what was recorded is kept if nothing but packets of registers
+// and batches of the header's matrix came of it.
+void PartDone()
+{
+    PartRecord* r = g_partRecording;
+    g_partRecording = nullptr;
+    if (!r)
+        return;
+    bool ok = !r->bad && g_vif1.BetweenCodes() && vu1::PartTrouble() == r->troubleWas && g_counts.vifInterrupts == r->interruptsWas &&
+              g_counts.finishes == r->finishesWas && !r->items.empty();
+    float matrix[16];
+    vu1::PartMatrix(r->before.tops, matrix);
+    std::uint32_t minId = ~0u, maxId = 0;
+    for (std::size_t k = 0; ok && k < r->items.size(); k++) {
+        const std::vector<std::uint32_t>& w = *r->items[k].words;
+        if (r->items[k].path == 4) {
+            gs::Batch b;
+            std::memcpy(&b, &w[1], sizeof b);
+            ok = std::memcmp(b.matrix, matrix, sizeof matrix) == 0;
+            if (b.id != 0) {
+                minId = std::min(minId, b.id);
+                maxId = std::max(maxId, b.id);
+            }
+        } else {
+            // a path's packet: tags of A+D writes alone, and none to a vertex's registers
+            for (std::size_t q = 0; ok && q + 4 <= w.size();) {
+                std::uint32_t nloop = w[q] & 0x7FFF, flg = (w[q + 1] >> 26) & 3, nreg = (w[q + 1] >> 28) & 0xF;
+                ok = flg == 0 && nreg == 1 && (w[q + 2] & 0xF) == 0xE && q + 4 + (std::size_t)nloop * 4 <= w.size();
+                for (std::uint32_t i = 0; ok && i < nloop; i++) {
+                    std::uint32_t reg = w[q + 4 + i * 4 + 2] & 0xFF;
+                    ok = reg > 0x05 && reg != 0x0C && reg != 0x0D && reg != 0x61;
+                }
+                q += 4 + (std::size_t)nloop * 4;
+            }
+        }
+    }
+    r->after = g_vif1.GetRegs();
+    r->firstId = minId == ~0u ? 0 : minId;
+    r->ids = minId == ~0u ? 0 : maxId - minId + 1;
+    r->ok = ok;
+    if (!ok) {
+        r->items.clear();
+        g_partWords -= std::min<std::uint64_t>(g_partWords, r->words);
+        r->words = 0;
+    }
+    (ok ? g_partsRecorded : g_partsRefused)++;
+}
+}  // namespace
+
 // The chain's walk hands the data over a quadword at a time; quadwords that follow each other in
 // memory are given to the VIF as one stretch, so that it takes whole unpacks and whole runs of a
 // GIF tag's loops at once, as from a copy. (A quadword at a time cost the Switch's render thread 5
@@ -1185,19 +1568,31 @@ struct LiveSink {
     ~LiveSink() { Flush(); }
 
     // A model part drawn from its cache (tools/patches.py's hook: a NOP naming the cache's packet,
-    // then the DMA call of it): from the NOP to the tag that returns from the call.
+    // then the DMA call of it): from the NOP to the tag that returns from the call. PartCall says
+    // whether the call is left out, the part drawn from what was kept of the packet.
     int depth = 0, partDepth = -1;
+    bool SkipCall(std::uint32_t target)
+    {
+        Flush();   // the words before the call first, the NOP among them
+        std::uint32_t marker = g_vif1.TakePartBegin();
+        if (!marker)
+            return false;
+        if (PartCall(marker, target)) {
+            g_vif1.PartEnd();
+            return true;
+        }
+        partDepth = depth;
+        return false;
+    }
     void OnTagDone(std::uint32_t id)
     {
-        if (id == 5) {   // call: the words before it are done first, the NOP among them
-            Flush();
-            if (g_vif1.TakePartBegin())
-                partDepth = depth;
+        if (id == 5) {
             depth++;
         } else if (id == 6 && depth > 0) {   // ret
             depth--;
             if (depth == partDepth) {
                 Flush();
+                PartDone();
                 g_vif1.PartEnd();
                 partDepth = -1;
             }
@@ -1254,6 +1649,7 @@ struct CaptureSink {
     void OnVif(const std::uint32_t* w, int n) { out.insert(out.end(), w, w + n); }
     void OnGif(const std::uint32_t* q) { out.insert(out.end(), q, q + 4); }
     void OnTagDone(std::uint32_t) {}
+    bool SkipCall(std::uint32_t) { return false; }
     bool Direct() const { return false; }
 };
 
@@ -1304,6 +1700,11 @@ void WalkChain(std::uint32_t regs, std::uint32_t tadr, Sink& sink)
         case 2: next = addr | (spr ? 0x80000000u : 0); break;            // next
         case 3: case 4: data = addr; dataSpr = spr; next = tadr + 16; break;   // ref, refs
         case 5:                                                          // call
+            if (sink.SkipCall(addr | (spr ? 0x80000000u : 0))) {   // drawn from what was kept of it (PartReplay)
+                next = data + qwc * 16;
+                id = 1;
+                break;
+            }
             if (depth < 2)
                 stack[depth++] = data + qwc * 16;
             next = addr | (spr ? 0x80000000u : 0);
@@ -1474,17 +1875,18 @@ void GsThreadMain()
             gs::Batch b;
             const std::size_t head = 1 + (sizeof(gs::Batch) + 3) / 4;
             std::memcpy(&b, &item.words[1], sizeof b);
-            b.quads = &item.words[head];
+            b.quads = item.kept ? item.kept->data() + head : &item.words[head];
             if (!gs::DrawBatch(item.words[0], b))
                 g_batchesRefused++;   // not a strip the renderer takes: nothing drawn of it
         } else {
             // whole runs of a tag's loops at once where the data allows (Gif::Run), as without the thread
             Gif& gif = item.path == 1 ? g_path1 : item.path == 2 ? g_path2 : g_gif;
             gs::Hold hold;
-            for (std::size_t k = 0; k + 4 <= item.words.size();) {
-                std::uint32_t taken = gif.Left() ? gif.Run(&item.words[k], (std::uint32_t)((item.words.size() - k) / 4)) : 0;
+            const std::vector<std::uint32_t>& words = item.kept ? *item.kept : item.words;
+            for (std::size_t k = 0; k + 4 <= words.size();) {
+                std::uint32_t taken = gif.Left() ? gif.Run(&words[k], (std::uint32_t)((words.size() - k) / 4)) : 0;
                 if (taken == 0) {
-                    gif.Qword(&item.words[k]);
+                    gif.Qword(&words[k]);
                     taken = 1;
                 }
                 k += (std::size_t)taken * 4;
@@ -1626,6 +2028,15 @@ void DmacDump()
             std::fprintf(stderr, "dmac: %llu model parts drawn from their caches' packets: %llu batches (%llu vertices) in them, %llu (%llu) not\n",
                          (unsigned long long)parts, (unsigned long long)in[0], (unsigned long long)in[1], (unsigned long long)out[0], (unsigned long long)out[1]);
     }
+    if (g_partsRecorded || g_partsRefused)
+        std::fprintf(stderr, "dmac: model parts drawn again from what was kept of their packets: %llu (%llu packets and batches); kept anew %llu times, of them %llu "
+                     "because the packet or the header had changed; not kept %llu times; run as ever because their vertices move %llu times\n", (unsigned long long)g_partsReplayed,
+                     (unsigned long long)g_partItemsReplayed, (unsigned long long)g_partsRecorded, (unsigned long long)g_partsStale, (unsigned long long)g_partsRefused,
+                     (unsigned long long)g_partsMoving);
+    if (g_partsRecorded || g_partsRefused)
+        std::fprintf(stderr, "dmac: parts kept anew because of the hash %llu, VIF1's registers %llu, the header %llu; %.2f s hashing packets; %.1f MB kept, "
+                     "all let go %llu times\n", (unsigned long long)g_partsStaleBy[0], (unsigned long long)g_partsStaleBy[1], (unsigned long long)g_partsStaleBy[2],
+                     g_partHashNs / 1e9, g_partWords * 4 / 1e6, (unsigned long long)g_partsCleared);
     if (g_liveLists.load())
         std::fprintf(stderr, "dmac: %llu lists of VIF1's walked where they lie (a frame's, or one with interrupts), %llu from their copies\n",
                      (unsigned long long)g_liveLists.load(), (unsigned long long)g_copiedLists.load());

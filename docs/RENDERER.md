@@ -578,3 +578,51 @@ What it is for: a part's packet is the same from frame to frame until the part i
 what the renderer made of it (each batch's vertices and colours, and the GS registers written
 between them) can be kept and drawn again with the new header, without the VIF's unpacks, VU1's
 handlers, the copy to the GS thread or the copy to the GPU. Not built yet.
+
+## A model part drawn again from what was kept of its packet (2026-11-17)
+
+`SLY1_PART_REPLAY=1`, with the GS thread; off by default. Built on the hook above.
+
+The first time a part's packet is called, what the part queues for the GS thread is kept: the
+packets that set registers and the batches (their vertices as VIF1 unpacked them, for the
+renderer to transform). After that, while the part is what it was, the render thread does not
+follow the call: it queues the kept packets and batches again, the batches with the matrix made
+of this frame's header and VU1's matrix at 4 (`vu1::PartMatrix`, the arithmetic of the program
+at 0x31B), and sets VIF1's registers as the packet left them. Neither VIF1's unpacks nor VU1's
+programs run for the part.
+
+"What it was" is three things:
+
+- VIF1's registers when the call comes.
+- The header, in what the packet's programs read of it apart from the matrix: quadwords 8 and 9
+  and 10's w. (Quadwords 4 to 7, the inverse matrix, are for lights the cached path does not
+  have. Quadword 10's x, y and z are whatever was on the game's stack: compared, they made a
+  quarter of the parts look changed every frame.)
+- A hash of the packet as VIF1 would take it (`PartHasher`): its tags, every VIFcode, and every
+  code's data whole but for unpacks of more than 64 words, the vertices, of which one quadword in
+  eight is taken. A part is hashed whole, vertices and all, the first eight times it is drawn
+  again and one frame in 32 after; one found changed where the eighths were not is marked as
+  moving and run as ever from then on.
+
+A part is not kept when anything else came of it: a batch not handed over as unpacked, a batch
+whose matrix is not the header's times VU1's, a packet with a vertex's registers in it, an
+interrupt, a FINISH. Everything kept is let go when it passes 48 MB.
+
+What the comparison with the run without it found on the way (the counting renderer's hash of
+each frame, which for a batch now takes what is drawn of a vertex and not Q and the word after
+it): a flag whose vertices move while its packet does not (hence the whole hash); a texture's
+place, which the game writes anew in a mesh's data when it moves the texture, missed for up to 32
+frames while the pieces a tag refers to were only sampled (hence the hash by VIFcodes); and the
+stack's words in the header.
+
+Verified. The Mac, 899 frames of the opening under lockstep, the counting renderer taking batches
+with the GS thread: three runs with it against a run without, every frame's hash the same (one
+further run differed in a stretch of 15 frames, the stretches that come and go). 164,873 parts
+drawn again of some 180,000, 10,251 kept anew; the render thread's time for VIF1's data 1.54 s
+against 1.94 s, 0.30 s of it the hashing; 34 MB kept. Ryujinx with the GPU renderer: frames 501
+to 506 and 620 to 625 byte for byte as without it; --verify-levels with it printed "all 46
+levels loaded and ran 60 frames" (586,918 parts drawn again, no batch refused).
+
+Not yet: the renderer still copies a kept batch's vertices to the GPU's memory every frame, and
+the hash is a walk of each part's packet every frame, which a hook where the game writes a
+cache's packet would spare.
