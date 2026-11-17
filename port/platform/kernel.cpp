@@ -256,6 +256,12 @@ void KernelStartMainThread()
 std::int32_t CurrentThreadId() { return t_self; }
 
 // The kernel's threads, for a diagnosis when the port stops: state, priority, what each waits on.
+bool KernelIdle()
+{
+    std::lock_guard<std::mutex> lk(g_kernel);
+    return g_current == kIdle && g_pendingCauses.load() == 0;
+}
+
 void KernelDump()
 {
     std::fprintf(stderr, "kernel: no game thread ran for %.2f s\n", g_idleNs / 1e9);

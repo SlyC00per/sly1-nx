@@ -286,8 +286,29 @@ std::string Compare(const Snapshot& h, const Capture& hc, const Snapshot& i, con
 
 }  // namespace
 
+namespace {
+std::uint32_t g_currentHash, g_currentEntry;
+}
+
+void CurrentProgram(std::uint32_t* hash, std::uint32_t* entry)
+{
+    *hash = g_currentHash;
+    *entry = g_currentEntry;
+}
+
 std::uint64_t Run(std::uint32_t start, const Context& ctx)
 {
+    {
+        int o = g_owner[start & 0x7FF];
+        g_currentHash = o < 0 ? 0 : core::kTranslated[o].hash;
+        g_currentEntry = start & 0x7FF;
+        static const bool seq = std::getenv("SLY1_VU1_SEQ") != nullptr;   // the programs in order, for diagnosis
+        static long printed;
+        if (seq && printed++ < 400000) {
+            const HandlerEntry* hh = HandlerFor(start);
+            std::fprintf(stderr, "seq %08X 0x%03X top %u %s\n", g_currentHash, g_currentEntry, ctx.top, hh ? hh->name : "-");
+        }
+    }
     static const bool off = std::getenv("SLY1_VU1_NO_HANDLERS") != nullptr;
     const HandlerEntry* h = live::Enabled() || off ? nullptr : HandlerFor(start);
     static const bool check = std::getenv("SLY1_VU1_CHECK") != nullptr;

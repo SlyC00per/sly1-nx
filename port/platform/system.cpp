@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The platform layer's system state (port/system.h) and the VU0 microprogram stand-in.
 #include "port/system.h"
+
+#include <atomic>
 #include "port/retail_data.h"
 
 #include <chrono>
@@ -26,8 +28,18 @@ std::uint64_t NowNs()
 #endif
 }
 
+namespace {
+std::atomic<bool> g_lockstep{false};
+std::atomic<std::uint64_t> g_lockstepTicks{0}, g_lockstepCalls{0};
+}
+
+void SetLockstep(bool on) { g_lockstep = on; }
+void LockstepTick() { g_lockstepTicks++; }
+
 std::uint64_t CycleCount()
 {
+    if (g_lockstep)   // a vblank's cycles each (294,912,000 / 60), and 1,000 a call
+        return g_lockstepTicks.load() * 4915200 + (g_lockstepCalls++ % 4000) * 1000;
     static const std::uint64_t start = NowNs();
     std::uint64_t ns = NowNs() - start;
     return ns * 294912 / 1000000;   // 294.912 MHz

@@ -16,6 +16,7 @@
 // address (port/ptr32.h). The memory retail's entry clears is static here, and zero.
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -40,6 +41,7 @@
 #include "port/gpu.h"
 #include "port/gs.h"
 #include "port/gs_backend.h"
+#include "port/vu1.h"
 #include "port/iso.h"
 #include "port/memory_card.h"
 #include "port/retail_data.h"
@@ -118,6 +120,29 @@ void* Clock(void*)
     port::SetGameFloatMode();
     auto next = std::chrono::steady_clock::now();
     auto stop = next + std::chrono::seconds(g_seconds);
+    // SLY1_LOCKSTEP=N: N vblanks in all, each once the game's threads all wait and the render
+    // thread has drawn what they gave it, the game's clock made of them (port::SetLockstep): every
+    // run sees the same frames, however fast it runs (for comparing runs; not for playing)
+    if (const char* ls = std::getenv("SLY1_LOCKSTEP")) {
+        long total = std::atol(ls);
+        port::SetLockstep(true);
+        while (!g_started)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        for (long n = 0; n < total; n++) {
+            // idle in three looks a millisecond apart; a game busy without waiting (a load polls the
+            // IOP) is given its vblank after 100 ms all the same
+            for (int quiet = 0, looks = 0; quiet < 3 && looks < 100; looks++) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                port::RenderFlush();
+                quiet = port::KernelIdle() ? quiet + 1 : 0;
+            }
+            port::LockstepTick();
+            port::RaiseInterrupt(2);
+        }
+        std::fprintf(stderr, "sly1: stopping after %ld vblanks in lockstep\n", total);
+        Report();
+        Finish(0);
+    }
     while (g_seconds == 0 || std::chrono::steady_clock::now() < stop) {
         next += std::chrono::microseconds(16683);
         std::this_thread::sleep_until(next);
@@ -493,8 +518,20 @@ int main(int argc, char** argv)
                 return true;
             }
             std::vector<std::uint32_t> pixels;
+            std::uint64_t dateRuns = 0;
+            bool lastDate = false;
+            std::uint32_t beganHash = 0, beganEntry = 0;
             void Begin(const port::gs::DrawState& s) override
             {
+                lastDate = (s.test >> 14) & 1;
+                port::vu1::CurrentProgram(&beganHash, &beganEntry);
+                if (false) {
+                    std::uint32_t hash, entry;
+                    port::vu1::CurrentProgram(&hash, &entry);
+                    std::fprintf(stderr, "date: frame %llu program %08X entry 0x%03X test %016llX alpha %016llX tex0 %016llX\n",
+                                 (unsigned long long)frames, hash, entry, (unsigned long long)s.test, (unsigned long long)s.alpha,
+                                 (unsigned long long)s.tex0);
+                }
                 int w, h;
                 if (s.tme && std::getenv("SLY1_GS_CHECK"))   // the decoder exercised (and checked)
                     port::gs::DecodeTexture(s, pixels, w, h);
@@ -503,6 +540,24 @@ int main(int argc, char** argv)
                       std::size_t i) override
             {
                 runs++; vertices += v; indices += i;
+                bool odd = false;
+                for (std::size_t k = 0; k < v; k++)
+                    odd = odd || std::fabs(vv[k].s) > 1e30f || std::fabs(vv[k].x) > 3000 || std::fabs(vv[k].y) > 3000;
+                static std::uint64_t oddRuns, allDate;
+                if (lastDate) {
+                    allDate++;
+                    if (odd)
+                        oddRuns++;
+                    if ((allDate & 1023) == 0)
+                        std::fprintf(stderr, "date count: %llu runs with DATE, %llu with odd vertices\n", (unsigned long long)allDate,
+                                     (unsigned long long)oddRuns);
+                }
+                if (lastDate && std::getenv("SLY1_VU1_SEQ"))
+                    std::fprintf(stderr, "seq   draw with DATE: %s (begun in %08X 0x%03X)\n", odd ? "ODD" : "plain", beganHash, beganEntry);
+                if (lastDate && odd && std::getenv("SLY1_GS_DATE_TRACE") && dateRuns++ < 40)
+                    for (std::size_t k = 0; k < v && k < 8; k++)
+                        std::fprintf(stderr, "date:   v%zu %.1f %.1f z %u colour %u %u %u %u stq %g %g %g\n", k, vv[k].x, vv[k].y, vv[k].z,
+                                     vv[k].r, vv[k].g, vv[k].b, vv[k].a, vv[k].s, vv[k].t, vv[k].q);
                 double zmin = 1e30, zmax = -1e30, xmin = 1e30, xmax = -1e30, ymin = 1e30, ymax = -1e30;
                 for (std::size_t k = 0; k < v; k++) {
                     zmin = std::min<double>(zmin, vv[k].z); zmax = std::max<double>(zmax, vv[k].z);

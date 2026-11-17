@@ -125,8 +125,8 @@ matrix and the viewport to `batch_vsh.glsl` (`gs::Batch`). The arithmetic is che
 against the program's (`SLY1_GPU_BATCH_CHECK`: 23.6 million vertices in view, none further than
 1/16 pixel, 1 of depth, 1 of fog), and the host draws the batches right in software
 (`SLY1_GS_SOFT_BATCH` with `--dump-fb`). On the Switch and in Ryujinx it halves VU1's time, but
-from the opening's second scene on most of the picture is black (the sky and the buildings
-missing). Not found yet. What is known:
+from the opening's second scene on most of the picture was black (the sky and the buildings
+missing), until the fix below. What was ruled out on the way:
 
 - the renderer is handed the right draws in the right order (`SLY1_GPU_LIST`);
 - the first scene (the flag) is drawn right, the later ones are not, in the emulator as on the
@@ -139,6 +139,23 @@ missing). Not found yet. What is known:
   a drawn batch is transformed after all when another program follows, `Materialise`);
 - a frame's number is not the same moment in every run (the game keeps real time):
   `SLY1_GPU_CAPTURE_HEAVY` starts the capture at the first frame of that many draws instead.
+
+Found (2026-11-16, late): not the GPU at all. The sprites program (0x076 of E1624411: the shadows
+under characters, drawn with the destination alpha test) reads the screen positions and STQ of the
+lit batch just drawn, in the same half of the data memory. The batch's transform is done in memory
+before such a program (`Materialise`), but an upload of the batch's colours (one quadword in four,
+by CYCLE) between the transform and its kicks was taken for an upload over the whole batch, so the
+transform was never done and the shadows were drawn from the untransformed vertices: large quads
+over the screen, which the renderer (without the destination alpha test yet) drew everywhere.
+`vu1::DataWritten` now looks at the quadwords an upload writes, the transform keeps the header it
+read (the sprites' upload replaces it), and every program but those known not to read the batch
+before (`BeforeProgram`) gets the transform done first.
+
+How it was found: `SLY1_LOCKSTEP=N` (N vblanks, each once the game waits and the render thread is
+idle, the game's clock made of them) makes two host runs see the same frames, so the inputs of a
+program can be compared run against run; `SLY1_GPU_REPLAY` records a frame's draws on the Switch
+or in Ryujinx and draws them again cut short (`SLY1_GPU_REPLAY_SEARCH` halves to the draw that
+darkens the sky); `SLY1_GS_DATE_TRACE` counts the destination-alpha draws with vertices far off.
 
 Diagnosis switches in the renderer: `SLY1_GPU_CAPTURE` (frames printed, with views of the batches
 on the five frames after), `SLY1_GPU_CAPTURE_STEP`, `SLY1_GPU_ZMAP` (the depth buffer as bands),

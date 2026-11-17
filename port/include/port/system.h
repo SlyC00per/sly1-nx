@@ -12,6 +12,15 @@ std::uint32_t Cop0Status();
 // The EE's cycle counter: 294,912,000 counts a second, from the port's clock (in a deterministic
 // run, from the frame count).
 std::uint64_t CycleCount();
+
+// SLY1_LOCKSTEP (port/host/main.cpp): the game's time made of the vblanks delivered, not the wall
+// clock, so that every run of the same build sees the same frames. LockstepTick counts a vblank;
+// CycleCount then counts from them (and a little at each call, so a wait on it ends).
+void SetLockstep(bool on);
+void LockstepTick();
+
+// Whether no game thread runs now (all of them wait).
+bool KernelIdle();
 // A monotonic clock in nanoseconds, cheap to read (the Switch's CPU counter, no system call).
 std::uint64_t NowNs();
 // The id of the game thread that is running.

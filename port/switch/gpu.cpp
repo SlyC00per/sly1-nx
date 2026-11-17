@@ -15,6 +15,7 @@
 
 #if defined(__SWITCH__)
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -135,6 +136,28 @@ private:
     long drawInFrame_ = 0;
     bool stopped_ = true, paintLast_ = false;
     long allDraws_ = 0;
+    // SLY1_GPU_REPLAY=n: the first frame of n draws or more kept (record_), then drawn again from the
+    // record onto a cleared target in the frames after, cut short at each of SLY1_GPU_REPLAY_AT's
+    // counts in turn, each printed (SLY1_GPU_CAPTURE's lines) with its brightness
+    struct Recorded {
+        gs::DrawState s;
+        std::vector<std::uint8_t> vertices;
+        std::uint32_t vertexSize = 0;
+        std::vector<std::uint32_t> index;
+        bool isBatch = false;
+        gs::Batch batch;
+        const Texture* texture = nullptr;
+    };
+    std::vector<Recorded> record_;
+    bool recording_ = false, replaying_ = false;
+    int recordTarget_ = 0;
+    std::vector<long> replayAt_;
+    std::size_t replayNext_ = 0;
+    int replayState_ = 0;   // 0 waiting for the frame, 1 recording it, 2 replaying, 3 done
+    void Replay(long count, bool capture = true);
+    double SkyBlue(int target);
+    void Search();
+    void DumpDraw(long k);
     long listAt_ = -1;
     int listed_ = 0;
     int view_ = 0;   // SLY1_GPU_CAPTURE's views of the batches, a frame each after the first: 1 no depth test,
@@ -522,6 +545,44 @@ void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t
 // that closes it last (its control word says whether a backface is dropped).
 bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
 {
+    static const bool asRuns = std::getenv("SLY1_GPU_BATCH_AS_RUNS") != nullptr;
+    if (asRuns) {   // diagnosis: the batch made the GS's vertices here and drawn the GS's way (nothing cut:
+                    // a triangle with a vertex outside the view is left out)
+        std::vector<gs::DrawVertex> v(b.count);
+        std::vector<bool> inside(b.count);
+        for (std::uint32_t k = 0; k < b.count; k++) {
+            gs::BatchVertex bv = gs::VertexOf(b, k);
+            float w = bv.clip[3];
+            inside[k] = w > 0.0f && std::fabs(bv.clip[0]) <= w && std::fabs(bv.clip[1]) <= w && std::fabs(bv.clip[2]) <= w;
+            const std::uint32_t* q = b.quads + k * b.stride * 4;
+            gs::DrawVertex& o = v[k];
+            o.x = (bv.x - b.ofx) / 16.0f;
+            o.y = (bv.y - b.ofy) / 16.0f;
+            o.z = inside[k] ? (std::uint32_t)bv.z : 0;
+            const std::uint32_t* c = q + b.colourAt * 4;
+            o.r = (std::uint8_t)c[0]; o.g = (std::uint8_t)c[1]; o.b = (std::uint8_t)c[2]; o.a = (std::uint8_t)c[3];
+            float stq[3];
+            std::memcpy(stq, q + b.stqAt * 4, 12);
+            float over = w != 0.0f ? 1.0f / w : 0.0f;
+            o.s = stq[0] * over; o.t = stq[1] * over; o.q = stq[2] * over;
+            o.fog = bv.fog;
+        }
+        batchIndex_.clear();
+        for (std::uint32_t k = 2; k < b.count; k++) {
+            if ((b.quads[(k * b.stride + b.positionAt) * 4 + 3] & gs::kStripStart) || !inside[k] || !inside[k - 1] || !inside[k - 2])
+                continue;
+            batchIndex_.push_back(k - 2);
+            batchIndex_.push_back(k - 1);
+            batchIndex_.push_back(k);
+        }
+        batches_++;
+        if (batchIndex_.empty())
+            return true;
+        Source src = {v.data(), (std::uint32_t)(v.size() * sizeof(gs::DrawVertex)), sizeof(gs::DrawVertex), batchIndex_.data(),
+                      (std::uint32_t)batchIndex_.size(), nullptr};
+        Submit(s, src);
+        return true;
+    }
     batchIndex_.clear();
     for (std::uint32_t k = 2; k < b.count; k++) {
         if (b.quads[(k * b.stride + b.positionAt) * 4 + 3] & gs::kStripStart)
@@ -592,6 +653,18 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         }
     }
     allDraws_++;
+    if (recording_ && !replaying_) {   // SLY1_GPU_REPLAY: the frame's draws kept as they are submitted
+        Recorded rec;
+        rec.s = s;
+        rec.vertices.assign((const std::uint8_t*)src.vertices, (const std::uint8_t*)src.vertices + src.vertexBytes);
+        rec.vertexSize = src.vertexSize;
+        rec.index.assign(src.index, src.index + src.indices);
+        rec.isBatch = src.batch != nullptr;
+        if (rec.isBatch)
+            rec.batch = *src.batch;
+        rec.texture = texture_;
+        record_.push_back(std::move(rec));
+    }
     std::uint32_t bytes = src.vertexBytes, indexBytes = indices * 4;
     if (bytes + indexBytes + 256 > kFrameMemory)
         return;
@@ -802,6 +875,24 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
 
 // The frame buffer's image read back, quartered each way and printed as lines of hexadecimal RGB
 // (tools/gpu_capture.py makes a PNG of them).
+// The top quarter of the frame's left two thirds (the sky, in the opening): its mean blue, 0 to 255.
+double Renderer::SkyBlue(int target)
+{
+    DkImageView view;
+    dkImageViewDefaults(&view, &colour_[target]);
+    DkImageRect rect = {0, 0, 0, kWidth, kHeight, 1};
+    DkCopyBuf to = {dkMemBlockGetGpuAddr(dataMem_) + capture_, 0, 0};
+    dkCmdBufCopyImageToBuffer(cmd_, &view, &rect, &to, 0);
+    Send(true);
+    const std::uint8_t* p = (const std::uint8_t*)dkMemBlockGetCpuAddr(dataMem_) + capture_;
+    double sum = 0;
+    long n = 0;
+    for (std::uint32_t y = 8; y < kHeight / 4; y += 4)
+        for (std::uint32_t x = 8; x < kWidth * 2 / 3; x += 4, n++)
+            sum += p[(y * kWidth + x) * 4 + 2];
+    return n ? sum / n : 0;
+}
+
 void Renderer::Capture(int target)
 {
     DkImageView view;
@@ -829,8 +920,155 @@ void Renderer::Capture(int target)
     std::fprintf(stderr, "gpucap: end\n");
 }
 
+void Renderer::Replay(long count, bool capture)
+{
+    count = std::max(0L, std::min(count, (long)record_.size()));
+    int target = recordTarget_;
+    BindTarget(target);
+    DkScissor all = {0, 0, kWidth, kHeight};
+    dkCmdBufSetScissors(cmd_, 0, &all, 1);
+    DkColorWriteState write;
+    dkColorWriteStateDefaults(&write);
+    dkCmdBufBindColorWriteState(cmd_, &write);
+    DkDepthStencilState ds;
+    dkDepthStencilStateDefaults(&ds);
+    ds.depthWriteEnable = 1;
+    dkCmdBufBindDepthStencilState(cmd_, &ds);
+    float grey[4] = {0.5f, 0.0f, 0.5f, 1.0f};   // purple: what nothing drew over
+    dkCmdBufClearColor(cmd_, 0, DkColorMask_RGBA, grey);
+    static const float startDepth = std::getenv("SLY1_GPU_REPLAY_DEPTH") ? (float)std::atof(std::getenv("SLY1_GPU_REPLAY_DEPTH")) : 0.0f;
+    dkCmdBufClearDepthStencil(cmd_, true, startDepth, 0, 0);
+    last_.any = false;
+    replaying_ = true;
+    for (long k = 0; k < count; k++) {
+        Recorded& r = record_[(std::size_t)k];
+        texture_ = r.texture;
+        Source src = {r.vertices.data(), (std::uint32_t)r.vertices.size(), r.vertexSize, r.index.data(),
+                      (std::uint32_t)r.index.size(), r.isBatch ? &r.batch : nullptr};
+        if (r.isBatch)
+            r.batch.quads = reinterpret_cast<const std::uint32_t*>(r.vertices.data());
+        Submit(r.s, src);
+    }
+    replaying_ = false;
+    if (capture) {
+        std::fprintf(stderr, "gpureplay: the first %ld of %zu draws\n", count, record_.size());
+        Capture(target);
+    }
+}
+
+// SLY1_GPU_REPLAY_SEARCH: the first draw after which the sky is dark, by halving: the frame replayed
+// up to a count, its sky measured, until two counts a draw apart; that draw printed in full, and the
+// frame captured just before and just after it.
+void Renderer::Search()
+{
+    long n = (long)record_.size();
+    long lo = 4, hi = n;
+    Replay(lo, false);
+    double bright = SkyBlue(recordTarget_);
+    Replay(hi, false);
+    double dark = SkyBlue(recordTarget_);
+    std::fprintf(stderr, "gpusearch: the sky's blue %.1f after %ld draws, %.1f after all %ld\n", bright, lo, dark, n);
+    if (!(dark < bright * 0.5)) {
+        std::fprintf(stderr, "gpusearch: the frame's sky is not dark: nothing to look for\n");
+        return;
+    }
+    double limit = bright * 0.5;
+    while (hi - lo > 1) {
+        long mid = (lo + hi) / 2;
+        Replay(mid, false);
+        double b = SkyBlue(recordTarget_);
+        std::fprintf(stderr, "gpusearch: %ld draws: %.1f\n", mid, b);
+        if (b >= limit)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    std::fprintf(stderr, "gpusearch: dark from draw %ld (index %ld)\n", hi, hi - 1);
+    DumpDraw(hi - 1);
+    if (hi >= 2)
+        DumpDraw(hi - 2);
+    Replay(lo, true);
+    Replay(hi, true);
+}
+
+void Renderer::DumpDraw(long k)
+{
+    const Recorded& r = record_[(std::size_t)k];
+    const gs::DrawState& s = r.s;
+    std::fprintf(stderr, "gpusearch: draw %ld: %s, %zu indices, %zu vertex bytes of %u; kind %u tme %u fge %u abe %u; test %016llX "
+                 "alpha %016llX frame %016llX zbuf %016llX scissor %016llX tex0 %016llX clamp %016llX\n", k,
+                 r.isBatch ? "batch" : "run", r.index.size(), r.vertices.size(), r.vertexSize, s.kind, s.tme, s.fge, s.abe,
+                 (unsigned long long)s.test, (unsigned long long)s.alpha, (unsigned long long)s.frame, (unsigned long long)s.zbuf,
+                 (unsigned long long)s.scissor, (unsigned long long)s.tex0, (unsigned long long)s.clamp);
+    if (r.isBatch) {
+        gs::Batch b = r.batch;
+        b.quads = reinterpret_cast<const std::uint32_t*>(r.vertices.data());
+        std::fprintf(stderr, "gpusearch:   batch: count %u stride %u at %u/%u/%u cull %d fog %g wMax %g ofx %d ofy %d scale %g %g %g offset %g %g %g\n",
+                     b.count, b.stride, b.positionAt, b.stqAt, b.colourAt, (int)b.cull, b.fogScale, b.wMax, b.ofx, b.ofy, b.scale[0],
+                     b.scale[1], b.scale[2], b.offset[0], b.offset[1], b.offset[2]);
+        std::fprintf(stderr, "gpusearch:   matrix %g %g %g %g / %g %g %g %g / %g %g %g %g / %g %g %g %g\n", b.matrix[0], b.matrix[1],
+                     b.matrix[2], b.matrix[3], b.matrix[4], b.matrix[5], b.matrix[6], b.matrix[7], b.matrix[8], b.matrix[9], b.matrix[10],
+                     b.matrix[11], b.matrix[12], b.matrix[13], b.matrix[14], b.matrix[15]);
+        for (std::uint32_t v = 0; v < b.count && v < 24; v++) {
+            const std::uint32_t* q = b.quads + v * b.stride * 4;
+            const float* pos = reinterpret_cast<const float*>(q + b.positionAt * 4);
+            const std::uint32_t* c = q + b.colourAt * 4;
+            const float* stq = reinterpret_cast<const float*>(q + b.stqAt * 4);
+            gs::BatchVertex bv = gs::VertexOf(b, v);
+            std::fprintf(stderr, "gpusearch:   v%u pos %g %g %g ctl %08X stq %g %g %g colour %X %X %X %X clip %g %g %g %g screen %.1f %.1f z %.0f fog %.0f\n",
+                         v, pos[0], pos[1], pos[2], q[b.positionAt * 4 + 3], stq[0], stq[1], stq[2], c[0], c[1], c[2], c[3], bv.clip[0],
+                         bv.clip[1], bv.clip[2], bv.clip[3], (bv.x - b.ofx) / 16, (bv.y - b.ofy) / 16, bv.z, bv.fog);
+        }
+    } else {
+        const gs::DrawVertex* v = reinterpret_cast<const gs::DrawVertex*>(r.vertices.data());
+        std::size_t nv = r.vertices.size() / sizeof(gs::DrawVertex);
+        for (std::size_t i = 0; i < nv && i < 24; i++)
+            std::fprintf(stderr, "gpusearch:   v%zu %.1f %.1f z %u colour %u %u %u %u stq %g %g %g fog %g\n", i, v[i].x, v[i].y, v[i].z,
+                         v[i].r, v[i].g, v[i].b, v[i].a, v[i].s, v[i].t, v[i].q, v[i].fog);
+    }
+}
+
 void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
 {
+    {
+        static const long replayHeavy = std::getenv("SLY1_GPU_REPLAY") ? std::atol(std::getenv("SLY1_GPU_REPLAY")) : 0;
+        if (replayHeavy > 0) {
+            if (replayState_ == 0 && allDraws_ >= replayHeavy) {
+                replayState_ = 1;   // the next frame is recorded
+                recording_ = true;
+                record_.clear();
+            } else if (replayState_ == 1) {
+                recording_ = false;
+                replayState_ = 2;
+                recordTarget_ = record_.empty() ? 0 : TargetOf(record_.back().s.frame & 0x1FF);   // the buffer the frame drew into
+                long n = (long)record_.size();
+                std::fprintf(stderr, "gpureplay: recorded %ld draws; the frame as drawn live:\n", n);
+                Capture(recordTarget_);
+                if (const char* at = std::getenv("SLY1_GPU_REPLAY_AT")) {
+                    for (const char* p = at; *p;) {
+                        long v = std::strtol(p, const_cast<char**>(&p), 10);
+                        replayAt_.push_back(v < 0 ? n + v : v);
+                        while (*p == ',') p++;
+                    }
+                } else {
+                    for (int k = 0; k <= 8; k++)
+                        replayAt_.push_back(n * k / 8);
+                }
+            } else if (replayState_ == 2 && std::getenv("SLY1_GPU_REPLAY_SEARCH")) {
+                Search();
+                replayState_ = 3;
+                std::fprintf(stderr, "gpureplay: done\n");
+            } else if (replayState_ == 2) {
+                if (replayNext_ < replayAt_.size()) {
+                    Replay(replayAt_[replayNext_]);
+                    replayNext_++;
+                } else {
+                    replayState_ = 3;
+                    std::fprintf(stderr, "gpureplay: done\n");
+                }
+            }
+        }
+    }
     {   // SLY1_GPU_CAPTURE_HEAVY=n: the capture two frames after the first frame of n draws or more (the
         // same scene in every run, which a frame's number is not: the game keeps real time)
         static const long heavy = std::getenv("SLY1_GPU_CAPTURE_HEAVY") ? std::atol(std::getenv("SLY1_GPU_CAPTURE_HEAVY")) : 0;

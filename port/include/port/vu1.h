@@ -27,10 +27,12 @@ State& Vu1();
 std::uint32_t* Micro();
 std::uint8_t* Data();
 
-// VIF1 unpacked count quadwords at qaddr of the data memory (port/platform/dmac.cpp): a batch whose
+// VIF1 unpacked to qaddr of the data memory (port/platform/dmac.cpp): a batch whose
 // transform was left to the GPU renderer is no longer the one in memory when they are its own
 // (port/render/vu1_handlers.cpp).
-void DataWritten(std::uint32_t qaddr, std::uint32_t count);
+// count quadwords written in cycles: write of every cycle quadwords (all of them when write is 0 or
+// not below cycle), VIF1's CYCLE.
+void DataWritten(std::uint32_t qaddr, std::uint32_t count, std::uint32_t cycle, std::uint32_t write);
 
 // VIF1's TOP and ITOP, which XTOP and XITOP read, and where XGKICK sends a packet (the quadword
 // address of its first GIF tag in data memory).
@@ -55,6 +57,9 @@ void ReportLive();
 
 // The instructions run in translated chunks so far.
 std::uint64_t TranslatedInstructions();
+
+// The program running now (or last): its upload's hash and its entry, for diagnosis.
+void CurrentProgram(std::uint32_t* hash, std::uint32_t* entry);
 
 }  // namespace vu1
 }  // namespace port

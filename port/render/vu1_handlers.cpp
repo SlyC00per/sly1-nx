@@ -385,8 +385,9 @@ void Kick(Runner& r, std::uint32_t qaddr);
 // for showing the game, not for SLY1_VU1_CHECK, which keeps it off.
 struct Deferred {
     bool on = false, kicked = false;
-    bool overwritten = false;      // VIF1 has unpacked over the batch or its header since
+    bool overwritten = false;      // VIF1 has unpacked over the batch's vertices since
     std::uint16_t first = 0, end = 0;   // the batch's quadwords
+    V header[10], viewport[2];     // what the transform reads of TOP + 8 to 17 and of 0 and 1, as they were
     std::uint16_t top = 0;
     int stride = 0;
     Test test = Test::Guard274;
@@ -407,21 +408,45 @@ bool DeferTransforms()
     return on && gs::TakesBatches();
 }
 
-// The transform noted before, done now: a program other than the batch's kicks may read what the
-// transform leaves in memory (the outlines' programs read the screen positions of a batch already
-// drawn). Not when VIF1 has unpacked over the batch since: the memory is the next batch's.
+// The transform noted before, done now, in memory only: a program other than the batch's kicks may
+// read what the transform leaves there (the outlines read the screen positions of a batch already
+// drawn, 0x6DA those of the batch in the other half). Not when VIF1 has unpacked over the batch
+// since: the memory is the next batch's.
 void Materialise(Runner& r, bool always = false)
 {
     if (!g_deferred.on)
         return;
     Deferred d = g_deferred;
     g_deferred.on = false;
-    if (d.overwritten || (std::uint16_t)r.ctx.top != d.top)
+    static const bool seq = std::getenv("SLY1_VU1_SEQ") != nullptr;
+    if (seq)
+        std::fprintf(stderr, "seq   materialise top %u (batch's top %u, overwritten %d)\n", r.ctx.top, d.top, (int)d.overwritten);
+    if (d.overwritten)
         return;
     (void)always;
-    std::uint32_t pc = r.s.pc;
-    BatchTransformNow(r, d.stride, d.test, d.endPc);
-    r.s.pc = pc;
+    // the batch's own half of the data memory (TOP), which need not be the program's now: a program
+    // may read the batch the half before held (0x6DA does); the registers as they are
+    Context ctx = r.ctx;
+    ctx.top = d.top;
+    Runner late(ctx);
+    State saved = r.s;
+    // the header and the viewport as the batch had them (a later upload may have replaced them:
+    // the sprites' own header, over a batch whose vertices they read), put back after
+    V header[10], viewport[2];
+    for (int k = 0; k < 10; k++) {
+        header[k] = Load(late, (std::uint16_t)(d.top + 8 + k));
+        Store(late, (std::uint16_t)(d.top + 8 + k), d.header[k]);
+    }
+    for (int k = 0; k < 2; k++) {
+        viewport[k] = Load(late, (std::uint16_t)k);
+        Store(late, (std::uint16_t)k, d.viewport[k]);
+    }
+    BatchTransformNow(late, d.stride, d.test, d.endPc);
+    for (int k = 0; k < 10; k++)
+        Store(late, (std::uint16_t)(d.top + 8 + k), header[k]);
+    for (int k = 0; k < 2; k++)
+        Store(late, (std::uint16_t)k, viewport[k]);
+    r.s = saved;
 }
 
 // The viewport's offsets between 2 to the 33rd and 2 to the 34th, and its depths staying there:
@@ -564,16 +589,68 @@ bool BatchTransform(Runner& r, const int stride, const Test test, const std::uin
         std::uint16_t span = (std::uint16_t)(Half(hdr.y) - Half(hdr.x));
         if (span != 0 && span % stride == 0 && span / stride <= 256 && Half(Load(r, top + 13).z) == 0 &&
             ViewportAsExpected(r)) {
+            if (std::getenv("SLY1_VU1_SEQ"))
+                std::fprintf(stderr, "seq   deferred top %u first %u end %u stride %d%s\n", top, top + Half(hdr.x), top + Half(hdr.y), stride,
+                             g_deferred.on ? " (the one before never done)" : "");
             g_deferred.on = true;
             g_deferred.kicked = false;
             g_deferred.overwritten = false;
             g_deferred.first = (std::uint16_t)(top + Half(hdr.x));
             g_deferred.end = (std::uint16_t)(top + Half(hdr.y));
+            for (int k = 0; k < 10; k++)
+                g_deferred.header[k] = Load(r, (std::uint16_t)(top + 8 + k));
+            for (int k = 0; k < 2; k++)
+                g_deferred.viewport[k] = Load(r, (std::uint16_t)k);
             g_deferred.top = top;
             g_deferred.stride = stride;
             g_deferred.test = test;
             g_deferred.endPc = endPc;
+            static const bool leaveCheck = std::getenv("SLY1_GPU_LEAVE_CHECK") != nullptr;
+            State full;
+            static std::vector<std::uint8_t> memory;
+            if (leaveCheck) {   // the registers the whole transform leaves, on copies, against LeaveRegisters'
+                memory.assign(r.data, r.data + 16384);
+                State before = r.s;
+                BatchTransformNow(r, stride, test, endPc);
+                full = r.s;
+                r.s = before;
+                std::memcpy(r.data, memory.data(), 16384);
+            }
             LeaveRegisters(r, top, stride, test, endPc);
+            if (leaveCheck) {
+                static std::uint64_t checks, differed;
+                static std::uint32_t regsDiffer[32];
+                static std::uint64_t otherDiffer[8];
+                checks++;
+                bool any = false;
+                for (int k = 0; k < 32; k++)
+                    if (std::memcmp(full.vf[k], r.s.vf[k], 16) != 0) {
+                        regsDiffer[k]++;
+                        any = true;
+                    }
+                const bool o[8] = {std::memcmp(full.vi, r.s.vi, sizeof full.vi) != 0, std::memcmp(full.acc, r.s.acc, 16) != 0,
+                                   full.q != r.s.q, full.p != r.s.p, full.i != r.s.i || full.r != r.s.r, full.mac != r.s.mac,
+                                   full.status != r.s.status, full.clip != r.s.clip};
+                for (int k = 0; k < 8; k++)
+                    if (o[k]) {
+                        otherDiffer[k]++;
+                        any = true;
+                    }
+                if (any)
+                    differed++;
+                if ((checks & (checks - 1)) == 0 || checks % 100000 == 0) {
+                    std::fprintf(stderr, "leave check: %llu batches, %llu differed; registers:", (unsigned long long)checks,
+                                 (unsigned long long)differed);
+                    for (int k = 0; k < 32; k++)
+                        if (regsDiffer[k])
+                            std::fprintf(stderr, " vf%02d %u", k, regsDiffer[k]);
+                    static const char* kOther[8] = {"vi", "acc", "Q", "P", "I/R", "MAC", "status", "clip"};
+                    for (int k = 0; k < 8; k++)
+                        if (otherDiffer[k])
+                            std::fprintf(stderr, " %s %llu", kOther[k], (unsigned long long)otherDiffer[k]);
+                    std::fprintf(stderr, "\n");
+                }
+            }
             return true;
         }
     }
@@ -3192,25 +3269,47 @@ bool OffsetXy(Runner& r)
                     "vf30.xyzw vf31.xyzw "
 const char kAllVfAndP[] = VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "P";
 
+// Before a program: the batch's transform done in memory unless the program is one known not to
+// read it. Those are the batch's own kicks, and the programs that make the next batch ready (its
+// matrix, its header from the other half, its lights, colours, skinning, morphs) or transform it.
+// Every other program may read the screen positions of the batch before: the outlines and the
+// sprites (0x076: the shadows under characters) do, and a program on the microcode may read anything.
 void BeforeProgram(Handler fn, core::Runner& r)
 {
-    if (g_deferred.on && fn != BatchFinish && fn != BatchSecond && fn != UnlitFinish)
-        Materialise(r);
+    if (!g_deferred.on)
+        return;
+    static const Handler kSafe[] = {BatchFinish, BatchSecond, UnlitFinish, MatrixAt14, CopyFromOtherBuffer, BatchSetup,
+                                    DirectionalLight, PointLight, SpotLight, LitColours, Skin, SkinNormals, UnitNormals,
+                                    MorphFromStride, MorphFromStart, OffsetXy, LitBatchTransform, BatchTransform274,
+                                    BatchTransform28E};
+    for (Handler h : kSafe)
+        if (fn == h)
+            return;
+    Materialise(r);
 }
 
 void LeftToMicrocode(core::Runner& r) { Materialise(r); }
 
-void DataWritten(std::uint32_t qaddr, std::uint32_t count)
+void DataWritten(std::uint32_t qaddr, std::uint32_t count, std::uint32_t cycle, std::uint32_t write)
 {
     Deferred& d = g_deferred;
     if (!d.on || d.overwritten)
         return;
-    // the batch's vertices (with the four read ahead) or what the transform reads of its header
-    std::uint32_t end = qaddr + count;
-    std::uint32_t lo = d.first, hi = (std::uint32_t)d.end + 4u * (std::uint32_t)d.stride;
-    std::uint32_t hlo = d.top + 8u, hhi = d.top + 18u;
-    if ((qaddr < hi && end > lo) || (qaddr < hhi && end > hlo))
-        d.overwritten = true;
+    static const bool seq = std::getenv("SLY1_VU1_SEQ") != nullptr;
+    // what the transform reads of each vertex: its STQ (quadword 0) and its position (the last);
+    // the header is kept (Materialise)
+    const std::uint32_t stride = (std::uint32_t)d.stride, span = (std::uint16_t)(d.end - d.first);
+    bool skipping = write != 0 && cycle > write;
+    for (std::uint32_t k = 0; k < count; k++) {
+        std::uint32_t at = skipping ? qaddr + (k / write) * cycle + (k % write) : qaddr + k;
+        std::uint32_t rel = (at - d.first) & 0x3FF;
+        if (rel < span && (rel % stride == 0 || rel % stride == stride - 1)) {
+            d.overwritten = true;
+            if (seq)
+                std::fprintf(stderr, "seq   unpack over the batch: %u quadwords at %u (cycle %u, write %u)\n", count, qaddr, cycle, write);
+            return;
+        }
+    }
 }
 
 void BatchCounts(std::uint64_t* taken, std::uint64_t* notTaken)

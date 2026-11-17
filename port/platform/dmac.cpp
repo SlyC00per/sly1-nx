@@ -320,6 +320,26 @@ void KickPath1(std::uint32_t qaddr, void*)
         return;
     }
     gs::Hold hold;
+    {   // SLY1_KICK_TRACE=entry: the GIF tags of that program's kicks (the first few), for diagnosis
+        static const long traced = std::getenv("SLY1_KICK_TRACE") ? std::strtol(std::getenv("SLY1_KICK_TRACE"), nullptr, 16) : -1;
+        static int printed;
+        std::uint32_t hash, entry;
+        vu1::CurrentProgram(&hash, &entry);
+        if (traced >= 0 && (long)entry == traced && printed < 12) {
+            printed++;
+            std::uint32_t at = qaddr;
+            for (int tags = 0; tags < 8; tags++) {
+                const std::uint32_t* t = reinterpret_cast<const std::uint32_t*>(d + (at & 0x3FF) * 16);
+                std::uint32_t nloop = t[0] & 0x7FFF, flg = (t[1] >> 26) & 3, nreg = (t[1] >> 28) & 0xF;
+                std::fprintf(stderr, "kick 0x%03X: tag at %u NLOOP %u EOP %u PRE %u PRIM %03X FLG %u NREG %u REGS %08X%08X\n", entry, at & 0x3FF,
+                             nloop, (t[0] >> 15) & 1, (t[1] >> 14) & 1, (t[1] >> 15) & 0x7FF, flg, nreg ? nreg : 16, t[3], t[2]);
+                std::uint32_t n = flg == 0 ? nloop * (nreg ? nreg : 16) : flg == 1 ? (nloop * (nreg ? nreg : 16) + 1) / 2 : nloop;
+                at += n + 1;
+                if ((t[0] >> 15) & 1)
+                    break;
+            }
+        }
+    }
     for (int tags = 0; tags < 1024; tags++) {
         const std::uint32_t* tag = reinterpret_cast<const std::uint32_t*>(d + (qaddr & 0x3FF) * 16);
         bool eop = (tag[0] >> 15) & 1;
@@ -644,8 +664,8 @@ private:
         std::uint32_t addr = imm_ & 0x3FF;
         if (!vu0_ && ((imm_ >> 15) & 1))
             addr += tops_;
-        if (!vu0_)   // the quadwords written, with those a cycle longer than its writes skips
-            vu1::DataWritten(addr & 0x3FF, cl_ > wl_ && wl_ ? n * ((cl_ + wl_ - 1) / wl_) : n);
+        if (!vu0_)   // the quadwords written (a cycle longer than its writes skips some)
+            vu1::DataWritten(addr & 0x3FF, n, cl_, wl_);
         // every format's fields are 8, 16 or 32 bits (V4-5 a 16-bit colour): read them as such
         const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(data_.data());
         std::size_t have = data_.size() * 4, at = 0;
