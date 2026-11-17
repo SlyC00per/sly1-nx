@@ -446,10 +446,13 @@ void DeferredKicked() { g_deferred.kicked = true; }
 
 bool DeferTransforms()
 {
-    // SLY1_GPU_TRANSFORM: off unless asked for. With it some scenes of the opening lose their sky and
-    // their lighting passes on the Switch's GPU and in the emulator (docs/RENDERER.md), though each
-    // batch's arithmetic agrees with the program's (SLY1_GPU_BATCH_CHECK) and the host draws them right.
-    static const bool on = std::getenv("SLY1_GPU_TRANSFORM") && !std::getenv("SLY1_VU1_CHECK");
+    // On wherever the renderer takes batches (the Switch's GPU); SLY1_GPU_TRANSFORM=0 turns it off,
+    // for comparing with the transform on the CPU. Off under SLY1_VU1_CHECK, which compares what the
+    // handlers leave in memory.
+    static const bool on = [] {
+        const char* e = std::getenv("SLY1_GPU_TRANSFORM");
+        return !(e && e[0] == '0') && !std::getenv("SLY1_VU1_CHECK");
+    }();
     return on && gs::TakesBatches();
 }
 
