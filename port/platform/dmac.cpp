@@ -748,6 +748,35 @@ private:
                 return;
             }
             std::uint32_t i = 0;
+            if (Fields == 4 && Bits == 8) {   // four quadwords from each sixteen bytes
+                typedef std::uint8_t B16 __attribute__((vector_size(16)));
+                typedef std::int8_t S16 __attribute__((vector_size(16)));
+                for (; i + 4 <= n; i += 4, out += 64, bytes += 16) {
+                    if (Usn) {
+                        B16 b;
+                        std::memcpy(&b, bytes, 16);
+                        W4 v0 = __builtin_convertvector(__builtin_shufflevector(b, b, 0, 1, 2, 3), W4);
+                        W4 v1 = __builtin_convertvector(__builtin_shufflevector(b, b, 4, 5, 6, 7), W4);
+                        W4 v2 = __builtin_convertvector(__builtin_shufflevector(b, b, 8, 9, 10, 11), W4);
+                        W4 v3 = __builtin_convertvector(__builtin_shufflevector(b, b, 12, 13, 14, 15), W4);
+                        std::memcpy(out, &v0, 16);
+                        std::memcpy(out + 16, &v1, 16);
+                        std::memcpy(out + 32, &v2, 16);
+                        std::memcpy(out + 48, &v3, 16);
+                    } else {
+                        S16 b;
+                        std::memcpy(&b, bytes, 16);
+                        I4v v0 = __builtin_convertvector(__builtin_shufflevector(b, b, 0, 1, 2, 3), I4v);
+                        I4v v1 = __builtin_convertvector(__builtin_shufflevector(b, b, 4, 5, 6, 7), I4v);
+                        I4v v2 = __builtin_convertvector(__builtin_shufflevector(b, b, 8, 9, 10, 11), I4v);
+                        I4v v3 = __builtin_convertvector(__builtin_shufflevector(b, b, 12, 13, 14, 15), I4v);
+                        std::memcpy(out, &v0, 16);
+                        std::memcpy(out + 16, &v1, 16);
+                        std::memcpy(out + 32, &v2, 16);
+                        std::memcpy(out + 48, &v3, 16);
+                    }
+                }
+            }
             for (; i < n; i++, out += 16, bytes += kIn)
                 one(reinterpret_cast<std::uint32_t*>(out), bytes);
             return;
