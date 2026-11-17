@@ -202,39 +202,89 @@ void LoadClut(std::uint64_t tex)
         return;
     std::uint32_t psm = (std::uint32_t)Bits(tex, 20, 6), cpsm = (std::uint32_t)Bits(tex, 51, 4);
     std::uint32_t csm = (std::uint32_t)Bits(tex, 55, 1), csa = (std::uint32_t)Bits(tex, 56, 5);
-    {   // the load before was this one, and nothing uploaded over the palette since: the buffer holds
-        // what this load would write (not with the reference drawing, which writes local memory)
-        bool eight = psm == PSMT8 || psm == PSMT8H;
-        std::uint64_t key = (std::uint64_t)cbp | (std::uint64_t)cpsm << 14 | (std::uint64_t)csm << 18 | (std::uint64_t)csa << 19 |
-                            (std::uint64_t)eight << 24 | (csm ? (g_regs.texclut & 0x3FFFFF) << 25 : 0);
-        std::uint32_t latest = 0;
-        PagesOf(cbp, csm ? (std::uint32_t)Bits(g_regs.texclut, 0, 6) : 1, cpsm, 0, 0, csm ? 1024 : 16, csm ? 1024 : 16,
-                [&](std::uint32_t page) { latest = std::max(latest, g_pageUpload[page]); });
-        static std::uint64_t lastKey = ~0ull;
-        static std::uint32_t lastAt;
-        static const bool check = std::getenv("SLY1_GS_CHECK") != nullptr;
-        if (!g_rasterise && key == lastKey && latest <= lastAt) {
-            if (!check)
-                return;
-            // SLY1_GS_CHECK: the load done all the same, the buffer compared with what it held
-            static std::uint32_t before[256];
-            static std::uint64_t skips, differed;
-            std::memcpy(before, g_clut, sizeof before);
-            std::uint32_t psmBefore = g_clutPsm;
-            lastKey = ~0ull;
-            LoadClut(tex);
-            lastKey = key;
-            skips++;
-            if ((std::memcmp(before, g_clut, sizeof before) != 0 || psmBefore != g_clutPsm) && differed++ < 8)
-                std::fprintf(stderr, "gs check: a palette load skipped would have changed the buffer\n");
-            if ((skips & (skips - 1)) == 0)
-                std::fprintf(stderr, "gs check: %llu palette loads skipped, %llu would have changed it\n", (unsigned long long)skips,
-                             (unsigned long long)differed);
+    // A palette loaded before, with nothing uploaded over its pages since, is copied from a small
+    // cache of the last loads instead of read entry by entry (not with the reference drawing, which
+    // writes local memory without marking pages). SLY1_GS_CHECK reads it all the same and compares.
+    bool eight = psm == PSMT8 || psm == PSMT8H;
+    std::uint64_t key = (std::uint64_t)cbp | (std::uint64_t)cpsm << 14 | (std::uint64_t)csm << 18 | (std::uint64_t)csa << 19 |
+                        (std::uint64_t)eight << 24 | (csm ? (g_regs.texclut & 0x3FFFFF) << 25 : 0);
+    std::uint32_t latest = 0;
+    PagesOf(cbp, csm ? (std::uint32_t)Bits(g_regs.texclut, 0, 6) : 1, cpsm, 0, 0, csm ? 1024 : 16, csm ? 1024 : 16,
+            [&](std::uint32_t page) { latest = std::max(latest, g_pageUpload[page]); });
+    struct Cached {
+        std::uint64_t key = ~0ull;
+        std::uint32_t at = 0, first = 0, count = 0, psm = 0, used = 0;
+        std::uint32_t entries[256];
+    };
+    static Cached cache[16];
+    static std::uint32_t uses;
+    static const bool check = std::getenv("SLY1_GS_CHECK") != nullptr;
+    Cached* hit = nullptr;
+    if (!g_rasterise)
+        for (Cached& c : cache)
+            if (c.key == key && latest <= c.at) {
+                hit = &c;
+                break;
+            }
+    std::uint32_t before[256], psmBefore = g_clutPsm;
+    if (hit) {
+        hit->used = ++uses;
+        if (!check) {
+            for (std::uint32_t k = 0; k < hit->count; k++)
+                g_clut[(hit->first + k) & 255] = hit->entries[k];
+            g_clutPsm = hit->psm;
             return;
         }
-        lastKey = key;
-        lastAt = g_uploads;
+        std::memcpy(before, g_clut, sizeof before);
+        for (std::uint32_t k = 0; k < hit->count; k++)
+            before[(hit->first + k) & 255] = hit->entries[k];
+        psmBefore = hit->psm;
     }
+    // where this load writes, for the cache
+    std::uint32_t first = 0, count = 256;
+    if (csm)
+        count = eight ? 256 : 16;
+    else if (!eight) {
+        first = (csa & ((cpsm == PSMCT16 || cpsm == PSMCT16S) ? 31 : 15)) * 16;
+        count = 16;
+    }
+    struct Store {
+        std::uint64_t key;
+        std::uint32_t at, first, count;
+        Cached* hit;
+        std::uint32_t* before;
+        std::uint32_t psmBefore;
+        ~Store()
+        {
+            if (hit) {   // SLY1_GS_CHECK: the cached palette against the one read
+                static std::uint64_t hits, differed;
+                hits++;
+                bool same = g_clutPsm == psmBefore;
+                for (std::uint32_t k = 0; same && k < count; k++)
+                    same = g_clut[(first + k) & 255] == before[(first + k) & 255];
+                if (!same && differed++ < 8)
+                    std::fprintf(stderr, "gs check: a cached palette differs from the one read\n");
+                if ((hits & (hits - 1)) == 0)
+                    std::fprintf(stderr, "gs check: %llu palettes from the cache, %llu differed\n", (unsigned long long)hits,
+                                 (unsigned long long)differed);
+                return;
+            }
+            if (g_rasterise)
+                return;
+            Cached* slot = &cache[0];
+            for (Cached& c : cache)
+                if (c.used < slot->used)
+                    slot = &c;
+            slot->key = key;
+            slot->at = at;
+            slot->first = first;
+            slot->count = count;
+            slot->psm = g_clutPsm;
+            slot->used = ++uses;
+            for (std::uint32_t k = 0; k < count; k++)
+                slot->entries[k] = g_clut[(first + k) & 255];
+        }
+    } store{key, g_uploads, first, count, hit, before, psmBefore};
     g_clutPsm = cpsm;
     bool c16 = cpsm == PSMCT16 || cpsm == PSMCT16S;
     auto fetch = [&](std::uint32_t x, std::uint32_t y) -> std::uint32_t {

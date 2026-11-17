@@ -492,7 +492,7 @@ int main(int argc, char** argv)
         struct Counting : port::gs::Backend {
             std::uint64_t runs = 0, vertices = 0, indices = 0, frames = 0;
             std::uint64_t batches = 0;
-            bool TakesBatches() const override { return std::getenv("SLY1_GS_COUNT_BATCHES") != nullptr; }
+            bool TakesBatches() const override { static const bool on = std::getenv("SLY1_GS_COUNT_BATCHES") != nullptr; return on; }
             // SLY1_GS_LIST=N: frame N's runs and batches, with their depth test and depths
             long listAt = std::getenv("SLY1_GS_LIST") ? std::atol(std::getenv("SLY1_GS_LIST")) : -1;
             void List(const char* what, const port::gs::DrawState& s, std::size_t n, double zmin, double zmax)
@@ -533,7 +533,8 @@ int main(int argc, char** argv)
                                  (unsigned long long)s.tex0);
                 }
                 int w, h;
-                if (s.tme && std::getenv("SLY1_GS_CHECK"))   // the decoder exercised (and checked)
+                static const bool check = std::getenv("SLY1_GS_CHECK") != nullptr;
+                if (s.tme && check)   // the decoder exercised (and checked)
                     port::gs::DecodeTexture(s, pixels, w, h);
             }
             void Draw(const port::gs::DrawState& st, const port::gs::DrawVertex* vv, std::size_t v, const std::uint32_t*,
@@ -552,9 +553,11 @@ int main(int argc, char** argv)
                         std::fprintf(stderr, "date count: %llu runs with DATE, %llu with odd vertices\n", (unsigned long long)allDate,
                                      (unsigned long long)oddRuns);
                 }
-                if (lastDate && std::getenv("SLY1_VU1_SEQ"))
+                static const bool seqTrace = std::getenv("SLY1_VU1_SEQ") != nullptr;
+                if (lastDate && seqTrace)
                     std::fprintf(stderr, "seq   draw with DATE: %s (begun in %08X 0x%03X)\n", odd ? "ODD" : "plain", beganHash, beganEntry);
-                if (lastDate && odd && std::getenv("SLY1_GS_DATE_TRACE") && dateRuns++ < 40)
+                static const bool dateTrace = std::getenv("SLY1_GS_DATE_TRACE") != nullptr;
+                if (lastDate && odd && dateTrace && dateRuns++ < 40)
                     for (std::size_t k = 0; k < v && k < 8; k++)
                         std::fprintf(stderr, "date:   v%zu %.1f %.1f z %u colour %u %u %u %u stq %g %g %g\n", k, vv[k].x, vv[k].y, vv[k].z,
                                      vv[k].r, vv[k].g, vv[k].b, vv[k].a, vv[k].s, vv[k].t, vv[k].q);
