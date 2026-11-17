@@ -96,6 +96,8 @@ struct Source {
     // vertex), its colours (16), its indices, as offsets in the frame's memory
     bool placed = false;
     bool kept = false;        // placed in keepMem_, not in the frame's memory
+    bool allCullable = false; // a batch's: every triangle is one dropped when it faces away (the GPU can cull)
+    std::uint8_t alphaMin = 0, alphaMax = 255;   // of the vertices' alpha, where it is known
     std::uint32_t vertexAt = 0, colourAt = 0, indexAt = 0;
 };
 
@@ -112,6 +114,7 @@ struct Texture {
     std::uint32_t generation;
     std::uint64_t hash;
     int width, height;
+    std::uint8_t alphaMin = 0, alphaMax = 255;   // of its texels (a small target's: not known)
 };
 
 class Renderer : public gs::Backend {
@@ -149,9 +152,10 @@ private:
     double area_[4] = {};
     int areaRuns_[4] = {};
     // SLY1_GPU_AB=1: a measurement in one run. Every 30 frames the next of six ways of drawing: 0 as it
-    // is, 1 the long pixel shader for every run, 2 no destination alpha test, 3 no batches, 4 none of the GS's
-    // runs into the frame, 5 everything cut to a sixteenth of the picture. For each, the mean time
-    // from one frame's end to the next and the mean wait for the GPU (the picture is not to look at).
+    // is, 1 a batch's backfaces dropped in the pixel shader (not culled by the rasteriser), 2 every
+    // alpha test in two draws (none decided for the whole run), 3 both, 4 no batches, 5 everything
+    // cut to a sixteenth of the picture. For each, the mean time from one frame's end to the next
+    // and the mean wait for the GPU (with 4 and 5 the picture is not to look at).
     int ab_ = 0;
     bool abOn_ = false;
     std::uint64_t abAt_ = 0, abNs_[6] = {}, abWaitNs_[6] = {}, abFrames_[6] = {};
@@ -218,6 +222,8 @@ private:
     // more frames have been shown: the GPU may still be drawing from it till then.
     struct Kept {
         std::uint32_t at = 0, bytes = 0, indexAt = 0, vertexAt = 0, colourAt = 0, indices = 0, count = 0;
+        bool allCullable = false;
+        std::uint8_t alphaMin = 0, alphaMax = 255;
     };
     struct FreeBlock {
         std::uint32_t at, bytes;
@@ -239,7 +245,10 @@ private:
         const std::uint32_t* quads = nullptr;
         std::uint32_t count = 0, stride = 0, positionAt = 0, stqAt = 0;
         std::uint32_t vertexAt = 0, indexAt = 0, indices = 0;
+        bool allCullable = false;
     } batchCache_;
+    int cullBound_ = 0;   // the rasteriser's culling bound: 0 none, 1 the faces a batch drops
+    std::uint64_t culledDraws_ = 0, onePassDraws_ = 0, twoPassDraws_ = 0;
     std::vector<std::uint32_t> staging_;   // a batch's indices, positions or colours made before they are copied
     std::uint64_t batches_ = 0, batchVertices_ = 0;
     float cullFront_ = 1.0f;
@@ -454,9 +463,11 @@ void Renderer::BeginCommands()
     DkRasterizerState raster;
     dkRasterizerStateDefaults(&raster);
     raster.depthClampEnable = 0;
-    raster.cullMode = DkFace_None;   // a batch's backfaces are the fragment shader's to drop, triangle by triangle
+    raster.cullMode = DkFace_None;   // a batch's backfaces are the fragment shader's to drop, triangle by triangle,
+                                     // or the rasteriser's when all of a batch's triangles are (Submit)
     raster.provokingVertex = DkProvokingVertex_Last;
     dkCmdBufBindRasterizerState(cmd_, &raster);
+    cullBound_ = 0;
     DkBufExtents vertices = {dkMemBlockGetGpuAddr(frameMem_), kFrameMemory};
     dkCmdBufBindVtxBuffers(cmd_, 0, &vertices, 1);
     dkCmdBufBindIdxBuffer(cmd_, DkIdxFormat_Uint32, dkMemBlockGetGpuAddr(frameMem_));
@@ -716,6 +727,11 @@ const Texture* Renderer::TextureFor(const gs::DrawState& state)
     int w, h;
     gs::DecodeTexture(state, pixels_, w, h);
     decodes_++;
+    std::uint32_t texelLo = 255, texelHi = 0;
+    for (std::uint32_t p : pixels_) {
+        texelLo = std::min(texelLo, p >> 24);
+        texelHi = std::max(texelHi, p >> 24);
+    }
     std::uint32_t bytes = (std::uint32_t)pixels_.size() * 4;
     if (frameUsed_ + bytes > kFrameMemory)
         Send(true);
@@ -756,6 +772,8 @@ const Texture* Renderer::TextureFor(const gs::DrawState& state)
     Texture& t = it->second;
     t.generation = generation;
     t.hash = hash;
+    t.alphaMin = (std::uint8_t)texelLo;
+    t.alphaMax = (std::uint8_t)texelHi;
     std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(frameMem_) + frameUsed_, pixels_.data(), bytes);
     DkImageView view;
     dkImageViewDefaults(&view, &t.image);
@@ -953,9 +971,11 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
             std::uint32_t* index = staging_.data();
             std::uint32_t n = 0;
             const std::uint32_t controlAt = b.positionAt * 4 + 3, step = b.stride * 4;
+            bool allCullable = true;
             for (std::uint32_t k = 2; k < b.count; k++) {   // as below
                 if (b.quads[k * step + controlAt] & gs::kStripStart)
                     continue;
+                allCullable = allCullable && (b.quads[k * step + controlAt] & gs::kCullable) != 0;
                 index[n] = (k & 1) ? k - 2 : k - 1;
                 index[n + 1] = (k & 1) ? k - 1 : k - 2;
                 index[n + 2] = k;
@@ -964,6 +984,15 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
             Kept k;
             k.indices = n;
             k.count = b.count;
+            k.allCullable = allCullable;
+            std::uint32_t lo = 255, hi = 0;
+            for (std::uint32_t v = 0; v < b.count; v++) {
+                const std::uint32_t a = std::min<std::uint32_t>(b.quads[v * step + b.colourAt * 4 + 3], 255);
+                lo = std::min(lo, a);
+                hi = std::max(hi, a);
+            }
+            k.alphaMin = (std::uint8_t)lo;
+            k.alphaMax = (std::uint8_t)hi;
             const std::uint32_t indexBytes = Align(n * 4, 64), vertexBytes = Align(b.count * 32, 64), colourBytes = Align(b.count * 16, 64);
             std::uint32_t at = 0, got = 0;
             if (KeepRoom(indexBytes + vertexBytes + colourBytes, &at, &got)) {
@@ -1004,6 +1033,9 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
             Source src = {nullptr, 0, 32, nullptr, k.indices, &b};
             src.placed = true;
             src.kept = true;
+            src.allCullable = k.allCullable;
+            src.alphaMin = k.alphaMin;
+            src.alphaMax = k.alphaMax;
             src.vertexAt = k.vertexAt;
             src.colourAt = k.colourAt;
             src.indexAt = k.indexAt;
@@ -1037,9 +1069,11 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
         std::uint32_t* index = staging_.data();
         std::uint32_t n = 0;
         const std::uint32_t controlAt = b.positionAt * 4 + 3, step = b.stride * 4;
+        c.allCullable = true;
         for (std::uint32_t k = 2; k < b.count; k++) {
             if (b.quads[k * step + controlAt] & gs::kStripStart)
                 continue;
+            c.allCullable = c.allCullable && (b.quads[k * step + controlAt] & gs::kCullable) != 0;
             index[n] = (k & 1) ? k - 2 : k - 1;
             index[n + 1] = (k & 1) ? k - 1 : k - 2;
             index[n + 2] = k;
@@ -1081,14 +1115,22 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
     std::uint32_t colourAt = frameUsed_;
     staging_.resize((std::size_t)b.count * 4);
     std::uint32_t* colours = staging_.data();
-    for (std::uint32_t k = 0; k < b.count; k++)
+    std::uint32_t alphaLo = 255, alphaHi = 0;
+    for (std::uint32_t k = 0; k < b.count; k++) {
         std::memcpy(colours + k * 4, b.quads + k * b.stride * 4 + b.colourAt * 4, 16);
+        const std::uint32_t a = std::min<std::uint32_t>(colours[k * 4 + 3], 255);
+        alphaLo = std::min(alphaLo, a);
+        alphaHi = std::max(alphaHi, a);
+    }
     std::memcpy(mem + frameUsed_, colours, colourBytes);
     frameUsed_ += colourBytes;
     copiedBytes_ += colourBytes;
     copyNs_ += Tick() - c0;
     Source src = {nullptr, 0, 32, nullptr, c.indices, &b};
     src.placed = true;
+    src.allCullable = c.allCullable;
+    src.alphaMin = (std::uint8_t)alphaLo;
+    src.alphaMax = (std::uint8_t)alphaHi;
     src.vertexAt = c.vertexAt;
     src.colourAt = colourAt;
     src.indexAt = c.indexAt;
@@ -1325,8 +1367,8 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     // first: right, but a depth buffer with a stencil is twice the size, and a dozen copies a frame
     // took the Switch from 24 to 17 frames a second.) SLY1_GPU_NO_DATE leaves the test out.
     static const bool noDate = std::getenv("SLY1_GPU_NO_DATE") != nullptr;
-    const bool dateRun = date && !noDate && target < 2 && ab_ != 2;
-    if ((ab_ == 3 && src.batch) || (ab_ == 4 && !src.batch && target < 2))
+    const bool dateRun = date && !noDate && target < 2;
+    if (ab_ == 4 && src.batch)
         return;
     if (date)
         destinationAlpha_++;
@@ -1437,7 +1479,23 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     fp.blend[3] = (float)fsView;
     {   // the pixel shader: the short one where the run needs no more (gs_lite_fsh.glsl)
         static const bool noLite = std::getenv("SLY1_GPU_NO_LITE") != nullptr;
-        const bool lite = !noLite && ab_ != 1 && !src.batch && !dateRun && fsView == 0 && view_ == 0 && fp.coef[0] == 99.0f;
+        // A batch too, when no triangle of it is dropped in the shader for facing away: none is to be
+        // dropped at all, or every one is and the rasteriser culls them (below).
+        static const bool noCull = std::getenv("SLY1_GPU_NO_CULL") != nullptr;
+        const bool rasterCull = src.batch && src.batch->cull && src.allCullable && !noCull && ab_ != 1 && ab_ != 3;
+        const bool lite = !noLite && (!src.batch || !src.batch->cull || rasterCull) && !dateRun && fsView == 0 && view_ == 0 && fp.coef[0] == 99.0f;
+        const int cull = rasterCull && lite ? 1 : 0;
+        if (cull != cullBound_) {
+            // the faces the pixel shader drops (gs_fsh.glsl: front-facing ones when cullFront_ is set)
+            DkRasterizerState raster;
+            dkRasterizerStateDefaults(&raster);
+            raster.depthClampEnable = 0;
+            raster.cullMode = cull == 0 ? DkFace_None : cullFront_ != 0.0f ? DkFace_Front : DkFace_Back;
+            raster.provokingVertex = DkProvokingVertex_Last;
+            dkCmdBufBindRasterizerState(cmd_, &raster);
+            cullBound_ = cull;
+        }
+        culledDraws_ += cull;
         if (lite != liteBound_) {
             const DkShader* shader[1] = {lite ? &liteShader_ : &fragmentShader_};
             dkCmdBufBindShaders(cmd_, DkStageFlag_Fragment, shader, 1);
@@ -1569,6 +1627,62 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         pass(DkCompareOp_Always, true, true, true);
         return;
     }
+    // Where the pixels' alpha is known to lie (the texture's texels' and the vertices'), the test
+    // may be decided for the whole run: all pass (one draw without the test, where the GPU can
+    // leave hidden pixels out before the shader) or all fail (the AFAIL draw alone). The game
+    // tests nearly everything against 126 with FB_ONLY for what fails: two draws of every batch,
+    // the second of which, for a texture without holes, draws nothing.
+    static const bool noRange = std::getenv("SLY1_GPU_NO_ALPHA_RANGE") != nullptr;
+    int decided = 0;   // 1 all pass, -1 all fail
+    if (!noRange && ab_ != 2 && ab_ != 3 && !smallTexture && atst != 0 && atst != 4 && atst != 7) {
+        float lo = src.alphaMin, hi = src.alphaMax;   // the vertices' alone, unless the texture's comes in
+        const int tfx = (int)((s.tex0 >> 35) & 3), tcc = (int)((s.tex0 >> 34) & 1);
+        bool known = true;
+        if (s.tme && tcc) {
+            if (!texture) {
+                known = false;
+            } else if (tfx == 0) {
+                lo = lo * texture->alphaMin / 128.0f;
+                hi = std::min(hi * texture->alphaMax / 128.0f, 255.0f);
+            } else if (tfx == 1 || tfx == 3) {
+                lo = texture->alphaMin;
+                hi = texture->alphaMax;
+            } else {
+                lo = lo + texture->alphaMin;
+                hi = std::min(hi + texture->alphaMax, 255.0f);
+            }
+        }
+        lo = std::floor(lo) - 1.0f;   // a margin for the shader's arithmetic and the filter's
+        hi = std::ceil(hi) + 1.0f;
+        const float ref = (float)aref;
+        if (known) {
+            const bool allPass = atst == 5 ? lo >= ref : atst == 6 ? lo > ref : atst == 2 ? hi < ref : hi <= ref;
+            const bool allFail = atst == 5 ? hi < ref : atst == 6 ? hi <= ref : atst == 2 ? lo >= ref : lo > ref;
+            decided = allPass ? 1 : allFail ? -1 : 0;
+        }
+    }
+    // What fails is drawn to the frame all the same (FB_ONLY) and nothing writes the depth (ZMSK, or
+    // a small target, which has none): what passes and what fails are together every pixel, written
+    // the same way. One draw without the test. (A particle effect's sprites are these, and the
+    // steam of the opening's vents covers the picture twenty times over with them.)
+    if (decided == 0 && afail == 1 && atst != 0 && (zmsk || target >= 2))
+        decided = 1;
+    if (decided == 1) {
+        onePassDraws_++;
+        pass(DkCompareOp_Always, true, true, true);
+        return;
+    }
+    if (decided == -1) {
+        onePassDraws_++;
+        if (afail == 1)
+            pass(DkCompareOp_Always, true, true, false);
+        else if (afail == 2)
+            pass(DkCompareOp_Always, shown, false, true);
+        else if (afail == 3)
+            pass(DkCompareOp_Always, true, false, false);
+        return;
+    }
+    twoPassDraws_ += afail != 0 ? 1 : 0;
     if (atst != 0)
         pass(kPasses[atst], true, true, true);
     // AFAIL: KEEP, FB_ONLY, ZB_ONLY, RGB_ONLY
@@ -1963,7 +2077,7 @@ void Renderer::Report()
                  (unsigned long long)sends_);
     std::fprintf(stderr, "gpu: %llu runs added to the run before (the same state and texture) and drawn with it; %llu left out (the run before again, for its depth alone)\n",
                  (unsigned long long)merged_, (unsigned long long)dropped_);
-    static const char* const kAb[6] = {"as it is", "the long pixel shader", "no destination alpha test", "no batches", "no runs into the frame",
+    static const char* const kAb[6] = {"as it is", "backfaces dropped in the shader", "every alpha test in two draws", "both of those", "no batches",
                                        "a sixteenth of the picture"};
     for (int k = 0; abOn_ && k < 6; k++)
         std::fprintf(stderr, "gpuab: %-26s %4llu frames, %6.2f ms a frame, %6.2f ms of it waiting for the GPU\n", kAb[k], (unsigned long long)abFrames_[k],
@@ -1975,6 +2089,8 @@ void Renderer::Report()
     std::fprintf(stderr, "gpu: batches kept from frame to frame: %llu draws from %llu written once (%.1f MB), %llu let go, %llu with no room; %.1f MB of %u in use, "
                  "%zu blocks free, emptied %llu times\n", (unsigned long long)keptDraws_, (unsigned long long)keptPlaced_, keptBytes_ / 1e6, (unsigned long long)keptForgotten_,
                  (unsigned long long)keptNoRoom_, keepUsed_ / 1e6, kKeepMemory >> 20, keepFree_.size(), (unsigned long long)keepResets_);
+    std::fprintf(stderr, "gpu: %llu runs whose alpha test was decided for the whole run (one draw), %llu drawn twice (what passes, what fails); "
+                 "%llu batches culled by the rasteriser\n", (unsigned long long)onePassDraws_, (unsigned long long)twoPassDraws_, (unsigned long long)culledDraws_);
     std::fprintf(stderr, "gpu: %llu runs with the short pixel shader\n", (unsigned long long)liteRuns_);
     std::fprintf(stderr, "gpu: %llu batches transformed by the GPU (%llu vertices); %.3f s making their triangles' indices\n",
                  (unsigned long long)batches_, (unsigned long long)batchVertices_, indexNs_ / 1e9);

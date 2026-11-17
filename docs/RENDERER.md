@@ -687,3 +687,32 @@ after the list. For one blank they must come to under 16.7 ms together.
 - The parts' hash takes one quadword in 32 of the vertices (it took one in eight): the whole
   hash is what finds vertices that move.
 - The walk that finds a list's length counts a tag's data without going through it.
+
+## The GPU's time: the batches' pixels (2026-11-17)
+
+With the parts drawn again the GS thread waited 10 ms a frame for the GPU (14.7 s of a 50 s run
+on the Switch Lite). `SLY1_GPU_AB=1`, its six ways changed for the question: the destination
+alpha test without its barrier, nothing drawn into small targets, and no runs with the test
+each left the wait as it was (7 to 11 ms); no batches, or a sixteenth of the picture, took it to
+nothing. So it was the batches' pixels. Two things about how a batch was drawn:
+
+- Its backfaces were dropped in the pixel shader (`discard`, by a flag on the triangle's last
+  vertex), so the GPU could leave out no hidden pixel before running the shader. Where every
+  triangle of a batch is one to drop when it faces away (all but a few are), the rasteriser now
+  culls, and the batch has the short pixel shader, which has no discard. `SLY1_GPU_NO_CULL=1`:
+  as before. Not the same to the pixel: in Ryujinx, frame 620 of the opening at full size, 49
+  pixels of 691,200 differ, single pixels along edges (a triangle seen edge-on is not taken the
+  same way by the two).
+- The game tests nearly everything against an alpha of 126, with FB_ONLY for what fails: two
+  draws of every such run, what passes and what fails. Where the alpha is known to lie on one
+  side for the whole run (the texture's least and greatest alpha, kept when it is decoded, with
+  the vertices' for a batch), there is one draw, without the test. Also where what fails goes to
+  the frame all the same and nothing writes the depth. `SLY1_GPU_NO_ALPHA_RANGE=1`: as before.
+  The same to the pixel (frames 501, 620 and 2,700 and the five after each).
+
+The second `SLY1_GPU_AB=1` (as it is; backfaces in the shader; every test in two draws; both):
+the wait for the GPU 0.00, 10.17, 4.16 and 10.97 ms a frame, the frame 24.3, 32.2, 26.7 and
+35.5 ms. Then the opening as it is: 41.7 frames a second where it was 30.0; of the frames after
+the 600th, 798 of one vertical blank, 624 of two, 2 of three; the wait for the GPU 3.0 s of the
+run, nearly all of it on the roof with the steaming vents (21 screens of blended sprites a
+frame, each drawn once already), where the GS thread takes 26 to 31 ms a frame.
