@@ -451,6 +451,15 @@ PATCHES = [
      'extern "C" f32 ConvertDoubleToFloat(u64 bits);',
      'extern "C" f32 ConvertDoubleToFloat(double a);\nstatic inline f32 port_DoubleBitsToFloat(u64 bits)\n{\n    double d;\n    __builtin_memcpy(&d, &bits, 8);\n    return ConvertDoubleToFloat(d);\n}',
      "a double's bits, as a word slot holds them, made the double the conversion takes in its FP register"),
+    # PlaceOnTargetObject calls a path shape's method 1 (SamplePathCurveAtTime and its kin: self, a
+    # float, two vectors out) through a type of three words, its second vector cast to an int and the
+    # float left where the caller's own argument t still was (f12). Here the int is a game address
+    # the method then wrote through (a crash choosing a jump's target in a scripted scene, level
+    # 0x505), and the float's register is not the caller's to rely on. The call gets its real type.
+    ('src/main/player_target.cpp',
+     '        shape->vtbl[1](shape, &a, (s32)&b);',
+     '        ((void (*)(void*, f32, void*, void*))shape->vtbl[1])(shape, t, &a, &b);',
+     "a method called with its real arguments: the float named, the second vector as a pointer"),
     # The other side of the same: UpdateSixEntryBlendWeights declares ConvertFloatToDouble as giving
     # the double's bits (u64), which here it gives as a double in a floating-point register; read
     # from a general register the three blend factors were whatever that register held (zeros: the
