@@ -32,6 +32,7 @@
 #include "semaphore_params.h"
 #include "port/ptr32.h"
 #include "port/system.h"
+#include "port/dmac.h"
 
 namespace port {
 
@@ -256,6 +257,9 @@ void KernelStartMainThread()
 std::int32_t CurrentThreadId() { return t_self; }
 
 // The kernel's threads, for a diagnosis when the port stops: state, priority, what each waits on.
+// How long no game thread has run so far (while none runs now, up to the last time one stopped).
+std::uint64_t KernelIdleNs() { return g_idleNs; }
+
 bool KernelIdle()
 {
     std::lock_guard<std::mutex> lk(g_kernel);
@@ -511,9 +515,21 @@ static s32 Signal(s32 id, bool fromGameThread)
     return id;
 }
 
+// SLY1_TIMELINE (port/platform/dmac.cpp): a semaphore posted or awaited, by which thread.
+static void TimelineSemaphore(const char* what, s32 id)
+{
+    static const bool on = std::getenv("SLY1_TIMELINE") != nullptr;
+    if (!on || id < 2 || id > 5)   // the vertical blank's, the GS's FINISH, a frame ready, a frame done
+        return;
+    char line[64];
+    std::snprintf(line, sizeof line, "thread %d %s semaphore %d", t_self, what, (int)id);
+    port::TimelineEvent(line);
+}
+
 s32 PostSemaphore(void* a)
 {
     ServiceInterrupts();
+    TimelineSemaphore("posts", (s32)port::WordArg(a));
     return Signal((s32)port::WordArg(a), t_self != kIdle);
 }
 void PostSemaphoreFromInterrupt(s32 sema) { Signal(sema, false); }
@@ -525,6 +541,13 @@ s32 AwaitSemaphore(void* a)
     std::unique_lock<std::mutex> lk(g_kernel);
     if (id < 1 || id >= kSemaphores || !g_semas[id].used)
         return -1;
+    if (g_semas[id].count > 0) {
+        g_semas[id].count--;
+        return id;
+    }
+    lk.unlock();
+    TimelineSemaphore("waits on", id);
+    lk.lock();
     if (g_semas[id].count > 0) {
         g_semas[id].count--;
         return id;

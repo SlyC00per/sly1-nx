@@ -486,3 +486,38 @@ it: stretches at 16.7 ms a frame with the render thread at 14.)
 Not found: the first frame of the opening's close shot of the police sign (frame 1426 under
 lockstep in Ryujinx) lacks the building on the right, in every mode, without the render thread
 too; retail's video has it from the first frame.
+
+## A frame's list read in place, and the GS thread by default (2026-11-17)
+
+`SLY1_TIMELINE=N` prints, from the Nth frame shown, the order of events with their times: what
+the game's threads queue, what the render thread starts and ends, FINISH, the vertical blank,
+the buffer swap, and the frame's semaphores. A heavy frame of the opening on a Switch Lite, from
+its vertical blank: the game's render thread swaps the buffers and sends an upload (0.5 ms),
+walks and copies the frame's list of VIF1's, 2 MB (7.5 ms); the port's render thread draws it
+(35 ms); the game sends two more GIF packets, each with its FINISH, the first an upload of
+200 KB (4 ms); it posts the frame done and waits for the next vertical blank: three blanks,
+50 ms. The game's main thread builds the next frame meanwhile (it waits for a frame to be done,
+with two frames' packets in turn), so it costs the frame nothing; the copy did.
+
+A list of VIF1's of 64 KiB or more is no longer copied. Its tags are walked for its length, and
+the render thread walks it where it lies, giving the VIF the quadwords that follow each other in
+memory as one stretch (a quadword at a time cost the render thread 5 ms a frame). A shorter list
+is copied, unless it has interrupts. `SLY1_COPY_LISTS=1`: every list copied, as before.
+
+The GS thread is on by default on the Switch (`SLY1_GS_THREAD=0`: not).
+
+The opening on the Switch Lite, 40 s after the first 10, `SLY1_PERF_LOG=1` (which now also gives
+the time any of the game's threads ran):
+
+| build | frames a second | a heavy stretch: frame, render thread, GS thread, the game's |
+| --- | --- | --- |
+| lists copied | 24.7 | 62.3 ms, 46.6, none, about 20 |
+| lists in place | 26.2 | 50.6 ms, 46.0, none, 9.8 |
+| and the GS thread | 27.0 | 50.0 ms, 32.9, 25.8, 9.7 |
+
+Frames of four vertical blanks after the 600th: 132, then 11, then none.
+
+Verified as the change before: 899 frames against the run without the render thread, all the
+same but frame 40 (and the stretches of 15 that come and go); the Mac's --verify-levels with
+both checks and Ryujinx's, with and without the GS thread, all 46 levels; Ryujinx's captures of
+frames 501 to 506 and 620 to 625 byte for byte as before.

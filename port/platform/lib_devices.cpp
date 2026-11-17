@@ -200,6 +200,7 @@ s32 SwapDoubleBuffer(void* self, s32 flag)
 {
     std::uint8_t* base = static_cast<std::uint8_t*>(self);
     s32 idx = flag & 1;
+    port::TimelineEvent("game swaps the buffers");
     WriteDisplayRegisters(base + idx * 0x28);
     s32 r = SendDrawEnvironment(base + (idx ? 0x140 : 0x50));
     port::RenderCall([](std::uint64_t, std::uint64_t) { port::gs::FrameShown(); }, 0, 0);

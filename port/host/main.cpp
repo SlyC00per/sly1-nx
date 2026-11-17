@@ -158,8 +158,11 @@ void* Clock(void*)
     while (g_seconds == 0 || std::chrono::steady_clock::now() < stop) {
         next += std::chrono::microseconds(16683);
         std::this_thread::sleep_until(next);
-        if (g_started)
+        if (g_started) {
+            port::TimelineEvent("vblank");
             port::RaiseInterrupt(2);
+            port::TimelineEvent("vblank serviced");
+        }
         if (!warmed && next >= warm) {   // past the start and the first load: for the steady rate
             warmed = true;
             g_warmFrames = port::gs::FramesShown();
@@ -651,9 +654,16 @@ int main(int argc, char** argv)
     // The Switch's GPU renderer, before any thread draws (SLY1_NO_GPU: without it, nothing shown).
     if (!std::getenv("SLY1_NO_GPU"))
         port::gpu::Start();
-    // SLY1_GS_THREAD: the GS on a thread of its own (measured slower on the Switch: the hand-over
-    // costs more than the GS's work there, and in batches the GS no longer overlaps VU1)
-    if (std::getenv("SLY1_GS_THREAD") &&
+    // The GS on a thread of its own, after the render thread's VIF1 and VU1 (docs/RENDERER.md): on
+    // the Switch, where the two have a core each (27.0 frames a second in the opening against
+    // 26.2 without); SLY1_GS_THREAD=1 or 0 says otherwise.
+#if defined(__SWITCH__)
+    const bool gsThreadDefault = true;
+#else
+    const bool gsThreadDefault = false;
+#endif
+    const char* gsThreadAsked = std::getenv("SLY1_GS_THREAD");
+    if ((gsThreadAsked ? gsThreadAsked[0] != '0' : gsThreadDefault) &&
         port::StartThread(&gsThread, g_gsStack, sizeof g_gsStack,
                           [](void*) -> void* {
                               port::PlaceThread(port::ThreadRole::Gs);

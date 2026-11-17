@@ -32,6 +32,7 @@ void RenderThreadMain();
 void GsThreadMain();
 void RenderCall(void (*fn)(std::uint64_t, std::uint64_t), std::uint64_t a, std::uint64_t b);
 void RenderFlush();
+void TimelineEvent(const char* what);   // SLY1_TIMELINE (port/platform/dmac.cpp)
 
 // What the transfers have done so far, for the run's report.
 void DmacDump();

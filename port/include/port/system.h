@@ -21,6 +21,7 @@ void LockstepTick();
 
 // Whether no game thread runs now (all of them wait).
 bool KernelIdle();
+std::uint64_t KernelIdleNs();
 // A monotonic clock in nanoseconds, cheap to read (the Switch's CPU counter, no system call).
 std::uint64_t NowNs();
 // The id of the game thread that is running.
