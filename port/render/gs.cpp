@@ -662,7 +662,10 @@ void Shade(const Draw& d, int x, int y, const Attr& p, const Attr& flat)
         }
     }
     double zd = std::max(0.0, std::min(4294967295.0, (double)p.z));
-    Pixel(d, x, y, (int)c.r, (int)c.g, (int)c.b, (int)c.a, (std::uint32_t)zd, (int)p.f, u, v);
+    // to the nearest: three weights that sum to 1 less a rounding error must not make a constant 0x80
+    // (the alpha a volume marks pixels with for the destination alpha test) 0x7F
+    auto n = [](float x) { return (int)std::lround(std::clamp(x, 0.0f, 255.0f)); };
+    Pixel(d, x, y, n(c.r), n(c.g), n(c.b), n(c.a), (std::uint32_t)zd, n(p.f), u, v);
 }
 
 Attr Lerp3(const Attr& a, const Attr& b, const Attr& c, float wa, float wb, float wc)
