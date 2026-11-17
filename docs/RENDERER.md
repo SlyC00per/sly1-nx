@@ -220,18 +220,31 @@ passes, and 0x076's shadow textures with DATM 1). Without the test the polygon d
 seen through the volume: with the camera inside one (the opening's rooftop shots) the sky and the
 buildings went black, on the Switch and on the host alike, for two reasons:
 
-- **The GPU renderer did not make the test.** A GPU cannot test the frame it draws into, so the
-  alpha bit is copied to the stencil (`BuildStencil`: the frame buffer's image drawn over the
-  whole stencil with the alpha test keeping alpha 0x80 and more) before a draw with DATE, when a
-  draw without it has come since; the draw then tests the stencil. The depth buffer is
-  `ZF32_X24S8` for it. `SLY1_GPU_NO_DATE=1` leaves the test out, as before, for comparison.
+- **The GPU renderer did not make the test.** Its pixel shader now makes it: for a run with DATE
+  it reads the frame's alpha under the pixel (the frame buffer bound as a second texture while it
+  is the target) and drops the pixel when the top bit is not DATM. A barrier comes before such a
+  run when a run without DATE has come since, so that what was drawn is in the image when it is
+  read. `SLY1_GPU_NO_DATE=1` leaves the test out, as before, for comparison.
 - **The host's rasteriser truncated interpolated colours**, so the walls' constant 0x80 was
   written 0x7F and marked nothing. It rounds to the nearest now.
 
 Found by leaving draws out of a frame of the host's rasteriser (temporary switches, not kept): the
 frame was right without the untextured fans, then without only the DATE ones; counting pixels by
 pass showed the walls' alpha written as 0x7F. In Ryujinx, lockstep, the rooftop shots are bright
-with the test and dark with `SLY1_GPU_NO_DATE`. Its cost there: about 16 copies a frame (nearly
-one a run with DATE, as other draws come between), the render thread's VIF1 time 2.6 s to 5.2 s
-over 1,200 vblanks; to be measured on the Switch, and reduced if it shows (a copy only of the
-part of the screen a run covers, or none when no draw since can have changed the bit).
+with the test and dark with `SLY1_GPU_NO_DATE`.
+
+What it costs, on the Switch (30 s from boot, the frame rate after the first 10 s):
+
+| How the test is made | Frames a second |
+| --- | --- |
+| Not at all (the picture dark), depth buffer `ZF32` | 29.2 (before the opening's run was fixed: a different 30 s) |
+| Not at all, depth buffer `ZF32_X24S8` | 24.3 |
+| The alpha bit copied to a stencil before each run with DATE (about 13 copies a frame), behind a full barrier, a fragment barrier, or without unbinding the frame buffer | 16.4, 16.8, 16.8 |
+| The same, each copy only of the run's box on the screen (43% of it on average) | 19.4 |
+| In the pixel shader, depth buffer `ZF32` | 23.2 |
+
+The stencil's cost went with the area copied: a depth buffer with a stencil is 8 bytes a pixel, and
+a copy clears and fills it. Two ways with a stencil and no copies drew Sly black in the opening's
+run and are not kept: the bit written to the stencil by the runs that mark pixels (a darkening
+polygon also covers pixels its volume did not mark, where the frame's own bit decides), and the bit
+guessed from each run's vertices (a texture's alpha takes part).

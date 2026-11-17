@@ -16,10 +16,11 @@ layout (location = 0, index = 0) out vec4 outColour;
 layout (location = 0, index = 1) out vec4 outFactor;
 
 layout (binding = 0) uniform sampler2D texture0;
+layout (binding = 1) uniform sampler2D frame0;   // the frame buffer being drawn into, for the destination alpha test
 
 layout (std140, binding = 0) uniform FragmentParams {
-    ivec4 mode;       // TME (2: the texel under the pixel), TFX, TCC, FGE
-    vec4 fogColour;   // 0 to 255
+    ivec4 mode;       // TME, TFX, TCC, FGE
+    vec4 fogColour;   // 0 to 255; w: the destination alpha test (0 none, 1 drawn where the frame's alpha bit is set, 2 where it is clear)
     vec4 blend;       // x: 1 for As, 0 for FIX; y: FIX over 0x80; z: 1 when the front faces are the ones facing away;
                       // w: SLY1_GPU_CAPTURE's views (6 a flat colour, 7 the depth)
 } u;
@@ -27,6 +28,11 @@ layout (std140, binding = 0) uniform FragmentParams {
 void main()
 {
     int view = int(u.blend.w);
+    if (u.fogColour.w != 0.0) {   // DATE: the frame's alpha under the pixel, its top bit against DATM
+        bool set = texelFetch(frame0, ivec2(gl_FragCoord.xy), 0).a >= 127.5 / 255.0;
+        if (set != (u.fogColour.w == 1.0))
+            discard;
+    }
     if (inFlags != 0 && gl_FrontFacing == (u.blend.z != 0.0))
         discard;
     if (view == 8 && inOutside > 0.0)   // triangles reaching outside the clip volume left out
@@ -44,9 +50,7 @@ void main()
     vec3 rgb = inColour.rgb;
     float a = inColour.a;
     if (u.mode.x != 0) {
-        // 2: the texel under the pixel, for a frame buffer's image read over the whole of it (the
-        // destination alpha test's stencil, gpu.cpp's BuildStencil)
-        vec4 t = (u.mode.x == 2 ? texelFetch(texture0, ivec2(gl_FragCoord.xy), 0) : texture(texture0, inStq.xy / inStq.z)) * 255.0;
+        vec4 t = texture(texture0, inStq.xy / inStq.z) * 255.0;
         if (u.mode.y == 0) {          // MODULATE
             rgb = min(t.rgb * rgb / 128.0, 255.0);
             if (u.mode.z != 0)
