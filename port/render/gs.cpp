@@ -831,31 +831,7 @@ const Draw& RunState(std::uint64_t prim, std::uint32_t type)
 {
     static const std::uint32_t kKind[8] = {0, 1, 1, 2, 2, 2, 2, 0};
     static Draw d;
-    // What DrawOf and StateOf are made from: when it is what it was at the last look, with the run
-    // begun, they would give what they gave (a pass of a batch writes its registers again unchanged)
-    struct Key {
-        std::uint64_t prim, prmodecont, prmode, texa, fogcol, kind;
-        Context ctx;
-    };
-    static Key last;
-    static bool lastValid;
     if (g_stateChanged) {
-        Key k;
-        std::memset(&k, 0, sizeof k);
-        k.prim = prim;
-        k.prmodecont = g_regs.prmodecont;
-        k.prmode = g_regs.prmode;
-        k.texa = g_regs.texa;
-        k.fogcol = g_regs.fogcol;
-        k.kind = kKind[type];
-        std::uint64_t attrs = Bits(g_regs.prmodecont, 0, 1) ? prim : g_regs.prmode;
-        k.ctx = g_regs.ctx[Bits(attrs, 9, 1)];
-        if (g_runBegun && lastValid && std::memcmp(&k, &last, sizeof k) == 0) {
-            g_stateChanged = false;
-            return d;
-        }
-        last = k;
-        lastValid = true;
         d = DrawOf(prim);
         DrawState s = StateOf(d, kKind[type]);
         if (!g_runBegun || std::memcmp(&s, &g_runState, sizeof s) != 0) {
