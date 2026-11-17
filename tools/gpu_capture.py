@@ -25,7 +25,8 @@ def write(out, width, height, rows):
 def main():
     """Every capture in the log: OUT.png, then OUT-2.png and so on."""
     log, out = sys.argv[1], sys.argv[2]
-    width = height = count = 0
+    width = height = count = chunk = 0
+    part = b""
     rows = None
     for line in open(log, errors="replace"):
         if not line.startswith("gpucap: "):
@@ -38,12 +39,19 @@ def main():
                 count += 1
                 write(out if count == 1 else out.replace(".png", "-%d.png" % count), width, height, rows)
             width, height = int(word[2]), int(word[3])
+            # "chunk N": a row comes N pixels a line (a longer line is cut by the emulator's log)
+            chunk = int(word[word.index("chunk") + 1]) if "chunk" in word else width
             rows = []
+            part = b""
         elif word[1] != "end" and rows is not None:
             # a row the link cut short is black from there on
             digits = "".join(c for c in word[1] if c in "0123456789abcdef")[:width * 6]
             digits = digits[:len(digits) & ~1]
-            rows.append(bytes.fromhex(digits).ljust(width * 3, b"\0"))
+            left = width * 3 - len(part)
+            part += bytes.fromhex(digits).ljust(min(chunk * 3, left), b"\0")[:left]
+            if len(part) >= width * 3:
+                rows.append(part)
+                part = b""
     if rows:
         count += 1
         write(out if count == 1 else out.replace(".png", "-%d.png" % count), width, height, rows)

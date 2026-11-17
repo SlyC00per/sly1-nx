@@ -2012,6 +2012,15 @@ std::uint64_t TextureSource(const DrawState& state)
     return hash;
 }
 
+std::uint32_t UploadSerial() { return g_uploads; }
+
+std::uint32_t BufferGeneration(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t width, std::uint32_t height)
+{
+    std::uint32_t latest = 0;
+    PagesOf(fbp * 32, fbw, PSMCT32, 0, 0, width, height, [&](std::uint32_t p) { latest = std::max(latest, g_pageUpload[p]); });
+    return latest;
+}
+
 std::uint32_t TextureGeneration(const DrawState& state)
 {
     Context c;

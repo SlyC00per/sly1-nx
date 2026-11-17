@@ -386,3 +386,27 @@ byte for byte as before:
 
 Left: the render thread's own work, 21 ms a frame for VIF1's data (the VU1 handlers and their
 kicks), which is now most of a frame.
+
+## Small targets the game takes back (2026-11-17)
+
+Reported from the run of all levels: from the second episode on, wrong textures, mostly on the
+ground. A small target was kept for good under its frame base, and a run whose texture lay at that
+base was given the target's image. A later level puts ordinary textures where an earlier one
+drew a shadow's picture, and got the old picture for them; and once eight targets were made, a
+further buffer was not drawn into and every run textured from its place was left out (11,794
+runs into such buffers over the 46 levels).
+
+A small target now remembers the count of uploads when it was last drawn into
+(`gs::UploadSerial`). When a run takes its buffer as a texture and an upload has reached the
+buffer's pages since (`gs::BufferGeneration`), the target is retired: the texture is the uploaded
+one, and the target's images wait for the next buffer of their size. The same for a buffer this
+renderer does not draw into. Over the 46 levels in Ryujinx: 35 targets retired, 5 in use at the
+end, no run into a buffer left out. Level 20's first room, captured at full size
+(`SLY1_GPU_CAPTURE_FULL=1`) in the run of all levels: the carpet had a stale picture across it
+before, and is clean now.
+
+Still open in that room: the window's glass is drawn far more opaque than the software GS draws
+it (the city behind it hardly shows).
+
+A capture's rows are printed 160 pixels a line: the emulator's log cut longer lines, so every
+capture before this was missing its right-hand third.

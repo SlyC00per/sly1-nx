@@ -119,6 +119,12 @@ void DecodeTexture(const DrawState& state, std::vector<std::uint32_t>& rgba, int
 // A number that changes when an upload may have changed the state's texture or its palette.
 std::uint32_t TextureGeneration(const DrawState& state);
 
+// The uploads so far, and the latest of them (as that count was when it started) into the pages
+// of a 32-bit buffer at frame base fbp, fbw * 64 wide: a backend that keeps such a buffer as an
+// image of its own (the game drew into it) learns so that the game has since put textures there.
+std::uint32_t UploadSerial();
+std::uint32_t BufferGeneration(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t width, std::uint32_t height);
+
 // For a backend, inside Begin. A hash of what the state's texture is read from: the pages of
 // local memory it lies in and the palette loaded.
 std::uint64_t TextureSource(const DrawState& state);

@@ -161,7 +161,9 @@ private:
         std::uint32_t fbp = ~0u;
         std::uint32_t width = 0, height = 0;   // in the GS's pixels
         bool drawn = false;         // drawn into since it was last read as a texture
+        std::uint32_t serial = 0;   // gs::UploadSerial() when it was last drawn into
     };
+    static constexpr std::uint32_t kRetired = 0xFFFFFFFEu;   // a small target's fbp once the game has put textures in its buffer
     Small small_[kSmallTargets];
     int smallCount_ = 0;
     DkMemBlock targetMem_ = nullptr;
@@ -199,7 +201,8 @@ private:
     int frameBound_ = -1;          // the frame buffer bound as the test's texture in this command list
     std::uint64_t dateBarriers_ = 0;
     std::uint64_t frameTextured_ = 0, targetTextured_ = 0;
-    bool otherTarget_[512] = {};
+    std::uint32_t otherSerial_[512] = {};   // the uploads so far when a buffer this renderer does not draw into was last drawn into; 0: never
+    std::uint64_t retired_ = 0;
     BatchParams lastBatch_;
     std::vector<std::uint32_t> batchIndex_;
     struct BatchCache {   // the last batch put in the frame's memory (DrawBatch)
@@ -591,6 +594,25 @@ int Renderer::TargetFor(const gs::DrawState& s)
     for (int k = 0; k < smallCount_; k++)
         if (small_[k].fbp == fbp)
             return 2 + k;
+    for (int k = 0; k < smallCount_; k++)
+        if (small_[k].fbp == kRetired && small_[k].width == fbw * 64) {   // a retired one's images, for this buffer
+            Small& t = small_[k];
+            t.fbp = fbp;
+            t.drawn = false;
+            for (int i = 0; i < 2; i++) {
+                t.cur = i;
+                bound_ = -1;
+                BindTarget(2 + k);
+                DkScissor all = {0, 0, t.width * kSmallScale, t.height * kSmallScale};
+                dkCmdBufSetScissors(cmd_, 0, &all, 1);
+                float none[4] = {0, 0, 0, 0};
+                dkCmdBufClearColor(cmd_, 0, DkColorMask_RGBA, none);
+            }
+            t.cur = 0;
+            bound_ = -1;
+            last_.any = false;
+            return 2 + k;
+        }
     if (smallCount_ == kSmallTargets)
         return -1;
     Small& t = small_[smallCount_];
@@ -718,10 +740,29 @@ void Renderer::Begin(const gs::DrawState& s)
     texture_ = nullptr;
     if (s.tme && TargetFor(s) >= 0) {
         const std::uint32_t tbp = (std::uint32_t)(s.tex0 & 0x3FFF);
-        for (int k = 0; k < smallCount_ && !texture_; k++)   // a small target the game drew into, read as a texture
-            if (small_[k].fbp * 32 == tbp)
-                texture_ = &small_[k].texture[0];   // which of its two images is decided when the run is drawn
-        if (!texture_ && !(tbp % 32 == 0 && otherTarget_[(tbp / 32) & 0x1FF]) && tbp != 0 && tbp != 70 * 32)
+        // A buffer the game drew into is the game's to use for textures again (another level's): an
+        // upload into it since it was last drawn into ends that. The small target is retired (its
+        // images kept for the next buffer of its size), and the texture is the uploaded one.
+        for (int k = 0; k < smallCount_ && !texture_; k++) {   // a small target the game drew into, read as a texture
+            Small& t = small_[k];
+            if (t.fbp * 32 != tbp || t.fbp == kRetired)
+                continue;
+            if (gs::BufferGeneration(t.fbp, t.width / 64, t.width, t.height) > t.serial) {
+                FlushPending();
+                t.fbp = kRetired;
+                retired_++;
+            } else {
+                texture_ = &t.texture[0];   // which of its two images is decided when the run is drawn
+            }
+        }
+        bool other = false;   // a buffer this renderer does not draw into: nothing to show of it
+        if (!texture_ && tbp % 32 == 0) {
+            std::uint32_t& serial = otherSerial_[(tbp / 32) & 0x1FF];
+            if (serial != 0 && gs::BufferGeneration(tbp / 32, 1, 64, 64) > serial)
+                serial = 0;
+            other = serial != 0;
+        }
+        if (!texture_ && !other && tbp != 0 && tbp != 70 * 32)
             texture_ = TextureFor(s);
     }
     textureNs_ += Tick() - t0;
@@ -855,7 +896,7 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
     }
     if (TargetFor(s) < 0) {
         otherTargets_++;
-        otherTarget_[(s.frame & 0x1FF)] = true;
+        otherSerial_[(s.frame & 0x1FF)] = gs::UploadSerial();
         return true;
     }
     batches_++;
@@ -956,7 +997,7 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     int target = TargetFor(s);
     if (target < 0) {
         otherTargets_++;
-        otherTarget_[(s.frame & 0x1FF)] = true;   // a buffer the game draws into and this renderer does not
+        otherSerial_[(s.frame & 0x1FF)] = gs::UploadSerial();   // a buffer the game draws into and this renderer does not
         return;
     }
     // A small target (a character's picture, laid on the ground afterwards as its shadow): drawn
@@ -965,6 +1006,7 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     // game softens the picture's edge so) is left out: the picture keeps its hard edge.
     if (target >= 2) {
         small_[target - 2].drawn = true;
+        small_[target - 2].serial = gs::UploadSerial();
         smallRuns_++;
         if (std::getenv("SLY1_GPU_SHADOW_TRACE") && frames_ > 500 && smallIntoTrace_ < 14) {
             smallIntoTrace_++;
@@ -1434,7 +1476,14 @@ void Renderer::Capture(int target)
         std::fprintf(stderr, "gpusmall: frame %llu: alpha 00-0F %ld, 10s %ld, 20s %ld, 30s %ld, 40s %ld, 50s %ld, 60s %ld, 70s %ld, 80+ %ld\n", (unsigned long long)frames_, hist[0], hist[1], hist[2],
                      hist[3], hist[4], hist[5], hist[6], hist[7], hist[8]);
     }
-    std::fprintf(stderr, "gpucap: begin %u %u frame %llu\n", w, h, (unsigned long long)frames_);
+    static const bool full = std::getenv("SLY1_GPU_CAPTURE_FULL") != nullptr;   // every pixel, not the mean of each four by four
+    if (full) {
+        w = kWidth;
+        h = kHeight;
+    }
+    // a row goes out 160 pixels a line: a longer line is cut by the emulator's log
+    const std::uint32_t kChunk = 160;
+    std::fprintf(stderr, "gpucap: begin %u %u frame %llu chunk %u\n", w, h, (unsigned long long)frames_, kChunk);
     std::vector<char> line(w * 6 + 1);
     static const char kHex[] = "0123456789abcdef";
     for (std::uint32_t y = 0; y < h; y++) {
@@ -1445,6 +1494,8 @@ void Renderer::Capture(int target)
                 static const bool alphaView = std::getenv("SLY1_GPU_CAPTURE_ALPHA") != nullptr;
                 const std::uint8_t* q = p + ((y * 4 + 1) * kWidth + x * 4 + 1) * 4 + c;
                 unsigned v = (q[0] + q[4] + q[kWidth * 4] + q[kWidth * 4 + 4] + 2) / 4;
+                if (full)
+                    v = p[(y * kWidth + x) * 4 + c];
                 if (alphaView) {
                     const std::uint8_t al = (p + ((y * 4 + 1) * kWidth + x * 4 + 1) * 4)[3];
                     v = c == 0 ? (al < 0x60 ? 0x50 : al < 0x80 ? 0xFF : 0) : c == 1 ? (al >= 0x80 ? (al == 0x80 ? 0x80 : 0xFF) : 0) : 0;
@@ -1452,8 +1503,10 @@ void Renderer::Capture(int target)
                 line[(x * 3 + c) * 2] = kHex[v >> 4];
                 line[(x * 3 + c) * 2 + 1] = kHex[v & 15];
             }
-        line[w * 6] = 0;
-        std::fprintf(stderr, "gpucap: %s\n", line.data());
+        for (std::uint32_t x = 0; x < w; x += kChunk) {
+            const std::uint32_t n = std::min(kChunk, w - x);
+            std::fprintf(stderr, "gpucap: %.*s\n", (int)(n * 6), line.data() + x * 6);
+        }
     }
     std::fprintf(stderr, "gpucap: end\n");
 }
@@ -1748,6 +1801,7 @@ void Renderer::Report()
     for (int k = 0; abOn_ && k < 6; k++)
         std::fprintf(stderr, "gpuab: %-26s %4llu frames, %6.2f ms a frame, %6.2f ms of it waiting for the GPU\n", kAb[k], (unsigned long long)abFrames_[k],
                      abFrames_[k] ? abNs_[k] / 1e6 / abFrames_[k] : 0.0, abFrames_[k] ? abWaitNs_[k] / 1e6 / abFrames_[k] : 0.0);
+    std::fprintf(stderr, "gpu: %llu small targets retired (the game put textures in their buffers)\n", (unsigned long long)retired_);
     std::fprintf(stderr, "gpu: %llu runs with the short pixel shader\n", (unsigned long long)liteRuns_);
     std::fprintf(stderr, "gpu: %llu batches transformed by the GPU (%llu vertices); %.3f s making their triangles' indices\n",
                  (unsigned long long)batches_, (unsigned long long)batchVertices_, indexNs_ / 1e9);
