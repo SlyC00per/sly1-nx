@@ -1765,6 +1765,12 @@ bool SkinLoop(Runner& r, float (*vf)[4], std::uint16_t first, std::uint16_t end,
     std::memcpy(&w, vf[3], 16);
     for (int j = 0; j < 4; j++)
         std::memcpy(&t[j], vf[20 + j], 16);
+    // The operands fixed once (the matrices for the batch, a vertex's position and weights for it):
+    // Mul4 and Add4 fix only an operand with the largest exponent, which no result has, so on fixed
+    // operands they are the host's arithmetic as it is.
+    F4 mf[16];
+    for (int k = 0; k < 16; k++)
+        mf[k] = FixIn4(m[k].v);
     for (int k = 0; k < n; k++) {
         std::uint16_t at = (std::uint16_t)(first + step * k);
         V p = Load(r, at);
@@ -1772,21 +1778,24 @@ bool SkinLoop(Runner& r, float (*vf)[4], std::uint16_t first, std::uint16_t end,
         pos.y = p.y;
         pos.z = p.z;
         w = Load(r, (std::uint16_t)(weights + k));
+        V pf, wf;
+        pf.v = FixIn4(p.v);
+        wf.v = FixIn4(w.v);
         for (int j = 0; j < 4; j++) {
-            F4 acc = Mul4(m[4 * j].v, Splat(p.x));
-            acc = Add4(acc, Mul4(m[4 * j + 1].v, Splat(p.y)));
-            acc = Add4(acc, Mul4(m[4 * j + 2].v, Splat(p.z)));
+            F4 acc = mf[4 * j] * Splat(pf.x);
+            acc = acc + mf[4 * j + 1] * Splat(pf.y);
+            acc = acc + mf[4 * j + 2] * Splat(pf.z);
             V x;
-            x.v = Add4(acc, Mul4(m[4 * j + 3].v, Splat(1.0f)));
+            x.v = acc + mf[4 * j + 3] * Splat(1.0f);
             t[j].x = x.x;
             t[j].y = x.y;
             t[j].z = x.z;
         }
-        F4 acc = Mul4(t[0].v, Splat(w.x));
-        acc = Add4(acc, Mul4(t[1].v, Splat(w.y)));
-        acc = Add4(acc, Mul4(t[2].v, Splat(w.z)));
+        F4 acc = t[0].v * Splat(wf.x);
+        acc = acc + t[1].v * Splat(wf.y);
+        acc = acc + t[2].v * Splat(wf.z);
         V out;
-        out.v = Add4(acc, Mul4(t[3].v, Splat(w.w)));
+        out.v = acc + t[3].v * Splat(wf.w);
         pos.x = out.x;
         pos.y = out.y;
         pos.z = out.z;
