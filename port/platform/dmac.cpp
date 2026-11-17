@@ -371,6 +371,16 @@ public:
         int k = 0;
         while (k < n) {
             if (left_ != 0 && keep_ && !direct_) {
+                if (data_.empty() && (cmd_ & 0x60) == 0x60 && (std::uint32_t)(n - k) >= left_) {
+                    // an unpack whose data is all here: unpacked from where it is, not copied first
+                    src_ = w + k;
+                    srcWords_ = left_;
+                    k += (int)left_;
+                    left_ = 0;
+                    End();
+                    src_ = nullptr;
+                    continue;
+                }
                 int take = (int)std::min<std::uint32_t>(left_, (std::uint32_t)(n - k));
                 data_.insert(data_.end(), w + k, w + k + take);
                 k += take;
@@ -790,8 +800,8 @@ private:
         if (!vu0_)   // the quadwords written (a cycle longer than its writes skips some)
             vu1::DataWritten(addr & 0x3FF, n, cl_, wl_);
         // every format's fields are 8, 16 or 32 bits (V4-5 a 16-bit colour): read them as such
-        const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(data_.data());
-        std::size_t have = data_.size() * 4, at = 0;
+        const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(src_ ? src_ : data_.data());
+        std::size_t have = (src_ ? srcWords_ : data_.size()) * 4, at = 0;
         auto take = [&](std::uint32_t nb) -> std::uint32_t {
             std::uint32_t v = 0;
             std::size_t n = nb / 8;
@@ -894,6 +904,8 @@ private:
     bool dbf_ = false;
     std::uint32_t cmd_ = 0, imm_ = 0, num_ = 0;
     std::vector<std::uint32_t> data_;
+    const std::uint32_t* src_ = nullptr;   // an unpack's data where it came, in place of data_ (Words)
+    std::size_t srcWords_ = 0;
     std::uint32_t left_ = 0, cl_ = 1, wl_ = 1, filled_ = 0;
     std::uint32_t qword_[4] = {};
     bool irq_ = false, direct_ = false;
