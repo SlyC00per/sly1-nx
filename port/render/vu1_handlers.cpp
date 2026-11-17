@@ -1642,15 +1642,21 @@ bool LitColours(Runner& r)
         v10.v = Mul4(R.get(13).v, Splat(v09.x));
         v12.w = Mul(R.vf[3][3], v09.x);
         V n08 = R.get(8);
-        V n05 = R.get(5);
-        for (int c = 0; c < 3; c++)
-            n08[c] = Itof0(n05[c]);
+        V n05;
+        n05.v = Itof4(R.get(5).v);   // ITOF0 and FTOI0 four fields at a time (Itof4, Ftoi4: the same rules)
+        n08.x = n05.x;
+        n08.y = n05.y;
+        n08.z = n05.z;
         R.put(8, n08, XYZ);
         at = (std::uint16_t)(at + 4);
         col = (std::uint16_t)(col + 1);
-        R.put(11, ftoi(v11), XYZW);
-        R.put(10, ftoi(v10), XYZ);
-        R.put(12, ftoi(v12), XYZW);
+        V t11, t10, t12;
+        t11.v = Ftoi4(v11.v);
+        t10.v = Ftoi4(v10.v);
+        t12.v = Ftoi4(v12.v);
+        R.put(11, t11, XYZW);
+        R.put(10, t10, XYZ);
+        R.put(12, t12, XYZW);
     }
     // 0x266-0x268: the last vertex stored
     Store(r, (std::uint16_t)(at - 2), R.get(11));
