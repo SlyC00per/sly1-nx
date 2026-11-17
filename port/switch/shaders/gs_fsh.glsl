@@ -21,6 +21,8 @@ layout (binding = 1) uniform sampler2D frame0;   // the frame buffer being drawn
 layout (std140, binding = 0) uniform FragmentParams {
     ivec4 mode;       // TME, TFX, TCC, FGE
     vec4 fogColour;   // 0 to 255; w: the destination alpha test (0 none, 1 drawn where the frame's alpha bit is set, 2 where it is clear)
+    vec4 coef;        // x of 99: the blend state has the factors. Else (a small target) the blend's Cs and Cd
+                      // coefficients as (times C, plus 1) pairs: Cs * (x * C + y), Cd * (z * C + w)
     vec4 blend;       // x: 1 for As, 0 for FIX; y: FIX over 0x80; z: 1 when the front faces are the ones facing away;
                       // w: SLY1_GPU_CAPTURE's views (6 a flat colour, 7 the depth)
 } u;
@@ -67,7 +69,18 @@ void main()
     }
     if (u.mode.w != 0)
         rgb = mix(u.fogColour.rgb, rgb, inFog / 255.0);
-    outColour = vec4(rgb, a) / 255.0;
-    float factor = u.blend.x != 0.0 ? a / 128.0 : u.blend.y;
-    outFactor = vec4(min(factor, 1.0));
+    float c = min(u.blend.x != 0.0 ? a / 128.0 : u.blend.y, 1.0);
+    if (u.coef.x == 99.0) {   // the blend state has the factors: C as the second output
+        outColour = vec4(rgb, a) / 255.0;
+        outFactor = vec4(c);
+    } else {
+        // A small target's blend, (A - B) * C + D, is Cs * ks + Cd * kd. The colour goes out times |ks|
+        // and the second output is one less |kd|: the blend state adds the first to the frame's
+        // colour times one less the second (or subtracts, for a negative coefficient). The second
+        // output's alpha is 1, so that what is there counts for nothing in the alpha written, which
+        // is the source's as on the GS (port/switch/gpu.cpp has why).
+        float ks = abs(u.coef.x * c + u.coef.y), kd = abs(u.coef.z * c + u.coef.w);
+        outColour = vec4(rgb * min(ks, 1.0), a) / 255.0;
+        outFactor = vec4(vec3(1.0 - min(kd, 1.0)), 1.0);
+    }
 }

@@ -91,6 +91,7 @@ struct Source {
 struct FragmentParams {
     std::int32_t mode[4];
     float fogColour[4];
+    float coef[4];
     float blend[4];
 };
 
@@ -406,6 +407,7 @@ void Renderer::BindSource(const Source& src)
 {
     DkGpuAddr data = dkMemBlockGetGpuAddr(dataMem_);
     const gs::Batch* b = src.batch;
+    const bool small = bound_ >= 2;
     int source = b ? 1 : 0;
     std::uint32_t layout = b ? 1 : 0;
     if (source != source_ || layout != layout_) {
@@ -442,7 +444,12 @@ void Renderer::BindSource(const Source& src)
         dkCmdBufBindVtxBuffers(cmd_, 0, &vertices, 1);
         dkCmdBufBindIdxBuffer(cmd_, DkIdxFormat_Uint32, dkMemBlockGetGpuAddr(frameMem_));
         if (!b) {
-            VertexParams vp = {{2.0f / fieldWidth_, -2.0f / fieldHeight_, -1.0f, 1.0f}};
+            // A small target is drawn as the GS draws: it takes a pixel's values at the pixel's corner
+            // (x, y), the GPU at its centre, so everything is put half a pixel right and down. The
+            // game's blur of a shadow's picture depends on it: each of its copies lies half a texel
+            // or a whole one aside, and which neighbours a pixel averages goes by where it is taken.
+            const float half = small ? 0.5f : 0.0f;
+            VertexParams vp = {{2.0f / fieldWidth_, -2.0f / fieldHeight_, -1.0f + half * 2.0f / fieldWidth_, 1.0f - half * 2.0f / fieldHeight_}};
             dkCmdBufPushConstants(cmd_, data + vertexUbo_, sizeof vp, 0, sizeof vp, &vp);
         }
         batchSet_ = false;
@@ -458,8 +465,9 @@ void Renderer::BindSource(const Source& src)
         std::memcpy(bp.matrix, b->matrix, sizeof bp.matrix);
         bp.toClip[0] = b->scale[0] * k * (2.0f / fieldWidth_);
         bp.toClip[1] = -b->scale[1] * k * (2.0f / fieldHeight_);
-        bp.toClip[2] = ((b->offset[0] - base) * k - b->ofx / 16.0f) * (2.0f / fieldWidth_) - 1.0f;
-        bp.toClip[3] = 1.0f - ((b->offset[1] - base) * k - b->ofy / 16.0f) * (2.0f / fieldHeight_);
+        const float half = small ? 0.5f : 0.0f;   // as for the GS's vertices above
+        bp.toClip[2] = ((b->offset[0] - base) * k - b->ofx / 16.0f + half) * (2.0f / fieldWidth_) - 1.0f;
+        bp.toClip[3] = 1.0f - ((b->offset[1] - base) * k - b->ofy / 16.0f + half) * (2.0f / fieldHeight_);
         bp.depth[0] = bp.depth[1] = bp.depth[2] = bp.depth[3] = 0.0f;
         // the depths the program's far and near planes (z of -w and w) come to
         float depth = (b->offset[2] - base) * k, range = b->scale[2] * k;
@@ -1047,6 +1055,7 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     blend.dstAlphaBlendFactor = DkBlendFactor_Zero;
     FragmentParams fp;
     std::memset(&fp, 0, sizeof fp);
+    fp.coef[0] = 99.0f;   // without a blend, or with the blend state's factors
     if (s.abe) {
         std::uint32_t a = s.alpha & 3, b = (s.alpha >> 2) & 3, c = (s.alpha >> 4) & 3, d = (s.alpha >> 6) & 3;
         fp.blend[0] = c == 0 ? 1.0f : 0.0f;
@@ -1054,26 +1063,47 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         bool frameAlpha = c == 1;
         // each of Cs and Cd: how many times C (-1, 0, 1) and how many times 1 (0, 1)
         int sc = (a == 0) - (b == 0), s1 = d == 0, dc = (a == 1) - (b == 1), d1 = d == 1;
-        auto factor = [&](int timesC, int times1, bool& negative) {
-            negative = false;
-            if (timesC == 0)
-                return times1 ? DkBlendFactor_One : DkBlendFactor_Zero;
-            if (timesC > 0) {
+        if (!frameAlpha && target >= 2) {
+            // A small target (a shadow's picture): the coefficients go to the pixel shader, which gives
+            // the colour times its own and one less the frame's as the second output, its alpha 1
+            // (gs_fsh.glsl), so that the alpha written is the source's, as on the GS. With the blend
+            // state's factors the GPU gives the frame's alpha the colour's factor whatever the state's
+            // own for alpha: the game's clear of the picture (alpha 0, blend 0x44) left what was
+            // there, and each frame's outline piled on the last's until the shadow was solid.
+            fp.coef[0] = (float)sc;
+            fp.coef[1] = (float)s1;
+            fp.coef[2] = (float)dc;
+            fp.coef[3] = (float)d1;
+            bool sneg = sc < 0 && !s1, dneg = dc < 0 && !d1;
+            if ((sc > 0 && s1) || (dc > 0 && d1))
+                unsupportedBlends_++;   // 1 + C: as 1
+            blend.srcColorBlendFactor = DkBlendFactor_One;
+            blend.dstColorBlendFactor = DkBlendFactor_InvSrc1Color;
+            blend.colorBlendOp = sneg ? DkBlendOp_RevSub : dneg ? DkBlendOp_Sub : DkBlendOp_Add;
+            if (sneg && dneg)
+                unsupportedBlends_++;
+        } else {
+            auto factor = [&](int timesC, int times1, bool& negative) {
+                negative = false;
+                if (timesC == 0)
+                    return times1 ? DkBlendFactor_One : DkBlendFactor_Zero;
+                if (timesC > 0) {
+                    if (times1)
+                        unsupportedBlends_++;   // 1 + C: as 1
+                    return times1 ? DkBlendFactor_One : frameAlpha ? DkBlendFactor_DstAlpha : DkBlendFactor_Src1Color;
+                }
                 if (times1)
-                    unsupportedBlends_++;   // 1 + C: as 1
-                return times1 ? DkBlendFactor_One : frameAlpha ? DkBlendFactor_DstAlpha : DkBlendFactor_Src1Color;
-            }
-            if (times1)
-                return frameAlpha ? DkBlendFactor_InvDstAlpha : DkBlendFactor_InvSrc1Color;
-            negative = true;
-            return frameAlpha ? DkBlendFactor_DstAlpha : DkBlendFactor_Src1Color;
-        };
-        bool sneg, dneg;
-        blend.srcColorBlendFactor = factor(sc, s1, sneg);
-        blend.dstColorBlendFactor = factor(dc, d1, dneg);
-        blend.colorBlendOp = sneg ? DkBlendOp_RevSub : dneg ? DkBlendOp_Sub : DkBlendOp_Add;
-        if (sneg && dneg)
-            unsupportedBlends_++;
+                    return frameAlpha ? DkBlendFactor_InvDstAlpha : DkBlendFactor_InvSrc1Color;
+                negative = true;
+                return frameAlpha ? DkBlendFactor_DstAlpha : DkBlendFactor_Src1Color;
+            };
+            bool sneg, dneg;
+            blend.srcColorBlendFactor = factor(sc, s1, sneg);
+            blend.dstColorBlendFactor = factor(dc, d1, dneg);
+            blend.colorBlendOp = sneg ? DkBlendOp_RevSub : dneg ? DkBlendOp_Sub : DkBlendOp_Add;
+            if (sneg && dneg)
+                unsupportedBlends_++;
+        }
     }
     if (fresh || std::memcmp(&blend, &last_.blend, sizeof blend) != 0) {
         dkCmdBufBindBlendStates(cmd_, 0, &blend, 1);
@@ -1176,7 +1206,7 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         dkColorStateDefaults(&colour);
         colour.blendEnableMask = s.abe ? 1 : 0;
         colour.alphaCompareOp = alphaOp;
-        std::uint32_t colourKey = (s.abe ? 1u : 0u) | (std::uint32_t)alphaOp << 1;
+        std::uint32_t colourKey = (colour.blendEnableMask ? 1u : 0u) | (std::uint32_t)alphaOp << 1;
         if (colourKey != last_.colour) {
             dkCmdBufBindColorState(cmd_, &colour);
             last_.colour = colourKey;
@@ -1262,6 +1292,14 @@ void Renderer::Capture(int target)
     Send(true);
     const std::uint8_t* p = (const std::uint8_t*)dkMemBlockGetCpuAddr(dataMem_) + capture_;
     std::uint32_t w = kWidth / 4, h = kHeight / 4;
+    if (std::getenv("SLY1_GPU_CAPTURE_SMALL") && smallCount_ > 0) {   // the small target's alpha, counted (it is laid 8 times its size)
+        long hist[9] = {};
+        for (std::uint32_t y = 0; y < 64; y++)
+            for (std::uint32_t x = 0; x < 64; x++)
+                hist[std::min<std::uint32_t>(8, p[((y * 8 + 4) * kWidth + x * 8 + 4) * 4 + 3] / 16)]++;
+        std::fprintf(stderr, "gpusmall: frame %llu: alpha 00-0F %ld, 10s %ld, 20s %ld, 30s %ld, 40s %ld, 50s %ld, 60s %ld, 70s %ld, 80+ %ld\n", (unsigned long long)frames_, hist[0], hist[1], hist[2],
+                     hist[3], hist[4], hist[5], hist[6], hist[7], hist[8]);
+    }
     std::fprintf(stderr, "gpucap: begin %u %u frame %llu\n", w, h, (unsigned long long)frames_);
     std::vector<char> line(w * 6 + 1);
     static const char kHex[] = "0123456789abcdef";

@@ -300,3 +300,47 @@ Ryujinx, lockstep, frame 560 of the opening: the shadow under Sly soft and trans
 same with the vertex work in the shader and on the CPU. `SLY1_GPU_CAPTURE_SMALL=1` lays the first
 small target over a capture's corner; `SLY1_GPU_SHADOW_TRACE=1` prints the first runs into a small
 target, the first that read their own, and the first shadow runs' triangles.
+
+### The shadow too dark: the picture never cleared
+
+On the Switch the shadow came out nearly solid. The cause was the alpha under a blend. Each frame
+the game clears the shadow's picture with a sprite of alpha 0 under blend 0x44 (Cs times As plus
+Cd times one less As: nothing of the colour, and the alpha written 0), then draws the outline
+with alpha 0x46 and blurs it. With the blend state's factors the GPU gives the frame's alpha the
+colour's factor for what is there, whatever the state's own factors for alpha: the clear left the
+picture as it was, and each frame's outline piled on the last's.
+
+For a small target the pixel shader now does the blend's arithmetic (`coef` in gs_fsh.glsl): the
+colour goes out times its own coefficient, the second output is one less the frame's, and the
+second output's alpha is 1, so the alpha written is the source's, as on the GS. A small target is
+also drawn half a pixel right and down: the GS takes a pixel's values at its corner, the GPU at
+its centre, and which neighbours the blur's half-texel copies average goes by that.
+
+The picture's alpha after the blur, counted over its 4,096 pixels at frame 501 of the opening
+(`SLY1_GPU_CAPTURE_SMALL=1` prints `gpusmall:`), against the software GS:
+
+| alpha | GPU | software GS |
+| --- | --- | --- |
+| 0x00 to 0x0F | 3,581 | 3,592 |
+| 0x10 to 0x1F | 143 | 189 |
+| 0x20 to 0x2F | 90 | 149 |
+| 0x30 to 0x3F | 106 | 151 |
+| 0x40 to 0x4F | 176 | 15 |
+| 0x50 and over | 0 | 0 |
+
+### Not done: the same for the frame, and what it showed
+
+The frame's two buffers keep the blend state's factors. With the shader's form there too, the
+dark volumes' first pass (alpha 0 over the volume's front faces, blend 0x6A) really clears the
+frame's alpha, which it does not now, and the volumes work as on the GS. Two things then went
+wrong, found at frame 620 of the opening under lockstep:
+
+- In Ryujinx the third pass, which reads the frame's alpha for the destination alpha test, read
+  it as it was before the second pass marked it (the sky above the roofs went black). A barrier
+  before the read is not enough there; ending the command list and waiting for the GPU is, which
+  is far too slow to do a dozen times a frame. Whether the Switch itself needs more than the
+  barrier is not known.
+- With the volumes working, Sly under the water tower is darkened, as the software GS draws him
+  and as the retail video does not show him. So something of the volumes is still not understood
+  (in the software GS too), and the picture the GPU renderer gives now, with the volumes mostly
+  without effect, is the one closer to retail.
