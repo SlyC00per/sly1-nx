@@ -1880,35 +1880,37 @@ bool LightFourWide(Runner& r, Regs& R)
     { V u; u.v = Mul4(R.get(2).v, Splat(p)); R.put(2, u, XYZ); }
     const bool setUp = Half(Load(r, top + 13).w) != 0;
     std::uint16_t colours = (std::uint16_t)(top + Half(Load(r, top + 12).w));
-    const V d = R.get(2);
+    const V d = R.get(2);   // a result: no field with the largest exponent
+    // The light's scale (vf04), base (vf05) and colour (vf03), not written in the loop, fixed once;
+    // the normals once each: on fixed operands and results Mul4 and Add4 are the host's arithmetic.
+    const F4 scaleF = FixIn4(R.get(4).v), baseF = FixIn4(R.get(5).v), colourF = FixIn4(R.get(3).v);
     for (int g = 0; g < groups; g++) {
         std::uint16_t at = (std::uint16_t)(first + 16 * g);
         R.put(25, Load(r, at), XYZW);
         R.put(26, Load(r, (std::uint16_t)(at + 4)), XYZW);
         R.put(27, Load(r, (std::uint16_t)(at + 8)), XYZW);
-        F4 a = Mul4(R.get(25).v, Splat(d.x));
-        a = Add4(a, Mul4(R.get(26).v, Splat(d.y)));
+        F4 a = FixIn4(R.get(25).v) * Splat(d.x);
+        a = a + FixIn4(R.get(26).v) * Splat(d.y);
         V v28;
-        v28.v = Add4(a, Mul4(R.get(27).v, Splat(d.z)));
+        v28.v = a + FixIn4(R.get(27).v) * Splat(d.z);
         R.put(28, v28, XYZW);
         V v29;
-        v29.v = Mul4(v28.v, v28.v);
+        v29.v = v28.v * v28.v;
         R.put(29, v29, XYZW);
-        F4 a2 = Add4(v28.v, Splat(0.0f));
+        F4 a2 = v28.v + Splat(0.0f);
         V v30;
-        v30.v = Add4(a2, Mul4(v29.v, v28.v));
+        v30.v = a2 + v29.v * v28.v;
         R.put(30, v30, XYZW);
-        F4 base = Add4(R.get(5).v, Splat(0.0f));
+        F4 base = baseF + Splat(0.0f);
         if (setUp) {
             for (int j = 0; j < 4; j++)
                 R.put(17 + j, Load(r, (std::uint16_t)(at + 2 + 4 * j)), XYZW);
             for (int j = 0; j < 4; j++)
                 R.put(21 + j, Load(r, (std::uint16_t)(colours + j)), XYZW);
         }
-        const V scale = R.get(4);
         for (int j = 0; j < 4; j++) {
             V l;
-            l.v = Add4(base, Mul4(scale.v, Splat(v30[j])));
+            l.v = base + scaleF * Splat(v30[j]);
             for (int c = 0; c < 3; c++)
                 l[c] = Max(l[c], 0.0f);
             R.put(9 + j, l, XYZ);
@@ -1919,11 +1921,10 @@ bool LightFourWide(Runner& r, Regs& R)
             l.y = Add(q.y, l.y);
             R.put(9 + j, l, XY);
         }
-        const V c22 = R.get(3);
         for (int j = 0; j < 4; j++) {
             F4 ca = Add4(Splat(0.0f), R.get(21 + j).v);
             V c;
-            c.v = Add4(ca, Mul4(c22.v, Splat(R.vf[9 + j][2])));
+            c.v = ca + colourF * Splat(R.vf[9 + j][2]);
             R.put(13 + j, c, XYZ);
             V l = R.get(9 + j);
             float* q = r.Qword((std::uint16_t)(at + 2 + 4 * j));
