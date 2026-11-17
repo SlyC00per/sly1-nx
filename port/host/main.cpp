@@ -82,6 +82,9 @@ int g_seconds = 10;
 
 // When the program started, for the report's frame rate.
 const auto g_programStart = std::chrono::steady_clock::now();
+// The frames shown 10 s in, and when, for the report's rate after the start and the first load.
+std::uint64_t g_warmFrames;
+std::chrono::steady_clock::time_point g_warmAt;
 
 // The run's report: the kernel's threads, the DMA counts, the frame semaphores, the card.
 void Report()
@@ -91,6 +94,12 @@ void Report()
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_programStart).count();
         std::fprintf(stderr, "sly1: %llu frames shown in %.1f s since the program started\n",
                      (unsigned long long)port::gs::FramesShown(), s);
+        if (g_warmFrames) {
+            double w = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_warmAt).count();
+            std::uint64_t n = port::gs::FramesShown() - g_warmFrames;
+            std::fprintf(stderr, "sly1: %llu frames shown in the %.1f s after the first 10 (%.1f a second)\n",
+                         (unsigned long long)n, w, w > 0 ? n / w : 0.0);
+        }
     }
     port::KernelDump();
     port::DmacDump();
@@ -143,11 +152,18 @@ void* Clock(void*)
         Report();
         Finish(0);
     }
+    const auto warm = next + std::chrono::seconds(10);
+    bool warmed = false;
     while (g_seconds == 0 || std::chrono::steady_clock::now() < stop) {
         next += std::chrono::microseconds(16683);
         std::this_thread::sleep_until(next);
         if (g_started)
             port::RaiseInterrupt(2);
+        if (!warmed && next >= warm) {   // past the start and the first load: for the steady rate
+            warmed = true;
+            g_warmFrames = port::gs::FramesShown();
+            g_warmAt = std::chrono::steady_clock::now();
+        }
     }
     std::fprintf(stderr, "sly1: stopping after %d s\n", g_seconds);
     Report();
