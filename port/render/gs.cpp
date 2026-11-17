@@ -237,18 +237,38 @@ void LoadClut(std::uint64_t tex)
                          (unsigned long long)misses);
     }
     std::uint32_t before[256], psmBefore = g_clutPsm;
+    static const Cached* applied = nullptr;   // the cached palette the buffer holds as it is, if any
     if (hit) {
         hit->used = ++uses;
         if (!check) {
-            for (std::uint32_t k = 0; k < hit->count; k++)
-                g_clut[(hit->first + k) & 255] = hit->entries[k];
+            if (hit != applied) {
+                if (hit->first == 0 && hit->count == 256)
+                    std::memcpy(g_clut, hit->entries, sizeof g_clut);
+                else
+                    for (std::uint32_t k = 0; k < hit->count; k++)
+                        g_clut[(hit->first + k) & 255] = hit->entries[k];
+                applied = hit;
+            }
             g_clutPsm = hit->psm;
             return;
+        }
+        if (hit == applied) {   // the copy would be skipped: the buffer must hold the cached palette already
+            static std::uint64_t skips, wrong;
+            skips++;
+            bool same = true;
+            for (std::uint32_t k = 0; same && k < hit->count; k++)
+                same = g_clut[(hit->first + k) & 255] == hit->entries[k];
+            if (!same && wrong++ < 8)
+                std::fprintf(stderr, "gs check: a palette copy skipped, but the buffer holds another\n");
+            if ((skips & (skips - 1)) == 0)
+                std::fprintf(stderr, "gs check: %llu palette copies skipped, %llu wrongly\n", (unsigned long long)skips,
+                             (unsigned long long)wrong);
         }
         std::memcpy(before, g_clut, sizeof before);
         for (std::uint32_t k = 0; k < hit->count; k++)
             before[(hit->first + k) & 255] = hit->entries[k];
         psmBefore = hit->psm;
+        applied = hit;   // after the read below, the buffer holds what the cache holds (or the check says)
     }
     // where this load writes, for the cache
     std::uint32_t first = 0, count = 256;
@@ -267,6 +287,7 @@ void LoadClut(std::uint64_t tex)
         ~Store()
         {
             if (hit) {   // SLY1_GS_CHECK: the cached palette against the one read
+                applied = hit;
                 static std::uint64_t hits, differed;
                 hits++;
                 bool same = g_clutPsm == psmBefore;
@@ -279,6 +300,7 @@ void LoadClut(std::uint64_t tex)
                                  (unsigned long long)differed);
                 return;
             }
+            applied = nullptr;   // the buffer now holds what was read
             if (g_rasterise)
                 return;
             Cached* slot = &cache[slot0];
@@ -294,6 +316,7 @@ void LoadClut(std::uint64_t tex)
             slot->used = ++uses;
             for (std::uint32_t k = 0; k < count; k++)
                 slot->entries[k] = g_clut[(first + k) & 255];
+            applied = slot;
         }
         std::uint32_t slot0;
     } store{key, g_uploads, first, count, hit, before, psmBefore, slot0};
