@@ -272,3 +272,23 @@ renderer draws into such buffers, which is the next step for them. Found with th
 the CPU (`SLY1_GPU_TRANSFORM=0`), where the roof was black in every frame: not the destination
 alpha test, not the volumes' depths, not the depth test of the light's passes (each tried).
 `SLY1_GPU_CAPTURE_ALPHA=1` makes a capture show the frame's alpha (green where its top bit is set).
+
+## Small targets, begun (2026-11-17)
+
+`SLY1_GPU_SMALL_TARGETS=1` makes the GPU renderer draw into the game's small buffers (64 to 256
+pixels wide, 32 bits a pixel: the shadow's picture at FBP 294) and bind such a buffer's image
+where a run takes it as its texture. Off by default, as the shadows it gives are not retail's:
+
+- The picture is right (`SLY1_GPU_CAPTURE_SMALL=1` lays the first small target over a capture's
+  corner: Sly's outline from above, alpha 0x80 inside).
+- A run that reads the buffer it draws into is left out. The game follows the outline's runs with
+  such a run, which is not only a softening of the edge: the host's rasteriser has the picture's
+  alpha at 0x34 after it, the GPU's 0x80, so the shadow is solid black with a hard edge.
+- With the vertex work in the shader the shadow's run (program 0x076, which reads the positions
+  of the batch it falls on from VU1's memory) draws fewer triangles than with the work on the CPU
+  (6 indices for 24 in one run of frame 501) and the shadow is mostly not there: what the late
+  transform leaves in memory for that program is not what the program's own transform leaves.
+- A run of the GS's vertices with ZTST GEQUAL is drawn with a depth bias when the switch is on
+  (`SLY1_GPU_EQUAL_BIAS`, 512 steps): not shown to be needed.
+
+`SLY1_GPU_SHADOW_TRACE=1` prints the first shadow runs' triangles (positions, texture coordinates).
