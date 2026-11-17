@@ -245,6 +245,18 @@ bool Ordinary(Runner& r, std::uint16_t qaddr, int n, int stride = 1)
 }
 constexpr int kEdgeRegs[3] = {24, 29, 14};
 
+// Whether no field of the n quadwords at qaddr has the largest exponent: for data that only goes
+// through the arithmetic (or is copied), where a denormal is flushed to zero by the thread as the VU
+// reads it, so the host's arithmetic gives the VU's results (a batch's vertices).
+bool FiniteFields(Runner& r, std::uint16_t qaddr)
+{
+    const std::uint32_t* q = reinterpret_cast<const std::uint32_t*>(r.Qword(qaddr));
+    std::uint32_t bad = 0;
+    for (int c = 0; c < 4; c++)
+        bad |= (q[c] & 0x7F800000u) == 0x7F800000u;
+    return bad == 0;
+}
+
 bool OrdinaryField(float f)
 {
     std::uint32_t b = Bits(f), e = b & 0x7F800000u;
@@ -721,7 +733,7 @@ bool BatchTransformNow(Runner& r, const int stride, const Test test, const std::
         int n = span / stride;
         for (int k = 0; k < n + 4 && plain; k++) {
             std::uint16_t at = (std::uint16_t)(first + stride * k);
-            plain = Ordinary(r, at, 1) && Ordinary(r, (std::uint16_t)(at + stride - 1), 1);
+            plain = FiniteFields(r, at) && FiniteFields(r, (std::uint16_t)(at + stride - 1));
         }
         for (int e : kEdgeRegs)
             plain = plain && OrdinaryField(r.s.vf[e][0]) && OrdinaryField(r.s.vf[e][1]);

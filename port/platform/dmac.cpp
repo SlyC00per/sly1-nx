@@ -748,13 +748,21 @@ private:
                 one(reinterpret_cast<std::uint32_t*>(out), bytes);
             return;
         }
-        std::uint32_t cyc = 0, base = addr;
-        for (std::uint32_t i = 0; i < n; i++, bytes += kIn) {
-            one(reinterpret_cast<std::uint32_t*>(mem + ((base + cyc) & qmask) * 16), bytes);
-            if (++cyc == wl) {
-                cyc = 0;
-                base += cl;
+        // by cycles: each block of wl quadwords written where it goes (a block wraps rarely)
+        std::uint32_t base = addr, i = 0;
+        while (i < n) {
+            std::uint32_t block = std::min(wl ? wl : n, n - i);
+            std::uint32_t at = base & qmask;
+            if (at + block <= qmask + 1) {
+                std::uint8_t* out = mem + at * 16;
+                for (std::uint32_t c = 0; c < block; c++, out += 16, bytes += kIn)
+                    one(reinterpret_cast<std::uint32_t*>(out), bytes);
+            } else {
+                for (std::uint32_t c = 0; c < block; c++, bytes += kIn)
+                    one(reinterpret_cast<std::uint32_t*>(mem + ((base + c) & qmask) * 16), bytes);
             }
+            i += block;
+            base += cl;
         }
     }
 
