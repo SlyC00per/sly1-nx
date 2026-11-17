@@ -521,3 +521,13 @@ Verified as the change before: 899 frames against the run without the render thr
 same but frame 40 (and the stretches of 15 that come and go); the Mac's --verify-levels with
 both checks and Ryujinx's, with and without the GS thread, all 46 levels; Ryujinx's captures of
 frames 501 to 506 and 620 to 625 byte for byte as before.
+
+### The upload after each frame, at the opening's end
+
+The 200 KB the game uploads after each frame's list (4 ms of the render thread on the Switch) is
+particular to the scene with the title: a 512 by 512 4-bit picture at DBP 5120 and others, into
+the pages where the textures uploaded before the list lie (1,024 by 128 at DBP 5248, two of 128
+by 128). Each set writes over the other every frame, so neither is "the same as last time" and
+both are written (some 280 KB a frame). Elsewhere in the opening the set before the list is
+found unchanged and skipped. A fix would keep an upload's data and write it into local memory
+only when something reads those pages; not done, since it is one scene.
