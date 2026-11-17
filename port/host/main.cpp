@@ -492,6 +492,13 @@ int main(int argc, char** argv)
         struct Counting : port::gs::Backend {
             std::uint64_t runs = 0, vertices = 0, indices = 0, frames = 0;
             std::uint64_t batches = 0;
+            std::uint64_t hash = 1469598103934665603ull;   // of everything drawn, for comparing runs
+            void Mix(const void* p, std::size_t n)
+            {
+                const unsigned char* b = static_cast<const unsigned char*>(p);
+                for (std::size_t k = 0; k < n; k++)
+                    hash = (hash ^ b[k]) * 1099511628211ull;
+            }
             bool TakesBatches() const override { static const bool on = std::getenv("SLY1_GS_COUNT_BATCHES") != nullptr; return on; }
             // SLY1_GS_LIST=N: frame N's runs and batches, with their depth test and depths
             long listAt = std::getenv("SLY1_GS_LIST") ? std::atol(std::getenv("SLY1_GS_LIST")) : -1;
@@ -508,6 +515,11 @@ int main(int argc, char** argv)
             {
                 batches++;
                 vertices += b.count;
+                Mix(&s, sizeof s);
+                Mix(b.quads, (std::size_t)b.count * b.stride * 16);
+                Mix(b.matrix, sizeof b.matrix);
+                Mix(b.scale, sizeof b.scale);
+                Mix(b.offset, sizeof b.offset);
                 double zmin = 1e30, zmax = -1e30;
                 if ((long)frames + 1 == listAt)
                     for (std::uint32_t k = 0; k < b.count; k++) {
@@ -537,10 +549,13 @@ int main(int argc, char** argv)
                 if (s.tme && check)   // the decoder exercised (and checked)
                     port::gs::DecodeTexture(s, pixels, w, h);
             }
-            void Draw(const port::gs::DrawState& st, const port::gs::DrawVertex* vv, std::size_t v, const std::uint32_t*,
+            void Draw(const port::gs::DrawState& st, const port::gs::DrawVertex* vv, std::size_t v, const std::uint32_t* ii,
                       std::size_t i) override
             {
                 runs++; vertices += v; indices += i;
+                Mix(&st, sizeof st);
+                Mix(vv, v * sizeof *vv);
+                Mix(ii, i * sizeof *ii);
                 bool odd = false;
                 for (std::size_t k = 0; k < v; k++)
                     odd = odd || std::fabs(vv[k].s) > 1e30f || std::fabs(vv[k].x) > 3000 || std::fabs(vv[k].y) > 3000;
@@ -575,9 +590,9 @@ int main(int argc, char** argv)
             void Present(std::uint64_t, std::uint64_t) override
             {
                 if ((++frames & 255) == 0)
-                    std::fprintf(stderr, "gs count: %llu frames, %llu runs, %llu vertices, %llu indices\n",
+                    std::fprintf(stderr, "gs count: %llu frames, %llu runs, %llu vertices, %llu indices, all drawn hashed %016llX\n",
                                  (unsigned long long)frames, (unsigned long long)runs, (unsigned long long)vertices,
-                                 (unsigned long long)indices);
+                                 (unsigned long long)indices, (unsigned long long)hash);
             }
         };
         static Counting counting;
