@@ -49,8 +49,19 @@ inline F4 Fix4(F4 x)
     b = (b & ~tiny) | (sign & tiny);
     return (F4)b;
 }
-inline F4 Mul4(F4 a, F4 b) { return Fix4(Fix4(a) * Fix4(b)); }
-inline F4 Add4(F4 a, F4 b) { return Fix4(Fix4(a) + Fix4(b)); }
+// An operand with the largest exponent made the largest finite float of its sign. A denormal
+// operand needs nothing: the thread flushes denormal operands and results to zero, keeping the
+// sign (FPCR.FZ; FTZ and DAZ on x86), as the VU reads and writes them. Nor does the result: the
+// thread rounds toward zero, so finite operands overflow to the largest finite float, as the VU's
+// do, and never give an infinity or a NaN.
+inline F4 FixIn4(F4 x)
+{
+    U4 b = (U4)x;
+    U4 big = (U4)((b & 0x7F800000u) == 0x7F800000u);
+    return (F4)((b & ~big) | (((b & 0x80000000u) | 0x7F7FFFFFu) & big));
+}
+inline F4 Mul4(F4 a, F4 b) { return FixIn4(a) * FixIn4(b); }
+inline F4 Add4(F4 a, F4 b) { return FixIn4(a) + FixIn4(b); }
 inline F4 Splat(float f) { return F4{f, f, f, f}; }
 
 union V {
