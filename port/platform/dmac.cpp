@@ -715,7 +715,12 @@ private:
         };
         if ((wl >= cl || wl == 0) && (addr & qmask) + n <= qmask + 1) {
             std::uint8_t* out = mem + (addr & qmask) * 16;
-            for (std::uint32_t i = 0; i < n; i++, out += 16, bytes += kIn)
+            if (Fields == 4 && Bits == 32) {   // the quadwords as they are
+                std::memcpy(out, bytes, (std::size_t)n * 16);
+                return;
+            }
+            std::uint32_t i = 0;
+            for (; i < n; i++, out += 16, bytes += kIn)
                 one(reinterpret_cast<std::uint32_t*>(out), bytes);
             return;
         }

@@ -493,10 +493,21 @@ int main(int argc, char** argv)
             std::uint64_t runs = 0, vertices = 0, indices = 0, frames = 0;
             std::uint64_t batches = 0;
             std::uint64_t hash = 1469598103934665603ull;   // of everything drawn, for comparing runs
+            // SLY1_GS_HASH: everything drawn hashed, eight bytes at a time (costly: for comparing runs)
             void Mix(const void* p, std::size_t n)
             {
+                static const bool on = std::getenv("SLY1_GS_HASH") != nullptr;
+                if (!on)
+                    return;
                 const unsigned char* b = static_cast<const unsigned char*>(p);
-                for (std::size_t k = 0; k < n; k++)
+                std::size_t k = 0;
+                for (; k + 8 <= n; k += 8) {
+                    std::uint64_t w;
+                    std::memcpy(&w, b + k, 8);
+                    hash = (hash ^ w) * 0x9E3779B97F4A7C15ull;
+                    hash ^= hash >> 31;
+                }
+                for (; k < n; k++)
                     hash = (hash ^ b[k]) * 1099511628211ull;
             }
             bool TakesBatches() const override { static const bool on = std::getenv("SLY1_GS_COUNT_BATCHES") != nullptr; return on; }

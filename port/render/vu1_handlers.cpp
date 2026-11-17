@@ -662,7 +662,13 @@ bool BatchTransform(Runner& r, const int stride, const Test test, const std::uin
                 r.s = before;
                 std::memcpy(r.data, memory.data(), 16384);
             }
-            LeaveRegisters(r, top, stride, test, endPc);
+            static const bool noLeave = std::getenv("SLY1_NO_LEAVE") != nullptr;   // diagnosis: the registers left as they are
+            if (noLeave) {
+                r.s.clip = 0;
+                r.s.pc = endPc;
+            } else {
+                LeaveRegisters(r, top, stride, test, endPc);
+            }
             if (leaveCheck) {
                 static std::uint64_t checks, differed;
                 static std::uint32_t regsDiffer[32];
