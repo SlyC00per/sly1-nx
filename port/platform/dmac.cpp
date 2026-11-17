@@ -412,6 +412,17 @@ public:
     Vif(int cause, bool vu0) : cause_(cause), vu0_(vu0) {}
 
     // A quadword's words: the data of a kept VIFcode (an unpack, microcode) appended at once.
+    // The hook's NOP seen since the last call (LiveSink): the part is open from here to PartEnd.
+    bool TakePartBegin()
+    {
+        if (!partBegin_)
+            return false;
+        gs::PartOpen(true, (partBegin_ & 0x1FFFFF) << 4, (partBegin_ >> 22) & 1);
+        partBegin_ = 0;
+        return true;
+    }
+    void PartEnd() { gs::PartOpen(false, 0, 0); }
+
     void Words(const std::uint32_t* w, int n)
     {
         int k = 0;
@@ -529,6 +540,8 @@ private:
             switch (cmd) {
             case 0x00: case 0x06: case 0x07: case 0x10: case 0x11: case 0x13:
                 left_ = 0;   // NOP, MSKPATH3, MARK, the flushes (the port's transfers are done when they end)
+                if (cmd == 0x00 && (w & 0x00800000) && !vu0_)   // the hook's NOP (tools/patches.py)
+                    partBegin_ = w;
                 break;
             case 0x02:   // OFFSET: the double buffer's second half, and back to the first
                 ofst_ = imm & 0x3FF;
@@ -1022,6 +1035,7 @@ private:
     std::vector<std::uint32_t> data_;
     const std::uint32_t* src_ = nullptr;   // an unpack's data where it came, in place of data_ (Words)
     std::size_t srcWords_ = 0;
+    std::uint32_t partBegin_ = 0;
     std::uint32_t left_ = 0, cl_ = 1, wl_ = 1, filled_ = 0;
     std::uint32_t qword_[4] = {};
     bool irq_ = false, direct_ = false;
@@ -1128,6 +1142,7 @@ struct DirectSink {
     }
     void OnVif(const std::uint32_t* w, int n) { vif->Words(w, n); }
     void OnGif(const std::uint32_t* q) { gif->Qword(q); }
+    void OnTagDone(std::uint32_t) {}
     bool Direct() const { return true; }
 };
 // A list's length, its tags walked and nothing else.
@@ -1135,6 +1150,7 @@ struct CountSink {
     std::size_t words = 0;
     void OnVif(const std::uint32_t*, int n) { words += (std::size_t)n; }
     void OnGif(const std::uint32_t*) { words += 4; }
+    void OnTagDone(std::uint32_t) {}
     bool Direct() const { return false; }
 };
 constexpr std::size_t kLiveListWords = 16384;   // 64 KiB: a frame's list is ten times that and more
@@ -1167,6 +1183,26 @@ struct LiveSink {
     void OnGif(const std::uint32_t*) {}
     bool Direct() const { return true; }
     ~LiveSink() { Flush(); }
+
+    // A model part drawn from its cache (tools/patches.py's hook: a NOP naming the cache's packet,
+    // then the DMA call of it): from the NOP to the tag that returns from the call.
+    int depth = 0, partDepth = -1;
+    void OnTagDone(std::uint32_t id)
+    {
+        if (id == 5) {   // call: the words before it are done first, the NOP among them
+            Flush();
+            if (g_vif1.TakePartBegin())
+                partDepth = depth;
+            depth++;
+        } else if (id == 6 && depth > 0) {   // ret
+            depth--;
+            if (depth == partDepth) {
+                Flush();
+                g_vif1.PartEnd();
+                partDepth = -1;
+            }
+        }
+    }
 };
 
 // How many of VIF1's codes in a list have the interrupt bit: the list walked by its codes' lengths
@@ -1217,6 +1253,7 @@ struct CaptureSink {
     std::vector<std::uint32_t>& out;
     void OnVif(const std::uint32_t* w, int n) { out.insert(out.end(), w, w + n); }
     void OnGif(const std::uint32_t* q) { out.insert(out.end(), q, q + 4); }
+    void OnTagDone(std::uint32_t) {}
     bool Direct() const { return false; }
 };
 
@@ -1290,6 +1327,7 @@ void WalkChain(std::uint32_t regs, std::uint32_t tadr, Sink& sink)
                 sink.OnGif(q);
             }
         }
+        sink.OnTagDone(id);
         if (end || (irq && tie))
             break;
         tadr = next;
@@ -1581,6 +1619,13 @@ void DmacDump()
     std::fprintf(stderr, "dmac: chains took %.2f s on the game's thread%s; the render queue held at most %.1f MB\n",
                  g_counts.dmaNanoseconds.load() / 1e9, g_renderStarted ? " (VIF1 and GIF chains copied for the render thread)" : "",
                  g_renderMaxQueued.load() * 4 / 1e6);
+    {
+        std::uint64_t in[2], out[2], parts;
+        gs::PartCounts(in, out, &parts);
+        if (parts)
+            std::fprintf(stderr, "dmac: %llu model parts drawn from their caches' packets: %llu batches (%llu vertices) in them, %llu (%llu) not\n",
+                         (unsigned long long)parts, (unsigned long long)in[0], (unsigned long long)in[1], (unsigned long long)out[0], (unsigned long long)out[1]);
+    }
     if (g_liveLists.load())
         std::fprintf(stderr, "dmac: %llu lists of VIF1's walked where they lie (a frame's, or one with interrupts), %llu from their copies\n",
                      (unsigned long long)g_liveLists.load(), (unsigned long long)g_copiedLists.load());

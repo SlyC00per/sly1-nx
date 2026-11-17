@@ -108,6 +108,12 @@ bool DrawBatch(std::uint32_t tagWord1, Batch& batch);
 // thread's queue, port/platform/dmac.cpp: the batch is then drawn later, in order with the GS's
 // packets, and counts as taken).
 bool KickBatch(std::uint32_t tagWord1, Batch& batch);
+// A model part drawn from its light cache's packet (the hook of tools/patches.py, seen by
+// port/platform/dmac.cpp): open from the hook to the return from the packet's call. The batches
+// kicked meanwhile are the part's. PartCounts: the batches and vertices kicked inside parts and
+// outside them, and the parts, so far.
+void PartOpen(bool open, std::uint32_t packet, std::uint32_t half);
+void PartCounts(std::uint64_t in[2], std::uint64_t out[2], std::uint64_t* parts);
 void SetBatchSink(bool (*sink)(std::uint32_t tagWord1, const Batch& batch));
 
 // Whether the renderer set takes batches.

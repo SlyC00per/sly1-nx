@@ -554,3 +554,27 @@ batch in ten matched.)
 Every one of those is unpacked by the VIF, taken through VU1's handlers, copied to the GS thread
 and copied to the GPU's memory again each frame. That is the work a renderer that kept a
 batch's vertices from one frame to the next would not do.
+
+## A hook: the model part drawn from its light cache (2026-11-17)
+
+The user's decision: the port may add named hooks to the game's mesh-drawing code, through
+tools/patches.py (the decompilation is not touched).
+
+The first. Where the game draws a model part whose lighting has not changed, it sends the part's
+header (BASE, OFFSET, an unpack of 11 quadwords: the matrix and what goes with it) and then
+calls, with a DMA call tag, the packet its light cache holds: the part's meshes with their
+colours as they were last lit. The patch puts a VIF NOP before the call, in the word the game
+pads the header's tag with (the tag is no longer), with the packet's address and which of the
+two it is in the NOP's unused bits. The render thread, walking the list where it lies, sees the
+NOP and then the call, and the tag that returns from the call: the batches kicked between are
+the part's (`gs::PartOpen`).
+
+The opening under lockstep on the Mac, 3,000 frames, the counting renderer taking batches:
+740,142 parts (247 a frame) with 4,838,364 batches in them and 1,090,510 outside: 82% of the
+batches, 79% of the vertices. The counting renderer's stream is as before (899 frames against the
+run without the render thread: frame 40 alone differs, as before).
+
+What it is for: a part's packet is the same from frame to frame until the part is lit again, so
+what the renderer made of it (each batch's vertices and colours, and the GS registers written
+between them) can be kept and drawn again with the new header, without the VIF's unpacks, VU1's
+handlers, the copy to the GS thread or the copy to the GPU. Not built yet.

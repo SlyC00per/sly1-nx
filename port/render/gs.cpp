@@ -1931,7 +1931,28 @@ namespace {
 bool (*g_batchSink)(std::uint32_t, const Batch&);
 }
 void SetBatchSink(bool (*sink)(std::uint32_t, const Batch&)) { g_batchSink = sink; }
-bool KickBatch(std::uint32_t tagWord1, Batch& batch) { return g_batchSink ? g_batchSink(tagWord1, batch) : DrawBatch(tagWord1, batch); }
+namespace {
+bool g_partOpen;
+std::uint64_t g_partIn[2], g_partOut[2], g_parts;
+}
+void PartOpen(bool open, std::uint32_t, std::uint32_t)
+{
+    g_partOpen = open;
+    g_parts += open ? 1 : 0;
+}
+void PartCounts(std::uint64_t in[2], std::uint64_t out[2], std::uint64_t* parts)
+{
+    in[0] = g_partIn[0]; in[1] = g_partIn[1];
+    out[0] = g_partOut[0]; out[1] = g_partOut[1];
+    *parts = g_parts;
+}
+bool KickBatch(std::uint32_t tagWord1, Batch& batch)
+{
+    std::uint64_t* n = g_partOpen ? g_partIn : g_partOut;
+    n[0]++;
+    n[1] += batch.count;
+    return g_batchSink ? g_batchSink(tagWord1, batch) : DrawBatch(tagWord1, batch);
+}
 
 void SetBackend(Backend* backend)
 {

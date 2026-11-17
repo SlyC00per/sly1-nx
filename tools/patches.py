@@ -524,6 +524,25 @@ PATCHES = [
      'AddDmaRefTag(self, n >> 4, (s32)port::GameAddrOf(c));',
      "a DMA reference tag's address: the pointer's game address, not its low 32 bits"),
 
+    # A hook for the port's renderer (the user's decision, 2026-11-17: named hooks in the game's
+    # mesh-drawing code, through this file). Where the game draws a model part from its light
+    # cache it sends the part's header and then calls the cache's packet, which holds the part's
+    # meshes with their colours as they were last lit. The port is told which packet: one VIF NOP
+    # with the packet's address in its unused bits, in the word the game pads the header's tag
+    # with (the tag is no longer). The renderer may then draw the part from what it kept of the
+    # packet the last time, with this frame's header (port/platform/dmac.cpp, PartBegin).
+    ("src/main/placed_object_model.cpp",
+     "            VifPacketWriter::UnpackV4(&g_vifPacketWriter, &b, 0xB, 0);\n"
+     "            VifPacketWriter::Pad(&g_vifPacketWriter);\n"
+     "            VifPacketWriter::Close(&g_vifPacketWriter, tag);\n"
+     "            VifPacketWriter::Call(&g_vifPacketWriter, cache->refs[half]);",
+     "            VifPacketWriter::UnpackV4(&g_vifPacketWriter, &b, 0xB, 0);\n"
+     "            VifPacketWriter::Word(&g_vifPacketWriter, 0x00800000 | (half << 22) | (((u32)cache->refs[half] >> 4) & 0x1FFFFF));\n"
+     "            VifPacketWriter::Pad(&g_vifPacketWriter);\n"
+     "            VifPacketWriter::Close(&g_vifPacketWriter, tag);\n"
+     "            VifPacketWriter::Call(&g_vifPacketWriter, cache->refs[half]);",
+     "the renderer told which cached packet a model part is drawn from"),
+
     # PS3 parity (docs/PS3_PARITY.md): no memory card questions. The port's card is always there,
     # formatted and roomy (port/platform/memory_card.cpp); where the game would ask whether to
     # create its save file (page 7), it creates it, as the answer "Yes" does.
