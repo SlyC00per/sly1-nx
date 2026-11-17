@@ -161,3 +161,46 @@ Diagnosis switches in the renderer: `SLY1_GPU_CAPTURE` (frames printed, with vie
 on the five frames after), `SLY1_GPU_CAPTURE_STEP`, `SLY1_GPU_ZMAP` (the depth buffer as bands),
 `SLY1_GPU_STOP_AFTER` and `SLY1_GPU_OMIT` (a frame's draws cut short or one left out),
 `SLY1_GPU_SKIP` (kinds of draw left out), `SLY1_GPU_LIST`, `SLY1_GPU_NO_ZCULL`, `SLY1_GPU_CULL_FLIP`.
+
+## Measuring the render thread (2026-11-17)
+
+The Switch is render-bound: its game thread waits for the render thread (core 2) most of each
+frame. What follows is how the render thread's work is measured without the hardware, and what
+the night of 2026-11-16 found.
+
+- **Determinism.** `SLY1_LOCKSTEP=N` gives the game N vblanks, each once its threads all wait and
+  the render thread is idle, and makes the game's clock (`CycleCount`) of them: two runs see the
+  same frames however fast they run (for comparing runs, never for playing). A run slowed so much
+  that the game is not idle within 100 ms is given its vblank all the same, and is then no longer
+  deterministic.
+- **Exactness.** `SLY1_GS_COUNT=1` (host) gives the GS a renderer that only counts; with
+  `SLY1_GS_HASH=1` it also hashes everything drawn. Normal mode, 900 vblanks: 768 frames, 1,529,944
+  runs, 62,603,051 vertices, 57,461,178 indices. With `SLY1_GS_COUNT_BATCHES=1 SLY1_GPU_TRANSFORM=1`,
+  1,200 vblanks: hash `6E52FB08D049299D`. A change that draws the same keeps these.
+- **The Switch's code.** Ryujinx on an Apple Silicon Mac runs the Switch build's code on the host's
+  cores (its hypervisor), so lockstep runs there compare builds' work on the code GCC made for the
+  Switch. A read of the clock leaves the guest there, so the per-call timers are opt-in
+  (`SLY1_GPU_TIMERS`, `SLY1_VU1_TIMES`, `SLY1_VU1_PROFILE`) and a profiled run there measures mostly
+  the clock. The report's "render thread took X s for VIF1's data" is the measure.
+- **Where the time goes.** A host build with symbols (`-DPLATFORM=HOST`, `-O3 -g`: the default
+  platform is `HOST_ASAN`) sampled with `sample` and the leaves resolved with `atos -i`.
+
+Results, Ryujinx, lockstep 1,200 vblanks, the build before the night against after (both with the
+clock fixes): with `SLY1_GPU_TRANSFORM` the render thread's VIF1 time 4.78 s and 5.05 s to 2.76 s and
+2.71 s; without it 5.91 s to 3.59 s. What did it, by the host's measure:
+
+| Change | Effect |
+| --- | --- |
+| The handlers' arithmetic fixes only an operand with the largest exponent (the thread flushes denormals and rounds toward zero) | VU1 −37% |
+| A palette cache (256 entries, two ways), checked by `SLY1_GS_CHECK` | palette loads 95% from the cache |
+| The transform's fast path unless a vertex field has the largest exponent | the transform 0.32 s to 0.12 s |
+| A batch's positions and indices given to the GPU once, its colours per kick | 5.2 to 2.3 MB a frame |
+| Unpacks specialised and done in place; VIF codes counted in an array | about 5% |
+
+Tried and not kept: a GS state change only on a changed value (the hash changed); dropping the
+registers a deferred transform leaves (they reach the picture, `SLY1_NO_LEAVE`).
+
+What remains, host profile of the render thread: unpacking 22% (2.3 MB a frame into VU1's memory),
+the GS's handling of the kicked packets 15%, the second pass 12%, the outlines 8%, the deferred
+transform's registers 8%, skinning and lighting about 25% together. The next large step is
+lighting and skinning in the shaders.
