@@ -46,6 +46,7 @@
 #include "port/iso.h"
 #include "port/memory_card.h"
 #include "port/retail_data.h"
+#include "port/audio.h"
 struct Player;
 struct Vec4;
 void func_00178008(Player*, Vec4*);   // the game's SetPlayerPosition (SLY1_WARP)
@@ -79,6 +80,7 @@ int g_seconds = 10;
 {
     char line[64];
     std::snprintf(line, sizeof line, "sly1: done, status %d", status);
+    port::audio::Finish();
     std::fprintf(stderr, "%s\n", line);
     std::fflush(stderr);
 #if defined(__SWITCH__)
@@ -859,6 +861,17 @@ int main(int argc, char** argv)
                               },
                               nullptr, true) != 0)
             std::fprintf(stderr, "sly1: cannot start the helper thread: every hash on the render thread\n");
+    }
+    if (port::audio::Wanted()) {   // the sound engine's mixer (port/audio)
+        static pthread_t mixer;
+        static unsigned char mixerStack[1 << 18] __attribute__((aligned(16)));
+        if (port::StartThread(&mixer, mixerStack, sizeof mixerStack,
+                              [](void*) -> void* {
+                                  port::audio::MixerMain();
+                                  return nullptr;
+                              },
+                              nullptr, true) != 0)
+            std::fprintf(stderr, "sly1: cannot start the sound mixer's thread: no sound\n");
     }
     port::StartSampler();
     if (port::StartThread(&render, g_renderStack, sizeof g_renderStack,

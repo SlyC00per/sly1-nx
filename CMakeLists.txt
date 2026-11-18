@@ -157,7 +157,7 @@ add_library(port_platform STATIC
     port/platform/lib_runtime.cpp port/platform/lib_kernel.cpp port/platform/lib_devices.cpp
     port/platform/iop.cpp port/platform/iso.cpp port/platform/float_mode.cpp
     port/platform/kernel.cpp port/platform/lib_services.cpp port/platform/dmac.cpp
-    port/platform/memory_card.cpp port/platform/pad.cpp)
+    port/platform/memory_card.cpp port/platform/pad.cpp port/audio/audio.cpp)
 target_compile_options(port_platform PRIVATE ${GAME_FLAGS})
 target_include_directories(port_platform PRIVATE ${GAME_INCLUDES})
 add_dependencies(port_platform sly1_gen)
