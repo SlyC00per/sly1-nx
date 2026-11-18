@@ -156,6 +156,26 @@ void PlaceThread(ThreadRole role)
 {
     if (role == ThreadRole::Render || role == ThreadRole::Gs)
         g_sampled[role == ThreadRole::Gs ? 1 : 0] = threadGetCurHandle();
+    if (role == ThreadRole::Helper) {
+        // The render thread's helper (the parts' hashes): the fourth core where the system lets
+        // the program have it (it does not on the Switch as homebrew runs), else the game's core
+        // beside the game's threads (they leave about half of it idle). SLY1_HELPER_CORE=N says
+        // which.
+        const char* asked = std::getenv("SLY1_HELPER_CORE");
+        int core = asked ? std::atoi(asked) : 3;
+        Result r = svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core);
+        if (R_FAILED(r)) {
+            core = 0;
+            r = svcSetThreadCoreMask(CUR_THREAD_HANDLE, 0, 1u);
+        }
+        // Below the game's threads on their core: it runs in what they leave idle and never holds
+        // them up (at their own priority, frames that just made a vertical blank missed it: 825 of
+        // the opening's frames in one blank where 1,013 had been). SLY1_HELPER_PRIORITY=N (hex).
+        const char* prio = std::getenv("SLY1_HELPER_PRIORITY");
+        const Result p = svcSetThreadPriority(CUR_THREAD_HANDLE, prio ? (s32)std::strtol(prio, nullptr, 16) : core == 3 ? 0x2C : 0x2D);
+        std::fprintf(stderr, "sly1: the helper thread on core %d (0x%X, priority 0x%X)\n", core, (unsigned)r, (unsigned)p);
+        return;
+    }
     int core = role == ThreadRole::Game ? 0 : role == ThreadRole::Clock || role == ThreadRole::Gs ? 1 : 2;
     svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, 1u << core);
     s32 prio = 0x2C;

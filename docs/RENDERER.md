@@ -778,6 +778,37 @@ the Switch, each with the same output, none with a gain (kept out):
 - each part's lines of memory listed once and asked for when the part before it is reached:
   the hash 18% cheaper, the asking and its lookups as dear as what it saved.
 
+### The parts' hashes a frame late, on a helper thread (2026-11-17)
+
+What did gain: the hash is no longer made before the decision. A kept part is drawn again on
+what a helper thread found the last time it was asked (the frame before, as a rule) and the
+helper is asked again (`HashHelperMain`, `PartHashLate` in port/platform/dmac.cpp). A part whose
+packet has changed is drawn once more as it was and kept anew the frame after; the registers
+and the header are still compared at once. A part found changed is hashed before each decision,
+as before, for the next 120 frames: without that a part that changes every other frame was
+drawn as it was every other frame for good (on the host, every second frame's hash differed).
+`SLY1_PART_HASH_NOW=1`: every hash on the render thread, as before. The picture is no longer the
+same to the frame (the user's decision, 2026-11-17: frame-exact is not needed where it looks
+the same): on the host 15 of 898 frames of the opening differ in their hash, one part a frame
+late in each.
+
+The helper's place, found the hard way:
+
+- The fourth core is not the program's (`svcSetThreadCoreMask` refuses it); the helper is on
+  the game's core, which the game's threads leave about half idle.
+- A thread cannot be made from the render thread: `std::thread` never returned there (the
+  Switch showed its error screen; Ryujinx stood still at frame 21). The program starts the
+  helper beside the GS thread.
+- At the game's threads' priority it held them up: frames that had just made a vertical blank
+  missed it (825 of the opening's frames after the 600th in one blank, where 1,013 had been).
+  On the GS thread's core it gained nothing. Below the game's threads (0x2D) it runs only in
+  what they leave; the render thread takes the lock it shares with the helper only when it is
+  free, since the helper may be set aside while it holds it.
+
+On the Switch, the opening's frames after the 600th: 1,290 of one vertical blank and 434 of
+two (1,013 and 574). The render thread in frames 1,560 to 1,800: 18.0 to 19.2 ms a frame where
+it was 20.1 to 20.6.
+
 ### The handheld GPU clock: not used
 
 `SLY1_PERF_CONFIG=92220007` asks the system for that performance configuration in handheld mode

@@ -21,6 +21,8 @@
 #include <memory>
 #include <optional>
 #include <condition_variable>
+#include "port/thread.h"
+#include <thread>
 #include <deque>
 #include <cstdlib>
 #include <map>
@@ -1248,8 +1250,130 @@ struct PartRecord {
     // while it is recorded
     std::uint64_t troubleWas = 0, interruptsWas = 0, finishesWas = 0;
     bool bad = false;
+    // the hash a frame late (PartHashLate): what the helper last found, and whether it is asked
+    std::uint32_t serial = 0;            // which keeping of the part this is (a result for another is dropped)
+    std::uint64_t seen = 0, seenWhole = 0;
+    bool wholeArrived = false, asked = false;
+    // A part found changed is hashed before each decision, as it was, until this frame: one that
+    // changes every frame or two would otherwise be drawn as it was every other frame for good.
+    std::uint64_t watchUntil = 0;
 };
-std::unordered_map<std::uint32_t, PartRecord> g_parts;   // by the hook's packet and half
+std::unordered_map<std::uint32_t, PartRecord> g_parts;
+
+// --- The parts' hashes a frame late, on a helper thread.
+//
+// Hashing each part's packet before deciding to draw it again was about 2 ms a frame of the render
+// thread on the Switch, most of it the wait for memory. A part that is kept is now drawn again on
+// what the helper found the last time it was asked (the frame before, as a rule), and the helper
+// is asked again: a part whose packet has changed (a texture's next picture, new colours from the
+// lights) is drawn once more as it was and kept anew the frame after. The registers and the header
+// are compared at once as before. SLY1_PART_HASH_NOW=1: every hash before the decision, as before.
+struct HashJob {
+    std::uint32_t key, serial, target, cl, wl;
+    bool tte, whole;
+};
+struct HashResult {
+    std::uint32_t key, serial;
+    std::uint64_t hash, hashWhole;
+    bool whole;
+};
+std::mutex g_hashLock;
+std::condition_variable g_hashWake;
+std::vector<HashJob> g_hashJobs, g_hashPending;      // for the helper; the render thread's, not passed on yet
+std::vector<HashResult> g_hashResults;
+std::atomic<bool> g_hashAnyResult, g_hashStarted;
+std::atomic<std::uint64_t> g_hashHelperNs, g_hashHelped;
+std::uint32_t g_partSerial;
+std::uint64_t g_partsLate;   // drawn again on a hash a frame late
+
+std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte);
+
+}  // namespace
+
+void HashHelperMain()
+{
+    PlaceThread(ThreadRole::Helper);
+    g_hashStarted.store(true, std::memory_order_release);
+    std::vector<HashJob> jobs;
+    std::vector<HashResult> results;
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lk(g_hashLock);
+            for (const HashResult& r : results)
+                g_hashResults.push_back(r);
+            if (!results.empty())
+                g_hashAnyResult.store(true, std::memory_order_release);
+            results.clear();
+            g_hashWake.wait(lk, [] { return !g_hashJobs.empty(); });
+            jobs.swap(g_hashJobs);
+        }
+        const std::uint64_t t0 = NowNs();
+        for (std::size_t n = 0; n < jobs.size(); n++) {
+            const HashJob& j = jobs[n];
+            HashResult r = {j.key, j.serial, PartHash(j.target, false, j.cl, j.wl, j.tte), 0, j.whole};
+            if (j.whole)
+                r.hashWhole = PartHash(j.target, true, j.cl, j.wl, j.tte);
+            results.push_back(r);
+        }
+        g_hashHelped += jobs.size();
+        jobs.clear();
+        g_hashHelperNs += NowNs() - t0;
+    }
+}
+
+namespace {
+bool PartHashLate()
+{
+    static const bool now = std::getenv("SLY1_PART_HASH_NOW") != nullptr;
+    if (now)
+        return false;
+    return g_hashStarted.load(std::memory_order_acquire);   // the helper is running (the program starts it)
+}
+
+// (on the render thread) The jobs asked for since the last time handed to the helper.
+void HashPassOn()
+{
+    if (g_hashPending.empty())
+        return;
+    {
+        // only if the lock is free: the helper may be set aside while it holds it (it runs below
+        // the game's threads), and the render thread does not wait for that
+        std::unique_lock<std::mutex> lk(g_hashLock, std::try_to_lock);
+        if (!lk.owns_lock())
+            return;
+        g_hashJobs.insert(g_hashJobs.end(), g_hashPending.begin(), g_hashPending.end());
+    }
+    g_hashPending.clear();
+    g_hashWake.notify_one();
+}
+
+// (on the render thread) What the helper has found, put in the parts' records.
+void HashTakeResults()
+{
+    if (!g_hashAnyResult.load(std::memory_order_acquire))
+        return;
+    static std::vector<HashResult> results;
+    {
+        std::unique_lock<std::mutex> lk(g_hashLock, std::try_to_lock);   // as HashPassOn
+        if (!lk.owns_lock())
+            return;
+        g_hashAnyResult.store(false, std::memory_order_release);
+        results.swap(g_hashResults);
+    }
+    for (const HashResult& h : results) {
+        auto it = g_parts.find(h.key);
+        if (it == g_parts.end() || it->second.serial != h.serial)
+            continue;
+        PartRecord& r = it->second;
+        r.asked = false;
+        r.seen = h.hash;
+        if (h.whole) {
+            r.seenWhole = h.hashWhole;
+            r.wholeArrived = true;
+        }
+    }
+    results.clear();
+}   // by the hook's packet and half
 std::uint64_t g_partsReplayed, g_partsRecorded, g_partsRefused, g_partsStale, g_partItemsReplayed, g_partsMoving, g_partsStaleBy[3], g_partHashNs, g_partWords, g_partsCleared, g_partKey, g_partsFickle;
 constexpr std::size_t kBatchHead = 1 + (sizeof(gs::Batch) + 3) / 4;
 
@@ -1359,13 +1483,14 @@ struct PartHasher {
     }
 };
 
-std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl)
+bool PartTte() { return (static_cast<volatile std::uint32_t*>(Native(kVif1))[0] & 0x40) != 0; }
+
+std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte)
 {
     PartHasher hasher;
     hasher.whole = whole;
     hasher.cl = cl;
     hasher.wl = wl;
-    const bool tte = (static_cast<volatile std::uint32_t*>(Native(kVif1))[0] & 0x40) != 0;
     auto data = [&](std::uint32_t addr, bool spr, std::uint32_t qwc) {
         if (!spr) {
             hasher.Feed(At(addr, false), (std::size_t)qwc * 4);
@@ -1457,10 +1582,37 @@ bool PartCall(std::uint32_t marker, std::uint32_t target)
     const Vif::Regs regs = g_vif1.GetRegs();
     std::uint32_t header[44];
     PartHeader(regs.tops, header);
-    const std::uint64_t h0 = NowNs();
-    const std::uint64_t hash = PartHash(target, false, regs.cl, regs.wl);
-    g_partHashNs += NowNs() - h0;
+    const bool tte = PartTte();
     auto it = g_parts.find(key);
+    std::uint64_t hash = 0;
+    bool late = false;   // the hash is what the helper last found, not this frame's
+    if (PartHashLate() && it != g_parts.end()) {
+        HashTakeResults();
+        PartRecord& r = it->second;
+        if (!r.ok && !r.moving && r.notBefore > gs::FramesShown()) {
+            g_partsFickle++;
+            return false;   // one that keeps changing, left alone for now: no hash needed
+        }
+        if ((r.ok || r.moving) && gs::FramesShown() >= r.watchUntil) {
+            late = true;
+            hash = r.seen ? r.seen : r.hash;
+            if (!r.asked) {
+                r.asked = true;
+                const bool whole = r.ok && (r.verified < 8 || ((gs::FramesShown() + key) & 31) == 0);
+                g_hashPending.push_back({key, r.serial, target, regs.cl, regs.wl, tte, whole});
+                if (g_hashPending.size() >= 16)
+                    HashPassOn();
+            }
+        }
+    }
+    auto hashNow = [&] {
+        const std::uint64_t h0 = NowNs();
+        const std::uint64_t h = PartHash(target, false, regs.cl, regs.wl, tte);
+        g_partHashNs += NowNs() - h0;
+        return h;
+    };
+    if (!late)
+        hash = hashNow();
     if (it != g_parts.end() && it->second.moving && it->second.hash == hash) {
         g_partsMoving++;
         return false;   // run as ever, and not kept
@@ -1470,8 +1622,11 @@ bool PartCall(std::uint32_t marker, std::uint32_t target)
         bool same = hash != 0 && r.hash == hash && r.before == regs && PartHeaderSame(r.header, header);
         if (!same)   // why, for the report: the hash, the registers, or the header
             g_partsStaleBy[r.hash != hash ? 0 : !(r.before == regs) ? 1 : 2]++;
-        if (same && (r.verified < 8 || ((gs::FramesShown() + key) & 31) == 0)) {
-            if (PartHash(target, true, regs.cl, regs.wl) == r.hashWhole) {
+        const bool wholeDue = late ? r.wholeArrived : (r.verified < 8 || ((gs::FramesShown() + key) & 31) == 0);
+        if (same && wholeDue) {
+            const std::uint64_t whole = late ? r.seenWhole : PartHash(target, true, regs.cl, regs.wl, tte);
+            r.wholeArrived = false;
+            if (whole == r.hashWhole) {
                 r.verified++;
             } else {
                 r.moving = true;
@@ -1504,10 +1659,17 @@ bool PartCall(std::uint32_t marker, std::uint32_t target)
             vu1::PartSkipped();
             r.stale = 0;
             g_partsReplayed++;
+            g_partsLate += late ? 1 : 0;
             g_partItemsReplayed += r.kept->size();
             return true;
         }
         g_partsStale++;
+    }
+    std::uint64_t watchUntil = it != g_parts.end() ? it->second.watchUntil : 0;
+    if (late) {
+        if (it->second.hash != hash)
+            watchUntil = gs::FramesShown() + 120;
+        hash = hashNow();   // kept anew: the hash of what is there now
     }
     if (hash == 0)
         return false;
@@ -1531,6 +1693,8 @@ bool PartCall(std::uint32_t marker, std::uint32_t target)
     g_partWords -= std::min<std::uint64_t>(g_partWords, r.words);   // what it held before is let go
     PartForget(r);
     r = PartRecord();
+    r.serial = ++g_partSerial;
+    r.watchUntil = watchUntil;
     r.stale = stale;
     if (stale >= 3) {
         r.stale = 0;
@@ -1540,7 +1704,7 @@ bool PartCall(std::uint32_t marker, std::uint32_t target)
     }
     r.keyFirst = g_partKey + 1;
     r.hash = hash;
-    r.hashWhole = PartHash(target, true, regs.cl, regs.wl);
+    r.hashWhole = PartHash(target, true, regs.cl, regs.wl, tte);
     std::memcpy(r.header, header, sizeof header);
     r.before = regs;
     r.troubleWas = vu1::PartTrouble();
@@ -2091,6 +2255,7 @@ void RenderThreadMain()
             break;
         }
         GsPassOn();
+        HashPassOn();
         TIMELINE("render ends it");
         g_renderNs[kind < 3 ? kind : 0] += NowNs() - started;
         // SLY1_PERF_LOG=1: every 60 frames shown, the mean time a frame took and how much of it
@@ -2153,6 +2318,9 @@ void DmacDump()
         std::fprintf(stderr, "dmac: parts kept anew because of the hash %llu, VIF1's registers %llu, the header %llu; %.2f s hashing packets; %.1f MB kept, "
                      "all let go %llu times; run as ever %llu times because they kept changing\n", (unsigned long long)g_partsStaleBy[0], (unsigned long long)g_partsStaleBy[1],
                      (unsigned long long)g_partsStaleBy[2], g_partHashNs / 1e9, g_partWords * 4 / 1e6, (unsigned long long)g_partsCleared, (unsigned long long)g_partsFickle);
+    if (g_hashHelped.load())
+        std::fprintf(stderr, "dmac: %llu parts drawn again on the hash of the frame before; the helper hashed %llu parts in %.2f s\n",
+                     (unsigned long long)g_partsLate, (unsigned long long)g_hashHelped.load(), g_hashHelperNs.load() / 1e9);
     if (g_liveLists.load())
         std::fprintf(stderr, "dmac: %llu lists of VIF1's walked where they lie (a frame's, or one with interrupts), %llu from their copies\n",
                      (unsigned long long)g_liveLists.load(), (unsigned long long)g_copiedLists.load());

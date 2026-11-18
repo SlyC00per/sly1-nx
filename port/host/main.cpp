@@ -61,6 +61,7 @@ alignas(16384) unsigned char g_clockStack[1 << 20];
 // The render thread's (port/dmac.h): it may run the VIF's and the GS's interrupt handlers.
 alignas(16384) unsigned char g_renderStack[1 << 20];
 alignas(16384) unsigned char g_gsStack[1 << 20];
+alignas(16384) unsigned char g_helperStack[1 << 18];
 std::atomic<bool> g_started;
 #if defined(__SWITCH__)
 int g_seconds = 0;   // until the program is closed
@@ -776,6 +777,17 @@ int main(int argc, char** argv)
                           nullptr, true) != 0) {
         std::fprintf(stderr, "sly1: cannot start the GS thread on its stack in game memory\n");
         return 1;
+    }
+    // the render thread's helper, with the GS thread (the parts are drawn again only with it)
+    if ((gsThreadAsked ? gsThreadAsked[0] != '0' : gsThreadDefault) && !std::getenv("SLY1_PART_HASH_NOW")) {
+        static pthread_t helper;
+        if (port::StartThread(&helper, g_helperStack, sizeof g_helperStack,
+                              [](void*) -> void* {
+                                  port::HashHelperMain();
+                                  return nullptr;
+                              },
+                              nullptr, true) != 0)
+            std::fprintf(stderr, "sly1: cannot start the helper thread: every hash on the render thread\n");
     }
     port::StartSampler();
     if (port::StartThread(&render, g_renderStack, sizeof g_renderStack,

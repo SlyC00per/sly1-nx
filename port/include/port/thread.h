@@ -25,7 +25,7 @@ int StartThread(pthread_t* thread, void* stack, std::size_t size, void* (*entry)
 // where the render thread (VIF1 and VU1) runs too, and the GS's thread on core 1 beside the
 // clock, both at the game's priority. Nothing on the
 // host, whose scheduler shares the cores.
-enum class ThreadRole { Game, Clock, Watch, Render, Gs };
+enum class ThreadRole { Game, Clock, Watch, Render, Gs, Helper };
 void PlaceThread(ThreadRole role);
 
 // SLY1_SAMPLE=1 (the Switch): a thread that stops the render thread and the GS thread a thousand
