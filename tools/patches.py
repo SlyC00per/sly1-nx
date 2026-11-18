@@ -188,6 +188,33 @@ PATCHES = [
      "        if (p->mode != 0) {\n            port::Wide2D(p->shownX + p->w * 0.5f);\n            p->vt->m09(p);\n            port::Wide2D(-1.0f);\n        }",
      "each screen element drawn about the side of the screen it rests at"),
 
+    # The camera's turn by the right stick, and a setting for it (as the PS Vita release has under
+    # Controls: "Camera: Normal" or "Camera: Inverted"). Measured against retail on a PS2 by the
+    # player: retail turns the other way from what this build did, so Normal (the default, bit
+    # 0x10000 of the save's option flags clear) turns that way and Inverted the way it was. The
+    # page's items are copied to a list of the port's with item 27 before the last ("Back"); its
+    # label is the port's, and it has no set of alternative labels to measure.
+    ("src/main/on_off_object.cpp",
+     "                f32 x = pad->secondStickX;\n                f32 lim = g_onOffCameraStepRate[0] * step;",
+     "                f32 x = (g_saveData->optionFlags & 0x10000) ? pad->secondStickX : -pad->secondStickX;\n                f32 lim = g_onOffCameraStepRate[0] * step;",
+     "the camera's turn: Normal or Inverted"),
+    ("src/main/pause_menu.cpp",
+     "char* GetMenuChoiceLabel(s32 index)\n{\n    return g_menuChoiceLabels[index];",
+     "char* GetMenuChoiceLabel(s32 index)\n{\n    if (index == 27) {\n        static char port_normal[] = \"Camera: Normal\", port_inverted[] = \"Camera: Inverted\";\n        return (g_saveData->optionFlags & 0x10000) ? port_inverted : port_normal;\n    }\n    return g_menuChoiceLabels[index];",
+     "the Camera setting's label"),
+    ("src/main/pause_menu.cpp",
+     "        ChoiceLabels* cl = &g_choiceTextSets[row->items[i]];\n        f32 w = 0.0f;",
+     "        static ChoiceLabels port_none;\n        ChoiceLabels* cl = row->items[i] == 27 ? &port_none : &g_choiceTextSets[row->items[i]];\n        f32 w = 0.0f;",
+     "the Camera setting has no set of labels of the game's"),
+    ("src/main/pause_menu.cpp",
+     "    s32 page = self->page;\n    MenuPage* row = &g_pauseMenuPages[page];\n    switch (page) {\n    case 0:\n        row->count = 0;",
+     "    s32 page = self->page;\n    MenuPage* row = &g_pauseMenuPages[page];\n    if (page == 31) {\n        static s32 port_items[8];\n        if (row->items != port_items && row->count >= 1 && row->count < 7) {\n            s32 n = row->count;\n            for (s32 k = 0; k < n; k++) port_items[k] = row->items[k];\n            port_items[n] = port_items[n - 1];\n            port_items[n - 1] = 27;\n            row->items = port_items;\n            row->count = n + 1;\n        }\n    }\n    switch (page) {\n    case 0:\n        row->count = 0;",
+     "the Controls page with the Camera setting before Back"),
+    ("src/main/pause_menu.cpp",
+     "    case 31:\n        switch (sel) {\n        case 0x18: {",
+     "    case 31:\n        switch (sel) {\n        case 27: {\n            g_saveData->u19EC ^= 0x10000;\n            s32 keep = self->cursor;\n            BuildPauseMenuPage(self);\n            self->cursor = keep;\n            return;\n        }\n        case 0x18: {",
+     "choosing the Camera setting turns it over"),
+
     # Frame layout: g++ 2.95 put t right after arr[32] in the frame, and the cleanup walks back from
     # &t; a modern compiler places locals as it likes.
     ("src/main/script_machine.cpp",

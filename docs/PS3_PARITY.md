@@ -37,3 +37,12 @@ asks.
   observe it, then record it here.
 - The HD textures come from the maintainer's own copy at run time and are never committed.
 - The changes live in the port's own layer and patches, never in `sly1-decomp/`.
+
+## Beyond the PS3 release
+
+- **Camera: Normal / Inverted** on the Controls page of the pause menu, as the PS Vita release
+  has (tools/patches.py; bit 0x10000 of the save's option flags, set for Inverted). Normal, the
+  default, turns the camera by the right stick the way retail does on a PS2 (the user's
+  measurement, 2026-11-18); before the setting the port turned it the other way, and why it
+  differed from retail there was not found (the stick's values reach the game in the PS2's
+  convention). Inverted is that earlier direction.
