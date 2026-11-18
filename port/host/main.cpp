@@ -612,7 +612,8 @@ int main(int argc, char** argv)
                 if (reuseOn)
                     NoteReuse(b);
                 static const long batchesOf = std::getenv("SLY1_GS_HASH_RUNS") ? std::atol(std::getenv("SLY1_GS_HASH_RUNS")) : -1;
-                if ((long)frames + 1 == batchesOf) {   // SLY1_GS_HASH_RUNS=N: frame N's batches too, each with its parts' hashes
+                static const long batchesTo = std::getenv("SLY1_GS_HASH_RUNS_TO") ? std::atol(std::getenv("SLY1_GS_HASH_RUNS_TO")) : batchesOf;   // (to frame M)
+                if ((long)frames + 1 >= batchesOf && (long)frames + 1 <= batchesTo && batchesOf >= 0) {   // SLY1_GS_HASH_RUNS=N: frame N's batches too, each with its parts' hashes
                     const std::uint64_t was = hash;
                     std::uint64_t part[4];
                     hash = 1; Mix(&s, sizeof s); part[0] = hash;
@@ -681,7 +682,8 @@ int main(int argc, char** argv)
                 runs++; vertices += v; indices += i;
                 // SLY1_GS_HASH_RUNS=N: frame N's runs, each with the hashes of its state, vertices and indices alone
                 static const long runsOf = std::getenv("SLY1_GS_HASH_RUNS") ? std::atol(std::getenv("SLY1_GS_HASH_RUNS")) : -1;
-                if ((long)frames + 1 == runsOf) {
+                static const long runsTo = std::getenv("SLY1_GS_HASH_RUNS_TO") ? std::atol(std::getenv("SLY1_GS_HASH_RUNS_TO")) : runsOf;
+                if ((long)frames + 1 >= runsOf && (long)frames + 1 <= runsTo && runsOf >= 0) {
                     const std::uint64_t was = hash;
                     std::uint64_t part[3];
                     hash = 1; Mix(&st, sizeof st); part[0] = hash;
@@ -787,10 +789,13 @@ int main(int argc, char** argv)
         return 1;
     }
     // the render thread's helper, with the GS thread (the parts are drawn again only with it)
-    if ((gsThreadAsked ? gsThreadAsked[0] != '0' : gsThreadDefault) && !std::getenv("SLY1_PART_HASH_NOW")) {
+    // (SLY1_PART_HELPER=1 with SLY1_PART_HASH_NOW=1: the helper for the parts' jobs alone, every hash still
+    // before its decision: the jobs' output checked exactly with the helper running them)
+    if ((gsThreadAsked ? gsThreadAsked[0] != '0' : gsThreadDefault) && (!std::getenv("SLY1_PART_HASH_NOW") || std::getenv("SLY1_PART_HELPER"))) {
         static pthread_t helper;
         if (port::StartThread(&helper, g_helperStack, sizeof g_helperStack,
                               [](void*) -> void* {
+                                  port::SetGameFloatMode();   // (it runs parts' jobs: VU1's arithmetic, as the render thread's)
                                   port::HashHelperMain();
                                   return nullptr;
                               },

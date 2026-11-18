@@ -39,6 +39,14 @@ void LeftToMicrocode(core::Runner& r);
 // The batches' kicks the GPU renderer took, and those it did not (done by the program after all).
 void BatchCounts(std::uint64_t* taken, std::uint64_t* notTaken);
 
+// This thread's own VU1 when it has one (port/vu1.h's Lane), or null.
+State* LaneState();
+std::uint8_t* LaneData();
+// The lane's micro memory and tables (port/render/vu1.cpp's image), or null; and the image of
+// what the program's are now (on the render thread).
+const void* LaneMicro();
+const void* MicroNow();
+
 extern const HandlerEntry kHandlers[];
 extern const std::size_t kHandlerCount;
 

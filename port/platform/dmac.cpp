@@ -278,7 +278,18 @@ struct GsItem {
     std::shared_ptr<const std::vector<PartKept>> part;
     void (*fn)(std::uint64_t, std::uint64_t) = nullptr;
     std::uint64_t a = 0, b = 0;
+    // path 6, a part run beside the render thread (PartJob): its items come in this one's place
+    std::shared_ptr<struct PartJob> job;
 };
+// On a thread running a part's job: where what it queues for the GS goes. The items stay where
+// they are from job to job, and each one's buffer is used again for the item that comes in its
+// place: a job's thread neither allocates nor takes a lock (the helper may be set aside by the
+// game's threads at any point, and what it held would be held until it runs again).
+struct Collect {
+    std::vector<GsItem> items;
+    std::size_t used = 0;
+};
+thread_local Collect* t_collect = nullptr;
 std::mutex g_gsLock;
 std::condition_variable g_gsWake, g_gsIdle;
 std::deque<GsItem> g_gsQueue;
@@ -289,7 +300,8 @@ std::atomic<bool> g_gsStarted;
 // (a wake of the GS thread is a system call on the Switch: one a packet cost more than the GS's
 // work), and its own stock of emptied buffers.
 std::vector<GsItem> g_gsPending;
-std::vector<std::vector<std::uint32_t>> g_gsLocalSpare;
+// (each thread that queues for the GS has a stock of its own: the render thread, and those running a part's job)
+thread_local std::vector<std::vector<std::uint32_t>>* t_gsLocalSpare = nullptr;
 
 // Only with the render thread: without it, the paths reach the GS from the game's thread in turn.
 bool GsAsync()
@@ -300,6 +312,16 @@ bool GsAsync()
 
 std::vector<std::uint32_t> GsSpare()
 {
+    if (Collect* c = t_collect) {   // the buffer of the item that was in the next one's place
+        if (c->used >= c->items.size())
+            return {};
+        std::vector<std::uint32_t> v = std::move(c->items[c->used].words);
+        v.clear();
+        return v;
+    }
+    if (!t_gsLocalSpare)
+        t_gsLocalSpare = new std::vector<std::vector<std::uint32_t>>;
+    std::vector<std::vector<std::uint32_t>>& g_gsLocalSpare = *t_gsLocalSpare;
     if (g_gsLocalSpare.empty()) {
         std::lock_guard<std::mutex> lk(g_gsLock);
         for (int k = 0; k < 64 && !g_gsSpare.empty(); k++) {
@@ -331,14 +353,26 @@ void GsPassOn()
 // batches while the render thread is still at its later ones (a frame is one item of VIF1's).
 struct PartRecord;
 PartRecord* g_partRecording;   // the model part being recorded (PartReplay, below)
+extern PartRecord* g_partObserving;
+extern bool g_observeBad;
 void PartRecordItem(const GsItem& item);
 bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow);
 void PartDone();
 
 void GsEnqueue(GsItem&& item)
 {
+    if (Collect* c = t_collect) {
+        if (c->used < c->items.size())
+            c->items[c->used] = std::move(item);
+        else
+            c->items.push_back(std::move(item));
+        c->used++;
+        return;
+    }
     if (g_partRecording)
         PartRecordItem(item);
+    if (g_partObserving && (item.path == 0 || item.path == 3 || item.path == 5))
+        g_observeBad = true;
     g_gsPending.push_back(std::move(item));
     if (g_gsPending.size() >= 24)
         GsPassOn();
@@ -1268,6 +1302,10 @@ struct PartRecord {
     std::uint64_t keyFirst = 0, keys = 0;   // its batches' keys (gs::Batch::keep)
     std::uint32_t stale = 0;             // the times running it was found changed
     std::uint64_t notBefore = 0;         // a part that keeps changing is not kept again before this frame
+    // How long it is then left alone: 30 frames, and twice as long each time after (to 960),
+    // until it has been drawn again 60 times from one keeping. Keeping a part costs several
+    // times running it, and a part that fades for seconds was kept anew three times a second.
+    std::uint32_t lockout = 0, replays = 0;
     std::uint32_t ids = 0;               // the batches' ids run from firstId for this many
     std::uint32_t firstId = 0;
     // while it is recorded
@@ -1294,6 +1332,14 @@ struct PartRecord {
     std::vector<std::uint64_t> texWas;
     std::vector<TexFix> texFix;
     bool texStrict = false;
+    // For a job (PartJob): its packet's shape when it was last run here, and the registers it was
+    // run from and left (two pairs: the game turns VIF1's buffers about from part to part, and a
+    // part comes with either), with nothing a job must not have (an interrupt, a FINISH, a call).
+    bool jobOk = false;
+    Vif::Regs jobBefore2, jobAfter2;
+    bool jobTwo = false;
+    std::uint64_t shape = 0;
+    Vif::Regs jobBefore, jobAfter;
 };
 std::unordered_map<std::uint32_t, PartRecord> g_parts;
 
@@ -1324,6 +1370,20 @@ std::atomic<std::uint32_t> g_listsBegun;
 std::atomic<std::uint64_t> g_hashTooLate;
 std::mutex g_hashLock;
 std::condition_variable g_hashWake;
+// The parts' jobs (PartJob, below) waiting for a thread, with g_hashLock as the helper's other work.
+// A list's jobs in their order: written by the render thread alone and counted when written,
+// taken by number (the helper, and the render thread when its list is walked). No lock: the
+// helper runs below the game's threads and may be set aside while it holds one.
+constexpr std::uint32_t kListJobs = 4096;
+std::shared_ptr<PartJob> g_listJobs[kListJobs];
+std::atomic<std::uint32_t> g_listJobCount, g_listJobNext;
+bool g_jobHelperWaiting;
+std::atomic<bool> g_hashQueued;   // hash work has been passed on since the helper last took it
+// While the render thread walks a list the helper does not sleep between jobs: it asks again
+// (waking it for each job was a system call a part on the render thread).
+std::atomic<bool> g_listWalked;
+PartJob* PartJobTake();
+bool PartJobRun(PartJob& j, int who, bool again);
 std::vector<HashJob> g_hashJobs, g_hashPending;      // for the helper; the render thread's, not passed on yet
 std::vector<HashResult> g_hashResults;
 std::atomic<bool> g_hashAnyResult, g_hashStarted;
@@ -1367,7 +1427,7 @@ struct PartTurns {
 std::uint64_t g_partsSlowReplayed, g_partsSlowKept, g_partsSlowRefused;
 
 std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow = false,
-                       std::vector<const std::uint32_t*>* tex = nullptr);
+                       std::vector<const std::uint32_t*>* tex = nullptr, bool shape = false);
 
 }  // namespace
 
@@ -1385,11 +1445,24 @@ void HashHelperMain()
             if (!results.empty())
                 g_hashAnyResult.store(true, std::memory_order_release);
             results.clear();
-            g_hashWake.wait(lk, [] { return !g_hashJobs.empty(); });
+            g_jobHelperWaiting = true;
+            g_hashWake.wait(lk, [] { return !g_hashJobs.empty() || g_listWalked.load(std::memory_order_acquire); });
+            g_jobHelperWaiting = false;
+            g_hashQueued.store(false, std::memory_order_release);
             jobs.swap(g_hashJobs);
+        }
+        for (;;) {   // the parts' jobs first: the GS thread waits for them
+            if (PartJob* j = PartJobTake())
+                PartJobRun(*j, 0, false);
+            else if (g_listWalked.load(std::memory_order_acquire) && jobs.empty() && !g_hashQueued.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            else
+                break;
         }
         const std::uint64_t t0 = NowNs();
         for (std::size_t n = 0; n < jobs.size(); n++) {
+            while (PartJob* pj = PartJobTake())
+                PartJobRun(*pj, 0, false);
             const HashJob& j = jobs[n];
             HashResult r = {j.key, j.serial, 0, 0, j.whole, true};
             if (!(j.slow && g_listsBegun.load(std::memory_order_acquire) != j.list)) {
@@ -1430,6 +1503,7 @@ void HashPassOn()
         if (!lk.owns_lock())
             return;
         g_hashJobs.insert(g_hashJobs.end(), g_hashPending.begin(), g_hashPending.end());
+        g_hashQueued.store(true, std::memory_order_release);
     }
     g_hashPending.clear();
     g_hashWake.notify_one();
@@ -1519,6 +1593,7 @@ struct PartHasher {
     // unpacks for VU1 to kick is left out (the game places a texture anew in the GS's memory from
     // frame to frame, and nothing else of the part changes with it); where the writes are is
     // noted when asked for (tex), for PartCall to read them as they are now.
+    bool shape = false, shapeBad = false, shapeData = false;
     bool texFree = false, adWatch = false;
     std::uint32_t adLeft = 0;
     std::vector<const std::uint32_t*>* tex = nullptr;
@@ -1533,6 +1608,8 @@ struct PartHasher {
             if (left == 0) {
                 std::uint32_t code = w[k++], cmd = (code >> 24) & 0x7F, imm = code & 0xFFFF, num = (code >> 16) & 0xFF;
                 Mix(code);
+                shapeData = cmd == 0x20 || cmd == 0x30 || cmd == 0x31;
+                shapeBad = shapeBad || (code >> 31) != 0 || cmd == 0x4A;
                 if (segs)
                     segs->push_back({code, 0});
                 sampled = false;
@@ -1573,7 +1650,7 @@ struct PartHasher {
             if (segs && !ignored && !segs->empty())
                 for (std::size_t i = 0; i < take; i++)
                     segs->back().second = (segs->back().second ^ w[k + i]) * 0x9E3779B97F4A7C15ull + 1;
-            if (ignored) {
+            if (ignored || (shape && !shapeData)) {
                 k += take;
                 at += (std::uint32_t)take;
                 left -= (std::uint32_t)take;
@@ -1631,12 +1708,16 @@ struct PartHasher {
 std::vector<std::pair<std::uint32_t, std::uint64_t>>* g_diffSegs;
 bool PartTte() { return (static_cast<volatile std::uint32_t*>(Native(kVif1))[0] & 0x40) != 0; }
 
+// shape: the packet's VIFcodes and tags alone (and the data of the codes that set VIF1's
+// registers), 0 when it has what a part's job must not (microcode loaded, an interrupt): two
+// packets of one shape leave VIF1's registers the same.
 std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow,
-                       std::vector<const std::uint32_t*>* tex)
+                       std::vector<const std::uint32_t*>* tex, bool shape)
 {
     PartHasher hasher;
-    hasher.skipHeader = slow;
-    hasher.texFree = !slow;   // (a part drawn the long way has its packets in the frame's memory: no place to read again)
+    hasher.skipHeader = slow && !shape;
+    hasher.shape = shape;
+    hasher.texFree = !slow && !shape;   // (a part drawn the long way has its packets in the frame's memory: no place to read again)
     hasher.tex = tex;
     hasher.segs = g_diffSegs;
     hasher.whole = whole;
@@ -1672,7 +1753,10 @@ std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::
         std::uint32_t qwc = tag[0] & 0xFFFF, id = (tag[0] >> 28) & 7, addr = tag[1] & 0x7FFFFFF0;
         bool spr = (tag[1] >> 31) != 0;
         hasher.Mix(tag[0]);
-        hasher.Mix(tag[1]);
+        if (!shape)
+            hasher.Mix(tag[1]);
+        else if (tag[0] >> 31)
+            return 0;
         if (g_diffSegs)
             g_diffSegs->push_back({0xFF000000u | id, tag[0] | (std::uint64_t)tag[1] << 32});
         if (tte)
@@ -1698,7 +1782,7 @@ std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::
         case 6:
             data(after, tagSpr, qwc);
             if (depth == 0)
-                return hasher.left == 0 ? (hasher.h | 1) : 0;   // it must end between VIFcodes
+                return hasher.left == 0 && !hasher.shapeBad ? (hasher.h | 1) : 0;   // it must end between VIFcodes
             tadr = stack[--depth];
             break;
         default: return 0;   // refe, end: not a called packet's
@@ -1835,7 +1919,12 @@ void PartDiffReport()
 
 // The hook's NOP and then the call of target: true when the part has been drawn from what was
 // kept, and the call is not to be followed.
-bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
+// What PartDecide found of the call, for PartCall to make a job of it.
+std::uint32_t g_callKey, g_callHeader[44], g_callHeaderAt;
+Vif::Regs g_callRegs;
+bool g_callTte;
+
+bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
 {
     if (!PartReplayOn() || !g_vif1.BetweenCodes())
         return false;
@@ -1877,6 +1966,11 @@ bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
         PartHeader(regs.tops, header);
     }
     const bool tte = PartTte();
+    g_callKey = key;
+    std::memcpy(g_callHeader, header, sizeof header);
+    g_callHeaderAt = headerAt;
+    g_callRegs = regs;
+    g_callTte = tte;
     static const bool diffOn = std::getenv("SLY1_PART_DIFF") != nullptr && std::getenv("SLY1_PART_HASH_NOW") != nullptr;
     if (diffOn)
         PartDiff(key, target, regs.cl, regs.wl, tte, slow, header);
@@ -1988,6 +2082,8 @@ bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
             g_vif1.SetRegs(r.after);
             vu1::PartSkipped();
             r.stale = 0;
+            if (r.lockout != 0 && ++r.replays >= 60)
+                r.lockout = 0;
             g_partsReplayed++;
             g_partsLate += late ? 1 : 0;
             g_partItemsReplayed += r.kept->size();
@@ -2022,7 +2118,22 @@ bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
     }
     g_partWords -= std::min<std::uint64_t>(g_partWords, r.words);   // what it held before is let go
     PartForget(r);
-    r = PartRecord();
+    {
+        const std::uint32_t lockout = r.lockout;
+        const bool jobOk = r.jobOk;
+        const std::uint64_t shape = r.shape;
+        const Vif::Regs jobBefore = r.jobBefore, jobAfter = r.jobAfter, jobBefore2 = r.jobBefore2, jobAfter2 = r.jobAfter2;
+        const bool jobTwo = r.jobTwo;
+        r = PartRecord();
+        r.lockout = lockout;
+        r.jobOk = jobOk;
+        r.shape = shape;
+        r.jobBefore = jobBefore;
+        r.jobAfter = jobAfter;
+        r.jobBefore2 = jobBefore2;
+        r.jobAfter2 = jobAfter2;
+        r.jobTwo = jobTwo;
+    }
     r.serial = ++g_partSerial;
     r.verdictList = g_listSerial;
     r.slow = slow;
@@ -2030,12 +2141,20 @@ bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
     r.stale = stale;
     if (stale >= 3) {
         r.stale = 0;
-        r.notBefore = gs::FramesShown() + 30;
+        r.lockout = std::min<std::uint32_t>(std::max<std::uint32_t>(r.lockout * 2, 30), 960);
+        r.notBefore = gs::FramesShown() + r.lockout;
         g_partsFickle++;
         return false;
     }
     r.keyFirst = g_partKey + 1;
     r.hash = hash;
+    {
+        const std::uint64_t shape = PartHash(target, false, regs.cl, regs.wl, tte, slow, nullptr, true);
+        if (shape != r.shape) {
+            r.shape = shape;
+            r.jobOk = r.jobTwo = false;
+        }
+    }
     r.hashWhole = PartHash(target, true, regs.cl, regs.wl, tte, slow, &r.texAt);
     for (const std::uint32_t* q : r.texAt) {
         std::uint64_t v;
@@ -2052,16 +2171,419 @@ bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
     return false;
 }
 
+// --- A part run beside the render thread.
+//
+// A part that is neither drawn again from what was kept nor being kept (one lit by VU1 afresh each
+// frame, one whose packets write vertices, one that keeps changing) was run by the render thread
+// in its turn: most of that thread's time in a heavy scene. Such a part is now made a job: its
+// packet is walked through a VIF1 of the job's own into a VU1 of the job's own (vu1::Lane, begun
+// as a copy of the render thread's), and what it queues for the GS is collected in the job. The
+// render thread goes on at once from the registers the part left the last time it ran here,
+// which the packet's shape answers for (PartHash's shape: the same VIFcodes leave the same
+// registers), as it does after a part drawn again. An item in the GS's queue stands for the job:
+// the GS thread takes the job's items there, running the job itself if no one has begun it. The
+// helper thread takes jobs in their order, and the render thread the rest when its list is
+// walked; it does not begin the next list before every job of this one is done (a part's packet
+// may lie in the frame's own memory). SLY1_PART_JOBS=0: every part in its turn as before.
+struct PartJob {
+    vu1::Lane* lane = vu1::LaneNew();
+    std::uint32_t target = 0, key = 0;
+    bool tte = false;
+    Vif::Regs before, after;
+    Collect out;
+    std::atomic<int> state{0};   // 0 waiting, 1 begun by a thread, 2 done
+    // The lane stays as the job began: a thread runs the job on a copy of its own, and the first
+    // to end gives the job its items. So a thread that needs a job another has begun and not
+    // ended (the helper, set aside by the game's threads in the middle of one) runs it again
+    // itself and does not wait.
+    std::atomic<bool> given{false};
+    std::uint64_t begunAt = 0;
+    // A job is used again for another part once done, while a thread set aside in the middle of
+    // it may still hold it. gen is odd while the render thread makes the job anew and other
+    // after; a thread counts itself in runners before it reads gen, and gives nothing when gen
+    // has changed. The render thread makes gen odd before it reads runners, and leaves a job
+    // with a runner alone.
+    std::atomic<std::uint32_t> gen{0};
+    std::atomic<int> runners{0};
+    Collect ref;   // SLY1_PART_JOBS_CHECK: what the job gives when run at once on the render thread
+    bool hasRef = false;
+};
+std::vector<PartJob*> g_jobFree;
+std::mutex g_jobFreeLock;   // (the render thread and the GS thread: never the helper)
+std::vector<std::uint32_t> g_jobWrongKeys;         // parts whose job left other registers than foretold
+std::atomic<std::uint32_t> g_jobsOut;              // jobs made and not yet done
+std::atomic<std::uint64_t> g_jobsBy[3], g_jobNsBy[3], g_jobsWrong;   // by the helper, the render thread, the GS thread
+std::uint64_t g_jobsMade, g_jobsShape, g_jobSerial;
+std::atomic<std::uint64_t> g_jobsAgain, g_jobsChecked, g_jobsDiffered;   // jobs run a second time by a thread that needed them
+std::uint64_t g_jobDrainWaitNs;
+std::uint64_t g_jobMakeNs[4];   // making a job: the shape's hash, the job taken, VU1 copied, queued
+
+bool PartJobsOn()
+{
+    static const bool off = std::getenv("SLY1_PART_JOBS") && std::getenv("SLY1_PART_JOBS")[0] == '0';
+    return !off && GsAsync();
+}
+
+// The part's packet through vif: the walk PartHash makes, the data given to the VIF.
+bool WalkPart(std::uint32_t target, bool tte, Vif& vif)
+{
+    bool wild = false;
+    auto inMemory = [&](std::uint32_t addr, std::uint32_t quads) {
+        const std::uint32_t a = addr & 0x0FFFFFF0;
+        const bool ok = (addr & 0x40000000u) == 0 && a >= 0x10 && a < kRamSize && quads <= (kRamSize - a) / 16;
+        wild = wild || !ok;
+        return ok;
+    };
+    auto data = [&](std::uint32_t addr, bool spr, std::uint32_t qwc) {
+        if (!spr) {
+            if (qwc && inMemory(addr, qwc))
+                vif.Words(At(addr, false), (int)(qwc * 4));
+        } else {
+            for (std::uint32_t i = 0; i < qwc; i++)
+                vif.Words(At(addr + i * 16, true), 4);
+        }
+    };
+    std::uint32_t tadr = target, stack[2];
+    int depth = 0;
+    for (int guard = 0; guard < 4096; guard++) {
+        const bool tagSpr = (tadr & 0x80000000u) != 0;
+        if (wild || (!tagSpr && !inMemory(tadr & 0x7FFFFFFFu, 2)))
+            return false;
+        const std::uint32_t* tag = At(tadr & 0x7FFFFFFFu, tagSpr);
+        const std::uint32_t qwc = tag[0] & 0xFFFF, id = (tag[0] >> 28) & 7, addr = tag[1] & 0x7FFFFFF0;
+        const bool spr = (tag[1] >> 31) != 0;
+        if (tag[0] >> 31)
+            return false;
+        if (tte)
+            vif.Words(tag + 2, 2);
+        const std::uint32_t after = (tadr & 0x7FFFFFFFu) + 16;
+        switch (id) {
+        case 1:
+            data(after, tagSpr, qwc);
+            tadr = (after + qwc * 16) | (tagSpr ? 0x80000000u : 0);
+            break;
+        case 2: tadr = addr | (spr ? 0x80000000u : 0); break;
+        case 3: case 4:
+            data(addr, spr, qwc);
+            tadr = after | (tagSpr ? 0x80000000u : 0);
+            break;
+        case 5:
+            if (depth >= 2)
+                return false;
+            data(after, tagSpr, qwc);
+            stack[depth++] = (after + qwc * 16) | (tagSpr ? 0x80000000u : 0);
+            tadr = addr | (spr ? 0x80000000u : 0);
+            break;
+        case 6:
+            data(after, tagSpr, qwc);
+            if (depth == 0)
+                return !wild;
+            tadr = stack[--depth];
+            break;
+        default:
+            return false;
+        }
+    }
+    return false;
+}
+
+// The job's work on this thread's own copy of its lane: what it queues for the GS into out.
+// False when the packet did not leave VIF1's registers as foretold.
+bool PartJobWork(PartJob& j, Collect& out)
+{
+    static thread_local vu1::Lane* work = nullptr;
+    static thread_local Vif* vif = nullptr;   // (the thread's own, kept: its buffers are not made again for each job)
+    if (!work)
+        work = vu1::LaneNew();
+    if (!vif)
+        vif = new Vif(kCauseVif1, false);
+    vu1::LaneCopy(work, j.lane);
+    out.used = 0;
+    vu1::LaneEnter(work);
+    t_collect = &out;
+    vif->SetRegs(j.before);
+    const bool right = WalkPart(j.target, j.tte, *vif) && vif->BetweenCodes() && vif->GetRegs() == j.after;
+    if (!vif->BetweenCodes()) {   // left inside a code: not used again
+        delete vif;
+        vif = nullptr;
+    }
+    t_collect = nullptr;
+    vu1::LaneEnter(nullptr);
+    return right;
+}
+
+// The job run by this thread: if no thread has begun it, or (again) when it was begun elsewhere
+// and is not done. who: 0 the helper, 1 the render thread, 2 the GS thread.
+bool PartJobRun(PartJob& j, int who, bool again = false)
+{
+    struct Runner {
+        PartJob& j;
+        explicit Runner(PartJob& job) : j(job) { j.runners.fetch_add(1, std::memory_order_seq_cst); }
+        ~Runner() { j.runners.fetch_sub(1, std::memory_order_seq_cst); }
+    } runner(j);
+    const std::uint32_t gen = j.gen.load(std::memory_order_seq_cst);
+    if (gen & 1)
+        return false;
+    int waiting = 0;
+    if (!j.state.compare_exchange_strong(waiting, 1, std::memory_order_acq_rel)) {
+        if (!again || waiting == 2)
+            return false;
+        g_jobsAgain++;
+    } else {
+        j.begunAt = NowNs();
+    }
+    const std::uint64_t t0 = NowNs();
+    static thread_local Collect* mine = nullptr;
+    if (!mine)
+        mine = new Collect;
+    const bool right = PartJobWork(j, *mine);
+    g_jobNsBy[who] += NowNs() - t0;
+    if (j.gen.load(std::memory_order_seq_cst) != gen || j.given.exchange(true, std::memory_order_acq_rel))
+        return true;   // another thread ended it first (or the job is another part's now): this run's items are dropped
+    std::swap(j.out, *mine);
+    if (!right) {
+        g_jobsWrong++;
+        std::lock_guard<std::mutex> lk(g_hashLock);
+        g_jobWrongKeys.push_back(j.key);
+    }
+    g_jobsBy[who]++;
+    j.state.store(2, std::memory_order_release);
+    g_jobsOut.fetch_sub(1, std::memory_order_acq_rel);
+    return true;
+}
+
+// (the render thread or the GS thread) The job is needed now: run here if not begun, waited for
+// a little if begun elsewhere (a job takes a quarter of a millisecond), then run here again.
+void PartJobNeed(PartJob& j, int who)
+{
+    while (j.state.load(std::memory_order_acquire) != 2) {
+        if (PartJobRun(j, who))
+            continue;
+        if (NowNs() - j.begunAt > 400000)
+            PartJobRun(j, who, true);
+        else
+            std::this_thread::yield();
+    }
+}
+
+// The list's next job that no thread has taken by its number, or none. (The GS thread begins the
+// one it has come to without asking here: PartJobRun then finds it begun.)
+PartJob* PartJobTake()
+{
+    for (;;) {
+        std::uint32_t next = g_listJobNext.load(std::memory_order_acquire);
+        if (next >= g_listJobCount.load(std::memory_order_acquire))
+            return nullptr;
+        if (g_listJobNext.compare_exchange_weak(next, next + 1, std::memory_order_acq_rel))
+            return g_listJobs[next].get();
+    }
+}
+
+// (the render thread, its list walked) The jobs no thread has begun run here, and those begun
+// waited for.
+void PartJobsDrain()
+{
+    while (PartJob* j = PartJobTake())
+        PartJobRun(*j, 1);
+    const std::uint64_t t0 = NowNs();
+    const std::uint32_t count = g_listJobCount.load(std::memory_order_acquire);
+    for (std::uint32_t k = 0; k < count; k++)
+        PartJobNeed(*g_listJobs[k], 1);
+    while (g_jobsOut.load(std::memory_order_acquire) != 0)
+        std::this_thread::yield();
+    g_jobDrainWaitNs += NowNs() - t0;
+}
+
+// (the render thread, a list begun) The parts whose jobs went wrong are not made jobs again.
+void PartJobsBegin()
+{
+    // (every job of the list before is done: PartJobsDrain)
+    const std::uint32_t had = g_listJobCount.load(std::memory_order_acquire);
+    g_listJobNext.store(0, std::memory_order_release);
+    g_listJobCount.store(0, std::memory_order_release);
+    for (std::uint32_t k = 0; k < had; k++)
+        g_listJobs[k].reset();
+    if (g_jobsWrong.load(std::memory_order_acquire) == 0)
+        return;
+    std::vector<std::uint32_t> keys;
+    {
+        std::lock_guard<std::mutex> lk(g_hashLock);
+        keys.swap(g_jobWrongKeys);
+    }
+    for (std::uint32_t key : keys) {
+        auto it = g_parts.find(key);
+        if (it != g_parts.end()) {
+            it->second.jobOk = it->second.jobTwo = false;
+            it->second.shape = 0;
+        }
+    }
+}
+
+// A part run here from registers its record has no pair for: watched (not kept) to its return,
+// for the pair. g_observeBad: it queued what a job must not (a call, the GIF channel's packet).
+PartRecord* g_partObserving;
+Vif::Regs g_observeBefore;
+std::uint64_t g_observeInterrupts, g_observeFinishes;
+bool g_observeBad;
+
+// The part has just been run here from before: the pair noted if the run was clean, or the part
+// not to be made a job.
+void PartJobSeen(PartRecord& r, const Vif::Regs& before, bool clean)
+{
+    if (!clean) {
+        r.jobOk = r.jobTwo = false;
+        r.shape = 0;
+        return;
+    }
+    const Vif::Regs after = g_vif1.GetRegs();
+    if (!r.jobOk || r.jobBefore == before) {
+        r.jobBefore = before;
+        r.jobAfter = after;
+        r.jobOk = true;
+    } else {
+        r.jobBefore2 = before;
+        r.jobAfter2 = after;
+        r.jobTwo = true;
+    }
+}
+
+bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
+{
+    g_callKey = 0;
+    if (PartDecide(marker, target, slow))
+        return true;
+    if (g_partRecording || g_callKey == 0 || !PartJobsOn())
+        return false;
+    // (a part lit by its cache and by volumes of light, mode 1, reads the volumes' packets where
+    // the game writes them anew each frame: run in its turn, before the game has)
+    if (g_callHeader[37] == 1)
+        return false;
+    auto it = g_parts.find(g_callKey);
+    if (it == g_parts.end())
+        return false;
+    PartRecord& r = it->second;
+    const bool first = r.jobOk && r.jobBefore == g_callRegs, second = !first && r.jobOk && r.jobTwo && r.jobBefore2 == g_callRegs;
+    if (!first && !second) {
+        // run here and watched, if its shape is the one known (or none is yet)
+        const std::uint64_t shape = PartHash(target, false, g_callRegs.cl, g_callRegs.wl, g_callTte, slow, nullptr, true);
+        if (shape != 0) {
+            if (r.shape != shape) {
+                r.shape = shape;
+                r.jobOk = r.jobTwo = false;
+            }
+            g_partObserving = &r;
+            g_observeBefore = g_callRegs;
+            g_observeInterrupts = g_counts.vifInterrupts;
+            g_observeFinishes = g_counts.finishes;
+            g_observeBad = false;
+        }
+        return false;
+    }
+    const Vif::Regs jobAfter = first ? r.jobAfter : r.jobAfter2;
+    {   // SLY1_PART_JOBS_ONLY=slow, cached, or a mode's number: jobs of those parts alone (diagnosis)
+        static const char* only = std::getenv("SLY1_PART_JOBS_ONLY");
+        if (only && (only[0] == 's' ? !slow : only[0] == 'c' ? slow : (int)g_callHeader[37] != std::atoi(only)))
+            return false;
+    }
+    const std::uint64_t tCall = NowNs();
+    if (PartHash(target, false, g_callRegs.cl, g_callRegs.wl, g_callTte, slow, nullptr, true) != r.shape) {
+        r.jobOk = r.jobTwo = false;   // (watched when it next comes)
+        r.shape = 0;
+        g_jobsShape++;
+        return false;
+    }
+    const std::uint64_t tShape = NowNs();
+    std::shared_ptr<PartJob> job;
+    const auto back = [](PartJob* j) {
+        std::lock_guard<std::mutex> lk2(g_jobFreeLock);
+        g_jobFree.push_back(j);
+    };
+    {
+        std::lock_guard<std::mutex> lk(g_jobFreeLock);
+        for (std::size_t k = g_jobFree.size(); k-- > 0 && !job;) {
+            PartJob* j = g_jobFree[k];
+            j->gen.fetch_add(1, std::memory_order_seq_cst);   // odd: being made anew
+            if (j->runners.load(std::memory_order_seq_cst) != 0) {
+                j->gen.fetch_add(1, std::memory_order_seq_cst);   // a thread still holds it: another
+                continue;
+            }
+            g_jobFree.erase(g_jobFree.begin() + (std::ptrdiff_t)k);
+            job.reset(j, back);
+        }
+    }
+    if (!job) {
+        job.reset(new PartJob, back);
+        job->gen.fetch_add(1, std::memory_order_seq_cst);
+    }
+    job->target = target;
+    job->key = g_callKey;
+    job->tte = g_callTte;
+    job->before = g_callRegs;
+    job->after = jobAfter;
+    job->out.used = 0;
+    job->given.store(false, std::memory_order_release);
+    job->begunAt = 0;
+    job->state.store(0, std::memory_order_release);
+    // (its batches' ids from a run of its own, far from the render thread's)
+    const std::uint64_t tCopy = NowNs();
+    vu1::LaneCopyMain(job->lane, 0x80000000u | (std::uint32_t)((g_jobSerial++ & 0x7FFFF) << 12) | 1);
+    {   // SLY1_PART_JOBS_CHECK=1: the job's work done here too, at once, to compare what a thread gives with
+        static const bool check = std::getenv("SLY1_PART_JOBS_CHECK") != nullptr;
+        job->hasRef = check;
+        if (check)
+            PartJobWork(*job, job->ref);
+    }
+    job->gen.fetch_add(1, std::memory_order_seq_cst);   // made: threads may run it
+    const std::uint64_t tQueue = NowNs();
+    g_jobsOut.fetch_add(1, std::memory_order_acq_rel);
+    GsItem item;
+    item.path = 6;
+    item.job = job;
+    g_gsPending.push_back(std::move(item));
+    if (g_gsPending.size() >= 24)
+        GsPassOn();
+    // SLY1_PART_JOBS=now: each job run here at once (the same work in the same order, for telling
+    // a fault of the job's own state from one of its timing)
+    static const bool now = std::getenv("SLY1_PART_JOBS") && std::getenv("SLY1_PART_JOBS")[0] == 'n';
+    const std::uint32_t at = g_listJobCount.load(std::memory_order_acquire);
+    if (now || at >= kListJobs) {
+        PartJobRun(*job, 1);
+    } else {
+        g_listJobs[at] = std::move(job);
+        g_listJobCount.store(at + 1, std::memory_order_release);
+    }
+    if (slow) {   // its header where its packet would have put it, as for one drawn again
+        std::uint8_t* d = vu1::Data();
+        for (int k = 0; k < 11; k++)
+            std::memcpy(d + ((g_callHeaderAt + (std::uint32_t)k) & 0x3FF) * 16, g_callHeader + k * 4, 16);
+    }
+    g_vif1.SetRegs(jobAfter);
+    vu1::PartSkipped();
+    g_jobsMade++;
+    g_jobMakeNs[0] += tShape - tCall;
+    g_jobMakeNs[1] += tCopy - tShape;
+    g_jobMakeNs[2] += tQueue - tCopy;
+    g_jobMakeNs[3] += NowNs() - tQueue;
+    return true;
+}
+
 // The return from a part's call: what was recorded is kept if nothing but packets of registers
 // and batches of the header's matrix came of it.
 void PartDone()
 {
+    if (PartRecord* seen = g_partObserving) {
+        g_partObserving = nullptr;
+        PartJobSeen(*seen, g_observeBefore, !g_observeBad && g_vif1.BetweenCodes() && g_counts.vifInterrupts == g_observeInterrupts &&
+                                                g_counts.finishes == g_observeFinishes);
+    }
     PartRecord* r = g_partRecording;
     g_partRecording = nullptr;
     if (!r)
         return;
     bool ok = !r->bad && g_vif1.BetweenCodes() && vu1::PartTrouble() == r->troubleWas && g_counts.vifInterrupts == r->interruptsWas &&
               g_counts.finishes == r->finishesWas && !r->items.empty();
+    PartJobSeen(*r, r->before, r->shape != 0 && !r->bad && g_vif1.BetweenCodes() && g_counts.vifInterrupts == r->interruptsWas &&
+                                   g_counts.finishes == r->finishesWas);
     float matrix[16];
     if (r->slow) {
         vu1::PartMatrixFrom(reinterpret_cast<const float*>(r->header), matrix);
@@ -2146,7 +2668,8 @@ void PartDone()
         g_partWords -= std::min<std::uint64_t>(g_partWords, r->words);
         r->words = 0;
         r->keys = 0;   // the renderer never saw them
-        r->notBefore = gs::FramesShown() + 30;   // not tried again at once
+        r->lockout = std::min<std::uint32_t>(std::max<std::uint32_t>(r->lockout * 2, 30), 960);
+        r->notBefore = gs::FramesShown() + r->lockout;   // not tried again at once
     }
     (ok ? g_partsRecorded : g_partsRefused)++;
     if (r->slow)
@@ -2157,6 +2680,12 @@ void PartDone()
 void PartCountsLine(const char* what)
 {
     PartDiffReport();
+    std::fprintf(stderr, "partjobs: making them: the shape %.2f s, the job %.2f, the copy %.2f, the queue %.2f; the render thread waited %.2f s for them at its lists' ends\n",
+                 g_jobMakeNs[0] / 1e9, g_jobMakeNs[1] / 1e9, g_jobMakeNs[2] / 1e9, g_jobMakeNs[3] / 1e9, g_jobDrainWaitNs / 1e9);
+    std::fprintf(stderr, "partjobs: %s: %llu made (%llu not, the shape other), %llu wrong, %llu run again by a thread that needed them; run by the helper %llu (%.2f s), the render thread %llu (%.2f s), "
+                 "the GS thread %llu (%.2f s)\n", what, (unsigned long long)g_jobsMade, (unsigned long long)g_jobsShape, (unsigned long long)g_jobsWrong.load(), (unsigned long long)g_jobsAgain.load(),
+                 (unsigned long long)g_jobsBy[0].load(), g_jobNsBy[0].load() / 1e9, (unsigned long long)g_jobsBy[1].load(), g_jobNsBy[1].load() / 1e9,
+                 (unsigned long long)g_jobsBy[2].load(), g_jobNsBy[2].load() / 1e9);
     std::fprintf(stderr, "partcounts: %s: drawn again %llu (long way %llu, texture moved %llu), kept %llu, refused %llu, stale by hash %llu regs %llu header %llu, fickle %llu, "
                  "moving %llu, hashed here %.2f s, too late %llu, kept words %.1f MB, let go %llu, batches queued %llu\n", what,
                  (unsigned long long)g_partsReplayed, (unsigned long long)g_partsSlowReplayed, (unsigned long long)g_partsTexMoved,
@@ -2491,8 +3020,10 @@ void GsThreadMain()
     // lot, not twice an item.
     std::deque<GsItem> taken;
     std::vector<std::vector<std::uint32_t>> emptied;
+    std::shared_ptr<PartJob> jobNow;   // the job whose items are being taken, and the next of them
+    std::size_t jobAt = 0;
     for (;;) {
-        if (taken.empty()) {
+        if (!jobNow && taken.empty()) {
             std::unique_lock<std::mutex> lk(g_gsLock);
             for (auto& v : emptied)
                 if (g_gsSpare.size() < 256)
@@ -2508,8 +3039,51 @@ void GsThreadMain()
             taken.swap(g_gsQueue);
             g_gsBusy = true;
         }
-        GsItem item = std::move(taken.front());
+        GsItem owned;
+        GsItem* itemp = &owned;
+        if (!jobNow) {
+        owned = std::move(taken.front());
         taken.pop_front();
+        GsItem& item = owned;
+        if (item.path == 6) {   // a part's job: its items in this one's place, the job run here if not begun
+            PartJob& j = *item.job;
+            PartJobNeed(j, 2);
+            if (j.hasRef) {
+                static int printed;
+                bool same = j.ref.used == j.out.used;
+                std::size_t at = 0, word = 0;
+                for (; same && at < j.out.used; at++) {
+                    const GsItem& a = j.out.items[at], &b = j.ref.items[at];
+                    same = a.path == b.path && a.words.size() == b.words.size();
+                    // (a batch's record has where its vertices lay in the thread's lane: not compared)
+                    const std::size_t skip = a.path == 4 ? 1 + offsetof(gs::Batch, quads) / 4 : ~std::size_t(0);
+                    for (word = 0; same && word < a.words.size(); word++)
+                        same = word == skip || word == skip + 1 || (a.path == 4 && (word == 1 + offsetof(gs::Batch, ofx) / 4 || word == 1 + offsetof(gs::Batch, ofy) / 4 ||
+                                                                                     word == offsetof(gs::Batch, cull) / 4 + 1 || word == offsetof(gs::Batch, id) / 4 + 2)) ||
+                               a.words[word] == b.words[word];   // (nor what the GS thread fills in, nor the padding beside cull)
+                    if (!same)
+                        break;
+                }
+                g_jobsChecked++;
+                if (!same && printed++ < 40)
+                    std::fprintf(stderr, "jobcheck: frame %llu, part %08X at 0x%08X: %zu items against %zu; item %zu differs at word %zu\n",
+                                 (unsigned long long)gs::FramesShown(), j.key, j.target, j.out.used, j.ref.used, at, word ? word - 1 : 0);
+                if (!same)
+                    g_jobsDiffered++;
+            }
+            jobNow = std::move(item.job);   // its items in their turn, where they are (they stay the job's)
+            jobAt = 0;
+            continue;
+        }
+        }
+        if (jobNow) {
+            if (jobAt >= jobNow->out.used) {
+                jobNow.reset();
+                continue;
+            }
+            itemp = &jobNow->out.items[jobAt++];
+        }
+        GsItem& item = *itemp;
         const std::uint64_t gsStarted = NowNs();
         struct Busy {
             std::uint64_t from;
@@ -2604,7 +3178,7 @@ void GsThreadMain()
                 k += (std::size_t)taken * 4;
             }
         }
-        if (item.words.capacity() && emptied.size() < 256)
+        if (itemp == &owned && item.words.capacity() && emptied.size() < 256)
             emptied.push_back(std::move(item.words));
     }
 }
@@ -2650,8 +3224,20 @@ void RenderThreadMain()
             {
                 g_partTurns.clear();
                 g_listsBegun.store(++g_listSerial, std::memory_order_release);
+                PartJobsBegin();
+                if (PartJobsOn()) {
+                    g_listWalked.store(true, std::memory_order_release);
+                    std::unique_lock<std::mutex> lk(g_hashLock, std::try_to_lock);   // (held: the helper is not asleep)
+                    if (lk.owns_lock() && g_jobHelperWaiting)
+                        g_hashWake.notify_one();
+                }
                 LiveSink sink;
                 WalkChain(item.regs, item.tadr, sink);
+            }
+            g_listWalked.store(false, std::memory_order_release);
+            if (g_jobsOut.load(std::memory_order_acquire) != 0) {
+                GsPassOn();   // (the GS thread may take what is left as it comes to it)
+                PartJobsDrain();
             }
             break;
         }
@@ -2768,6 +3354,12 @@ void DmacDump()
     if (g_partsSlowKept || g_partsSlowRefused)
         std::fprintf(stderr, "dmac: parts drawn the long way: drawn again %llu times, kept %llu times, not kept %llu times\n",
                      (unsigned long long)g_partsSlowReplayed, (unsigned long long)g_partsSlowKept, (unsigned long long)g_partsSlowRefused);
+        if (g_jobsChecked.load())
+        std::fprintf(stderr, "dmac: jobs checked against the same work done at once: %llu, %llu differed\n", (unsigned long long)g_jobsChecked.load(),
+                     (unsigned long long)g_jobsDiffered.load());
+    std::fprintf(stderr, "dmac: parts run beside the render thread: %llu (%llu not, the shape other; %llu went wrong); by the helper %llu in %.2f s, the render thread %llu in %.2f s, the GS thread %llu in %.2f s\n",
+                     (unsigned long long)g_jobsMade, (unsigned long long)g_jobsShape, (unsigned long long)g_jobsWrong.load(), (unsigned long long)g_jobsBy[0].load(), g_jobNsBy[0].load() / 1e9,
+                     (unsigned long long)g_jobsBy[1].load(), g_jobNsBy[1].load() / 1e9, (unsigned long long)g_jobsBy[2].load(), g_jobNsBy[2].load() / 1e9);
     if (g_hashTooLate.load())
         std::fprintf(stderr, "dmac: %llu hashes of parts drawn the long way not made in time (a later list had begun)\n", (unsigned long long)g_hashTooLate.load());
     if (g_hashHelped.load())

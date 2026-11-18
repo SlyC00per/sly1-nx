@@ -44,11 +44,33 @@ using core::Runner;
 
 State& Vu1()
 {
+    if (State* lane = LaneState())
+        return *lane;
     static State s;
     return s;
 }
-std::uint32_t* Micro() { return reinterpret_cast<std::uint32_t*>(Vu1Memory()); }
-std::uint8_t* Data() { return Vu1Memory() + 0x4000; }
+namespace {
+// The micro memory and what runs it, as a lane's work found them when it was made (MicroNow):
+// the render thread loads other microcode further down its list while the lane's part is run.
+struct MicroImage {
+    std::uint32_t micro[4096];
+    core::ChunkFn table[2048];
+    int owner[2048];
+};
+const MicroImage* Image() { return static_cast<const MicroImage*>(LaneMicro()); }
+}  // namespace
+std::uint32_t* Micro()
+{
+    if (const MicroImage* image = Image())
+        return const_cast<std::uint32_t*>(image->micro);
+    return reinterpret_cast<std::uint32_t*>(Vu1Memory());
+}
+std::uint8_t* Data()
+{
+    if (std::uint8_t* lane = LaneData())
+        return lane;
+    return Vu1Memory() + 0x4000;
+}
 
 namespace {
 
@@ -56,6 +78,9 @@ namespace {
 core::ChunkFn g_table[2048];
 int g_owner[2048];   // the index of the chunk installed there, or -1
 bool g_tableReady;
+bool g_microChanged = true;   // since MicroNow last made or found its image
+const core::ChunkFn* Table() { const MicroImage* image = Image(); return image ? image->table : g_table; }
+const int* Owner() { const MicroImage* image = Image(); return image ? image->owner : g_owner; }
 std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> g_profile;   // SLY1_VU1_PROFILE
 std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> g_profileCalls;
 std::uint64_t g_handlerNs[64], g_handlerCalls[64], g_fallbacks[64], g_handlerKickNs[64];
@@ -86,8 +111,39 @@ std::uint32_t HashWords(const std::uint32_t* w, std::size_t n)
 
 }  // namespace
 
+const void* MicroNow()
+{
+    static std::map<std::uint64_t, MicroImage*> images;
+    static const MicroImage* now = nullptr;
+    if (!g_microChanged && now)
+        return now;
+    const std::uint32_t* micro = reinterpret_cast<const std::uint32_t*>(Vu1Memory());
+    std::uint64_t h = 0xCBF29CE484222325ull;
+    for (int k = 0; k < 4096; k += 2) {
+        std::uint64_t v;
+        std::memcpy(&v, micro + k, 8);
+        h = (h ^ v) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 29;
+    }
+    MicroImage*& image = images[h];
+    if (!image) {
+        image = new MicroImage;
+        std::memcpy(image->micro, micro, sizeof image->micro);
+        std::memcpy(image->table, g_table, sizeof image->table);
+        if (g_tableReady)
+            std::memcpy(image->owner, g_owner, sizeof image->owner);
+        else
+            for (int& o : image->owner)
+                o = -1;
+    }
+    g_microChanged = false;
+    now = image;
+    return now;
+}
+
 void MicrocodeLoaded(std::uint32_t addr, std::uint32_t count)
 {
+    g_microChanged = true;
     if (!g_tableReady) {
         for (int& o : g_owner)
             o = -1;
@@ -136,29 +192,37 @@ std::uint64_t Interpret(std::uint32_t start, const Context& ctx)
     static const bool stretches = profileEnv && profileEnv[0] == '2';   // per 16 instructions
     static const bool interpretOnly = tracking || stretches || std::getenv("SLY1_VU1_INTERPRET") != nullptr;
     if (tracking) {
-        int o = g_owner[pc];
+        int o = Owner()[pc];
         live::Begin(pc, o < 0 ? 0 : core::kTranslated[o].hash);
     }
+    std::uint64_t translated = 0;
+    const core::ChunkFn* table = Table();
     while (!r.done) {
         if (stretches)
             g_stretch[pc & ~15u]++;
         if (tracking)
             live::Instruction(pc, Micro()[pc * 2 + 1], Micro()[pc * 2], r.cycle);
-        if (!interpretOnly && r.branch < 0 && !r.ending && g_table[pc]) {
+        if (!interpretOnly && r.branch < 0 && !r.ending && table[pc]) {
             std::uint64_t before = r.executed;
-            pc = g_table[pc](r, pc);
-            g_translatedRun += r.executed - before;
+            pc = table[pc](r, pc);
+            translated += r.executed - before;
         } else {
             core::Step(r, pc);
         }
-        if (r.executed > (1u << 24)) {
+        if (r.executed > (LaneState() ? 1u << 20 : 1u << 24)) {
+            // (in a lane: a job run again elsewhere may be left reading a packet the game has
+            // since written over; what it makes is dropped, and it need only end)
+            if (LaneState())
+                break;
             std::fprintf(stderr, "port: a VU1 microprogram from 0x%03X ran without ending\n", start);
             std::abort();
         }
     }
+    if (!LaneState())
+        g_translatedRun += translated;
     static const bool profile = std::getenv("SLY1_VU1_PROFILE") != nullptr;
     if (profile) {
-        int o = g_owner[start & 0x7FF];
+        int o = Owner()[start & 0x7FF];
         g_profile[{o < 0 ? 0u : core::kTranslated[o].hash, start & 0x7FF}] += r.executed;
         g_profileCalls[{o < 0 ? 0u : core::kTranslated[o].hash, start & 0x7FF}]++;
         // the instructions run in each 16-instruction stretch of micro memory
@@ -175,7 +239,7 @@ std::uint64_t Interpret(std::uint32_t start, const Context& ctx)
 // The handler registered for the entry of the chunk installed there, or none.
 const HandlerEntry* HandlerFor(std::uint32_t start)
 {
-    int o = g_owner[start & 0x7FF];
+    int o = Owner()[start & 0x7FF];
     if (o < 0)
         return nullptr;
     std::uint32_t hash = core::kTranslated[o].hash;
@@ -287,7 +351,7 @@ std::string Compare(const Snapshot& h, const Capture& hc, const Snapshot& i, con
 }  // namespace
 
 namespace {
-std::uint32_t g_currentHash, g_currentEntry;
+thread_local std::uint32_t g_currentHash, g_currentEntry;
 }
 
 void CurrentProgram(std::uint32_t* hash, std::uint32_t* entry)
@@ -299,7 +363,7 @@ void CurrentProgram(std::uint32_t* hash, std::uint32_t* entry)
 std::uint64_t Run(std::uint32_t start, const Context& ctx)
 {
     {
-        int o = g_owner[start & 0x7FF];
+        int o = Owner()[start & 0x7FF];
         g_currentHash = o < 0 ? 0 : core::kTranslated[o].hash;
         g_currentEntry = start & 0x7FF;
         static const bool seq = std::getenv("SLY1_VU1_SEQ") != nullptr;   // the programs in order, for diagnosis

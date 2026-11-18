@@ -46,6 +46,16 @@ std::uint64_t PartTrouble();
 void PartSkipped();
 std::uint32_t TakeBatchIds(std::uint32_t count);
 
+// A VU1 of a thread's own, for a model part run beside the render thread
+// (port/platform/dmac.cpp's part jobs): its registers and data memory, begun as copies of the
+// program's (LaneCopyMain, on the render thread; its batches' ids from firstBatchId). Between
+// LaneEnter(lane) and LaneEnter(nullptr) everything here that the thread calls works on the lane.
+struct Lane;
+Lane* LaneNew();
+void LaneCopyMain(Lane* lane, std::uint32_t firstBatchId);
+void LaneCopy(Lane* to, const Lane* from);   // a lane as another is (one kept as it began, for a thread to work on a copy)
+void LaneEnter(Lane* lane);
+
 // VIF1's TOP and ITOP, which XTOP and XITOP read, and where XGKICK sends a packet (the quadword
 // address of its first GIF tag in data memory).
 struct Context {

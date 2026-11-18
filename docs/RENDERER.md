@@ -895,6 +895,68 @@ are never kept because their packets write vertices (register 1, RGBAQ: triangle
 clipper cut, which depend on the matrix), 8 with a program the handlers do not take, and
 parts that do fade.
 
+### Parts run beside the render thread (2026-11-18)
+
+What was left of the render thread's time in a heavy scene was the parts that cannot be drawn
+again from what was kept: those VU1 lights afresh each frame (skinned, or with a light of their
+own), those whose packets write vertices (outlines), those that fade. In "Back Alley Heist"
+they were 16.9 of the render thread's 24.7 ms a frame on the Switch, the 624 parts drawn again
+2.6. Such a part is now a job (`PartJob` in port/platform/dmac.cpp; `SLY1_PART_JOBS=0` turns
+it off):
+
+- The part's packet is walked through a VIF1 of the job's thread into a VU1 of its own
+  (`vu1::Lane`: registers, data memory, the deferred batch's record), begun as a copy of the
+  render thread's, with the micro memory and its table of translated chunks as they were when
+  the job was made (`MicroNow`: the render thread loads other microcode further down its list).
+  What the part queues for the GS is collected in the job.
+- The render thread goes on at once from the registers the part left the last time it ran
+  there. The packet's shape answers for them (`PartHash`'s shape: its VIFcodes and tags, and
+  the data of the codes that set VIF1's registers); a shape with microcode loaded or an
+  interrupt is never a job. A part comes with either of two sets of registers (the game turns
+  VIF1's buffers about from part to part), so a record holds two pairs; a part met with
+  registers it has no pair for is run in its turn and watched for the pair.
+- An item in the GS's queue stands for the job, and the GS thread takes the job's items there,
+  where they are. The helper thread (core 0, below the game's threads) takes jobs in their
+  order; the render thread takes the rest when its list is walked and does not begin the next
+  list before every job is done (a part's packet may lie in the frame's own memory).
+- A thread that needs a job another has begun and not ended within 0.4 ms runs it again itself
+  and does not wait: the helper is set aside by the game's threads in the middle of a job for
+  as long as they run. Each thread works on its own copy of the job's lane, and the first to
+  end gives the job its items (`given`; `gen` and `runners` keep a thread set aside in an old
+  job from giving it anything once the job is another part's).
+- A job's thread takes no lock and allocates nothing: the items stay in the job from one use to
+  the next and each one's buffer is used again; the thread's VIF1 is kept. With a lock (the
+  buffers' stock, the allocator's) the helper was set aside holding it, and jobs on the GS
+  thread took 1.75 ms each.
+- The helper thread has the game's float mode (`SetGameFloatMode`). Without it the parts it ran
+  were rounded to nearest and could overflow to infinity: Sly's shadow flickered.
+
+Also: a part that keeps changing is left alone for twice as long each time (30 frames to 960)
+until it has been drawn again 60 times from one keeping. Keeping a part costs several times
+running it, and a part that fades for seconds was kept anew three times a second.
+
+Checks, on the host: `SLY1_PART_JOBS_CHECK=1` runs each job at once on the render thread too
+and compares what the job's thread gives, word for word: 146,236 jobs over the 46 levels, 0
+differed. `SLY1_PART_HASH_NOW=1 SLY1_PART_HELPER=1` runs the helper for the jobs alone with
+every hash before its decision: the opening's 898 frames hash as with `SLY1_PART_REPLAY=0`,
+but for a burst of 15 frames in some runs in which one full-screen pass at the frame's end has
+its T coordinate half a line other (the field the frame falls on, which the host's timing
+moves; not the jobs). `SLY1_PART_JOBS=now` runs each job at once (the same work, no other
+thread); `SLY1_PART_JOBS_ONLY=slow|cached|N` makes jobs of one kind of part.
+
+On the Switch, "Back Alley Heist" played from its start: 52.5 frames a second over the first
+minute (46.8 with the first version of the jobs; a median frame of 33 ms with
+`SLY1_PART_JOBS=0`, 50 ms with `SLY1_PART_REPLAY=0` too). Further in, the render thread is at
+13 to 16 ms, the GS thread 10 to 12, the game's threads 10 to 14, and most frames still take
+two vertical blanks. Jobs the GS thread runs itself take it 0.95 ms each (the helper 0.16, the
+render thread 0.12): not understood yet.
+
+Not from this: a searchlight in that level is not drawn at all, with the jobs and the parts'
+reuse both off as well. Likely one of the volumes that mark the frame's alpha, which the GPU
+renderer leaves without effect ("Not done", above). And once, at a start, the game began a
+chain on channel 0x4A8E3020 and faulted before any level was loaded; the next start of the
+same program ran.
+
 ### The handheld GPU clock: not used
 
 `SLY1_PERF_CONFIG=92220007` asks the system for that performance configuration in handheld mode

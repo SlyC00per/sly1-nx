@@ -23,6 +23,9 @@
 namespace port {
 namespace vu1 {
 
+// A thread's own VU1 (port/vu1.h's Lane), or none: the program's.
+thread_local Lane* t_lane = nullptr;
+
 namespace {
 
 using core::Bits;
@@ -281,7 +284,14 @@ bool BatchTransformT(Runner& r, const int stride, const Test test, const std::ui
         return false;
     const int n = span / stride;
     const int posAt = stride - 1;
-    static LitVertex v[kMax + 4];
+    static LitVertex mainV[kMax + 4];
+    static thread_local LitVertex* laneV = nullptr;   // (a thread with a VU1 of its own: scratch of its own)
+    LitVertex* v = mainV;
+    if (t_lane) {
+        if (!laneV)
+            laneV = new LitVertex[kMax + 4];
+        v = laneV;
+    }
 
     V m[4] = {Load(r, top + 14), Load(r, top + 15), Load(r, top + 16), Load(r, top + 17)};
     V params = Load(r, top + 8);
@@ -436,16 +446,57 @@ struct Deferred {
     int stride = 0;
     Test test = Test::Guard274;
     std::uint32_t endPc = 0;
-} g_deferred;
-std::map<std::uint64_t, std::uint64_t> g_lateBy;   // late transforms by program (hash << 12 | entry)
-std::uint64_t g_lateNs, g_lateVertices, g_skippedOverwritten;
+};
+struct LaneCounts {
+    std::map<std::uint64_t, std::uint64_t> lateBy;   // late transforms by program (hash << 12 | entry)
+    std::uint64_t lateNs = 0, lateVertices = 0, skippedOverwritten = 0, notTaken = 0, taken = 0;
+};
+Deferred g_mainDeferred;
+LaneCounts g_mainCounts;
+}  // namespace
+
+// A VU1 of a thread's own: its registers, its data memory, and what the handlers keep between
+// programs. The micro memory is the program's own (a lane's work loads no microcode).
+struct Lane {
+    State s;
+    alignas(16) std::uint8_t data[0x4000];
+    Deferred deferred;
+    LaneCounts counts;
+    const void* micro = nullptr;
+};
+State* LaneState() { return t_lane ? &t_lane->s : nullptr; }
+std::uint8_t* LaneData() { return t_lane ? t_lane->data : nullptr; }
+const void* LaneMicro() { return t_lane ? t_lane->micro : nullptr; }
+Lane* LaneNew() { return new Lane; }
+void LaneCopyMain(Lane* lane, std::uint32_t firstBatchId)
+{
+    lane->s = Vu1();
+    lane->micro = MicroNow();
+    std::memcpy(lane->data, Data(), sizeof lane->data);
+    lane->deferred = Deferred();
+    lane->deferred.serial = firstBatchId - 1;
+    lane->counts.lateNs = lane->counts.lateVertices = lane->counts.skippedOverwritten = lane->counts.notTaken = lane->counts.taken = 0;
+}
+void LaneCopy(Lane* to, const Lane* from)
+{
+    to->s = from->s;
+    std::memcpy(to->data, from->data, sizeof to->data);
+    to->deferred = from->deferred;
+    to->micro = from->micro;
+    to->counts.lateNs = to->counts.lateVertices = to->counts.skippedOverwritten = to->counts.notTaken = to->counts.taken = 0;
+}
+void LaneEnter(Lane* lane) { t_lane = lane; }
+
+namespace {
+Deferred& Def() { return t_lane ? t_lane->deferred : g_mainDeferred; }
+LaneCounts& Cnt() { return t_lane ? t_lane->counts : g_mainCounts; }
 
 bool BatchTransformNow(Runner& r, const int stride, const Test test, const std::uint32_t endPc);
 void ClipIfMarked(Runner& r, std::uint16_t top, std::uint16_t colour);
 bool Clippable(Runner& r, std::uint16_t top, int stride);
 
-bool DeferredFor(std::uint16_t top) { return g_deferred.on && g_deferred.top == top; }
-void DeferredKicked() { g_deferred.kicked = true; }
+bool DeferredFor(std::uint16_t top) { return Def().on && Def().top == top; }
+void DeferredKicked() { Def().kicked = true; }
 
 bool DeferTransforms()
 {
@@ -465,15 +516,15 @@ bool DeferTransforms()
 // since: the memory is the next batch's.
 void Materialise(Runner& r, bool always = false)
 {
-    if (!g_deferred.on)
+    if (!Def().on)
         return;
-    Deferred d = g_deferred;
-    g_deferred.on = false;
+    Deferred d = Def();
+    Def().on = false;
     static const bool seq = std::getenv("SLY1_VU1_SEQ") != nullptr;
     if (seq)
         std::fprintf(stderr, "seq   materialise top %u (batch's top %u, overwritten %d)\n", r.ctx.top, d.top, (int)d.overwritten);
     if (d.overwritten) {
-        g_skippedOverwritten++;
+        Cnt().skippedOverwritten++;
         return;
     }
     (void)always;
@@ -482,13 +533,14 @@ void Materialise(Runner& r, bool always = false)
     {   // counted by the program it is done for, for the report (BatchCounts)
         std::uint32_t hash, entry;
         CurrentProgram(&hash, &entry);
-        g_lateBy[(std::uint64_t)hash << 12 | entry]++;
-        g_lateVertices += (std::uint16_t)(d.end - d.first) / (std::uint32_t)d.stride;
+        if (!t_lane)   // (a lane's work allocates nothing: the helper may be set aside inside the allocator)
+            Cnt().lateBy[(std::uint64_t)hash << 12 | entry]++;
+        Cnt().lateVertices += (std::uint16_t)(d.end - d.first) / (std::uint32_t)d.stride;
     }
     std::uint64_t lateStart = NowNs();
     struct LateTime {
         std::uint64_t start;
-        ~LateTime() { g_lateNs += NowNs() - start; }
+        ~LateTime() { Cnt().lateNs += NowNs() - start; }
     } lateTime{lateStart};
     Context ctx = r.ctx;
     ctx.top = d.top;
@@ -548,7 +600,7 @@ bool ViewportAsExpected(Runner& r)
 // renderer. False, with only the tag's packet sent, when the renderer does not take it.
 bool KickDeferred(Runner& r, std::uint16_t top, std::uint16_t tag)
 {
-    const Deferred& d = g_deferred;
+    const Deferred& d = Def();
     std::uint16_t at = (std::uint16_t)(top + tag);
     V t = Load(r, at);
     V hdr = Load(r, top + 11);
@@ -589,7 +641,7 @@ bool KickDeferred(Runner& r, std::uint16_t top, std::uint16_t tag)
     b.fogScale = params.y;
     b.wMax = params.z;
     b.cull = Half(Load(r, top + 9).z) != 0;
-    b.id = g_deferred.overwritten ? 0 : g_deferred.serial;
+    b.id = Def().overwritten ? 0 : Def().serial;
     static const bool check = std::getenv("SLY1_GPU_BATCH_CHECK") != nullptr;
     if (check) {
         // SLY1_GPU_BATCH_CHECK: the renderer's arithmetic on the vertices as they are, against what
@@ -676,22 +728,22 @@ bool BatchTransform(Runner& r, const int stride, const Test test, const std::uin
             static const bool seqTrace = std::getenv("SLY1_VU1_SEQ") != nullptr;
             if (seqTrace)
                 std::fprintf(stderr, "seq   deferred top %u first %u end %u stride %d%s\n", top, top + Half(hdr.x), top + Half(hdr.y), stride,
-                             g_deferred.on ? " (the one before never done)" : "");
-            g_deferred.on = true;
-            g_deferred.serial++;
-            g_deferred.kicked = false;
-            g_deferred.overwritten = false;
-            g_deferred.header13Written = false;
-            g_deferred.first = (std::uint16_t)(top + Half(hdr.x));
-            g_deferred.end = (std::uint16_t)(top + Half(hdr.y));
+                             Def().on ? " (the one before never done)" : "");
+            Def().on = true;
+            Def().serial++;
+            Def().kicked = false;
+            Def().overwritten = false;
+            Def().header13Written = false;
+            Def().first = (std::uint16_t)(top + Half(hdr.x));
+            Def().end = (std::uint16_t)(top + Half(hdr.y));
             for (int k = 0; k < 10; k++)
-                g_deferred.header[k] = Load(r, (std::uint16_t)(top + 8 + k));
+                Def().header[k] = Load(r, (std::uint16_t)(top + 8 + k));
             for (int k = 0; k < 2; k++)
-                g_deferred.viewport[k] = Load(r, (std::uint16_t)k);
-            g_deferred.top = top;
-            g_deferred.stride = stride;
-            g_deferred.test = test;
-            g_deferred.endPc = endPc;
+                Def().viewport[k] = Load(r, (std::uint16_t)k);
+            Def().top = top;
+            Def().stride = stride;
+            Def().test = test;
+            Def().endPc = endPc;
             static const bool leaveCheck = std::getenv("SLY1_GPU_LEAVE_CHECK") != nullptr;
             State full;
             static std::vector<std::uint8_t> memory;
@@ -875,7 +927,6 @@ void Colours4DD(Runner& r, std::uint16_t top, int n)
 // the tag kicked, then the vertices.
 bool KickDeferred(Runner& r, std::uint16_t top, std::uint16_t tag);
 void Materialise(Runner& r, bool always);
-std::uint64_t g_notTaken, g_taken;
 bool DeferredFor(std::uint16_t top);
 void DeferredKicked();
 
@@ -884,11 +935,11 @@ void KickBatch(Runner& r, std::uint16_t top, std::uint16_t tag)
     if (DeferredFor(top)) {   // the batch's transform is the renderer's
         if (KickDeferred(r, top, tag)) {
             DeferredKicked();
-            g_taken++;
+            Cnt().taken++;
             return;
         }
         // not taken: the transform now, then the vertices' packet (the tag's is sent)
-        g_notTaken++;
+        Cnt().notTaken++;
         Materialise(r, true);
         Kick(r, (std::uint16_t)(top + Half(Load(r, top + 11).x)) - 1);
         return;
@@ -3426,7 +3477,7 @@ const char kAllVfAndP[] = VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "P";
 // sprites (0x076: the shadows under characters) do, and a program on the microcode may read anything.
 void BeforeProgram(Handler fn, core::Runner& r)
 {
-    if (!g_deferred.on)
+    if (!Def().on)
         return;
     static const Handler kSafe[] = {BatchFinish, BatchSecond, UnlitFinish, MatrixAt14, CopyFromOtherBuffer, BatchSetup,
                                     DirectionalLight, PointLight, SpotLight, LitColours, Skin, SkinNormals, UnitNormals,
@@ -3442,7 +3493,7 @@ void LeftToMicrocode(core::Runner& r) { Materialise(r); }
 
 void DataWritten(std::uint32_t qaddr, std::uint32_t count, std::uint32_t cycle, std::uint32_t write)
 {
-    Deferred& d = g_deferred;
+    Deferred& d = Def();
     if (!d.on || d.overwritten)
         return;
     static const bool seq = std::getenv("SLY1_VU1_SEQ") != nullptr;
@@ -3524,38 +3575,38 @@ void PartMatrixFrom(const float* header, float out[16])
 std::uint64_t PartTrouble()
 {
     std::uint64_t late = 0;
-    for (const auto& kv : g_lateBy)
+    for (const auto& kv : Cnt().lateBy)
         late += kv.second;
-    return late + g_notTaken + g_skippedOverwritten;
+    return late + Cnt().notTaken + Cnt().skippedOverwritten;
 }
 
 // The part's packet was not run: no batch waits for its kicks.
 void PartSkipped()
 {
-    g_deferred.on = false;
-    g_deferred.kicked = false;
+    Def().on = false;
+    Def().kicked = false;
 }
 
 // The next batch's id (gs::Batch::id), and that many more passed over (a part drawn again gives
 // its batches ids of their own).
 std::uint32_t TakeBatchIds(std::uint32_t count)
 {
-    std::uint32_t first = g_deferred.serial + 1;
-    g_deferred.serial += count;
+    std::uint32_t first = Def().serial + 1;
+    Def().serial += count;
     return first;
 }
 
 void BatchCounts(std::uint64_t* taken, std::uint64_t* notTaken)
 {
-    *taken = g_taken;
-    *notTaken = g_notTaken;
-    if (!g_lateBy.empty() || g_skippedOverwritten) {
+    *taken = Cnt().taken;
+    *notTaken = Cnt().notTaken;
+    if (!Cnt().lateBy.empty() || Cnt().skippedOverwritten) {
         std::uint64_t all = 0;
-        for (const auto& kv : g_lateBy)
+        for (const auto& kv : Cnt().lateBy)
             all += kv.second;
         std::fprintf(stderr, "vu1: %llu batches transformed late in memory (%llu vertices, %.3f s), %llu not (overwritten first); for:\n",
-                     (unsigned long long)all, (unsigned long long)g_lateVertices, g_lateNs / 1e9, (unsigned long long)g_skippedOverwritten);
-        for (const auto& kv : g_lateBy) {
+                     (unsigned long long)all, (unsigned long long)Cnt().lateVertices, Cnt().lateNs / 1e9, (unsigned long long)Cnt().skippedOverwritten);
+        for (const auto& kv : Cnt().lateBy) {
             std::uint32_t hash = (std::uint32_t)(kv.first >> 12), entry = (std::uint32_t)(kv.first & 0xFFF);
             const char* name = "(on the microcode)";
             for (std::size_t k = 0; k < kHandlerCount; k++)
