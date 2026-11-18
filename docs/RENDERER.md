@@ -405,8 +405,10 @@ end, no run into a buffer left out. Level 20's first room, captured at full size
 (`SLY1_GPU_CAPTURE_FULL=1`) in the run of all levels: the carpet had a stale picture across it
 before, and is clean now.
 
-Still open in that room: the window's glass is drawn far more opaque than the software GS draws
-it (the city behind it hardly shows).
+In that room the window's glass was then drawn far more opaque than the software GS draws it
+(the city behind it hardly showed). No longer, as of 78c8829 (2026-11-17): captured again at
+full size (`--levels 20`, the run's last frames), the city shows through the glass as in the
+host's dump of the same room. Which of the changes since did it was not traced.
 
 A capture's rows are printed 160 pixels a line: the emulator's log cut longer lines, so every
 capture before this was missing its right-hand third.
