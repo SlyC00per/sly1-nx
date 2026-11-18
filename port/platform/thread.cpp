@@ -10,6 +10,7 @@
 #include <map>
 #include <vector>
 
+#include "port/gs.h"
 #include "port/ptr32.h"
 
 #if defined(__SWITCH__)
@@ -91,8 +92,20 @@ void Sampler(void*)
 {
     svcSleepThread(12000000000ll);
     const std::uint64_t base = (std::uint64_t)ImageBase();
+    // SLY1_SAMPLE_FRAMES=A,B: only while the frame shown is one of A to B
+    std::uint64_t from = 0, to = ~0ull;
+    if (const char* f = std::getenv("SLY1_SAMPLE_FRAMES")) {
+        unsigned long long a = 0, b = 0;
+        if (std::sscanf(f, "%llu,%llu", &a, &b) == 2) {
+            from = a;
+            to = b;
+        }
+    }
     while (g_sampling.load()) {
         svcSleepThread(1000000);
+        const std::uint64_t shown = gs::FramesShown();
+        if (shown < from || shown > to)
+            continue;
         for (int k = 0; k < 2; k++) {
             if (!g_sampled[k] || g_samples[k].size() >= 120000)
                 continue;

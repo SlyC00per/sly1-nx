@@ -747,6 +747,23 @@ for the GPU 0.94 s of the run where it was 3.0 s. The roof with the vents: 25 to
 What is left at two blanks is the processor's: the render thread and the GS thread, 15 to 21 ms
 each in the busy stretches.
 
+### The GS thread's own overheads (2026-11-17)
+
+`SLY1_SAMPLE_FRAMES=A,B` limits the sampler to the frames shown from A to B. Frames 1,500 to
+1,900 of the opening (two vertical blanks a frame; both threads busy about 18 ms of 33): no one
+function stands out on either thread. On the render thread the characters' lighting, skinning
+and outlines are about 5 ms, the parts' hashes about 2. On the GS thread, by source line, a
+tenth was the first read of each kept item of a part drawn again (its words behind three
+pointers), 7% the lock (taken twice an item) and 6% the map of kept batches. Now the GS thread
+takes everything queued at once and gives its emptied buffers back then; a kept part's items
+carry their words' address and the next one's memory is asked for ahead; the kept batches are in
+one flat table (`KeptTable`). The same output (the host's hash a frame over 898 frames; six
+frames in Ryujinx to the byte).
+
+On the Switch, frames 1,500 to 1,900: the GS thread 12.1 to 17.0 ms a frame where it was 14.3
+to 20.0; the opening's frames after the 600th, 1,013 of one vertical blank and 574 of two
+(948 and 605). The render thread, 15 to 21 ms there, is what holds those frames at two.
+
 ### The handheld GPU clock: not used
 
 `SLY1_PERF_CONFIG=92220007` asks the system for that performance configuration in handheld mode

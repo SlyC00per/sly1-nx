@@ -253,7 +253,58 @@ private:
     };
     DkMemBlock keepMem_ = nullptr;
     std::uint32_t keepUsed_ = 0;
-    std::unordered_map<std::uint64_t, Kept> kept_;
+    // The kept batches by their keys, in one table with the keys beside them (a lookup a batch:
+    // one place in memory, where a map of nodes was two or three).
+    struct KeptTable {
+        struct Slot {
+            std::uint64_t key = 0;   // 0 empty, all ones let go (a key is neither: Batch::keep, counted from 1)
+            Kept kept;
+        };
+        std::vector<Slot> slots = std::vector<Slot>(1u << 16);
+        std::size_t used = 0;   // slots that are not empty
+        static std::size_t Start(std::uint64_t key) { return (std::size_t)((key * 0x9E3779B97F4A7C15ull) >> 32); }
+        Kept* find(std::uint64_t key)
+        {
+            const std::size_t mask = slots.size() - 1;
+            for (std::size_t i = Start(key) & mask;; i = (i + 1) & mask) {
+                if (slots[i].key == key)
+                    return &slots[i].kept;
+                if (slots[i].key == 0)
+                    return nullptr;
+            }
+        }
+        Kept* emplace(std::uint64_t key, const Kept& k)
+        {
+            if ((used + 1) * 2 > slots.size()) {   // half full: made anew without what was let go,
+                std::size_t live = 0;              // with four times the room of what is left
+                for (const Slot& o : slots)
+                    live += o.key != 0 && o.key != ~0ull;
+                std::size_t size = 1u << 16;
+                while (size < (live + 1) * 4)
+                    size *= 2;
+                std::vector<Slot> old(size);
+                old.swap(slots);
+                used = 0;
+                for (const Slot& o : old)
+                    if (o.key != 0 && o.key != ~0ull)
+                        emplace(o.key, o.kept);
+            }
+            const std::size_t mask = slots.size() - 1;
+            std::size_t i = Start(key) & mask;
+            while (slots[i].key != 0 && slots[i].key != ~0ull)
+                i = (i + 1) & mask;
+            used += slots[i].key == 0;
+            slots[i].key = key;
+            slots[i].kept = k;
+            return &slots[i].kept;
+        }
+        void erase(Kept* k) { (reinterpret_cast<Slot*>(reinterpret_cast<char*>(k) - offsetof(Slot, kept)))->key = ~0ull; }
+        void clear()
+        {
+            std::fill(slots.begin(), slots.end(), Slot());
+            used = 0;
+        }
+    } kept_;
     std::vector<FreeBlock> keepFree_;
     bool indexKeep_ = false;   // the index buffer bound is keepMem_, not the frame's memory
     bool keepFull_ = false;    // a batch found no room: keepMem_ is emptied at the frame's end
@@ -1027,8 +1078,8 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
     batches_++;
     batchVertices_ += b.count;
     if (b.keep != 0 && keepMem_) {   // a batch that comes again unchanged: from keepMem_, where it is written once
-        auto it = kept_.find(b.keep);
-        if (it == kept_.end()) {
+        Kept* it = kept_.find(b.keep);
+        if (it == nullptr) {
             staging_.resize((std::size_t)b.count * 3 + 8);
             std::uint32_t* index = staging_.data();
             std::uint32_t n = 0;
@@ -1079,14 +1130,14 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
                 std::memcpy(mem + k.colourAt, staging_.data(), (std::size_t)b.count * 16);
                 keptPlaced_++;
                 keptBytes_ += got;
-                it = kept_.emplace(b.keep, k).first;
+                it = kept_.emplace(b.keep, k);
             } else {
                 keptNoRoom_++;
                 keepFull_ = true;   // everything kept is let go at the frame's end (Present)
             }
         }
-        if (it != kept_.end()) {
-            const Kept& k = it->second;
+        if (it != nullptr) {
+            const Kept& k = *it;
             if (k.indices == 0)
                 return true;
             if (draws_ >= kMaxDraws)
@@ -1350,10 +1401,10 @@ bool Renderer::KeepRoom(std::uint32_t bytes, std::uint32_t* at, std::uint32_t* g
 void Renderer::ForgetKept(std::uint64_t first, std::uint64_t count)
 {
     for (std::uint64_t key = first; key < first + count; key++) {
-        auto it = kept_.find(key);
-        if (it == kept_.end())
+        Kept* it = kept_.find(key);
+        if (it == nullptr)
             continue;
-        keepFree_.push_back({it->second.at, it->second.bytes, frames_});
+        keepFree_.push_back({it->at, it->bytes, frames_});
         kept_.erase(it);
         keptForgotten_++;
     }

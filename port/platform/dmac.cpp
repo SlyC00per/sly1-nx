@@ -258,6 +258,10 @@ Gif g_path2{2};
 struct PartKept {
     std::uint8_t path;
     std::shared_ptr<const std::vector<std::uint32_t>> words;
+    // the words themselves, set when the part is kept: the GS thread goes through a part's items
+    // without following each one's pointers first (it asks for the next one's memory ahead)
+    const std::uint32_t* data = nullptr;
+    std::uint32_t size = 0;
 };
 
 struct GsItem {
@@ -1588,6 +1592,10 @@ void PartDone()
     r->keys = g_partKey + 1 - r->keyFirst;
     r->ok = ok;
     if (ok)
+        for (PartKept& k : r->items) {
+            k.data = k.words->data();
+            k.size = (std::uint32_t)k.words->size();
+        }
         r->kept = std::make_shared<const std::vector<PartKept>>(std::move(r->items));
     r->items.clear();
     if (!ok) {
@@ -1912,10 +1920,17 @@ void GsThreadMain()
 {
     gs::SetBatchSink(QueueBatch);
     g_gsStarted.store(true, std::memory_order_release);
+    // Everything queued is taken at once, and the emptied buffers given back then: the lock once a
+    // lot, not twice an item.
+    std::deque<GsItem> taken;
+    std::vector<std::vector<std::uint32_t>> emptied;
     for (;;) {
-        GsItem item;
-        {
+        if (taken.empty()) {
             std::unique_lock<std::mutex> lk(g_gsLock);
+            for (auto& v : emptied)
+                if (g_gsSpare.size() < 256)
+                    g_gsSpare.push_back(std::move(v));
+            emptied.clear();
             g_gsBusy = false;
             if (g_gsQueue.empty()) {
                 g_gsIdle.notify_all();
@@ -1923,10 +1938,11 @@ void GsThreadMain()
                 g_gsWake.wait(lk, [] { return !g_gsQueue.empty(); });
                 g_gsWaiting = false;
             }
-            item = std::move(g_gsQueue.front());
-            g_gsQueue.pop_front();
+            taken.swap(g_gsQueue);
             g_gsBusy = true;
         }
+        GsItem item = std::move(taken.front());
+        taken.pop_front();
         const std::uint64_t gsStarted = NowNs();
         struct Busy {
             std::uint64_t from;
@@ -1940,8 +1956,16 @@ void GsThreadMain()
             std::memcpy(viewport, &item.words[16], sizeof viewport);
             const std::uint32_t firstId = item.words[24], keptFirstId = item.words[25];
             const std::size_t head = 1 + (sizeof(gs::Batch) + 3) / 4;
-            for (const PartKept& kept : *item.part) {
-                const std::vector<std::uint32_t>& w = *kept.words;
+            const std::vector<PartKept>& part = *item.part;
+            for (std::size_t i = 0; i < part.size(); i++) {
+                const PartKept& kept = part[i];
+                if (i + 1 < part.size()) {
+                    __builtin_prefetch(part[i + 1].data);
+                    __builtin_prefetch(part[i + 1].data + 16);
+                    __builtin_prefetch(part[i + 1].data + 32);
+                }
+                const std::uint32_t* w = kept.data;
+                const std::size_t size = kept.size;
                 if (kept.path == 4) {
                     gs::Batch b;
                     std::memcpy(&b, &w[1], sizeof b);
@@ -1950,14 +1974,14 @@ void GsThreadMain()
                     std::memcpy(b.offset, viewport + 4, 16);
                     if (b.id != 0)
                         b.id = firstId + (b.id - keptFirstId);
-                    b.quads = w.data() + head;
+                    b.quads = w + head;
                     if (!gs::DrawBatch(w[0], b))
                         g_batchesRefused++;
                 } else {
                     Gif& gif = kept.path == 1 ? g_path1 : g_path2;
                     gs::Hold hold;
-                    for (std::size_t k = 0; k + 4 <= w.size();) {
-                        std::uint32_t taken = gif.Left() ? gif.Run(&w[k], (std::uint32_t)((w.size() - k) / 4)) : 0;
+                    for (std::size_t k = 0; k + 4 <= size;) {
+                        std::uint32_t taken = gif.Left() ? gif.Run(&w[k], (std::uint32_t)((size - k) / 4)) : 0;
                         if (taken == 0) {
                             gif.Qword(&w[k]);
                             taken = 1;
@@ -1987,11 +2011,8 @@ void GsThreadMain()
                 k += (std::size_t)taken * 4;
             }
         }
-        if (item.words.capacity()) {
-            std::lock_guard<std::mutex> lk(g_gsLock);
-            if (g_gsSpare.size() < 256)
-                g_gsSpare.push_back(std::move(item.words));
-        }
+        if (item.words.capacity() && emptied.size() < 256)
+            emptied.push_back(std::move(item.words));
     }
 }
 
