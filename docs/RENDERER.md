@@ -764,6 +764,18 @@ On the Switch, frames 1,500 to 1,900: the GS thread 12.1 to 17.0 ms a frame wher
 to 20.0; the opening's frames after the 600th, 1,013 of one vertical blank and 574 of two
 (948 and 605). The render thread, 15 to 21 ms there, is what holds those frames at two.
 
+### The parts' hashes: three things that gained nothing
+
+The hash of the parts drawn again is about 2 ms a frame of the render thread in that stretch,
+by line the first read of each small piece of a packet and the short runs after it. Tried on
+the Switch, each with the same output, none with a gain (kept out):
+
+- memory asked for a few lines ahead inside a run, and the next referred block's first lines;
+- long runs summed in four independent sums, and a sampled run's places asked for up front
+  (the runs are mostly under 32 words);
+- each part's lines of memory listed once and asked for when the part before it is reached:
+  the hash 18% cheaper, the asking and its lookups as dear as what it saved.
+
 ### The handheld GPU clock: not used
 
 `SLY1_PERF_CONFIG=92220007` asks the system for that performance configuration in handheld mode
