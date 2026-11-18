@@ -783,3 +783,21 @@ and prints what it had and has (it had 00020003 and took it). With it the openin
 to 44.2 frames a second on the Switch Lite and the roof with the steam from 43 and 34 ms a frame
 to 33 and 27. It is a trial switch and stays off: the port is to reach its frame rate at the
 system's default clocks (the user's decision: less power and heat are what the port is for).
+
+## A building one frame late after a cut: the game's own order (2026-11-17)
+
+In the opening, on the first frame of the shot of the "Le Police" sign, the building to the
+sign's right is not drawn; it is from the second frame on. Not the renderer's: the host's
+software GS shows the same with `SLY1_RENDER_SYNC=1`, and the game does not queue those parts
+that frame (51 parts of the world and 10 of six objects, queued from the next frame on).
+
+The cause is the order of the game's main loop (`RunMainLoop`): `UpdateCameraLocation` looks up
+the area the camera is in (`Camera::areaMask`, from the world's value tree at the camera's
+position) at the start of the frame, before the world's frame moves the camera; the parts are
+then queued for the camera's new position against the old area's mask. Traced on the host: at
+the cut the lookup still has the last shot's position (the mask stays 0x400), and the frame
+after it has the new one (mask 1). Retail runs the same code in the same order on one thread,
+so it leaves the building out for that frame too: a sixtieth of a second there, twice as long
+where the port takes two vertical blanks a frame. Left as it is (the port's gameplay is
+retail's); it shortens with the frame.
+
