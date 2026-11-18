@@ -293,6 +293,12 @@ void KernelDump()
 // A preemption point (port/retail_data.h): on the PS2 an interrupt that readies a thread of higher
 // priority preempts the running one where it is; here the running thread gives way at its next
 // loop test or kernel call. The interrupt handlers (on the clock's host thread) never do.
+float WideFactor()
+{
+    static const float factor = std::getenv("SLY1_WIDE") && std::getenv("SLY1_WIDE")[0] == '0' ? 1.0f : 4.0f / 3.0f;
+    return factor;
+}
+
 // A call for the game's own thread to make (the host's diagnosis: placing the player), taken at
 // the next point where a game thread lets others in.
 std::atomic<void (*)()> g_gameThreadCall{nullptr};

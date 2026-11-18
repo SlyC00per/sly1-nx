@@ -102,6 +102,10 @@ inline void* AsAddress(T word) { return Native((std::uint32_t)word); }
 // moment for the host's other threads.
 extern std::atomic<bool> g_preemptPending;
 void PreemptSlow();
+// The picture's width over the PS2's 4:3 one: 4/3 for the 16:9 screen (the camera's horizontal
+// extent is that much wider, the vertical kept; tools/patches.py's camera patch), 1 with
+// SLY1_WIDE=0.
+float WideFactor();
 // fn called once on a game thread, at its next point of letting others in (the host's diagnosis).
 void CallOnGameThread(void (*fn)());
 #ifdef PORT_SENTINEL

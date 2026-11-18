@@ -39,7 +39,8 @@ namespace gpu {
 namespace {
 
 constexpr std::uint32_t kScreenWidth = 1280, kScreenHeight = 720;
-constexpr std::uint32_t kWidth = 960, kHeight = 720;     // a frame buffer's image (4:3)
+constexpr std::uint32_t kWidth = 1280, kHeight = 720;    // a frame buffer's image: the whole 16:9 screen (the game's
+                                                         // 640 columns across it, its camera that much wider: port::WideFactor)
 constexpr float kFieldWidth = 640.0f, kFieldHeight = 224.0f;
 constexpr std::uint32_t kFrameMemory = 24u << 20;        // a frame's vertices and texture uploads
 constexpr std::uint32_t kCommandMemory = 16u << 20;

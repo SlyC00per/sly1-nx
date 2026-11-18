@@ -371,6 +371,22 @@ each second (`perfpos:`), and `--level N --env SLY1_WARP=x,y,z[,frames]` places 
 there with the game's own SetPlayerPosition once the level has run (`SLY1_LIGHTS=1` lists the
 level's lights). The spot here: `--level 20 --env SLY1_WARP=2899,-2340,2080,600`.
 
+## Widescreen: the world (2026-11-18)
+
+The picture is the whole 16:9 screen: a frame buffer's image is 1,280 by 720 (it was 960 by 720
+in the screen's middle), the game's 640 columns across it, and the camera's horizontal extent
+over the vertical is 4/3 of the PS2's (`port::WideFactor`, in tools/patches.py's patch of
+`InitCamera`'s aspect, from which the projection, the frustum's sides and what they cull all
+come). The vertical field of view is the PS2's. `SLY1_WIDE=0` keeps the PS2's aspect (the
+picture is then stretched: for comparison only).
+
+Seen on the host (a frame at a place in "Back Alley Heist", stretched to 16:9: nothing missing
+at the sides), in Ryujinx and on the Switch (played: nothing coming or going at the edges).
+Not done: the 2D elements (the counters, the text, the menus, the map at a level's end) are
+laid out for 4:3 and are a third too wide; videos. On the Switch the same place costs more
+than at 4:3 (a third more pixels and more of the world in view): the run's median frame was
+33 ms where the 4:3 run's was 28.
+
 ## Frame rate on the Switch: what limits it (2026-11-17)
 
 Measured on a Switch Lite (handheld clocks) in the opening, 30 s after the first 10.
