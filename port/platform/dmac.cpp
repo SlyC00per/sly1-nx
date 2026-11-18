@@ -503,6 +503,19 @@ public:
                     continue;
                 }
             }
+            if (left_ != 0 && direct_ && !keep_ && filled_ == 0 && n - k >= 4 && !vu0_ && GsAsync()) {
+                // DIRECT's data for the GS thread: whole quadwords copied at once, not gathered a
+                // word at a time (one copy a quadword was most of what the list's reading cost)
+                const std::uint32_t take = std::min<std::uint32_t>(left_, (std::uint32_t)(n - k)) & ~3u;
+                if (take > 0) {
+                    directData_.insert(directData_.end(), w + k, w + k + take);
+                    k += (int)take;
+                    left_ -= take;
+                    if (left_ == 0)
+                        End();
+                    continue;
+                }
+            }
             if (left_ != 0 && keep_ && !direct_) {
                 if (data_.empty() && (cmd_ & 0x60) == 0x60 && (std::uint32_t)(n - k) >= left_) {
                     // an unpack whose data is all here: unpacked from where it is, not copied first
@@ -2112,6 +2125,14 @@ void GsThreadMain()
             std::uint64_t from;
             ~Busy() { g_gsBusyNs += NowNs() - from; }
         } busy{gsStarted};
+        // The GS held once for the item, not once for each packet and batch in it (a call may wait
+        // for the display, and holds it for itself as it needs).
+        struct HeldIf {
+            bool on;
+            explicit HeldIf(bool o) : on(o) { if (on) new (hold) gs::Hold; }
+            ~HeldIf() { if (on) reinterpret_cast<gs::Hold*>(hold)->~Hold(); }
+            alignas(gs::Hold) unsigned char hold[sizeof(gs::Hold)];
+        } held(item.path != 0);
         if (item.path == 0) {
             item.fn(item.a, item.b);
         } else if (item.path == 5) {   // a part drawn again: its kept packets and batches in turn
@@ -2123,10 +2144,17 @@ void GsThreadMain()
             const std::vector<PartKept>& part = *item.part;
             for (std::size_t i = 0; i < part.size(); i++) {
                 const PartKept& kept = part[i];
-                if (i + 1 < part.size()) {
-                    __builtin_prefetch(part[i + 1].data);
-                    __builtin_prefetch(part[i + 1].data + 16);
-                    __builtin_prefetch(part[i + 1].data + 32);
+                if (i + 2 < part.size()) {
+                    __builtin_prefetch(part[i + 2].data);
+                    __builtin_prefetch(part[i + 2].data + 16);
+                    __builtin_prefetch(part[i + 2].data + 32);
+                }
+                if (i + 1 < part.size() && part[i + 1].path == 4) {
+                    // the next batch's record was asked for a turn ago: its place in the renderer's
+                    // table of kept batches asked for now
+                    std::uint64_t keep;
+                    std::memcpy(&keep, reinterpret_cast<const char*>(part[i + 1].data + 1) + offsetof(gs::Batch, keep), sizeof keep);
+                    gs::KeptAhead(keep);
                 }
                 const std::uint32_t* w = kept.data;
                 const std::size_t size = kept.size;

@@ -809,6 +809,23 @@ On the Switch, the opening's frames after the 600th: 1,290 of one vertical blank
 two (1,013 and 574). The render thread in frames 1,560 to 1,800: 18.0 to 19.2 ms a frame where
 it was 20.1 to 20.6.
 
+### Smaller cuts after the helper (2026-11-17)
+
+Each with the same output (the host's hash a frame over 898 frames with `SLY1_PART_HASH_NOW=1`;
+six frames in Ryujinx to the byte), measured on the Switch over frames 1,560 to 1,860:
+
+- DIRECT's data for the GS thread copied in whole runs, not a quadword at a time: no gain that
+  shows (the render thread's `memmove` and `Vif::Words` as before). Kept: it is the simpler path.
+- The GS held once for each of the GS thread's items, not once for each packet and batch in it;
+  the place of the next kept batch in `KeptTable` asked for a turn ahead (`Backend::KeptAhead`);
+  the last 64 textures found kept before the map (`Renderer::recent_`). The GS thread 14.3 to
+  15.8 ms a frame where it was 15.0 to 16.6.
+
+The opening's frames after the 600th: 1,317 of one vertical blank, 421 of two. What is left at
+two blanks is frames 1,560 to 1,860, where the render thread is busy 17.7 to 19.0 ms a frame:
+`LitColours` 2.2 ms, `LightFourWide` 1.2, the unpacks 1.2, `memmove` 1.0, `BatchTransformNow`
+0.9 (the registers a deferred batch leaves), the list's walk and words 1.7, outlines 0.7.
+
 ### The handheld GPU clock: not used
 
 `SLY1_PERF_CONFIG=92220007` asks the system for that performance configuration in handheld mode

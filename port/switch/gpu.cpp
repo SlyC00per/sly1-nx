@@ -263,6 +263,12 @@ private:
         std::vector<Slot> slots = std::vector<Slot>(1u << 16);
         std::size_t used = 0;   // slots that are not empty
         static std::size_t Start(std::uint64_t key) { return (std::size_t)((key * 0x9E3779B97F4A7C15ull) >> 32); }
+        void ahead(std::uint64_t key) const
+        {
+            const Slot* s = &slots[Start(key) & (slots.size() - 1)];
+            __builtin_prefetch(s);
+            __builtin_prefetch(reinterpret_cast<const char*>(s) + sizeof(Slot) - 1);
+        }
         Kept* find(std::uint64_t key)
         {
             const std::size_t mask = slots.size() - 1;
@@ -312,6 +318,12 @@ private:
     std::uint64_t keptDraws_ = 0, keptPlaced_ = 0, keptBytes_ = 0, keptNoRoom_ = 0, keptForgotten_ = 0;
     bool KeepRoom(std::uint32_t bytes, std::uint32_t* at, std::uint32_t* got);
     void ForgetKept(std::uint64_t first, std::uint64_t count) override;
+    struct Recent {
+        std::uint64_t key = 0;
+        const Texture* texture = nullptr;
+    };
+    Recent recent_[64];
+    void KeptAhead(std::uint64_t keep) override { kept_.ahead(keep); }
     struct BatchCache {   // the last batch put in the frame's memory (DrawBatch)
         std::uint32_t id = 0;
         std::uint64_t sends = 0;
@@ -827,9 +839,15 @@ const Texture* Renderer::TextureFor(const gs::DrawState& state)
     // what names the texels: TBP0, TBW, PSM, TW, TH and the palette's CBP, CPSM, CSM, CSA
     std::uint64_t key = state.tex0 & 0x1FFFFFE3FFFFFFFFull;
     std::uint32_t generation = gs::TextureGeneration(state);
+    // the last textures found, by their keys, before the map (its lookup is memory not seen lately)
+    Recent& recent = recent_[(key * 0x9E3779B97F4A7C15ull) >> 58];
+    if (recent.texture && recent.key == key && recent.texture->generation == generation)
+        return recent.texture;
     auto it = textures_.find(key);
-    if (it != textures_.end() && it->second.generation == generation)
+    if (it != textures_.end() && it->second.generation == generation) {
+        recent = {key, &it->second};
         return &it->second;
+    }
     std::uint64_t hash = gs::TextureSource(state);
     hashes_++;
     if (it != textures_.end() && it->second.hash == hash) {
@@ -863,6 +881,8 @@ const Texture* Renderer::TextureFor(const gs::DrawState& state)
             // full: everything drawn with the old textures first, then all of them forgotten
             Send(true);
             textures_.clear();
+            for (Recent& r : recent_)
+                r = Recent();
             beginTexture_ = nullptr;
             textureUsed_ = 0;
             nextTexture_ = 0;

@@ -97,6 +97,9 @@ public:
     virtual bool DrawBatch(const DrawState&, const Batch&) { return false; }
     // The batches with keep from first on, count of them, will not come again.
     virtual void ForgetKept(std::uint64_t, std::uint64_t) {}
+    // A batch with this keep comes soon: what the renderer will look up for it may be asked of
+    // memory now (called on the thread that draws, without the GS held).
+    virtual void KeptAhead(std::uint64_t) {}
     // The game swapped its double buffer: DISPFB's buffer is the one to show.
     virtual void Present(std::uint64_t dispfb, std::uint64_t display) = 0;
 };
@@ -122,6 +125,8 @@ void PartCounts(std::uint64_t in[2], std::uint64_t out[2], std::uint64_t* parts)
 // Batch::keep's keys from first on, count of them, will not come again (the backend may let go of
 // what it kept for them).
 void ForgetKept(std::uint64_t first, std::uint64_t count);
+// A batch with this keep is about to be handed over (Backend::KeptAhead).
+void KeptAhead(std::uint64_t keep);
 void SetBatchSink(bool (*sink)(std::uint32_t tagWord1, const Batch& batch));
 
 // Whether the renderer set takes batches.

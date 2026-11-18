@@ -2000,6 +2000,11 @@ namespace {
 bool (*g_batchSink)(std::uint32_t, const Batch&);
 }
 void SetBatchSink(bool (*sink)(std::uint32_t, const Batch&)) { g_batchSink = sink; }
+void KeptAhead(std::uint64_t keep)
+{
+    if (g_backend)
+        g_backend->KeptAhead(keep);
+}
 void ForgetKept(std::uint64_t first, std::uint64_t count)
 {
     Guard lk;
