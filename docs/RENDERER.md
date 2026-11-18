@@ -826,6 +826,45 @@ two blanks is frames 1,560 to 1,860, where the render thread is busy 17.7 to 19.
 `LitColours` 2.2 ms, `LightFourWide` 1.2, the unpacks 1.2, `memmove` 1.0, `BatchTransformNow`
 0.9 (the registers a deferred batch leaves), the list's walk and words 1.7, outlines 0.7.
 
+### The parts drawn the long way (2026-11-18)
+
+A part with no light cache to draw from (`DrawModelPart`'s slow path: the game writes the
+part's own packets, and VU1 lights it each frame) had no hook, so it was never drawn again
+from what was kept. A second patch in `tools/patches.py` makes that path a chain of its own: a
+marker (two NOPs, `0x000051A0` and `0x00800000 | cache >> 4`), a CALL, a NEXT over the chain,
+the part's packets, a RET. `PartCall` takes it as it takes the first hook's, with these
+differences:
+
+- The header is unpacked inside the chain, so it is read from the chain's first tag (BASE,
+  OFFSET, the unpack of 11 quadwords) and left out of the hash; when the chain is not followed
+  it is written where the unpack would have put it.
+- The same cache is drawn more than once in a list, so a part's key has its turn in the list
+  (`g_partTurns`) and a bit for the long way.
+- VU1 lights such a part from the header, so the header is compared whole from quadword 4 on
+  (the inverse matrix and the light's centre with the rest). Comparing only what the cached
+  parts compare kept the colours of an earlier frame while the part or the camera turned: 693
+  of the opening's 898 frames hashed differently on the host. With the whole compare all 898
+  are the same as with `SLY1_PART_REPLAY=0` (`SLY1_PART_HASH_NOW=1`).
+- The helper's verdict may come too late for a part first seen this list; one with no verdict
+  for more than four lists is hashed on the render thread.
+
+`SLY1_PART_SLOW=0` runs such parts as ever. What it gains is small where things move: in the
+opening 689 such parts are drawn again (5,432 with the looser compare), and on
+the host's 360 frames at a level's start "Into the Machine" has 70 (9,413 before the compare
+was made whole), "Piranha Lake" 14,121 (37,513), "A Ghastly Voyage" 3,551 (23,371), "Treasure in the
+Depths" 18,849 (21,312). The parts refused are refused rightly: their inverse matrix does
+change. Drawing them again would need the lighting done apart from the geometry.
+
+A census of the levels is easy to misread. `--verify-levels` with `SLY1_LEVEL_FRAMES=360`
+stands at each level's start, and several levels change to a far lighter scene after some
+seconds ("Back Alley Heist": 580 parts drawn again a frame, then 40, and the frame from 33 ms
+to 17). Whether that moment falls inside the 360 frames differs from run to run, so a level's
+mean says little: three levels that looked slower with this patch were only standing in the
+heavy scene for longer. `SLY1_PERF_LOG=1` now prints the parts' counters a frame beside each
+second's times (`perfparts:`), and `partcounts:` after each level; compare seconds with the
+same counts. `SLY1_ADDR_TRACE=1` prints each caller that turns an unmapped game address into
+a pointer (none in any level).
+
 ### The handheld GPU clock: not used
 
 `SLY1_PERF_CONFIG=92220007` asks the system for that performance configuration in handheld mode

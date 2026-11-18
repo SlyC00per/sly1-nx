@@ -331,7 +331,7 @@ void GsPassOn()
 struct PartRecord;
 PartRecord* g_partRecording;   // the model part being recorded (PartReplay, below)
 void PartRecordItem(const GsItem& item);
-bool PartCall(std::uint32_t marker, std::uint32_t target);
+bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow);
 void PartDone();
 
 void GsEnqueue(GsItem&& item)
@@ -443,9 +443,14 @@ public:
     // A quadword's words: the data of a kept VIFcode (an unpack, microcode) appended at once.
     // The hook's NOP seen since the last call (LiveSink), 0 if none: the part is open from here to
     // PartEnd.
+    // Whether the hook's NOP was the pair of a part drawn the long way (its meshes' packets as a
+    // chain of their own); read before TakePartBegin, which forgets it.
+    bool PartSlow() const { return partSlow_; }
+    std::uint32_t LastTop() const { return lastTop_; }
     std::uint32_t TakePartBegin()
     {
         std::uint32_t w = partBegin_;
+        partSlow_ = false;
         partBegin_ = 0;
         if (w)
             gs::PartOpen(true, (w & 0x1FFFFF) << 4, (w >> 22) & 1);
@@ -609,6 +614,8 @@ private:
                 left_ = 0;   // NOP, MSKPATH3, MARK, the flushes (the port's transfers are done when they end)
                 if (cmd == 0x00 && (w & 0x00800000) && !vu0_)   // the hook's NOP (tools/patches.py)
                     partBegin_ = w;
+                else if (cmd == 0x00 && (w & 0x00FFFFFF) == 0x51A0 && !vu0_)   // before it: a part drawn the long way
+                    partSlow_ = true;
                 break;
             case 0x02:   // OFFSET: the double buffer's second half, and back to the first
                 ofst_ = imm & 0x3FF;
@@ -627,6 +634,7 @@ private:
                     // the double buffer swaps: the program gets TOPS as TOP, ITOPS as ITOP
                     vu1::Context c;
                     c.top = tops_;
+                    lastTop_ = tops_;
                     c.itop = itops_;
                     c.kick = KickPath1;
                     dbf_ = !dbf_;
@@ -1102,7 +1110,8 @@ private:
     std::vector<std::uint32_t> data_;
     const std::uint32_t* src_ = nullptr;   // an unpack's data where it came, in place of data_ (Words)
     std::size_t srcWords_ = 0;
-    std::uint32_t partBegin_ = 0;
+    std::uint32_t partBegin_ = 0, lastTop_ = 0;
+    bool partSlow_ = false;
     std::uint32_t left_ = 0, cl_ = 1, wl_ = 1, filled_ = 0;
     std::uint32_t qword_[4] = {};
     bool irq_ = false, direct_ = false;
@@ -1270,6 +1279,10 @@ struct PartRecord {
     // A part found changed is hashed before each decision, as it was, until this frame: one that
     // changes every frame or two would otherwise be drawn as it was every other frame for good.
     std::uint64_t watchUntil = 0;
+    // a part drawn the long way: its header as its first batch found it, and where
+    bool slow = false, headerSet = false;
+    std::uint32_t headerAt = 0;
+    std::uint32_t verdictList = 0;   // the list in which the helper's last good hash of it came
 };
 std::unordered_map<std::uint32_t, PartRecord> g_parts;
 
@@ -1283,13 +1296,21 @@ std::unordered_map<std::uint32_t, PartRecord> g_parts;
 // are compared at once as before. SLY1_PART_HASH_NOW=1: every hash before the decision, as before.
 struct HashJob {
     std::uint32_t key, serial, target, cl, wl;
-    bool tte, whole;
+    bool tte, whole, slow;
+    std::uint32_t list;   // the list it came in (g_listSerial)
 };
 struct HashResult {
     std::uint32_t key, serial;
     std::uint64_t hash, hashWhole;
-    bool whole;
+    bool whole, valid;
 };
+// The lists the render thread has begun. The chain of a part drawn the long way lies in its
+// frame's packet memory, which the game starts to write over when it has handed the next frame's
+// list to be drawn: a hash the helper makes of it is good only if no later list had begun when the
+// hash was done.
+std::uint32_t g_listSerial;
+std::atomic<std::uint32_t> g_listsBegun;
+std::atomic<std::uint64_t> g_hashTooLate;
 std::mutex g_hashLock;
 std::condition_variable g_hashWake;
 std::vector<HashJob> g_hashJobs, g_hashPending;      // for the helper; the render thread's, not passed on yet
@@ -1298,8 +1319,10 @@ std::atomic<bool> g_hashAnyResult, g_hashStarted;
 std::atomic<std::uint64_t> g_hashHelperNs, g_hashHelped;
 std::uint32_t g_partSerial;
 std::uint64_t g_partsLate;   // drawn again on a hash a frame late
+std::unordered_map<std::uint32_t, std::uint8_t> g_partTurns;   // the times each part has come in the list being walked
+std::uint64_t g_partsSlowReplayed, g_partsSlowKept, g_partsSlowRefused;
 
-std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte);
+std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow = false);
 
 }  // namespace
 
@@ -1323,9 +1346,16 @@ void HashHelperMain()
         const std::uint64_t t0 = NowNs();
         for (std::size_t n = 0; n < jobs.size(); n++) {
             const HashJob& j = jobs[n];
-            HashResult r = {j.key, j.serial, PartHash(j.target, false, j.cl, j.wl, j.tte), 0, j.whole};
-            if (j.whole)
-                r.hashWhole = PartHash(j.target, true, j.cl, j.wl, j.tte);
+            HashResult r = {j.key, j.serial, 0, 0, j.whole, true};
+            if (!(j.slow && g_listsBegun.load(std::memory_order_acquire) != j.list)) {
+                r.hash = PartHash(j.target, false, j.cl, j.wl, j.tte, j.slow);
+                if (j.whole)
+                    r.hashWhole = PartHash(j.target, true, j.cl, j.wl, j.tte, j.slow);
+            }
+            if (j.slow && g_listsBegun.load(std::memory_order_acquire) != j.list) {
+                r.valid = false;
+                g_hashTooLate++;
+            }
             results.push_back(r);
         }
         g_hashHelped += jobs.size();
@@ -1379,6 +1409,9 @@ void HashTakeResults()
             continue;
         PartRecord& r = it->second;
         r.asked = false;
+        if (!h.valid)
+            continue;
+        r.verdictList = g_listSerial;
         r.seen = h.hash;
         if (h.whole) {
             r.seenWhole = h.hashWhole;
@@ -1397,6 +1430,7 @@ bool PartReplayOn()
     return !off && GsAsync();
 }
 
+void PartHeader(std::uint32_t tops, std::uint32_t out[44]);
 void PartRecordItem(const GsItem& item)
 {
     PartRecord& r = *g_partRecording;
@@ -1430,6 +1464,9 @@ struct PartHasher {
     std::uint64_t h = 0xCBF29CE484222325ull;
     std::uint32_t left = 0, cl = 1, wl = 1, at = 0;
     bool whole = false, sampled = false;
+    // a part drawn the long way: the data of its header's unpack (the chain's first unpack of 11
+    // whole quadwords) is left out, as the header of a part drawn from its cache is compared apart
+    bool skipHeader = false, ignored = false;
     void Mix(std::uint32_t w)
     {
         h = (h ^ w) * 0x9E3779B97F4A7C15ull;
@@ -1451,6 +1488,12 @@ struct PartHasher {
                     std::uint32_t bits = (vn == 3 && vl == 3) ? 16 : (32u >> vl) * (vn + 1);
                     left = (vectors * bits + 31) / 32;
                     sampled = !whole && left > 64;
+                    ignored = false;
+                    if (skipHeader && num == 0x0B && vn == 3 && vl == 0) {
+                        skipHeader = false;
+                        ignored = true;
+                        sampled = false;
+                    }
                 } else if (cmd == 0x01) {
                     cl = imm & 0xFF;
                     wl = (imm >> 8) & 0xFF;
@@ -1468,6 +1511,12 @@ struct PartHasher {
                 continue;
             }
             const std::size_t take = std::min<std::size_t>(left, n - k);
+            if (ignored) {
+                k += take;
+                at += (std::uint32_t)take;
+                left -= (std::uint32_t)take;
+                continue;
+            }
             if (!sampled) {
                 std::size_t i = 0;
                 for (; i + 2 <= take; i += 2) {   // two words at a time
@@ -1498,14 +1547,27 @@ struct PartHasher {
 
 bool PartTte() { return (static_cast<volatile std::uint32_t*>(Native(kVif1))[0] & 0x40) != 0; }
 
-std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte)
+std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow)
 {
     PartHasher hasher;
+    hasher.skipHeader = slow;
     hasher.whole = whole;
     hasher.cl = cl;
     hasher.wl = wl;
+    // An address the walk reads must lie in main memory (or its uncached alias): the chain of a
+    // part drawn the long way is in the frame's own packet memory, which the game writes over two
+    // frames on, and the helper may come to it after that and find anything in its tags.
+    bool wild = false;
+    auto inMemory = [&](std::uint32_t addr, std::uint32_t quads) {
+        const std::uint32_t a = addr & 0x0FFFFFF0;
+        const bool ok = (addr & 0x40000000u) == 0 && a >= 0x10 && a < kRamSize && quads <= (kRamSize - a) / 16;
+        wild = wild || !ok;
+        return ok;
+    };
     auto data = [&](std::uint32_t addr, bool spr, std::uint32_t qwc) {
         if (!spr) {
+            if (!inMemory(addr, qwc))
+                return;
             hasher.Feed(At(addr, false), (std::size_t)qwc * 4);
         } else {
             for (std::uint32_t i = 0; i < qwc; i++)
@@ -1516,6 +1578,8 @@ std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::
     int depth = 0;
     for (int guard = 0; guard < 4096; guard++) {
         const bool tagSpr = (tadr & 0x80000000u) != 0;
+        if (wild || (!tagSpr && !inMemory(tadr & 0x7FFFFFFFu, 2)))
+            return 0;
         const std::uint32_t* tag = At(tadr & 0x7FFFFFFFu, tagSpr);
         std::uint32_t qwc = tag[0] & 0xFFFF, id = (tag[0] >> 28) & 7, addr = tag[1] & 0x7FFFFFF0;
         bool spr = (tag[1] >> 31) != 0;
@@ -1580,21 +1644,58 @@ void PartForget(PartRecord& r)
 // flag) and 10's w (the colours' scale). A part drawn from its cache is unlit or lit by the cache
 // alone, so the inverse matrix (4 to 7) is not read, and 10's x y z, the centre for a light, are
 // what was on the game's stack.
-bool PartHeaderSame(const std::uint32_t a[44], const std::uint32_t b[44])
+// A part drawn the long way is lit by VU1 from the header: its colours are right only while the
+// inverse matrix and the centre are the same too (4 to 10 whole).
+bool PartHeaderSame(const std::uint32_t a[44], const std::uint32_t b[44], bool slow)
 {
+    if (slow)
+        return std::memcmp(a + 16, b + 16, 28 * 4) == 0;
     return std::memcmp(a + 32, b + 32, 32) == 0 && a[43] == b[43];
 }
 
 // The hook's NOP and then the call of target: true when the part has been drawn from what was
 // kept, and the call is not to be followed.
-bool PartCall(std::uint32_t marker, std::uint32_t target)
+bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
 {
     if (!PartReplayOn() || !g_vif1.BetweenCodes())
         return false;
-    const std::uint32_t key = marker & 0x7FFFFF;
+    // A part drawn the long way (the game's own packets for its meshes, lit by VU1 each frame; the
+    // second hook makes them a chain called from the list): kept and drawn again as a part drawn
+    // from its cache is, with two differences. Its header is unpacked inside the chain, so the
+    // header is not compared apart (the hash covers it) and is taken from VU1's memory when the
+    // part's first batch is recorded; and when the chain is left out the header is put where the
+    // chain would have put it, for what the game draws of the part afterwards (its strips).
+    // SLY1_PART_SLOW=0: such parts run as ever.
+    static const bool noSlow = std::getenv("SLY1_PART_SLOW") && std::getenv("SLY1_PART_SLOW")[0] == '0';
+    if (slow && noSlow)
+        return false;
+    // A part drawn more than once in a list under one name (the same light cache for two
+    // requests) is a part of its own each time, by its turn in the list: under one key the
+    // drawings took each other's place and each was found changed every frame.
+    std::uint32_t key = (marker & 0x7FFFFF) | (slow ? 0x800000u : 0u);
+    {
+        std::uint8_t& turn = g_partTurns[key];
+        key |= (std::uint32_t)turn << 24;
+        if (turn < 255)
+            turn++;
+    }
     const Vif::Regs regs = g_vif1.GetRegs();
-    std::uint32_t header[44];
-    PartHeader(regs.tops, header);
+    std::uint32_t header[44], headerAt = 0;
+    if (slow) {
+        // the header where the chain has it: its first tag's data begins BASE, OFFSET, and the
+        // unpack of the header's 11 quadwords at TOPS (which OFFSET makes BASE)
+        if (target & 0x80000000u)
+            return false;
+        const std::uint32_t* tag = At(target, false);
+        const std::uint32_t* d = tag + 4;
+        if (((tag[0] >> 28) & 7) != 1 || (tag[0] & 0xFFFF) < 12 || (d[0] >> 24) != 0x03 || (d[1] >> 24) != 0x02 ||
+            ((d[2] >> 24) & 0x6F) != 0x6C || ((d[2] >> 16) & 0xFF) != 0x0B)
+            return false;
+        headerAt = ((d[2] & 0x8000) ? (d[0] & 0x3FF) : 0) + (d[2] & 0x3FF);
+        std::memcpy(header, d + 3, sizeof header);
+    } else {
+        PartHeader(regs.tops, header);
+    }
     const bool tte = PartTte();
     auto it = g_parts.find(key);
     std::uint64_t hash = 0;
@@ -1606,13 +1707,15 @@ bool PartCall(std::uint32_t marker, std::uint32_t target)
             g_partsFickle++;
             return false;   // one that keeps changing, left alone for now: no hash needed
         }
-        if ((r.ok || r.moving) && gs::FramesShown() >= r.watchUntil) {
+        // (a part drawn the long way whose hash the helper has not made in time for four lists is
+        // hashed here: it is not drawn again unseen for longer)
+        if ((r.ok || r.moving) && gs::FramesShown() >= r.watchUntil && !(slow && g_listSerial - r.verdictList > 4)) {
             late = true;
             hash = r.seen ? r.seen : r.hash;
             if (!r.asked) {
                 r.asked = true;
                 const bool whole = r.ok && (r.verified < 8 || ((gs::FramesShown() + key) & 31) == 0);
-                g_hashPending.push_back({key, r.serial, target, regs.cl, regs.wl, tte, whole});
+                g_hashPending.push_back({key, r.serial, target, regs.cl, regs.wl, tte, whole, slow, g_listSerial});
                 if (g_hashPending.size() >= 16)
                     HashPassOn();
             }
@@ -1620,7 +1723,7 @@ bool PartCall(std::uint32_t marker, std::uint32_t target)
     }
     auto hashNow = [&] {
         const std::uint64_t h0 = NowNs();
-        const std::uint64_t h = PartHash(target, false, regs.cl, regs.wl, tte);
+        const std::uint64_t h = PartHash(target, false, regs.cl, regs.wl, tte, slow);
         g_partHashNs += NowNs() - h0;
         return h;
     };
@@ -1632,12 +1735,12 @@ bool PartCall(std::uint32_t marker, std::uint32_t target)
     }
     if (it != g_parts.end() && it->second.ok) {
         PartRecord& r = it->second;
-        bool same = hash != 0 && r.hash == hash && r.before == regs && PartHeaderSame(r.header, header);
+        bool same = hash != 0 && r.hash == hash && r.before == regs && PartHeaderSame(r.header, header, slow);
         if (!same)   // why, for the report: the hash, the registers, or the header
             g_partsStaleBy[r.hash != hash ? 0 : !(r.before == regs) ? 1 : 2]++;
         const bool wholeDue = late ? r.wholeArrived : (r.verified < 8 || ((gs::FramesShown() + key) & 31) == 0);
         if (same && wholeDue) {
-            const std::uint64_t whole = late ? r.seenWhole : PartHash(target, true, regs.cl, regs.wl, tte);
+            const std::uint64_t whole = late ? r.seenWhole : PartHash(target, true, regs.cl, regs.wl, tte, slow);
             r.wholeArrived = false;
             if (whole == r.hashWhole) {
                 r.verified++;
@@ -1660,7 +1763,15 @@ bool PartCall(std::uint32_t marker, std::uint32_t target)
             item.words = GsSpare();
             item.words.resize(26);
             float matrix[16];
-            vu1::PartMatrix(regs.tops, matrix);
+            if (r.slow) {
+                vu1::PartMatrixFrom(reinterpret_cast<const float*>(header), matrix);
+                std::uint8_t* d = vu1::Data();
+                for (int k = 0; k < 11; k++)
+                    std::memcpy(d + ((headerAt + (std::uint32_t)k) & 0x3FF) * 16, header + k * 4, 16);
+                g_partsSlowReplayed++;
+            } else {
+                vu1::PartMatrix(regs.tops, matrix);
+            }
             std::memcpy(&item.words[0], matrix, sizeof matrix);
             std::memcpy(&item.words[16], vu1::Data(), 32);
             item.words[24] = vu1::TakeBatchIds(r.ids);
@@ -1707,6 +1818,8 @@ bool PartCall(std::uint32_t marker, std::uint32_t target)
     PartForget(r);
     r = PartRecord();
     r.serial = ++g_partSerial;
+    r.verdictList = g_listSerial;
+    r.slow = slow;
     r.watchUntil = watchUntil;
     r.stale = stale;
     if (stale >= 3) {
@@ -1717,7 +1830,7 @@ bool PartCall(std::uint32_t marker, std::uint32_t target)
     }
     r.keyFirst = g_partKey + 1;
     r.hash = hash;
-    r.hashWhole = PartHash(target, true, regs.cl, regs.wl, tte);
+    r.hashWhole = PartHash(target, true, regs.cl, regs.wl, tte, slow);
     std::memcpy(r.header, header, sizeof header);
     r.before = regs;
     r.troubleWas = vu1::PartTrouble();
@@ -1738,7 +1851,11 @@ void PartDone()
     bool ok = !r->bad && g_vif1.BetweenCodes() && vu1::PartTrouble() == r->troubleWas && g_counts.vifInterrupts == r->interruptsWas &&
               g_counts.finishes == r->finishesWas && !r->items.empty();
     float matrix[16];
-    vu1::PartMatrix(r->before.tops, matrix);
+    if (r->slow) {
+        vu1::PartMatrixFrom(reinterpret_cast<const float*>(r->header), matrix);
+    } else {
+        vu1::PartMatrix(r->before.tops, matrix);
+    }
     std::uint32_t minId = ~0u, maxId = 0;
     for (std::size_t k = 0; ok && k < r->items.size(); k++) {
         const std::vector<std::uint32_t>& w = *r->items[k].words;
@@ -1782,7 +1899,23 @@ void PartDone()
         r->notBefore = gs::FramesShown() + 30;   // not tried again at once
     }
     (ok ? g_partsRecorded : g_partsRefused)++;
+    if (r->slow)
+        (ok ? g_partsSlowKept : g_partsSlowRefused)++;
 }
+}  // namespace
+
+void PartCountsLine(const char* what)
+{
+    std::fprintf(stderr, "partcounts: %s: drawn again %llu (long way %llu), kept %llu, refused %llu, stale by hash %llu regs %llu header %llu, fickle %llu, "
+                 "moving %llu, hashed here %.2f s, too late %llu, kept words %.1f MB, let go %llu, batches queued %llu\n", what,
+                 (unsigned long long)g_partsReplayed, (unsigned long long)g_partsSlowReplayed, (unsigned long long)g_partsRecorded,
+                 (unsigned long long)g_partsRefused, (unsigned long long)g_partsStaleBy[0], (unsigned long long)g_partsStaleBy[1],
+                 (unsigned long long)g_partsStaleBy[2], (unsigned long long)g_partsFickle, (unsigned long long)g_partsMoving, g_partHashNs / 1e9,
+                 (unsigned long long)g_hashTooLate.load(), g_partWords * 4 / 1e6, (unsigned long long)g_partsCleared,
+                 (unsigned long long)g_batchesQueued.load());
+}
+
+namespace {
 }  // namespace
 
 // The chain's walk hands the data over a quadword at a time; quadwords that follow each other in
@@ -1821,10 +1954,11 @@ struct LiveSink {
     bool SkipCall(std::uint32_t target)
     {
         Flush();   // the words before the call first, the NOP among them
+        const bool slow = g_vif1.PartSlow();
         std::uint32_t marker = g_vif1.TakePartBegin();
         if (!marker)
             return false;
-        if (PartCall(marker, target)) {
+        if (PartCall(marker, target, slow)) {
             g_vif1.PartEnd();
             return true;
         }
@@ -2247,6 +2381,8 @@ void RenderThreadMain()
             if (!gsThread)
                 hold.emplace();
             {
+                g_partTurns.clear();
+                g_listsBegun.store(++g_listSerial, std::memory_order_release);
                 LiveSink sink;
                 WalkChain(item.regs, item.tadr, sink);
             }
@@ -2300,6 +2436,19 @@ void RenderThreadMain()
                     std::fprintf(stderr, "perf: frames to %llu: %.1f ms a frame; render thread %.1f, GS thread %.1f, the game's threads %.1f\n",
                                  (unsigned long long)shown, (now - since) / n, (render - renderWas) / n, (gsNs - gsWas) / n,
                                  ((double)(now - since) - (double)(idle - idleWas)) / n);
+                {
+                    // the parts' counters over the same frames, a frame
+                    static std::uint64_t was[8];
+                    const std::uint64_t is[8] = {g_partsReplayed, g_partsRecorded, g_partsRefused, g_partsStaleBy[0], g_partsStaleBy[1],
+                                                 g_partsStaleBy[2], g_partsFickle, g_batchesQueued.load()};
+                    const double f = (double)(shown - shownWas);
+                    if (since)
+                        std::fprintf(stderr, "perfparts: to %llu, a frame: drawn again %.0f, kept %.1f, refused %.1f, stale by hash %.1f regs %.1f header %.1f, "
+                                     "fickle %.0f, batches %.0f\n", (unsigned long long)shown, (is[0] - was[0]) / f, (is[1] - was[1]) / f,
+                                     (is[2] - was[2]) / f, (is[3] - was[3]) / f, (is[4] - was[4]) / f, (is[5] - was[5]) / f, (is[6] - was[6]) / f,
+                                     (is[7] - was[7]) / f);
+                    std::memcpy(was, is, sizeof was);
+                }
                 idleWas = idle;
                 shownWas = shown;
                 since = now;
@@ -2346,6 +2495,11 @@ void DmacDump()
         std::fprintf(stderr, "dmac: parts kept anew because of the hash %llu, VIF1's registers %llu, the header %llu; %.2f s hashing packets; %.1f MB kept, "
                      "all let go %llu times; run as ever %llu times because they kept changing\n", (unsigned long long)g_partsStaleBy[0], (unsigned long long)g_partsStaleBy[1],
                      (unsigned long long)g_partsStaleBy[2], g_partHashNs / 1e9, g_partWords * 4 / 1e6, (unsigned long long)g_partsCleared, (unsigned long long)g_partsFickle);
+    if (g_partsSlowKept || g_partsSlowRefused)
+        std::fprintf(stderr, "dmac: parts drawn the long way: drawn again %llu times, kept %llu times, not kept %llu times\n",
+                     (unsigned long long)g_partsSlowReplayed, (unsigned long long)g_partsSlowKept, (unsigned long long)g_partsSlowRefused);
+    if (g_hashTooLate.load())
+        std::fprintf(stderr, "dmac: %llu hashes of parts drawn the long way not made in time (a later list had begun)\n", (unsigned long long)g_hashTooLate.load());
     if (g_hashHelped.load())
         std::fprintf(stderr, "dmac: %llu parts drawn again on the hash of the frame before; the helper hashed %llu parts in %.2f s\n",
                      (unsigned long long)g_partsLate, (unsigned long long)g_hashHelped.load(), g_hashHelperNs.load() / 1e9);

@@ -30,6 +30,9 @@ void RenderThreadMain();
 // The render thread's helper (the hashes of the model parts drawn again, a frame late): its body,
 // started beside the GS thread. Without it every hash is made on the render thread.
 void HashHelperMain();
+// The counts of the model parts kept and drawn again so far, on one line (after each level of
+// --verify-levels, to see a level's own by the difference).
+void PartCountsLine(const char* what);
 // The GS thread's body (the GS's packets and the display's calls, after the render thread's), on
 // a stack in game memory too (it raises the GS's interrupt).
 void GsThreadMain();

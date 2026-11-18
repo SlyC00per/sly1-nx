@@ -4,6 +4,7 @@
 #include "port/ptr32.h"
 #include "port/vu0_micro.h"
 
+#include <set>
 #include <algorithm>
 #include <cstdio>
 #include <functional>
@@ -178,6 +179,17 @@ void* NativeSlow(std::uint32_t addr)
     // An address of nothing (a plain word the game keeps where a declaration says pointer comes
     // here too, and is never read): the first above main memory's end is reported with its caller,
     // which a read would fault in.
+    // SLY1_ADDR_TRACE=1: each place that asks for an address of nothing, once (a pointer cut to 32
+    // bits and handed on as a game address is found this way before it is read).
+    static const bool trace = std::getenv("SLY1_ADDR_TRACE") != nullptr;
+    if (trace) {
+        static std::mutex lock;
+        static std::set<std::uintptr_t> seen;
+        const std::uintptr_t from = reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)) - ImageBase();
+        std::lock_guard<std::mutex> lk(lock);
+        if (seen.size() < 200 && seen.insert(from).second)
+            std::fprintf(stderr, "addrtrace: game address 0x%08X maps to nothing; from image +0x%llX\n", addr, (unsigned long long)from);
+    }
     static bool reported;
     if (!reported && addr - kRamSize < 0x00100000u) {
         reported = true;

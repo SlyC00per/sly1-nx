@@ -39,6 +39,9 @@ void DataWritten(std::uint32_t qaddr, std::uint32_t count, std::uint32_t cycle, 
 // the header at top and the matrix at 4-7 of data memory; a count that grows when a batch was
 // not handed over as it was unpacked; the packet not run; ids for count batches.
 void PartMatrix(std::uint32_t top, float out[16]);
+// The same from a header's first four quadwords held elsewhere (a part whose header is unpacked
+// inside its own packet).
+void PartMatrixFrom(const float* header, float out[16]);
 std::uint64_t PartTrouble();
 void PartSkipped();
 std::uint32_t TakeBatchIds(std::uint32_t count);

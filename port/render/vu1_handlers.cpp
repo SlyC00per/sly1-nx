@@ -3501,6 +3501,24 @@ void PartMatrix(std::uint32_t top, float out[16])
     }
 }
 
+void PartMatrixFrom(const float* header, float out[16])
+{
+    const std::uint8_t* d = Data();
+    V g[4], a[4];
+    for (int k = 0; k < 4; k++) {
+        std::memcpy(&g[k], header + k * 4, 16);
+        std::memcpy(&a[k], d + (4 + k) * 16, 16);
+    }
+    for (int k = 0; k < 4; k++) {
+        F4 acc = Mul4(a[0].v, Splat(g[k].x));
+        acc = Add4(acc, Mul4(a[1].v, Splat(g[k].y)));
+        acc = Add4(acc, Mul4(a[2].v, Splat(g[k].z)));
+        V res;
+        res.v = Add4(acc, Mul4(a[3].v, Splat(g[k].w)));
+        std::memcpy(out + k * 4, &res, 16);
+    }
+}
+
 // What says a part's batches were not all handed over as they were unpacked: the batches
 // transformed late, those not taken, those written over first.
 std::uint64_t PartTrouble()

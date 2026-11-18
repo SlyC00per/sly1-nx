@@ -650,6 +650,39 @@ PATCHES = [
      "    case 6:\n        {\n            PlayerRequestFn fn = (PlayerRequestFn)self->lastMessage.fn;\n            if (fn != 0) {\n                self->lastMessage.fn = 0;\n                fn(self->lastMessage.data, self);",
      "    case 6:\n        {\n            PlayerRequestFn fn = (PlayerRequestFn)self->lastMessage.fn;\n            if (fn != 0) {\n                self->lastMessage.fn = 0;\n                fn((void*)self->lastMessage.data, self);",
      "the request's data is the object that sent it, which its callback takes as a pointer"),
+
+    # A second hook in the part's drawing (docs/RENDERER.md, "The parts drawn the long way"): the
+    # packets of a part's meshes written as a chain of their own, called from the list (a NOP
+    # pair naming the part's light cache, a call tag, a next tag over the chain, and a ret tag at
+    # its end). The GS sees the same words in the same order; the port may leave the call out
+    # and draw the part from what it kept of it.
+    ("src/main/placed_object_model.cpp",
+     "slow:\n    for (i = 0; i < part->nmeshes; i++) {\n        s32 k;",
+     "slow:\n"
+     "    u32* port_span = 0;\n"
+     "    if (cache != 0 && part->nmeshes > 0) {\n"
+     "        tag = VifPacketWriter::Open(&g_vifPacketWriter);\n"
+     "        VifPacketWriter::Word(&g_vifPacketWriter, 0x000051A0);\n"
+     "        VifPacketWriter::Word(&g_vifPacketWriter, 0x00800000 | (((u32)cache >> 4) & 0x1FFFFF));\n"
+     "        VifPacketWriter::Pad(&g_vifPacketWriter);\n"
+     "        VifPacketWriter::Close(&g_vifPacketWriter, tag);\n"
+     "        VifPacketWriter::Call(&g_vifPacketWriter, (s32)(g_vifPacketWriter.cur + 32));\n"
+     "        port_span = (u32*)g_vifPacketWriter.cur;\n"
+     "        port_span[0] = 0x20000000; port_span[1] = 0; port_span[2] = 0; port_span[3] = 0;\n"
+     "        g_vifPacketWriter.cur += 16;\n"
+     "    }\n"
+     "    for (i = 0; i < part->nmeshes; i++) {\n        s32 k;",
+     "the port's hook: a part drawn the long way is a call of its own, so that it can be drawn again from what was kept of it (docs/RENDERER.md)"),
+    ("src/main/placed_object_model.cpp",
+     "                QueueRangeRecordPacket((RangeRecord*)node);\n            }\n        }\n    }\n\n    if (skin != 0 && (skin->flags & 1)) {",
+     "                QueueRangeRecordPacket((RangeRecord*)node);\n            }\n        }\n    }\n"
+     "    if (port_span != 0) {\n"
+     "        u32* port_ret = (u32*)g_vifPacketWriter.cur;\n"
+     "        port_ret[0] = 0x60000000; port_ret[1] = 0; port_ret[2] = 0; port_ret[3] = 0;\n"
+     "        g_vifPacketWriter.cur += 16;\n"
+     "        port_span[1] = (u32)g_vifPacketWriter.cur;\n"
+     "    }\n\n    if (skin != 0 && (skin->flags & 1)) {",
+     "the port's hook: a part drawn the long way is a call of its own, so that it can be drawn again from what was kept of it (docs/RENDERER.md)"),
 ]
 
 

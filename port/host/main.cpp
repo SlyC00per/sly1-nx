@@ -263,6 +263,11 @@ void VerifyLevels()
             fail("60 frames did not run within 60 s of the load", i + 1);
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "verify: level %2d loaded and ran 60 frames (%.1f s)\n", i + 1, s);
+        {
+            char what[32];
+            std::snprintf(what, sizeof what, "after level %d", i + 1);
+            port::PartCountsLine(what);
+        }
         std::fprintf(stderr, "verify: level %2d stream at close: %d decompressed bytes unread, %d compressed bytes "
                      "unread, %d read but not unpacked, %d carried, texture block %d bytes %s\n", i + 1, end.remaining,
                      end.bytesToRead, end.nextCount, end.carry, end.blockSize, end.blockLoad ? "read" : "kept");
