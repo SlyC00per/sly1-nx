@@ -12,6 +12,8 @@ static std::uint32_t ReplyBuffer() { return *static_cast<std::uint32_t*>(port::N
 static std::int32_t ReplyWordCount() { return *static_cast<std::int32_t*>(port::Native(0x0025C344)); }
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <set>
@@ -33,12 +35,25 @@ void BindIopService(RemoteCallClient* client, std::uint32_t service)
     std::fprintf(stderr, "iop: bound service 0x%08X\n", service);
 }
 
-void CallIopService(RemoteCallClient* client, std::int32_t cmd, const void*, std::int32_t sendSize, void*,
+void CallIopService(RemoteCallClient* client, std::int32_t cmd, const void* send, std::int32_t sendSize, void*,
                     std::int32_t recvSize)
 {
     std::lock_guard<std::mutex> lock(g_lock);
     auto it = g_services.find(client);
     std::uint32_t service = it == g_services.end() ? 0 : it->second;
+    {   // SLY1_SND_LOG=1: each command with the words it sends (the first 40 of each), for the sound engine's design
+        static const bool log = std::getenv("SLY1_SND_LOG") != nullptr;
+        static std::map<std::pair<std::uint32_t, std::int32_t>, int> seen;
+        if (log && seen[{service, cmd}]++ < 40) {
+            std::fprintf(stderr, "sndlog: %08X cmd %02X:", service, (unsigned)cmd);
+            for (std::int32_t k = 0; send && k + 4 <= sendSize && k < 40; k += 4) {
+                std::uint32_t w;
+                std::memcpy(&w, static_cast<const char*>(send) + k, 4);
+                std::fprintf(stderr, " %08X", w);
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
     if (g_logged.insert({service, cmd}).second)
         std::fprintf(stderr, "iop: service 0x%08X command 0x%X (send %d, receive %d bytes)\n",
                      service, (unsigned)cmd, (int)sendSize, (int)recvSize);
