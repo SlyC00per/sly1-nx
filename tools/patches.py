@@ -162,6 +162,32 @@ PATCHES = [
      "    BuildMatrixFromRotationAndTranslation((const Vec4*)((Camera*)s)->position, (const Mat3*)&((Camera*)s)->rot80, (Mat4A*)tmp);\n    for (int port_k = 0; port_k < 3; port_k++) ((f32*)tmp)[1 * 4 + port_k] *= port::WideFactor();\n    ApplyPlacedObjectTransform(obj, (Camera*)s, (ScaledTransform*)tmp);",
      "the map page as wide as the 16:9 picture"),
 
+    # Widescreen: the 2D elements (the counters, the text, the menus) are laid out for the 4:3
+    # picture, which the port shows 4/3 wider. Each screen element is drawn 3/4 as wide about the
+    # side of the screen it rests at (port::Wide2D, by the middle of where it rests), so that it
+    # has its shape and keeps its place; a vertex at the screen's very edge stays there (a fill of
+    # the whole screen). Every 2D vertex goes through these four functions.
+    ("src/main/game_progress.cpp",
+     "void AddGifXyzEntry(PacketWriter* self, s32 a1, s32 a2, u64 a3)\n{\n",
+     "void AddGifXyzEntry(PacketWriter* self, s32 a1, s32 a2, u64 a3)\n{\n    a1 = port::WideX(a1);\n",
+     "a 2D vertex's x for the 16:9 picture (port::WideX)"),
+    ("src/main/game_progress.cpp",
+     "void AddGifXyzfEntry(PacketWriter* self, u32 a1, u32 a2, u32 a3, u32 a4)\n{\n",
+     "void AddGifXyzfEntry(PacketWriter* self, u32 a1, u32 a2, u32 a3, u32 a4)\n{\n    a1 = port::WideX(a1);\n",
+     "a 2D vertex's x for the 16:9 picture (port::WideX)"),
+    ("src/main/game_progress.cpp",
+     "void AddGifXyzfNoDrawEntry(PacketWriter* self, u32 a1, u32 a2, u32 a3, u32 a4)\n{\n",
+     "void AddGifXyzfNoDrawEntry(PacketWriter* self, u32 a1, u32 a2, u32 a3, u32 a4)\n{\n    a1 = port::WideX(a1);\n",
+     "a 2D vertex's x for the 16:9 picture (port::WideX)"),
+    ("src/main/game_progress.cpp",
+     "void AddGifXyzfRegListEntry(PacketWriter* self, s32 a1, s32 a2, u32 a3, u32 a4)\n{\n",
+     "void AddGifXyzfRegListEntry(PacketWriter* self, s32 a1, s32 a2, u32 a3, u32 a4)\n{\n    a1 = port::WideX(a1);\n",
+     "a 2D vertex's x for the 16:9 picture (port::WideX)"),
+    ("src/main/object_pool.cpp",
+     "        if (p->mode != 0) {\n            p->vt->m09(p);\n        }",
+     "        if (p->mode != 0) {\n            port::Wide2D(p->shownX + p->w * 0.5f);\n            p->vt->m09(p);\n            port::Wide2D(-1.0f);\n        }",
+     "each screen element drawn about the side of the screen it rests at"),
+
     # Frame layout: g++ 2.95 put t right after arr[32] in the frame, and the cleanup walks back from
     # &t; a modern compiler places locals as it likes.
     ("src/main/script_machine.cpp",

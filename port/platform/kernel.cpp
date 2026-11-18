@@ -299,6 +299,26 @@ float WideFactor()
     return factor;
 }
 
+namespace {
+float g_wideAnchor = -1.0f;   // the x the element being drawn is narrowed about, or none
+}
+void Wide2D(float middle)
+{
+    if (middle < 0.0f || WideFactor() == 1.0f)
+        g_wideAnchor = -1.0f;
+    else
+        g_wideAnchor = middle < 640.0f / 3 ? 0.0f : middle > 640.0f * 2 / 3 ? 640.0f : 320.0f;
+}
+int WideX(int x)
+{
+    if (g_wideAnchor < 0.0f)
+        return x;
+    const float at = (float)x / 16.0f - 1728.0f;
+    if (at <= 0.5f || at >= 639.5f)
+        return x;
+    return (int)((g_wideAnchor + (at - g_wideAnchor) / WideFactor() + 1728.0f) * 16.0f);
+}
+
 // A call for the game's own thread to make (the host's diagnosis: placing the player), taken at
 // the next point where a game thread lets others in.
 std::atomic<void (*)()> g_gameThreadCall{nullptr};

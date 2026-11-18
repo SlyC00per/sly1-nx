@@ -387,8 +387,18 @@ picture: it is made 4/3 wider across the screen (a patch of `ApplyWarpPageTransf
 PS3 release stretches it; before, the level showed at its sides. `--level N --env SLY1_MAP=1`
 opens a level's map page on the host.
 
-Not done: the 2D elements (the counters, the text, the menus) are laid out for 4:3 and are a
-third too wide; videos. On the Switch the same place costs more
+The 2D elements are laid out for the 4:3 picture. Each screen element (`DrawScreenElements`'s
+loop) is drawn 3/4 as wide about the left edge, the middle or the right edge of the screen, by
+the third in which the middle of its resting place lies (`port::Wide2D`), so it has its shape
+and keeps its side; a vertex at the screen's very edge stays there, so a fill of the whole
+screen (a fade, the letterbox bars) still spans it. Every 2D vertex goes through four functions
+of the game (`AddGifXyzEntry`, `AddGifXyzfEntry`, `AddGifXyzfNoDrawEntry`,
+`AddGifXyzfRegListEntry`), patched to pass its x through `port::WideX`. Seen on the host (the
+map page's caption) and on the Switch (the user's report: the counters, the pause menu, the
+text, the binocucom and the markers all right).
+
+Not done: videos (none are played yet). 2D drawn outside a screen element is as wide as the
+picture makes it; none has been reported. On the Switch the same place costs more
 than at 4:3 (a third more pixels and more of the world in view): the run's median frame was
 33 ms where the 4:3 run's was 28.
 

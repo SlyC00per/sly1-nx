@@ -106,6 +106,13 @@ void PreemptSlow();
 // extent is that much wider, the vertical kept; tools/patches.py's camera patch), 1 with
 // SLY1_WIDE=0.
 float WideFactor();
+// The 2D elements in the 16:9 picture (tools/patches.py). Wide2D(middle): what is drawn from now
+// is one element whose middle rests at that x of the 640 (it is drawn 3/4 as wide about the
+// left edge, the middle or the right edge of the screen, by the third the middle is in);
+// Wide2D(-1): no element. WideX: a vertex's x (12.4, with the game's offset of 1,728) as the
+// element's place makes it; one at the screen's very edge stays.
+void Wide2D(float middle);
+int WideX(int x);
 // fn called once on a game thread, at its next point of letting others in (the host's diagnosis).
 void CallOnGameThread(void (*fn)());
 #ifdef PORT_SENTINEL
