@@ -68,22 +68,32 @@ struct Stream {
     float volume = 1.0f, pan = 0.0f;
     float fade = 1.0f, fadeStep = 0.0f;   // a fade out: the gain and what it loses each frame mixed
     bool paused = false, done = false, opened = false;
+    std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();   // (for the host without a mixer)
     Adpcm decoder;
     std::vector<std::uint8_t> buffer;   // sectors read ahead
     std::uint32_t bufferAt = 0;         // the buffer's first byte, of the file
     std::int16_t frame[28] = {};
     int frameAt = 28;                   // samples of frame used
+    bool ended = false;                 // the last frame has been decoded
     double phase = 0.0;                 // the resampler's place between prev and next
     std::int16_t prev = 0, next = 0;
 
     bool Open()
     {
         std::uint8_t head[2048];
-        if (!ReadSectors(sector, 1, head) || std::memcmp(head, "VAGp", 4) != 0)
+        const bool read = ReadSectors(sector, 1, head);
+        static const bool log = std::getenv("SLY1_SND_LOG") != nullptr;
+        if (log)
+            std::fprintf(stderr, "sndlog: stream at sector %u: %s, first bytes %02X %02X %02X %02X %02X %02X %02X %02X, name %.16s\n", sector, read ? "read" : "not read",
+                         head[0], head[1], head[2], head[3], head[4], head[5], head[6], head[7], read ? (const char*)head + 32 : "");
+        if (!read || std::memcmp(head, "VAGp", 4) != 0)
             return false;
         auto be = [&](int o) { return (std::uint32_t)head[o] << 24 | (std::uint32_t)head[o + 1] << 16 | (std::uint32_t)head[o + 2] << 8 | head[o + 3]; };
         dataBytes = be(12);
         rate = be(16);
+        if (log)
+            std::fprintf(stderr, "sndlog:   %u bytes at %u Hz (%.1f s), words at 4, 8, 20, 24: %08X %08X %08X %08X\n", dataBytes, rate, dataBytes / 16.0 * 28 / (rate ? rate : 1),
+                         be(4), be(8), be(20), be(24));
         if (rate < 4000 || rate > 96000)
             rate = 44100;
         opened = true;
@@ -109,18 +119,14 @@ struct Stream {
     bool Sample(std::int16_t* out)
     {
         if (frameAt >= 28) {
+            // the frame whose flags have bit 0 set is the sample's last: its samples are played,
+            // and nothing after it
             std::uint8_t f[16];
-            if (!Bytes(f) || (f[1] & 1)) {   // the file's end, or the frame that ends the sample
-                if (at <= dataBytes && (f[1] & 1) && at > 16) {
-                    // (the last frame's samples are played)
-                } else {
-                    return false;
-                }
-            }
+            if (ended || !Bytes(f))
+                return false;
             decoder.Frame(f, frame);
             frameAt = 0;
-            if (f[1] & 1)
-                dataBytes = at;   // nothing after it
+            ended = (f[1] & 1) != 0;
         }
         *out = frame[frameAt++];
         return true;
@@ -165,7 +171,7 @@ std::map<std::uint32_t, std::shared_ptr<Stream>> g_streams;
 std::uint32_t g_nextHandle = 0x100, g_nextBank = 1;
 float g_channelVolume[16];
 bool g_channelSet;
-std::atomic<bool> g_started;
+std::atomic<bool> g_started, g_mixing;
 std::atomic<bool> g_quit;
 std::vector<std::int16_t> g_wav;   // the host's file, kept in memory until the end
 const char* g_wavPath;
@@ -198,6 +204,7 @@ void MixChunk(std::int16_t* out)
 
 void MixerMain()
 {
+    g_mixing.store(true);
 #if defined(__SWITCH__)
     if (R_FAILED(audoutInitialize()) || R_FAILED(audoutStartAudioOut())) {
         std::fprintf(stderr, "audio: the Switch's audio output could not be started\n");
@@ -297,6 +304,23 @@ std::uint32_t Command(std::int32_t cmd, const std::uint8_t* data, std::int32_t s
         g_channelSet = true;
     }
     const std::uint32_t a = Word(data, size, 0), b = Word(data, size, 1), c = Word(data, size, 2);
+    {   // SLY1_SND_LOG: what is sent about a stream, each time (a question's answer only when it changes)
+        static const bool log = std::getenv("SLY1_SND_LOG") != nullptr;
+        static std::map<std::uint32_t, int> lastAnswer;
+        if (log && cmd != 0x2C && size >= 4 && g_streams.count(a)) {
+            Stream* st = g_streams[a].get();
+            const bool question = cmd == 0x19 || cmd == 0x2E || cmd == 0x4F;
+            const int answer = st->done ? 0 : 1;
+            if (!question || lastAnswer[a * 256 + (std::uint32_t)cmd] != answer + 1) {
+                std::fprintf(stderr, "sndlog: stream %X: command %02X %08X %08X; at %.1f s of %.1f, %s%s\n", a, (unsigned)cmd, b, c,
+                             st->rate ? st->at / 16.0 * 28 / st->rate : 0.0, st->rate ? st->dataBytes / 16.0 * 28 / st->rate : 0.0, st->paused ? "paused" : "playing",
+                             st->done ? ", over" : "");
+                lastAnswer[a * 256 + (std::uint32_t)cmd] = answer + 1;
+            }
+        }
+        if (log && (cmd == 0x16 || cmd == 0x17 || cmd == 0x34))
+            std::fprintf(stderr, "sndlog: command %02X %08X with %zu streams\n", (unsigned)cmd, a, g_streams.size());
+    }
     switch (cmd) {
     case 0x00:   // the packet shared with the driver
     case 0x06:   // a bank unloaded
@@ -355,6 +379,15 @@ std::uint32_t Command(std::int32_t cmd, const std::uint8_t* data, std::int32_t s
         Stream* s = Find(a);
         if (!s)
             return 0;
+        if (!g_mixing.load()) {
+            // no mixer (the host with no file to write): the stream is over when its length has
+            // passed, so that what waits for it goes on as it would
+            if (!s->opened && !s->Open())
+                s->done = true;
+            const double length = (double)s->dataBytes / 16.0 * 28.0 / (double)s->rate;
+            if (std::chrono::duration<double>(std::chrono::steady_clock::now() - s->began).count() >= length)
+                s->done = true;
+        }
         if (s->done) {
             g_streams.erase(a);
             return 0;
