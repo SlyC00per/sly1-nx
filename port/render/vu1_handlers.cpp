@@ -1631,32 +1631,47 @@ bool LitColours(Runner& r)
     v14.x = Max(v14.x, R.vf[7][2]);
     R.put(14, v14, X);
     const float* one = st.vf[1];
+    // vf01 is not written in the loop: fixed once as an operand (oneF) and as a value compared
+    // (oneIn). What the loop computes with the host's arithmetic on fixed operands has no field
+    // with the largest exponent and none denormal, so it needs no fixing when it is used again:
+    // vf14.x and vf09 (chosen among fixed values), vf08 (ITOF0's, and 255), vf13, the sums.
+    V oneF, oneIn;
+    std::memcpy(&oneF, one, 16);
+    oneIn.v = Fix4(oneF.v);
+    oneF.v = FixIn4(oneF.v);
     for (int k = 0; k < n; k++) {
         // 0x253-0x256: the vertex before stored
         V v02 = R.get(2);
-        v02.y = Sub(one[1], R.vf[14][0]);
-        float acc = Sub(one[0], R.vf[14][0]);
-        v02.x = Sub(acc, Mul(one[0], R.vf[6][1]));
+        v02.y = oneF.y - R.vf[14][0];
+        float acc = oneF.x - R.vf[14][0];
+        v02.x = acc - oneF.x * FixIn(R.vf[6][1]);
         R.put(2, v02, XY);
         Store(r, (std::uint16_t)(at - 2), R.get(11));
         { V old = Load(r, (std::uint16_t)(at - 3)); V x = R.get(10); old.x = x.x; old.y = x.y; old.z = x.z;
           Store(r, (std::uint16_t)(at - 3), old); }
         Store(r, (std::uint16_t)(col - 1), R.get(12));
         V v12 = R.get(12), v07 = R.get(7);
-        for (int c = 0; c < 3; c++)
-            v12[c] = Mini(v07[c], one[c]);
+        {   // MINI, three fields at once: the lesser of the two as the VU reads them
+            V a, m;
+            a.v = Fix4(v07.v);
+            const I4 less = a.v < oneIn.v;
+            m.v = (F4)(((U4)a.v & (U4)less) | ((U4)oneIn.v & ~(U4)less));
+            v12.x = m.x;
+            v12.y = m.y;
+            v12.z = m.z;
+        }
         R.put(12, v12, XYZ);
         // 0x257-0x25A: the average of the base colour; the next vertex read
         V v08n = R.get(8);
-        F4 a4 = Mul4(c3.v, Splat(v08n.x));
-        a4 = Add4(a4, Mul4(c3.v, Splat(v08n.y)));
+        F4 a4 = c3.v * Splat(v08n.x);
+        a4 = a4 + c3.v * Splat(v08n.y);
         R.put(7, Load(r, (std::uint16_t)(col + 1)), XYZ);
         V v09 = R.get(9), v06 = R.get(6);
         v09.x = Mini(v06.x, v02.x);
         v09.y = Mini(v06.y, v02.y);
         R.put(5, Load(r, (std::uint16_t)(at + 5)), XYZ);
         V v13;
-        v13.v = Add4(a4, Mul4(c3.v, Splat(v08n.z)));
+        v13.v = a4 + c3.v * Splat(v08n.z);
         R.put(13, v13, XYZ);
         R.put(6, Load(r, (std::uint16_t)(at + 6)), XY);
         // 0x25B-0x265
@@ -1667,17 +1682,17 @@ bool LitColours(Runner& r)
         R.put(9, v09, XY);
         v12 = R.get(12);
         V prod;
-        prod.v = Mul4(v12.v, R.get(13).v);
+        prod.v = v12.v * v13.v;   // the fields used (xyz) are fixed: MINI's and vf13's
         v12.x = prod.x;
         v12.y = prod.y;
         v12.z = prod.z;
         nx.x = Max(nx.x, R.vf[7][2]);
         R.put(14, nx, X);
         V v11;
-        v11.v = Mul4(R.get(8).v, Splat(v09.y));
+        v11.v = v08n.v * Splat(v09.y);
         V v10;
-        v10.v = Mul4(R.get(13).v, Splat(v09.x));
-        v12.w = Mul(R.vf[3][3], v09.x);
+        v10.v = v13.v * Splat(v09.x);   // xyz used
+        v12.w = R.vf[3][3] * v09.x;
         V n08 = R.get(8);
         V n05;
         n05.v = Itof4(R.get(5).v);   // ITOF0 and FTOI0 four fields at a time (Itof4, Ftoi4: the same rules)
