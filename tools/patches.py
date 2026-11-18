@@ -154,6 +154,14 @@ PATCHES = [
      "    f32 k = 1.29870129f * port::WideFactor();\n    f32 x = g_cameraDefaultFogNear;",
      "the camera's aspect for the port's 16:9 picture"),
 
+    # Widescreen: the map page is laid before the camera to fill the 4:3 picture; it is made 4/3
+    # wider (the second row of its matrix: the camera's axis across the screen) to fill the 16:9 one, as the PS3
+    # release stretches it.
+    ("src/main/warp_menu.cpp",
+     "    BuildMatrixFromRotationAndTranslation((const Vec4*)((Camera*)s)->position, (const Mat3*)&((Camera*)s)->rot80, (Mat4A*)tmp);\n    ApplyPlacedObjectTransform(obj, (Camera*)s, (ScaledTransform*)tmp);",
+     "    BuildMatrixFromRotationAndTranslation((const Vec4*)((Camera*)s)->position, (const Mat3*)&((Camera*)s)->rot80, (Mat4A*)tmp);\n    for (int port_k = 0; port_k < 3; port_k++) ((f32*)tmp)[1 * 4 + port_k] *= port::WideFactor();\n    ApplyPlacedObjectTransform(obj, (Camera*)s, (ScaledTransform*)tmp);",
+     "the map page as wide as the 16:9 picture"),
+
     # Frame layout: g++ 2.95 put t right after arr[32] in the frame, and the cleanup walks back from
     # &t; a modern compiler places locals as it likes.
     ("src/main/script_machine.cpp",

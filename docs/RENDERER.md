@@ -382,8 +382,13 @@ picture is then stretched: for comparison only).
 
 Seen on the host (a frame at a place in "Back Alley Heist", stretched to 16:9: nothing missing
 at the sides), in Ryujinx and on the Switch (played: nothing coming or going at the edges).
-Not done: the 2D elements (the counters, the text, the menus, the map at a level's end) are
-laid out for 4:3 and are a third too wide; videos. On the Switch the same place costs more
+The map page (shown when a level is left) is an object laid before the camera to fill the 4:3
+picture: it is made 4/3 wider across the screen (a patch of `ApplyWarpPageTransform`), as the
+PS3 release stretches it; before, the level showed at its sides. `--level N --env SLY1_MAP=1`
+opens a level's map page on the host.
+
+Not done: the 2D elements (the counters, the text, the menus) are laid out for 4:3 and are a
+third too wide; videos. On the Switch the same place costs more
 than at 4:3 (a third more pixels and more of the world in view): the run's median frame was
 33 ms where the 4:3 run's was 28.
 

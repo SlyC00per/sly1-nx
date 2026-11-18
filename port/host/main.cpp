@@ -49,6 +49,8 @@
 struct Player;
 struct Vec4;
 void func_00178008(Player*, Vec4*);   // the game's SetPlayerPosition (SLY1_WARP)
+struct WarpPage;
+void func_001F1590(WarpPage*, int, int);   // the game's SetWarpCursor (SLY1_MAP)
 #include "port/system.h"
 #include "port/thread.h"
 
@@ -281,6 +283,20 @@ void VerifyLevels()
             float now[3];
             std::memcpy(now, port::Native(player + 0x100), sizeof now);
             std::fprintf(stderr, "warp: the player now at %.0f %.0f %.0f\n", (double)now[0], (double)now[1], (double)now[2]);
+        }
+        if (std::getenv("SLY1_MAP")) {
+            // SLY1_MAP=1: the level's map page opened (the game's SetWarpCursor, kind 2) and 300 frames
+            // run with it: for looking at the map (with --dump-fb)
+            if (word(0x0026FA68) == 0) {
+                std::fprintf(stderr, "map: the level has no map page\n");
+            } else {
+                port::CallOnGameThread([] {
+                    ::func_001F1590((::WarpPage*)port::Native(*(std::uint32_t*)port::Native(0x0026FA68)), 10, 2);
+                });
+                const std::int32_t from = word(kFrames);
+                waitFor([&] { return word(kFrames) - from >= 300; }, 120);
+                std::fprintf(stderr, "map: opened, mode %d\n", word((std::uint32_t)word(0x0026FA68) + 0x2D0));
+            }
         }
         if (std::getenv("SLY1_LIGHTS")) {
             // SLY1_LIGHTS=1: the level's lights (the groups CollectLightsForSphere goes through) and the
