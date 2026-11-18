@@ -293,8 +293,16 @@ void KernelDump()
 // A preemption point (port/retail_data.h): on the PS2 an interrupt that readies a thread of higher
 // priority preempts the running one where it is; here the running thread gives way at its next
 // loop test or kernel call. The interrupt handlers (on the clock's host thread) never do.
+// A call for the game's own thread to make (the host's diagnosis: placing the player), taken at
+// the next point where a game thread lets others in.
+std::atomic<void (*)()> g_gameThreadCall{nullptr};
+void CallOnGameThread(void (*fn)()) { g_gameThreadCall.store(fn, std::memory_order_release); }
+
 void PreemptSlow()
 {
+    if (g_gameThreadCall.load(std::memory_order_relaxed))
+        if (void (*fn)() = g_gameThreadCall.exchange(nullptr, std::memory_order_acq_rel))
+            fn();
     ServiceInterrupts();
     std::unique_lock<std::mutex> lk(g_kernel);
     int self = t_self;

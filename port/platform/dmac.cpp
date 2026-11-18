@@ -3302,6 +3302,14 @@ void RenderThreadMain()
                                      "fickle %.0f, batches %.0f; ms: drawing again %.2f, parts in full %.2f\n", (unsigned long long)shown, (is[0] - was[0]) / f, (is[1] - was[1]) / f,
                                      (is[2] - was[2]) / f, (is[3] - was[3]) / f, (is[4] - was[4]) / f, (is[5] - was[5]) / f, (is[6] - was[6]) / f,
                                      (is[7] - was[7]) / f, (times[0] - timesWas[0]) / f / 1e6, (times[1] - timesWas[1]) / f / 1e6);
+                    {   // where the player is (g_player's position), to find the place again
+                        const std::uint32_t player = *static_cast<const std::uint32_t*>(Native(0x00262E10));
+                        if (player >= 0x00100000 && player < kRamSize - 0x200) {
+                            float pos[3];
+                            std::memcpy(pos, Native(player + 0x100), sizeof pos);
+                            std::fprintf(stderr, "perfpos: to %llu: the player at %.0f %.0f %.0f\n", (unsigned long long)shown, (double)pos[0], (double)pos[1], (double)pos[2]);
+                        }
+                    }
                     std::memcpy(timesWas, times, sizeof timesWas);
                     std::memcpy(was, is, sizeof was);
                 }

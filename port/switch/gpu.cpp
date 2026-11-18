@@ -1664,6 +1664,13 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         return;   // nothing passes
 
     // the blend: (A - B) * C + D of Cs, Cd and 0, C the second output (As or FIX) or the frame's alpha
+    // A blend that leaves the frame's colour as it is (Cd alone: the passes of a volume that mark
+    // the frame's alpha, blend 0x6A) is drawn without a blend and with the colour not written: the
+    // alpha written is then the source's, as on the GS. With the blend on the GPU gave the alpha
+    // the colour's factors, the frame's alpha stayed, and a volume marked nothing: a searchlight
+    // showed as its whole cone, not as the light where the cone meets the walls.
+    // SLY1_GPU_NO_ALPHA_MARK=1: as before.
+    bool alphaOnly = false;
     DkBlendState blend;
     dkBlendStateDefaults(&blend);
     blend.alphaBlendOp = DkBlendOp_Add;
@@ -1679,6 +1686,8 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         bool frameAlpha = c == 1;
         // each of Cs and Cd: how many times C (-1, 0, 1) and how many times 1 (0, 1)
         int sc = (a == 0) - (b == 0), s1 = d == 0, dc = (a == 1) - (b == 1), d1 = d == 1;
+        static const bool noMark = std::getenv("SLY1_GPU_NO_ALPHA_MARK") != nullptr;
+        alphaOnly = !noMark && sc == 0 && s1 == 0 && dc == 0 && d1 == 1;
         if (!frameAlpha && target >= 2) {
             // A small target (a shadow's picture): the coefficients go to the pixel shader, which gives
             // the colour times its own and one less the frame's as the second output, its alpha 1
@@ -1861,9 +1870,11 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
 
     // one pass of the pixels an alpha comparison lets through, writing colour, alpha and depth or not
     auto pass = [&](DkCompareOp alphaOp, bool rgb, bool alpha, bool depthWrite) {
+        if (alphaOnly)
+            rgb = false;
         DkColorState colour;
         dkColorStateDefaults(&colour);
-        colour.blendEnableMask = s.abe ? 1 : 0;
+        colour.blendEnableMask = s.abe && !alphaOnly ? 1 : 0;
         colour.alphaCompareOp = alphaOp;
         std::uint32_t colourKey = (colour.blendEnableMask ? 1u : 0u) | (std::uint32_t)alphaOp << 1;
         if (colourKey != last_.colour) {

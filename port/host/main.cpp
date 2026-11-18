@@ -46,6 +46,9 @@
 #include "port/iso.h"
 #include "port/memory_card.h"
 #include "port/retail_data.h"
+struct Player;
+struct Vec4;
+void func_00178008(Player*, Vec4*);   // the game's SetPlayerPosition (SLY1_WARP)
 #include "port/system.h"
 #include "port/thread.h"
 
@@ -261,6 +264,45 @@ void VerifyLevels()
         static const int perLevel = std::getenv("SLY1_LEVEL_FRAMES") ? std::max(60, std::atoi(std::getenv("SLY1_LEVEL_FRAMES"))) : 60;
         if (!waitFor([&] { return word(kFrames) - frames >= perLevel; }, 60 + perLevel / 10))
             fail("60 frames did not run within 60 s of the load", i + 1);
+        if (const char* at = std::getenv("SLY1_WARP")) {
+            // SLY1_WARP=x,y,z[,frames]: the player placed there (the game's own SetPlayerPosition, on its
+            // thread) once the level has run, and that many frames more (300) run after: for looking
+            // at a place on the host (with --dump-fb)
+            static float pos[4] __attribute__((aligned(16)));
+            int more = 300;
+            std::sscanf(at, "%f,%f,%f,%d", &pos[0], &pos[1], &pos[2], &more);
+            pos[3] = 1.0f;
+            port::CallOnGameThread([] {
+                ::func_00178008((::Player*)port::Native(*(std::uint32_t*)port::Native(0x00262E10)), (::Vec4*)pos);
+            });
+            const std::int32_t from = word(kFrames);
+            waitFor([&] { return word(kFrames) - from >= more; }, 120);
+            const std::uint32_t player = (std::uint32_t)word(0x00262E10);
+            float now[3];
+            std::memcpy(now, port::Native(player + 0x100), sizeof now);
+            std::fprintf(stderr, "warp: the player now at %.0f %.0f %.0f\n", (double)now[0], (double)now[1], (double)now[2]);
+        }
+        if (std::getenv("SLY1_LIGHTS")) {
+            // SLY1_LIGHTS=1: the level's lights (the groups CollectLightsForSphere goes through) and the
+            // player's position, for finding a place to look at (diagnosis)
+            auto f = [&](std::uint32_t a) { float v; std::int32_t b = word(a); std::memcpy(&v, &b, 4); return (double)v; };
+            const std::uint32_t player = (std::uint32_t)word(0x00262E10);
+            std::fprintf(stderr, "lights: player at 0x%08X: %.0f %.0f %.0f\n", player, f(player + 0x100), f(player + 0x104), f(player + 0x108));
+            const int groups = word(0x00264668);
+            for (int g = 0; g < groups && g < 64; g++) {
+                const std::uint32_t grp = 0x00264670 + (std::uint32_t)g * 16, list = (std::uint32_t)word(grp);
+                const int count = word(grp + 4);
+                std::fprintf(stderr, "lights: group %d: %d lights, flags %X, kind %d\n", g, count, word(grp + 8), word(grp + 12) & 0xFFFF);
+                for (int k = 0; k < count && k < 64 && list; k++) {
+                    const std::uint32_t l = (std::uint32_t)word(list + (std::uint32_t)k * 4);
+                    if (!l)
+                        continue;
+                    std::fprintf(stderr, "lights:   0x%08X class 0x%08X at %.0f %.0f %.0f; shape %d colour %.0f %.0f %.0f range %.0f to %.0f dir %.2f %.2f %.2f\n", l,
+                                 (std::uint32_t)word(l), f(l + 0x100), f(l + 0x104), f(l + 0x108), word(l + 0x2D4), f(l + 0x2E0), f(l + 0x2E4), f(l + 0x2E8),
+                                 f(l + 0x330), f(l + 0x334), f(l + 0x310), f(l + 0x314), f(l + 0x318));
+                }
+            }
+        }
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "verify: level %2d loaded and ran 60 frames (%.1f s)\n", i + 1, s);
         {

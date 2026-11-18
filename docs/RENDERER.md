@@ -345,6 +345,32 @@ wrong, found at frame 620 of the opening under lockstep:
   (in the software GS too), and the picture the GPU renderer gives now, with the volumes mostly
   without effect, is the one closer to retail.
 
+### A volume's marks written (2026-11-18)
+
+A searchlight in "Back Alley Heist" was not drawn as the light where its cone meets the walls
+and floor: nothing on the Switch, the whole cone faintly in Ryujinx. Program 0x6DA draws a
+volume in passes: the faces of one side write alpha 0 where they are in front of the scene
+(TEST 0x71001: the alpha test never passes and its failure writes the frame alone; the depth
+test is GREATER), the faces of the other side write 0x80 again, both with blend 0x6A, which
+leaves the colour as it is (Cd); then the tint (yellow, alpha 0x41, blend 0x48) is drawn with
+the destination alpha test where the top bit is clear, which is where a surface of the scene
+lies inside the cone.
+
+With the blend on, the GPU gave the frame's alpha the colour's factors, so the two marking
+passes wrote nothing. A blend that leaves the colour as it is is now drawn without a blend and
+with the colour not written (`alphaOnly` in `Renderer::Submit`; `SLY1_GPU_NO_ALPHA_MARK=1`: as
+before). Seen right on the Switch. Ryujinx shows the whole cone with and without it: it reads
+the frame's alpha as it was before the passes, as noted above, so this cannot be checked there.
+
+The other blends still give the frame's alpha the colour's factors (the section above), and
+the dark volumes of the opening mark the frame now: whether Sly under the water tower is
+darkened again has to be looked at on the Switch.
+
+To look at a place on the host or in Ryujinx: `SLY1_PERF_LOG=1` prints the player's position
+each second (`perfpos:`), and `--level N --env SLY1_WARP=x,y,z[,frames]` places the player
+there with the game's own SetPlayerPosition once the level has run (`SLY1_LIGHTS=1` lists the
+level's lights). The spot here: `--level 20 --env SLY1_WARP=2899,-2340,2080,600`.
+
 ## Frame rate on the Switch: what limits it (2026-11-17)
 
 Measured on a Switch Lite (handheld clocks) in the opening, 30 s after the first 10.

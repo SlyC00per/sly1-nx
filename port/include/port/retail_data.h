@@ -102,6 +102,8 @@ inline void* AsAddress(T word) { return Native((std::uint32_t)word); }
 // moment for the host's other threads.
 extern std::atomic<bool> g_preemptPending;
 void PreemptSlow();
+// fn called once on a game thread, at its next point of letting others in (the host's diagnosis).
+void CallOnGameThread(void (*fn)());
 #ifdef PORT_SENTINEL
 // A software watchpoint (cmake -DSLY1_SENTINEL=ON): a zero word the kernel places right after its
 // thread stacks, checked at every preemption point; a change is reported with the caller's frames.
