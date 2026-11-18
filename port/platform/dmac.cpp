@@ -28,6 +28,7 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <set>
 #include <cstdio>
 #include <cstring>
 
@@ -1283,6 +1284,16 @@ struct PartRecord {
     bool slow = false, headerSet = false;
     std::uint32_t headerAt = 0;
     std::uint32_t verdictList = 0;   // the list in which the helper's last good hash of it came
+    // The TEX0 writes left out of the hash: where they are in the packet, what they were when the
+    // part was kept, and where each is in the kept packets (item, word, which write). texStrict:
+    // a kept TEX0 that is none of them, or too many: the values must be what they were.
+    struct TexFix {
+        std::uint32_t item, word, which;
+    };
+    std::vector<const std::uint32_t*> texAt;
+    std::vector<std::uint64_t> texWas;
+    std::vector<TexFix> texFix;
+    bool texStrict = false;
 };
 std::unordered_map<std::uint32_t, PartRecord> g_parts;
 
@@ -1319,10 +1330,44 @@ std::atomic<bool> g_hashAnyResult, g_hashStarted;
 std::atomic<std::uint64_t> g_hashHelperNs, g_hashHelped;
 std::uint32_t g_partSerial;
 std::uint64_t g_partsLate;   // drawn again on a hash a frame late
-std::unordered_map<std::uint32_t, std::uint8_t> g_partTurns;   // the times each part has come in the list being walked
+// The times each part has come in the list being walked: a table of fixed size, emptied by a new
+// stamp (a map's node for each part of each list was most of the render thread's allocations).
+struct PartTurns {
+    struct Slot {
+        std::uint32_t key, stamp;
+        std::uint8_t turn;
+    };
+    static constexpr std::uint32_t kSlots = 8192;
+    Slot slots[kSlots] = {};
+    std::uint32_t stamp = 1, used = 0;
+    void clear()
+    {
+        stamp++;
+        used = 0;
+    }
+    std::uint8_t& operator[](std::uint32_t key)
+    {
+        static std::uint8_t full;   // (a list of over 6,000 parts: the rest all the first turn)
+        for (std::uint32_t at = (key * 0x9E3779B1u) >> 19;; at = (at + 1) & (kSlots - 1)) {
+            Slot& s = slots[at];
+            if (s.stamp == stamp && s.key == key)
+                return s.turn;
+            if (s.stamp != stamp) {
+                if (used >= kSlots * 3 / 4) {
+                    full = 0;
+                    return full;
+                }
+                used++;
+                s = {key, stamp, 0};
+                return s.turn;
+            }
+        }
+    }
+} g_partTurns;
 std::uint64_t g_partsSlowReplayed, g_partsSlowKept, g_partsSlowRefused;
 
-std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow = false);
+std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow = false,
+                       std::vector<const std::uint32_t*>* tex = nullptr);
 
 }  // namespace
 
@@ -1420,7 +1465,8 @@ void HashTakeResults()
     }
     results.clear();
 }   // by the hook's packet and half
-std::uint64_t g_partsReplayed, g_partsRecorded, g_partsRefused, g_partsStale, g_partItemsReplayed, g_partsMoving, g_partsStaleBy[3], g_partHashNs, g_partWords, g_partsCleared, g_partKey, g_partsFickle;
+std::uint64_t g_partTimes[2];   // ns: parts drawn again, parts run in full
+std::uint64_t g_partsTexMoved, g_partsReplayed, g_partsRecorded, g_partsRefused, g_partsStale, g_partItemsReplayed, g_partsMoving, g_partsStaleBy[3], g_partHashNs, g_partWords, g_partsCleared, g_partKey, g_partsFickle;
 constexpr std::size_t kBatchHead = 1 + (sizeof(gs::Batch) + 3) / 4;
 
 bool PartReplayOn()
@@ -1467,6 +1513,15 @@ struct PartHasher {
     // a part drawn the long way: the data of its header's unpack (the chain's first unpack of 11
     // whole quadwords) is left out, as the header of a part drawn from its cache is compared apart
     bool skipHeader = false, ignored = false;
+    // SLY1_PART_DIFF: a hash for each VIFcode's data and each tag, to say what changed in a part
+    std::vector<std::pair<std::uint32_t, std::uint64_t>>* segs = nullptr;
+    // A part drawn from its cache: the value of a TEX0 write among the registers its packet
+    // unpacks for VU1 to kick is left out (the game places a texture anew in the GS's memory from
+    // frame to frame, and nothing else of the part changes with it); where the writes are is
+    // noted when asked for (tex), for PartCall to read them as they are now.
+    bool texFree = false, adWatch = false;
+    std::uint32_t adLeft = 0;
+    std::vector<const std::uint32_t*>* tex = nullptr;
     void Mix(std::uint32_t w)
     {
         h = (h ^ w) * 0x9E3779B97F4A7C15ull;
@@ -1478,6 +1533,8 @@ struct PartHasher {
             if (left == 0) {
                 std::uint32_t code = w[k++], cmd = (code >> 24) & 0x7F, imm = code & 0xFFFF, num = (code >> 16) & 0xFF;
                 Mix(code);
+                if (segs)
+                    segs->push_back({code, 0});
                 sampled = false;
                 at = 0;
                 if ((cmd & 0x60) == 0x60) {   // UNPACK, as Vif::Code has it
@@ -1489,6 +1546,8 @@ struct PartHasher {
                     left = (vectors * bits + 31) / 32;
                     sampled = !whole && left > 64;
                     ignored = false;
+                    adWatch = texFree && vn == 3 && vl == 0 && left <= 64;
+                    adLeft = 0;
                     if (skipHeader && num == 0x0B && vn == 3 && vl == 0) {
                         skipHeader = false;
                         ignored = true;
@@ -1511,13 +1570,37 @@ struct PartHasher {
                 continue;
             }
             const std::size_t take = std::min<std::size_t>(left, n - k);
+            if (segs && !ignored && !segs->empty())
+                for (std::size_t i = 0; i < take; i++)
+                    segs->back().second = (segs->back().second ^ w[k + i]) * 0x9E3779B97F4A7C15ull + 1;
             if (ignored) {
                 k += take;
                 at += (std::uint32_t)take;
                 left -= (std::uint32_t)take;
                 continue;
             }
-            if (!sampled) {
+            if (adWatch && (at & 3) == 0 && (take & 3) == 0) {
+                for (std::size_t i = 0; i < take; i += 4) {
+                    const std::uint32_t* q = w + k + i;
+                    std::uint64_t v[2];
+                    std::memcpy(v, q, 16);
+                    if (adLeft != 0) {
+                        adLeft--;
+                        if ((q[2] & 0xFF) == 0x06 && q[3] == 0) {
+                            v[0] = 0;
+                            if (tex)
+                                tex->push_back(q);
+                        }
+                    } else if (q[2] == 0xE && q[3] == 0 && (q[1] >> 28) == 1 && ((q[1] >> 26) & 3) == 0) {
+                        adLeft = q[0] & 0x7FFF;
+                    }
+                    h = (h ^ v[0]) * 0x9E3779B97F4A7C15ull;
+                    h ^= h >> 29;
+                    h = (h ^ v[1]) * 0x9E3779B97F4A7C15ull;
+                    h ^= h >> 29;
+                }
+            } else if (!sampled) {
+                adWatch = false;
                 std::size_t i = 0;
                 for (; i + 2 <= take; i += 2) {   // two words at a time
                     std::uint64_t v;
@@ -1545,12 +1628,17 @@ struct PartHasher {
     }
 };
 
+std::vector<std::pair<std::uint32_t, std::uint64_t>>* g_diffSegs;
 bool PartTte() { return (static_cast<volatile std::uint32_t*>(Native(kVif1))[0] & 0x40) != 0; }
 
-std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow)
+std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow,
+                       std::vector<const std::uint32_t*>* tex)
 {
     PartHasher hasher;
     hasher.skipHeader = slow;
+    hasher.texFree = !slow;   // (a part drawn the long way has its packets in the frame's memory: no place to read again)
+    hasher.tex = tex;
+    hasher.segs = g_diffSegs;
     hasher.whole = whole;
     hasher.cl = cl;
     hasher.wl = wl;
@@ -1585,6 +1673,8 @@ std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::
         bool spr = (tag[1] >> 31) != 0;
         hasher.Mix(tag[0]);
         hasher.Mix(tag[1]);
+        if (g_diffSegs)
+            g_diffSegs->push_back({0xFF000000u | id, tag[0] | (std::uint64_t)tag[1] << 32});
         if (tte)
             hasher.Feed(tag + 2, 2);
         std::uint32_t after = (tadr & 0x7FFFFFFFu) + 16;
@@ -1648,9 +1738,99 @@ void PartForget(PartRecord& r)
 // inverse matrix and the centre are the same too (4 to 10 whole).
 bool PartHeaderSame(const std::uint32_t a[44], const std::uint32_t b[44], bool slow)
 {
-    if (slow)
+    // (its mode, 9.y: -1 unlit and 0 lit by its cache alone read neither, as a part drawn from its
+    // cache; the others are lit by VU1 from them)
+    if (slow && !((a[37] == 0xFFFFFFFFu || a[37] == 0) && a[37] == b[37]))
         return std::memcmp(a + 16, b + 16, 28 * 4) == 0;
-    return std::memcmp(a + 32, b + 32, 32) == 0 && a[43] == b[43];
+    if (std::memcmp(a + 32, b + 32, 16) != 0 || std::memcmp(a + 37, b + 37, 12) != 0 || a[43] != b[43])
+        return false;
+    if (a[36] == b[36])
+        return true;
+    // 9.x, the scale of the vertices' alpha: a part that fades with its distance has it other in
+    // its last digits each frame while nothing moves. Within 1/512 of what the part was kept with
+    // (a quarter of a step of the GS's alpha) it is drawn as kept; SLY1_PART_HASH_NOW=1: never.
+    static const bool exact = std::getenv("SLY1_PART_HASH_NOW") != nullptr;
+    float x, y;
+    std::memcpy(&x, a + 36, 4);
+    std::memcpy(&y, b + 36, 4);
+    return !exact && x - y < 1.0f / 512 && y - x < 1.0f / 512;
+}
+
+// SLY1_PART_DIFF=1 (with SLY1_PART_HASH_NOW=1: the helper must not hash meanwhile): what changes in
+// the parts that change, and why a part is not kept. Each call's packet is hashed a VIFcode
+// and a tag at a time and compared with the same part's the list before; what differs is counted
+// by kind (PartDiffReport, with partcounts).
+struct DiffSeen {
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> segs;
+    std::uint32_t header[44];
+};
+std::unordered_map<std::uint32_t, DiffSeen> g_diffSeen;
+std::map<std::string, std::uint64_t> g_diffCounts;
+void PartDiff(std::uint32_t key, std::uint32_t target, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow, const std::uint32_t* header)
+{
+    DiffSeen now;
+    g_diffSegs = &now.segs;
+    PartHash(target, true, cl, wl, tte, slow);
+    g_diffSegs = nullptr;
+    std::memcpy(now.header, header, sizeof now.header);
+    auto it = g_diffSeen.find(key);
+    const char* kind = slow ? "long" : "cached";
+    g_diffCounts[std::string(kind) + " calls"]++;
+    {
+        char name[64];
+        std::snprintf(name, sizeof name, "%s calls of mode %d", kind, (int)header[37]);
+        g_diffCounts[name]++;
+    }
+    if (it != g_diffSeen.end()) {
+        const DiffSeen& was = it->second;
+        char name[96];
+        bool any = false;
+        if (was.segs.size() != now.segs.size()) {
+            g_diffCounts[std::string(kind) + " other shape"]++;
+            any = true;
+        } else {
+            std::set<std::string> kinds;
+            for (std::size_t k = 0; k < now.segs.size(); k++) {
+                const std::uint32_t c = now.segs[k].first;
+                if (was.segs[k].first != c) {
+                    std::snprintf(name, sizeof name, "%s code %08X", kind, (c >> 24) == 0xFF ? c : c & 0xFF000000u);
+                    kinds.insert(name);
+                } else if (was.segs[k].second != now.segs[k].second) {
+                    if ((c >> 24) == 0xFF)
+                        std::snprintf(name, sizeof name, "%s tag %u", kind, c & 7);
+                    else if (((c >> 24) & 0x60) == 0x60)
+                        std::snprintf(name, sizeof name, "%s unpack %02X to %03X%s num %u", kind, (c >> 24) & 0x6F, c & 0x3FF, (c & 0x8000) ? "+" : "",
+                                      (c >> 16) & 0xFF);
+                    else
+                        std::snprintf(name, sizeof name, "%s data of %02X", kind, (c >> 24) & 0x7F);
+                    kinds.insert(name);
+                }
+            }
+            for (const std::string& n : kinds)
+                g_diffCounts[n]++;
+            any = !kinds.empty();
+        }
+        for (int q = 4; q < 11; q++)
+            if (std::memcmp(was.header + q * 4, now.header + q * 4, 16) != 0) {
+                int mask = 0;
+                for (int w = 0; w < 4; w++)
+                    mask |= (was.header[q * 4 + w] != now.header[q * 4 + w]) << w;
+                std::snprintf(name, sizeof name, "%s header %d words %X%s", kind, q, q >= 8 ? mask : 0, any ? " (packet too)" : " (packet same)");
+                g_diffCounts[name]++;
+            }
+        if (any)
+            g_diffCounts[std::string(kind) + " packet changed"]++;
+    } else {
+        g_diffCounts[std::string(kind) + " first seen"]++;
+    }
+    g_diffSeen[key] = std::move(now);
+}
+void PartDiffReport()
+{
+    for (const auto& kv : g_diffCounts)
+        std::fprintf(stderr, "partdiff: %-44s %llu\n", kv.first.c_str(), (unsigned long long)kv.second);
+    g_diffCounts.clear();
+    g_diffSeen.clear();
 }
 
 // The hook's NOP and then the call of target: true when the part has been drawn from what was
@@ -1697,6 +1877,9 @@ bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
         PartHeader(regs.tops, header);
     }
     const bool tte = PartTte();
+    static const bool diffOn = std::getenv("SLY1_PART_DIFF") != nullptr && std::getenv("SLY1_PART_HASH_NOW") != nullptr;
+    if (diffOn)
+        PartDiff(key, target, regs.cl, regs.wl, tte, slow, header);
     auto it = g_parts.find(key);
     std::uint64_t hash = 0;
     bool late = false;   // the hash is what the helper last found, not this frame's
@@ -1736,6 +1919,20 @@ bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
     if (it != g_parts.end() && it->second.ok) {
         PartRecord& r = it->second;
         bool same = hash != 0 && r.hash == hash && r.before == regs && PartHeaderSame(r.header, header, slow);
+        std::uint64_t texNow[4];
+        bool texMoved = false;
+        for (std::size_t k = 0; same && k < r.texAt.size(); k++) {
+            const std::uint32_t* q = r.texAt[k];
+            std::uint64_t v;
+            std::memcpy(&v, q, 8);
+            same = (q[2] & 0xFF) == 0x06 && q[3] == 0 && (!r.texStrict || v == r.texWas[k]);
+            if (!r.texStrict) {
+                texNow[k] = v;
+                texMoved = texMoved || v != r.texWas[k];
+                for (std::size_t j = 0; j < k; j++)   // two that were one texture are still one
+                    same = same && (r.texWas[j] != r.texWas[k] || texNow[j] == v);
+            }
+        }
         if (!same)   // why, for the report: the hash, the registers, or the header
             g_partsStaleBy[r.hash != hash ? 0 : !(r.before == regs) ? 1 : 2]++;
         const bool wholeDue = late ? r.wholeArrived : (r.verified < 8 || ((gs::FramesShown() + key) & 31) == 0);
@@ -1776,6 +1973,15 @@ bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
             std::memcpy(&item.words[16], vu1::Data(), 32);
             item.words[24] = vu1::TakeBatchIds(r.ids);
             item.words[25] = r.firstId;
+            if (texMoved) {   // the kept packets' TEX0 writes with what the packet has now
+                for (const PartRecord::TexFix& f : r.texFix) {
+                    item.words.push_back(f.item);
+                    item.words.push_back(f.word);
+                    item.words.push_back((std::uint32_t)texNow[f.which]);
+                    item.words.push_back((std::uint32_t)(texNow[f.which] >> 32));
+                }
+                g_partsTexMoved++;
+            }
             g_gsPending.push_back(std::move(item));
             if (g_gsPending.size() >= 24)
                 GsPassOn();
@@ -1830,7 +2036,13 @@ bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
     }
     r.keyFirst = g_partKey + 1;
     r.hash = hash;
-    r.hashWhole = PartHash(target, true, regs.cl, regs.wl, tte, slow);
+    r.hashWhole = PartHash(target, true, regs.cl, regs.wl, tte, slow, &r.texAt);
+    for (const std::uint32_t* q : r.texAt) {
+        std::uint64_t v;
+        std::memcpy(&v, q, 8);
+        r.texWas.push_back(v);
+    }
+    r.texStrict = r.texAt.size() > 4;
     std::memcpy(r.header, header, sizeof header);
     r.before = regs;
     r.troubleWas = vu1::PartTrouble();
@@ -1863,6 +2075,13 @@ void PartDone()
             gs::Batch b;
             std::memcpy(&b, &w[1], sizeof b);
             ok = std::memcmp(b.matrix, matrix, sizeof matrix) == 0;
+            if (!ok && std::getenv("SLY1_PART_DIFF")) {
+                std::uint32_t hash, entry;
+                vu1::CurrentProgram(&hash, &entry);
+                char name[96];
+                std::snprintf(name, sizeof name, "refusal: batch %zu of %zu, matrix other (last program %08X 0x%03X)", k, r->items.size(), hash, entry);
+                g_diffCounts[name]++;
+            }
             if (b.id != 0) {
                 minId = std::min(minId, b.id);
                 maxId = std::max(maxId, b.id);
@@ -1872,13 +2091,44 @@ void PartDone()
             for (std::size_t q = 0; ok && q + 4 <= w.size();) {
                 std::uint32_t nloop = w[q] & 0x7FFF, flg = (w[q + 1] >> 26) & 3, nreg = (w[q + 1] >> 28) & 0xF;
                 ok = flg == 0 && nreg == 1 && (w[q + 2] & 0xF) == 0xE && q + 4 + (std::size_t)nloop * 4 <= w.size();
+                if (!ok && std::getenv("SLY1_PART_DIFF")) {
+                    std::uint32_t hash, entry;
+                    vu1::CurrentProgram(&hash, &entry);
+                    char name[112];
+                    std::snprintf(name, sizeof name, "refusal: packet tag flg %u nreg %u regs %X prim %X pre %u (last program %08X 0x%03X)", flg, nreg, w[q + 2], (w[q + 1] >> 15) & 0x7FF, (w[q+1]>>14)&1, hash, entry);
+                    g_diffCounts[name]++;
+                }
                 for (std::uint32_t i = 0; ok && i < nloop; i++) {
                     std::uint32_t reg = w[q + 4 + i * 4 + 2] & 0xFF;
                     ok = reg > 0x05 && reg != 0x0C && reg != 0x0D && reg != 0x61;
+                    if (!ok && std::getenv("SLY1_PART_DIFF")) {
+                        char name[96];
+                        std::snprintf(name, sizeof name, "refusal: packet writes register %02X", reg);
+                        g_diffCounts[name]++;
+                    }
+                    if (reg == 0x06 && !r->texAt.empty()) {
+                        std::uint64_t v;
+                        std::memcpy(&v, &w[q + 4 + i * 4], 8);
+                        std::size_t which = 0;
+                        while (which < r->texWas.size() && r->texWas[which] != v)
+                            which++;
+                        if (which < r->texWas.size())
+                            r->texFix.push_back({(std::uint32_t)k, (std::uint32_t)(q + 4 + i * 4), (std::uint32_t)which});
+                        else
+                            r->texStrict = true;
+                    }
                 }
                 q += 4 + (std::size_t)nloop * 4;
             }
         }
+    }
+    if (!ok && std::getenv("SLY1_PART_DIFF")) {
+        const char* why = r->bad ? "an item not a part's" : !g_vif1.BetweenCodes() ? "ends inside a VIFcode" :
+                          vu1::PartTrouble() != r->troubleWas ? "trouble (a program not taken)" : g_counts.vifInterrupts != r->interruptsWas ? "an interrupt" :
+                          g_counts.finishes != r->finishesWas ? "a FINISH" : r->items.empty() ? "nothing queued" : "a batch's matrix or a packet's registers";
+        char name[96];
+        std::snprintf(name, sizeof name, "refused %s mode %d: %s", r->slow ? "long" : "cached", (int)r->header[37], why);
+        g_diffCounts[name]++;
     }
     r->after = g_vif1.GetRegs();
     r->firstId = minId == ~0u ? 0 : minId;
@@ -1906,10 +2156,11 @@ void PartDone()
 
 void PartCountsLine(const char* what)
 {
-    std::fprintf(stderr, "partcounts: %s: drawn again %llu (long way %llu), kept %llu, refused %llu, stale by hash %llu regs %llu header %llu, fickle %llu, "
+    PartDiffReport();
+    std::fprintf(stderr, "partcounts: %s: drawn again %llu (long way %llu, texture moved %llu), kept %llu, refused %llu, stale by hash %llu regs %llu header %llu, fickle %llu, "
                  "moving %llu, hashed here %.2f s, too late %llu, kept words %.1f MB, let go %llu, batches queued %llu\n", what,
-                 (unsigned long long)g_partsReplayed, (unsigned long long)g_partsSlowReplayed, (unsigned long long)g_partsRecorded,
-                 (unsigned long long)g_partsRefused, (unsigned long long)g_partsStaleBy[0], (unsigned long long)g_partsStaleBy[1],
+                 (unsigned long long)g_partsReplayed, (unsigned long long)g_partsSlowReplayed, (unsigned long long)g_partsTexMoved,
+                 (unsigned long long)g_partsRecorded, (unsigned long long)g_partsRefused, (unsigned long long)g_partsStaleBy[0], (unsigned long long)g_partsStaleBy[1],
                  (unsigned long long)g_partsStaleBy[2], (unsigned long long)g_partsFickle, (unsigned long long)g_partsMoving, g_partHashNs / 1e9,
                  (unsigned long long)g_hashTooLate.load(), g_partWords * 4 / 1e6, (unsigned long long)g_partsCleared,
                  (unsigned long long)g_batchesQueued.load());
@@ -1951,6 +2202,7 @@ struct LiveSink {
     // then the DMA call of it): from the NOP to the tag that returns from the call. PartCall says
     // whether the call is left out, the part drawn from what was kept of the packet.
     int depth = 0, partDepth = -1;
+    std::uint64_t partBegan = 0;
     bool SkipCall(std::uint32_t target)
     {
         Flush();   // the words before the call first, the NOP among them
@@ -1958,11 +2210,14 @@ struct LiveSink {
         std::uint32_t marker = g_vif1.TakePartBegin();
         if (!marker)
             return false;
+        const std::uint64_t t0 = NowNs();   // (for SLY1_PERF_LOG's perfparts: where the parts' time goes)
         if (PartCall(marker, target, slow)) {
             g_vif1.PartEnd();
+            g_partTimes[0] += NowNs() - t0;
             return true;
         }
         partDepth = depth;
+        partBegan = t0;
         return false;
     }
     void OnTagDone(std::uint32_t id)
@@ -1976,6 +2231,7 @@ struct LiveSink {
                 PartDone();
                 g_vif1.PartEnd();
                 partDepth = -1;
+                g_partTimes[1] += NowNs() - partBegan;
             }
         }
     }
@@ -2276,6 +2532,7 @@ void GsThreadMain()
             const std::uint32_t firstId = item.words[24], keptFirstId = item.words[25];
             const std::size_t head = 1 + (sizeof(gs::Batch) + 3) / 4;
             const std::vector<PartKept>& part = *item.part;
+            std::size_t fix = 26;
             for (std::size_t i = 0; i < part.size(); i++) {
                 const PartKept& kept = part[i];
                 if (i + 2 < part.size()) {
@@ -2292,6 +2549,16 @@ void GsThreadMain()
                 }
                 const std::uint32_t* w = kept.data;
                 const std::size_t size = kept.size;
+                if (fix + 4 <= item.words.size() && item.words[fix] == i) {
+                    // its TEX0 writes are other values now: the packet from a copy with them
+                    static std::vector<std::uint32_t> copy;
+                    copy.assign(w, w + size);
+                    for (; fix + 4 <= item.words.size() && item.words[fix] == i; fix += 4) {
+                        copy[item.words[fix + 1]] = item.words[fix + 2];
+                        copy[item.words[fix + 1] + 1] = item.words[fix + 3];
+                    }
+                    w = copy.data();
+                }
                 if (kept.path == 4) {
                     gs::Batch b;
                     std::memcpy(&b, &w[1], sizeof b);
@@ -2438,15 +2705,18 @@ void RenderThreadMain()
                                  ((double)(now - since) - (double)(idle - idleWas)) / n);
                 {
                     // the parts' counters over the same frames, a frame
+                    static std::uint64_t timesWas[2];
+                    const std::uint64_t times[2] = {g_partTimes[0], g_partTimes[1]};
                     static std::uint64_t was[8];
                     const std::uint64_t is[8] = {g_partsReplayed, g_partsRecorded, g_partsRefused, g_partsStaleBy[0], g_partsStaleBy[1],
                                                  g_partsStaleBy[2], g_partsFickle, g_batchesQueued.load()};
                     const double f = (double)(shown - shownWas);
                     if (since)
                         std::fprintf(stderr, "perfparts: to %llu, a frame: drawn again %.0f, kept %.1f, refused %.1f, stale by hash %.1f regs %.1f header %.1f, "
-                                     "fickle %.0f, batches %.0f\n", (unsigned long long)shown, (is[0] - was[0]) / f, (is[1] - was[1]) / f,
+                                     "fickle %.0f, batches %.0f; ms: drawing again %.2f, parts in full %.2f\n", (unsigned long long)shown, (is[0] - was[0]) / f, (is[1] - was[1]) / f,
                                      (is[2] - was[2]) / f, (is[3] - was[3]) / f, (is[4] - was[4]) / f, (is[5] - was[5]) / f, (is[6] - was[6]) / f,
-                                     (is[7] - was[7]) / f);
+                                     (is[7] - was[7]) / f, (times[0] - timesWas[0]) / f / 1e6, (times[1] - timesWas[1]) / f / 1e6);
+                    std::memcpy(timesWas, times, sizeof timesWas);
                     std::memcpy(was, is, sizeof was);
                 }
                 idleWas = idle;

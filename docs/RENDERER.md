@@ -865,6 +865,36 @@ second's times (`perfparts:`), and `partcounts:` after each level; compare secon
 same counts. `SLY1_ADDR_TRACE=1` prints each caller that turns an unmapped game address into
 a pointer (none in any level).
 
+### What still changed each frame in a still scene (2026-11-18)
+
+"Back Alley Heist" from its start, nothing moving: 580 parts drawn again a frame, 47 kept
+anew and 140 run as ever. `SLY1_PART_DIFF=1` (with `SLY1_PART_HASH_NOW=1`) hashes each part's
+packet a VIFcode at a time and says what differs from the list before, and why a part is not
+kept (`partdiff:` after each level). It found:
+
+- **A texture's place.** 41 parts a frame differed in one quadword: the TEX0 write among the
+  registers the packet unpacks for VU1 to kick, its TBP0 and CBP other each frame (the game
+  places textures anew in the GS's memory). The hash now leaves the value of such a write out,
+  the part's record notes where the writes are and where each is in the kept packets, and a
+  part whose textures have moved is drawn again with the kept packets' TEX0 writes replaced
+  (`texture moved` in `partcounts:`). Exact: the opening's 898 frames hash the same.
+- **The alpha's scale.** 52 parts a frame had 9.x other in its last digits (a fade with the
+  distance: 0.65348, then 0.653482). Within 1/512 of what the part was kept with it is drawn
+  as kept. Not exact, and off under `SLY1_PART_HASH_NOW=1`.
+- **The turns' table.** `g_partTurns` was a map emptied for each list: a node allocated for
+  each part of each list, over half of the render thread's allocations. A fixed table now.
+- **Parts drawn the long way that are unlit or lit by their cache** (mode -1 or 0) read
+  neither the inverse matrix nor the centre: compared as the cached parts are.
+
+After it: 675 drawn again, 7 kept anew, 84 run as ever. On the Switch that scene went from
+21.5 to 20.6 ms a frame of the render thread: the parts that changed were not where its time
+is. `perfparts:` now has the time for parts drawn again and for parts run in full; on the
+host the 90 run in full are 63% of the render thread's time and the 675 drawn again 13%.
+Those 84 are: 34 lit by VU1 afresh (mode 4: skinned, or with a light of their own), 33 that
+are never kept because their packets write vertices (register 1, RGBAQ: triangles the
+clipper cut, which depend on the matrix), 8 with a program the handlers do not take, and
+parts that do fade.
+
 ### The handheld GPU clock: not used
 
 `SLY1_PERF_CONFIG=92220007` asks the system for that performance configuration in handheld mode
