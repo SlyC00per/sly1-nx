@@ -551,6 +551,20 @@ PATCHES = [
      "            case 3: { s32 CreateMemoryCardSaveFiles(MemoryCard* self);\n"
      "                StartBackgroundJob(&g_backgroundJob, (void*)CreateMemoryCardSaveFiles, self); break; }",
      "the save file is created without asking, as the PS3 release has no memory card questions"),
+
+    # An animation player's callbacks are called with the player itself as the third word
+    # (SendObjectNotification's argument); the state walker's is declared with an s32 there and
+    # compares it with its own player's address. With the pointer cut to 32 bits the two never
+    # matched: a walker never went on to its next edge, so Sly held one pose on the title screen
+    # where retail goes through his idle animations.
+    ("src/main/state_walker.cpp",
+     "void HandleStateWalkerTrackEnd(StateWalker* self, s32 a, s32 b)\n{\n    if (a == 5 && b == (s32)self->player) {",
+     "void HandleStateWalkerTrackEnd(StateWalker* self, s32 a, void* b)\n{\n    if (a == 5 && (AnimationPlayer*)b == self->player) {",
+     "the notification's third word is the animation player that ended, a pointer an s32 cannot hold here"),
+    ("include/functions/state_walker.h",
+     "void HandleStateWalkerTrackEnd(StateWalker* self, s32 a, s32 b);",
+     "void HandleStateWalkerTrackEnd(StateWalker* self, s32 a, void* b);",
+     "the notification's third word is the animation player that ended, a pointer an s32 cannot hold here"),
 ]
 
 
