@@ -1951,17 +1951,21 @@ bool LightFourWide(Runner& r, Regs& R)
             for (int j = 0; j < 4; j++)
                 R.put(21 + j, Load(r, (std::uint16_t)(colours + j)), XYZW);
         }
+        // Four fields at a time, the same rules: l is the host's result on fixed operands (no
+        // field with the largest exponent, none denormal), so Max against 0 is a choice by the
+        // comparison (what is not above 0 becomes +0), and Add needs only q fixed.
         for (int j = 0; j < 4; j++) {
             V l;
             l.v = base + scaleF * Splat(v30[j]);
-            for (int c = 0; c < 3; c++)
-                l[c] = Max(l[c], 0.0f);
+            const I4 above = l.v > Splat(0.0f);
+            l.v = (F4)((U4)l.v & (U4)above);
             R.put(9 + j, l, XYZ);
         }
         for (int j = 0; j < 4; j++) {
-            V l = R.get(9 + j), q = R.get(17 + j);
-            l.x = Add(q.x, l.x);
-            l.y = Add(q.y, l.y);
+            V l = R.get(9 + j), sum;
+            sum.v = FixIn4(R.get(17 + j).v) + FixIn4(l.v);
+            l.x = sum.x;
+            l.y = sum.y;
             R.put(9 + j, l, XY);
         }
         for (int j = 0; j < 4; j++) {
