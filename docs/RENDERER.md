@@ -716,3 +716,11 @@ the wait for the GPU 0.00, 10.17, 4.16 and 10.97 ms a frame, the frame 24.3, 32.
 the 600th, 798 of one vertical blank, 624 of two, 2 of three; the wait for the GPU 3.0 s of the
 run, nearly all of it on the roof with the steaming vents (21 screens of blended sprites a
 frame, each drawn once already), where the GS thread takes 26 to 31 ms a frame.
+
+### The handheld GPU clock: not used
+
+`SLY1_PERF_CONFIG=92220007` asks the system for that performance configuration in handheld mode
+and prints what it had and has (it had 00020003 and took it). With it the opening went from 41.7
+to 44.2 frames a second on the Switch Lite and the roof with the steam from 43 and 34 ms a frame
+to 33 and 27. It is a trial switch and stays off: the port is to reach its frame rate at the
+system's default clocks (the user's decision: less power and heat are what the port is for).

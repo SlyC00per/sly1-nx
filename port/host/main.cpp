@@ -738,6 +738,22 @@ int main(int argc, char** argv)
         port::gs::SetBackend(&counting);
     }
     // The Switch's GPU renderer, before any thread draws (SLY1_NO_GPU: without it, nothing shown).
+#if defined(__SWITCH__)
+    // SLY1_PERF_CONFIG=hex: asks the system for a performance configuration in handheld (normal)
+    // mode, and says what it had and has. A trial: the default has the GPU at its lowest handheld
+    // clock, and the roof with the steam is the GPU's.
+    if (const char* config = std::getenv("SLY1_PERF_CONFIG")) {
+        Result opened = apmInitialize();
+        u32 was = 0, now = 0;
+        Result got = apmGetPerformanceConfiguration(ApmPerformanceMode_Normal, &was);
+        Result set = apmSetPerformanceConfiguration(ApmPerformanceMode_Normal, (u32)std::strtoul(config, nullptr, 16));
+        apmGetPerformanceConfiguration(ApmPerformanceMode_Normal, &now);
+        u32 current = 0;
+        Result cur = appletGetCurrentPerformanceConfiguration(&current);
+        std::fprintf(stderr, "sly1: performance configuration: was %08X (result %X, apm %X), asked %s (result %X), now %08X; the applet's current %08X (result %X)\n", was, got, opened,
+                     config, set, now, current, cur);
+    }
+#endif
     if (!std::getenv("SLY1_NO_GPU"))
         port::gpu::Start();
     // The GS on a thread of its own, after the render thread's VIF1 and VU1 (docs/RENDERER.md): on
