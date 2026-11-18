@@ -30,6 +30,7 @@
 #include "gs_vsh_dksh.h"
 #include "gs_fsh_dksh.h"
 #include "gs_lite_fsh_dksh.h"
+#include "gs_fx_fsh_dksh.h"
 #include "batch_vsh_dksh.h"
 
 namespace port {
@@ -57,6 +58,10 @@ constexpr std::uint32_t kTargetMemory = 8u << 20;
 // Memory for the batches that come again unchanged (gs::Batch::keep): their positions and STQ,
 // colours and indices, written once and drawn from each frame after.
 constexpr std::uint32_t kKeepMemory = 64u << 20;
+// The half-size picture of the translucent effects (Renderer::FxRun): its number as a target, and
+// its and the depth buffer's places among the textures' descriptors.
+constexpr int kFxTarget = 100;
+constexpr std::uint32_t kFxTextureId = kMaxTextures - 3 - 2 * kSmallTargets, kDepthTextureId = kMaxTextures - 4 - 2 * kSmallTargets;
 constexpr std::uint32_t kMaxDraws = 12000;               // a frame's draws before its commands are sent
 
 std::uint32_t Align(std::uint32_t v, std::uint32_t a) { return (v + a - 1) & ~(a - 1); }
@@ -201,7 +206,24 @@ private:
                textureMem_ = nullptr;
     DkImage screen_[2], colour_[2], depth_;
     DkShader vertexShader_, fragmentShader_, batchShader_, liteShader_;
-    bool liteBound_ = false;   // gs_lite_fsh.glsl in place of gs_fsh.glsl
+    int fragBound_ = 0;        // the pixel shader bound: 0 gs_fsh.glsl, 1 gs_lite_fsh.glsl, 2 gs_fx_fsh.glsl
+    // The translucent effects at half size. Runs of sprites that only add their colour to the
+    // frame's (a particle effect: steam, glows) are drawn into a picture of half the frame's size
+    // each way, which is then laid over the frame, added to it, before anything else is drawn.
+    // Adding does not depend on the order, so the frame gets what it would have got, but for the
+    // size the sprites were drawn at: a quarter of the pixels. The roof with the steaming vents
+    // has 21 screens of them a frame, and they were what the GPU could not do in a sixtieth of a
+    // second. SLY1_GPU_NO_FX=1: drawn into the frame, as before.
+    DkImage fxImage_;
+    Texture fxTexture_;
+    DkShader fxShader_;
+    bool fxReady_ = false, fxOpen_ = false, inComposite_ = false, depthBound_ = false;
+    int fxFor_ = -1;   // the frame buffer the open picture is for
+    std::uint64_t fxRuns_ = 0, fxComposites_ = 0;
+    bool FxRun(const gs::DrawState& s, const Source& src, int target, bool smallTexture) const;
+    int AlphaDecided(const gs::DrawState& s, const Source& src, const Texture* texture, bool smallTexture) const;
+    void OpenFx(int target);
+    void CompositeFx();
     std::uint64_t liteRuns_ = 0;
     std::uint32_t batchUbo_ = 0;
     // what the commands so far draw with: whose vertices, their layout, the viewport's depths
@@ -385,6 +407,10 @@ bool Renderer::Create()
     std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(codeMem_) + liteAt, gs_lite_fsh_dksh, gs_lite_fsh_dksh_size);
     dkShaderMakerDefaults(&shaderMaker, codeMem_, liteAt);
     dkShaderInitialize(&liteShader_, &shaderMaker);
+    std::uint32_t fxAt = Align(liteAt + (std::uint32_t)gs_lite_fsh_dksh_size, DK_SHADER_CODE_ALIGNMENT);
+    std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(codeMem_) + fxAt, gs_fx_fsh_dksh, gs_fx_fsh_dksh_size);
+    dkShaderMakerDefaults(&shaderMaker, codeMem_, fxAt);
+    dkShaderInitialize(&fxShader_, &shaderMaker);
     if (std::getenv("SLY1_GPU_CULL_FLIP"))
         cullFront_ = 0.0f;
 
@@ -409,6 +435,35 @@ bool Renderer::Create()
 
     textureMem_ = Block(kTextureMemory, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image);
     targetMem_ = Block(kTargetMemory, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image);
+    if (targetMem_ && !std::getenv("SLY1_GPU_NO_FX")) {   // the effects' half-size picture, and it and the depth buffer as textures
+        DkImageLayoutMaker lm;
+        DkImageLayout layout;
+        dkImageLayoutMakerDefaults(&lm, device_);
+        lm.flags = DkImageFlags_UsageRender;
+        lm.format = DkImageFormat_RGBA8_Unorm;
+        lm.dimensions[0] = kWidth / 2;
+        lm.dimensions[1] = kHeight / 2;
+        dkImageLayoutInitialize(&layout, &lm);
+        std::uint32_t at = Align(targetUsed_, dkImageLayoutGetAlignment(&layout));
+        std::uint32_t size = (std::uint32_t)dkImageLayoutGetSize(&layout);
+        if (at + size <= kTargetMemory) {
+            targetUsed_ = at + size;
+            dkImageInitialize(&fxImage_, &layout, targetMem_, at);
+            fxTexture_.id = kFxTextureId;
+            fxTexture_.width = kWidth / 2;
+            fxTexture_.height = kHeight / 2;
+            std::uint8_t* set = (std::uint8_t*)dkMemBlockGetCpuAddr(dataMem_) + imageSet_;
+            DkImageView view;
+            DkImageDescriptor d;
+            dkImageViewDefaults(&view, &fxImage_);
+            dkImageDescriptorInitialize(&d, &view, false, false);
+            std::memcpy(set + kFxTextureId * sizeof d, &d, sizeof d);
+            dkImageViewDefaults(&view, &depth_);
+            dkImageDescriptorInitialize(&d, &view, false, false);
+            std::memcpy(set + kDepthTextureId * sizeof d, &d, sizeof d);
+            fxReady_ = true;
+        }
+    }
     if (!std::getenv("SLY1_GPU_NO_KEEP"))   // without it, a kept batch is copied each frame like any other
         keepMem_ = Block(kKeepMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
     for (int k = 0; k < kSets; k++) {
@@ -455,6 +510,7 @@ void Renderer::BeginCommands()
     batchSet_ = false;
     frameRead_ = false;
     frameBound_ = -1;
+    depthBound_ = false;
     DkGpuAddr data = dkMemBlockGetGpuAddr(dataMem_);
     DkBufExtents fragmentUbo = {data + fragmentUbo_, sizeof(FragmentParams)};
     dkCmdBufBindUniformBuffers(cmd_, DkStage_Fragment, 0, &fragmentUbo, 1);
@@ -491,7 +547,7 @@ void Renderer::BindSource(const Source& src)
     if (source != source_ || layout != layout_) {
         const DkShader* shaders[2] = {b ? &batchShader_ : &vertexShader_, &fragmentShader_};
         dkCmdBufBindShaders(cmd_, DkStageFlag_GraphicsMask, shaders, 2);
-        liteBound_ = false;
+        fragBound_ = 0;
         DkBufExtents ubo = {data + (b ? batchUbo_ : vertexUbo_), (std::uint32_t)(b ? sizeof(BatchParams) : sizeof(VertexParams))};
         dkCmdBufBindUniformBuffers(cmd_, DkStage_Vertex, 0, &ubo, 1);
         if (b) {
@@ -593,7 +649,13 @@ void Renderer::BindTarget(int target)
     DkImageView colour, depth;
     float fw = kFieldWidth, fh = kFieldHeight;
     std::uint32_t iw = kWidth, ih = kHeight;
-    if (target >= 2) {   // a small target: no depth buffer (the game draws into it without one)
+    if (target == kFxTarget) {   // the effects' half-size picture: the frame's field, half the pixels each way, no depth buffer
+        dkImageViewDefaults(&colour, &fxImage_);
+        const DkImageView* colours[1] = {&colour};
+        dkCmdBufBindRenderTargets(cmd_, colours, 1, nullptr);
+        iw = kWidth / 2;
+        ih = kHeight / 2;
+    } else if (target >= 2) {   // a small target: no depth buffer (the game draws into it without one)
         const Small& t = small_[target - 2];
         dkImageViewDefaults(&colour, &t.image[inSelf_ ? t.cur ^ 1 : t.cur]);
         const DkImageView* colours[1] = {&colour};
@@ -746,7 +808,7 @@ const Texture* Renderer::TextureFor(const gs::DrawState& state)
         dkImageLayoutInitialize(&layout, &lm);
         std::uint32_t at = Align(textureUsed_, dkImageLayoutGetAlignment(&layout));
         std::uint32_t size = (std::uint32_t)dkImageLayoutGetSize(&layout);
-        if (at + size > kTextureMemory || nextTexture_ == kMaxTextures - 2 - 2 * kSmallTargets) {   // the last are the frame buffers' and the small targets'
+        if (at + size > kTextureMemory || nextTexture_ == kMaxTextures - 4 - 2 * kSmallTargets) {   // the last are the frame buffers', the small targets' and the effects'
             // full: everything drawn with the old textures first, then all of them forgotten
             Send(true);
             textures_.clear();
@@ -1138,6 +1200,131 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
     return true;
 }
 
+// Whether a run's alpha test is decided for the whole run by where its pixels' alpha can lie: 1 all
+// pass, -1 all fail, 0 not known.
+int Renderer::AlphaDecided(const gs::DrawState& s, const Source& src, const Texture* texture, bool smallTexture) const
+{
+    const std::uint32_t test = (std::uint32_t)s.test;
+    const bool ate = test & 1;
+    const std::uint32_t atst = (test >> 1) & 7, aref = (test >> 4) & 0xFF;
+    if (!ate)
+        return 1;
+    static const bool noRange = std::getenv("SLY1_GPU_NO_ALPHA_RANGE") != nullptr;
+    int decided = 0;
+    if (!noRange && ab_ != 2 && ab_ != 3 && !smallTexture && atst != 0 && atst != 4 && atst != 7) {
+        float lo = src.alphaMin, hi = src.alphaMax;   // the vertices' alone, unless the texture's comes in
+        if (!src.batch && src.vertices && src.vertexSize == sizeof(gs::DrawVertex)) {   // the GS's vertices: looked at here
+            const gs::DrawVertex* v = static_cast<const gs::DrawVertex*>(src.vertices);
+            const std::size_t n = src.vertexBytes / sizeof(gs::DrawVertex);
+            std::uint32_t least = 255, most = 0;
+            for (std::size_t k = 0; k < n; k++) {
+                least = std::min<std::uint32_t>(least, v[k].a);
+                most = std::max<std::uint32_t>(most, v[k].a);
+            }
+            lo = (float)least;
+            hi = (float)most;
+        }
+        const int tfx = (int)((s.tex0 >> 35) & 3), tcc = (int)((s.tex0 >> 34) & 1);
+        bool known = true;
+        if (s.tme && tcc) {
+            if (!texture) {
+                known = false;
+            } else if (tfx == 0) {
+                lo = lo * texture->alphaMin / 128.0f;
+                hi = std::min(hi * texture->alphaMax / 128.0f, 255.0f);
+            } else if (tfx == 1 || tfx == 3) {
+                lo = texture->alphaMin;
+                hi = texture->alphaMax;
+            } else {
+                lo = lo + texture->alphaMin;
+                hi = std::min(hi + texture->alphaMax, 255.0f);
+            }
+        }
+        lo = std::floor(lo) - 1.0f;   // a margin for the shader's arithmetic and the filter's
+        hi = std::ceil(hi) + 1.0f;
+        const float ref = (float)aref;
+        if (known) {
+            const bool allPass = atst == 5 ? lo >= ref : atst == 6 ? lo > ref : atst == 2 ? hi < ref : hi <= ref;
+            const bool allFail = atst == 5 ? hi < ref : atst == 6 ? hi <= ref : atst == 2 ? lo >= ref : lo > ref;
+            decided = allPass ? 1 : allFail ? -1 : 0;
+        }
+    }
+    return decided;
+}
+
+// Whether a run goes into the effects' half-size picture: the GS's own triangles (sprites) into a
+// frame buffer, blended as Cs times As or FIX plus Cd (added to what is there), with no pixel of
+// them writing the depth: the alpha test NEVER, or one no pixel of the run can pass, with what
+// fails drawn to the frame. (The steam's sprites are tested against 0x80 with FB_ONLY and never
+// reach it. What they would write to the frame's alpha is not written this way.)
+bool Renderer::FxRun(const gs::DrawState& s, const Source& src, int target, bool smallTexture) const
+{
+    if (!fxReady_ || src.batch || target < 0 || target >= 2 || s.kind != 2 || !s.abe || smallTexture || view_ != 0)
+        return false;
+    const std::uint32_t alpha = (std::uint32_t)s.alpha & 0xFF, test = (std::uint32_t)s.test;
+    if (alpha != 0x48 && alpha != 0x68)
+        return false;
+    const bool ate = test & 1, date = (test >> 14) & 1, zte = (test >> 16) & 1;
+    const std::uint32_t atst = (test >> 1) & 7, afail = (test >> 12) & 3, ztst = (test >> 17) & 3;
+    if (!ate || date || (zte && ztst == 0) || (s.tme && texture_ == nullptr) || (afail != 1 && afail != 3))
+        return false;
+    return atst == 0 || AlphaDecided(s, src, texture_, false) == -1;
+}
+
+// The effects' picture begun for a frame buffer: emptied, and the depth buffer as it stands made
+// readable as a texture.
+void Renderer::OpenFx(int target)
+{
+    fxOpen_ = true;
+    fxFor_ = target;
+    BindTarget(kFxTarget);
+    DkScissor all = {0, 0, kWidth / 2, kHeight / 2};
+    dkCmdBufSetScissors(cmd_, 0, &all, 1);
+    float none[4] = {0, 0, 0, 0};
+    dkCmdBufClearColor(cmd_, 0, DkColorMask_RGBA, none);
+    dkCmdBufBarrier(cmd_, DkBarrier_Fragments, DkInvalidateFlags_Image);
+    last_.any = false;
+}
+
+// The effects' picture laid over its frame buffer, added to it: a sprite over the whole frame,
+// textured with the picture (the filter spreads it to the frame's size).
+void Renderer::CompositeFx()
+{
+    fxOpen_ = false;
+    fxComposites_++;
+    dkCmdBufBarrier(cmd_, DkBarrier_Fragments, DkInvalidateFlags_Image);
+    gs::DrawState st;
+    std::memset(&st, 0, sizeof st);
+    st.kind = 2;
+    st.tme = 1;
+    st.abe = 1;
+    st.alpha = 0x48;                                  // Cs times As plus Cd, As 0x80: added
+    st.test = 1u | (3u << 12) | (1u << 16) | (1u << 17);   // ATE, NEVER, RGB_ONLY; the depth test ALWAYS
+    st.frame = (fxFor_ == 1 ? 70 : 0) | (10ull << 16);
+    st.zbuf = 1ull << 32;                             // ZMSK
+    st.scissor = (639ull << 16) | (223ull << 48);
+    st.tex0 = (1ull << 35) | 0x3FFF;                  // DECAL, the vertex's alpha kept; a place no frame buffer has
+                                                      // (a run textured from one is the motion blur, left out)
+    st.clamp = 1 | (1 << 2);
+    gs::DrawVertex v[4];
+    static const float kCorner[4][2] = {{0, 0}, {1, 0}, {0, 1}, {1, 1}};
+    for (int k = 0; k < 4; k++) {
+        v[k].x = kCorner[k][0] * kFieldWidth;
+        v[k].y = kCorner[k][1] * kFieldHeight;
+        v[k].z = 0;
+        v[k].r = v[k].g = v[k].b = v[k].a = 0x80;
+        v[k].s = kCorner[k][0];
+        v[k].t = kCorner[k][1];
+        v[k].q = 1.0f;
+        v[k].fog = 0.0f;
+    }
+    static const std::uint32_t kIndex[6] = {0, 1, 2, 2, 1, 3};
+    Source src = {v, sizeof v, sizeof(gs::DrawVertex), kIndex, 6, nullptr};
+    inComposite_ = true;
+    Submit(st, src);
+    inComposite_ = false;
+}
+
 // Room in keepMem_ for a block of bytes: one let go at least three frames ago that is big enough
 // and not over twice the size, or new room at the end.
 bool Renderer::KeepRoom(std::uint32_t bytes, std::uint32_t* at, std::uint32_t* got)
@@ -1334,7 +1521,17 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         if (frameUsed_ + bytes + indexBytes + 256 > kFrameMemory || draws_ >= kMaxDraws)
             Send(true);
     }
-    const Texture* texture = smallTexture ? smallTexture : texture_;
+    // the effects at half size: a run of them goes into their picture, and the picture is laid over
+    // the frame before anything else is drawn into the frame
+    const bool fx = !inComposite_ && FxRun(s, src, target, smallTexture != nullptr);
+    if (!inComposite_) {
+        if (fxOpen_ && (!fx || fxFor_ != target))
+            CompositeFx();
+        if (fx && !fxOpen_)
+            OpenFx(target);
+    }
+    fxRuns_ += fx ? 1 : 0;
+    const Texture* texture = inComposite_ ? &fxTexture_ : smallTexture ? smallTexture : texture_;
     bool fresh = !last_.any;
     last_.any = true;
     if (listAt_ >= 0 && (long)frames_ + 1 == listAt_ && listed_ < 60) {   // SLY1_GPU_LIST=N: frame N's first draws
@@ -1347,7 +1544,7 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
                      target, (int)!last_.any, (t >> 17) & 3, (unsigned)((s.zbuf >> 32) & 1), t & 1, (t >> 1) & 7, (t >> 12) & 3,
                      s.abe, s.tme, (unsigned long long)s.scissor, p[0], p[1], src.vertices ? ((const std::uint32_t*)src.vertices)[2] : 0u);
     }
-    BindTarget(target);
+    BindTarget(fx ? kFxTarget : target);
     BindSource(src);
     runs_++;
     vertices_ += indices;
@@ -1496,10 +1693,18 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
             cullBound_ = cull;
         }
         culledDraws_ += cull;
-        if (lite != liteBound_) {
-            const DkShader* shader[1] = {lite ? &liteShader_ : &fragmentShader_};
+        const int frag = fx ? 2 : lite ? 1 : 0;
+        if (frag != fragBound_) {
+            const DkShader* shader[1] = {frag == 2 ? &fxShader_ : frag == 1 ? &liteShader_ : &fragmentShader_};
             dkCmdBufBindShaders(cmd_, DkStageFlag_Fragment, shader, 1);
-            liteBound_ = lite;
+            fragBound_ = frag;
+        }
+        if (fx) {   // its depth test is the shader's, against the depth buffer as a texture
+            if (!depthBound_) {
+                DkResHandle handle = dkMakeTextureHandle(kDepthTextureId, 0);
+                dkCmdBufBindTextures(cmd_, DkStage_Fragment, 2, &handle, 1);
+                depthBound_ = true;
+            }
         }
         liteRuns_ += lite ? 1 : 0;
     }
@@ -1510,7 +1715,8 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     fp.fogColour[0] = (float)(s.fogcol & 0xFF);
     fp.fogColour[1] = (float)((s.fogcol >> 8) & 0xFF);
     fp.fogColour[2] = (float)((s.fogcol >> 16) & 0xFF);
-    fp.fogColour[3] = dateRun ? (((test >> 15) & 1) ? 1.0f : 2.0f) : 0.0f;
+    fp.fogColour[3] = fx ? (!zte || ztst == 1 ? 0.0f : (float)ztst)   // gs_fx_fsh.glsl's depth test
+                         : dateRun ? (((test >> 15) & 1) ? 1.0f : 2.0f) : 0.0f;
     if (fresh || std::memcmp(&fp, &last_.fp, sizeof fp) != 0) {
         dkCmdBufPushConstants(cmd_, dkMemBlockGetGpuAddr(dataMem_) + fragmentUbo_, sizeof fp, 0, sizeof fp, &fp);
         last_.fp = fp;
@@ -1606,12 +1812,12 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         }
         DkDepthStencilState ds;
         dkDepthStencilStateDefaults(&ds);
-        ds.depthTestEnable = target < 2;   // a small target has no depth buffer
-        ds.depthWriteEnable = target < 2 && depthWrite && !zmsk;
+        ds.depthTestEnable = target < 2 && !fx;   // a small target has no depth buffer, nor has the effects' picture
+        ds.depthWriteEnable = target < 2 && !fx && depthWrite && !zmsk;
         ds.depthCompareOp = !zte || ztst == 1 ? DkCompareOp_Always : ztst == 2 ? DkCompareOp_Gequal : DkCompareOp_Greater;
         if (always)
             ds.depthCompareOp = DkCompareOp_Always;
-        std::uint32_t depthKey = (std::uint32_t)ds.depthWriteEnable | (std::uint32_t)ds.depthCompareOp << 1 | (target >= 2 ? 0x100u : 0u);
+        std::uint32_t depthKey = (std::uint32_t)ds.depthWriteEnable | (std::uint32_t)ds.depthCompareOp << 1 | (target >= 2 || fx ? 0x100u : 0u);
         if (depthKey != last_.depth) {
             dkCmdBufBindDepthStencilState(cmd_, &ds);
             last_.depth = depthKey;
@@ -1632,35 +1838,7 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     // leave hidden pixels out before the shader) or all fail (the AFAIL draw alone). The game
     // tests nearly everything against 126 with FB_ONLY for what fails: two draws of every batch,
     // the second of which, for a texture without holes, draws nothing.
-    static const bool noRange = std::getenv("SLY1_GPU_NO_ALPHA_RANGE") != nullptr;
-    int decided = 0;   // 1 all pass, -1 all fail
-    if (!noRange && ab_ != 2 && ab_ != 3 && !smallTexture && atst != 0 && atst != 4 && atst != 7) {
-        float lo = src.alphaMin, hi = src.alphaMax;   // the vertices' alone, unless the texture's comes in
-        const int tfx = (int)((s.tex0 >> 35) & 3), tcc = (int)((s.tex0 >> 34) & 1);
-        bool known = true;
-        if (s.tme && tcc) {
-            if (!texture) {
-                known = false;
-            } else if (tfx == 0) {
-                lo = lo * texture->alphaMin / 128.0f;
-                hi = std::min(hi * texture->alphaMax / 128.0f, 255.0f);
-            } else if (tfx == 1 || tfx == 3) {
-                lo = texture->alphaMin;
-                hi = texture->alphaMax;
-            } else {
-                lo = lo + texture->alphaMin;
-                hi = std::min(hi + texture->alphaMax, 255.0f);
-            }
-        }
-        lo = std::floor(lo) - 1.0f;   // a margin for the shader's arithmetic and the filter's
-        hi = std::ceil(hi) + 1.0f;
-        const float ref = (float)aref;
-        if (known) {
-            const bool allPass = atst == 5 ? lo >= ref : atst == 6 ? lo > ref : atst == 2 ? hi < ref : hi <= ref;
-            const bool allFail = atst == 5 ? hi < ref : atst == 6 ? hi <= ref : atst == 2 ? lo >= ref : lo > ref;
-            decided = allPass ? 1 : allFail ? -1 : 0;
-        }
-    }
+    int decided = AlphaDecided(s, src, texture, smallTexture != nullptr);   // 1 all pass, -1 all fail
     // What fails is drawn to the frame all the same (FB_ONLY) and nothing writes the depth (ZMSK, or
     // a small target, which has none): what passes and what fails are together every pixel, written
     // the same way. One draw without the test. (A particle effect's sprites are these, and the
@@ -1887,6 +2065,8 @@ void Renderer::DumpDraw(long k)
 void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
 {
     FlushPending();
+    if (fxOpen_)
+        CompositeFx();
     if (std::getenv("SLY1_GPU_AREA")) {
         if (frames_ % 20 == 0)
             std::fprintf(stderr, "gpuarea: frame %llu: opaque %.1f screens in %d runs, blended textured %.1f in %d, blended plain %.1f in %d, "
@@ -2091,6 +2271,8 @@ void Renderer::Report()
                  (unsigned long long)keptNoRoom_, keepUsed_ / 1e6, kKeepMemory >> 20, keepFree_.size(), (unsigned long long)keepResets_);
     std::fprintf(stderr, "gpu: %llu runs whose alpha test was decided for the whole run (one draw), %llu drawn twice (what passes, what fails); "
                  "%llu batches culled by the rasteriser\n", (unsigned long long)onePassDraws_, (unsigned long long)twoPassDraws_, (unsigned long long)culledDraws_);
+    std::fprintf(stderr, "gpu: the effects at half size: %llu runs into their picture, laid over the frame %llu times\n", (unsigned long long)fxRuns_,
+                 (unsigned long long)fxComposites_);
     std::fprintf(stderr, "gpu: %llu runs with the short pixel shader\n", (unsigned long long)liteRuns_);
     std::fprintf(stderr, "gpu: %llu batches transformed by the GPU (%llu vertices); %.3f s making their triangles' indices\n",
                  (unsigned long long)batches_, (unsigned long long)batchVertices_, indexNs_ / 1e9);

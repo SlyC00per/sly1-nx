@@ -717,6 +717,36 @@ the 600th, 798 of one vertical blank, 624 of two, 2 of three; the wait for the G
 run, nearly all of it on the roof with the steaming vents (21 screens of blended sprites a
 frame, each drawn once already), where the GS thread takes 26 to 31 ms a frame.
 
+### The translucent effects at half size
+
+What was left of the wait for the GPU was the steam: about 21 screens of blended sprites a frame
+on the roof with the vents. Those runs now go into a picture of their own at half the frame's
+size each way (480 by 360), which is laid over the frame, added to it, before anything else is
+drawn into the frame: a quarter of the pixels, and the steam slightly softer (accepted).
+
+- What goes there (`Renderer::FxRun`): the GS's own triangles into a frame buffer, blended as Cs
+  times As or FIX plus Cd (ALPHA 0x48 or 0x68: added to what is there, so the order among them
+  and against the frame does not matter), that write no depth: the alpha test NEVER, or one no
+  pixel of the run can pass (`AlphaDecided`), with what fails drawn to the frame. Not a batch,
+  not a run with the destination alpha test, not one into a small target.
+- The half-size picture has no depth buffer. The depth test is in its pixel shader
+  (`gs_fx_fsh.glsl`), against the frame's depth buffer read as a texture: a pixel stands for four
+  of the frame's and is drawn where the run is in front of the nearest of the four.
+- What those runs would write to the frame's alpha is not written.
+- `SLY1_GPU_NO_FX=1`: as before.
+
+Checked in Ryujinx against `SLY1_GPU_NO_FX=1` under lockstep, at a quarter size: every 100th
+frame of the opening from 420 to 2,720 and frames 750 to 850 by twenties (the dust behind the
+falling bricks). One pixel in all (frame 720) differs by more than 24 of 255. (A first version lost its depth test
+to a later line that set the same shader field: smoke showed through a wall.)
+
+On the Switch (the Lite, handheld, the clock as it is; measured with that first version, whose
+runs were not depth-tested), the opening: 44.0 frames a second where
+it was 41.7; of the frames after the 600th, 929 of one vertical blank and 614 of two; the wait
+for the GPU 0.94 s of the run where it was 3.0 s. The roof with the vents: 25 to 26 ms a frame.
+What is left at two blanks is the processor's: the render thread and the GS thread, 15 to 21 ms
+each in the busy stretches.
+
 ### The handheld GPU clock: not used
 
 `SLY1_PERF_CONFIG=92220007` asks the system for that performance configuration in handheld mode
