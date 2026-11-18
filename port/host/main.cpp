@@ -256,7 +256,10 @@ void VerifyLevels()
         waitFor([&] { return port::g_levelStreamCloses.load() != closes; }, 10);
         port::LevelStreamEnd end = port::g_levelStreamEnds[(closes + 1) % 16];
         std::int32_t frames = word(kFrames);
-        if (!waitFor([&] { return word(kFrames) - frames >= 60; }, 60))
+        // SLY1_LEVEL_FRAMES=N: N of the game's frames in each level, not 60 (with SLY1_PERF_LOG, what
+        // each level costs where the player starts)
+        static const int perLevel = std::getenv("SLY1_LEVEL_FRAMES") ? std::max(60, std::atoi(std::getenv("SLY1_LEVEL_FRAMES"))) : 60;
+        if (!waitFor([&] { return word(kFrames) - frames >= perLevel; }, 60 + perLevel / 10))
             fail("60 frames did not run within 60 s of the load", i + 1);
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "verify: level %2d loaded and ran 60 frames (%.1f s)\n", i + 1, s);

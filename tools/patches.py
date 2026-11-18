@@ -565,6 +565,91 @@ PATCHES = [
      "void HandleStateWalkerTrackEnd(StateWalker* self, s32 a, s32 b);",
      "void HandleStateWalkerTrackEnd(StateWalker* self, s32 a, void* b);",
      "the notification's third word is the animation player that ended, a pointer an s32 cannot hold here"),
+
+    # The walker collider's impulse response is called through the collider's slot with the
+    # contact's pointer (BuildContactItemRows); it is declared with an s32 there and reads the
+    # contact's other object through it. With the pointer cut to 32 bits that read was of nowhere:
+    # a fault in "Treasure in the Depths" a few seconds after the level starts.
+    ("src/main/pair_controller.cpp",
+     "void ComputeWalkerColliderImpulseResponse(WalkerCollider* self, s32 a1, s32 a2, s32 a3, s32 a4, s32 a5)\n{",
+     "void ComputeWalkerColliderImpulseResponse(WalkerCollider* self, s32 a1, BodyContact* a2, s32 a3, s32 a4, s32 a5)\n{",
+     "the contact is a pointer the solver passes through the collider's slot, which an s32 cannot hold here"),
+    ("src/main/pair_controller.cpp",
+     "    s32 n = *(s32*)(a2 + ((1 - a3) << 6));",
+     "    s32 n = *(s32*)((u8*)a2 + ((1 - a3) << 6));",
+     "the contact is a pointer the solver passes through the collider's slot, which an s32 cannot hold here"),
+    ("include/functions/pair_controller.h",
+     "void ComputeWalkerColliderImpulseResponse(WalkerCollider* self, s32 a1, s32 a2, s32 a3, s32 a4, s32 a5);",
+     "void ComputeWalkerColliderImpulseResponse(WalkerCollider* self, s32 a1, BodyContact* a2, s32 a3, s32 a4, s32 a5);",
+     "the contact is a pointer the solver passes through the collider's slot, which an s32 cannot hold here"),
+
+    # Three more overrides of slots that are called with a pointer where they declare an s32
+    # (found by looking for an integer parameter used as an address, after the walker collider's):
+    # the third world's boss and the seeking agent take the clip to start (EnterAgentState's
+    # Animation*), and the agent's collision callback takes the other collider's faces (the
+    # player's own callback has a pointer there). A clip read from the object's own fields is a
+    # game address, so those reads are cast.
+    ('src/main/warp_menu.cpp',
+     'void EnterWorld3BossState(World3Boss* self, s32 a, s32 b)\n{',
+     'void EnterWorld3BossState(World3Boss* self, s32 a, Animation* b)\n{',
+     "the clip is a pointer the agent's slot is called with, which an s32 cannot hold here"),
+    ('src/main/warp_menu.cpp',
+     '            b = self->pendingClip;',
+     '            b = (Animation*)self->pendingClip;',
+     "the clip is a pointer the agent's slot is called with, which an s32 cannot hold here"),
+    ('include/functions/warp_menu.h',
+     'void EnterWorld3BossState(World3Boss* self, s32 a, s32 b);',
+     'void EnterWorld3BossState(World3Boss* self, s32 a, Animation* b);',
+     "the clip is a pointer the agent's slot is called with, which an s32 cannot hold here"),
+    ('src/main/point_graph.cpp',
+     'void EnterSeekingAgentState(SeekingAgent* self, s32 a1, s32 a2)\n{\n    s32 a2v = a2;',
+     'void EnterSeekingAgentState(SeekingAgent* self, s32 a1, Animation* a2)\n{\n    Animation* a2v = a2;',
+     "the clip is a pointer the agent's slot is called with, which an s32 cannot hold here"),
+    ('src/main/point_graph.cpp',
+     '            a2v = self->hurtClipAlt;',
+     '            a2v = (Animation*)self->hurtClipAlt;',
+     "the clip is a pointer the agent's slot is called with, which an s32 cannot hold here"),
+    ('src/main/point_graph.cpp',
+     '            a2v = self->hurtClip;',
+     '            a2v = (Animation*)self->hurtClip;',
+     "the clip is a pointer the agent's slot is called with, which an s32 cannot hold here"),
+    ('src/main/point_graph.cpp',
+     '            a2v = self->removeClipAlt;',
+     '            a2v = (Animation*)self->removeClipAlt;',
+     "the clip is a pointer the agent's slot is called with, which an s32 cannot hold here"),
+    ('src/main/point_graph.cpp',
+     '            a2v = self->removeClip;',
+     '            a2v = (Animation*)self->removeClip;',
+     "the clip is a pointer the agent's slot is called with, which an s32 cannot hold here"),
+    ('include/functions/point_graph.h',
+     'void EnterSeekingAgentState(SeekingAgent* self, s32 a1, s32 a2);',
+     'void EnterSeekingAgentState(SeekingAgent* self, s32 a1, Animation* a2);',
+     "the clip is a pointer the agent's slot is called with, which an s32 cannot hold here"),
+    ('src/main/agent.cpp',
+     'void CollideAgentWithObject(Agent* a0, Collider* a1, s32 a2, s32 a3, s32 a4, s32 a5)',
+     'void CollideAgentWithObject(Agent* a0, Collider* a1, s32 a2, void* a3, s32 a4, s32 a5)',
+     "the faces are a pointer the collider's slot is called with, which an s32 cannot hold here"),
+    ('include/functions/agent.h',
+     'void CollideAgentWithObject(Agent* a0, Collider* a1, s32 a2, s32 a3, s32 a4, s32 a5);',
+     'void CollideAgentWithObject(Agent* a0, Collider* a1, s32 a2, void* a3, s32 a4, s32 a5);',
+     "the faces are a pointer the collider's slot is called with, which an s32 cannot hold here"),
+
+    # A player request's callback (ApplyChildGroupKnockback, LaunchObjectWithAgentVelocity and
+    # two more) takes the object that sent the request as its first argument; the call's type
+    # says s32 and passed the stored word as it is, a game address, where the callback expects
+    # a pointer: a fault in "Last Call" a few seconds after the level starts.
+    ("src/main/player_request.cpp",
+     "typedef void (*PlayerRequestFn)(s32 data, Player* self);",
+     "typedef void (*PlayerRequestFn)(void* data, Player* self);",
+     "the request's data is the object that sent it, which its callback takes as a pointer"),
+    ("src/main/player_request.cpp",
+     "    case 0:\n        StartSoundEffect(0xA3, 0, 0, 0, 3000.0f, 300.0f, 1.0f, 0.0f, 0.0f, 0, 0);\n        {\n            PlayerRequestFn fn = (PlayerRequestFn)self->lastMessage.fn;\n            if (fn != 0) {\n                self->lastMessage.fn = 0;\n                fn(self->lastMessage.data, self);",
+     "    case 0:\n        StartSoundEffect(0xA3, 0, 0, 0, 3000.0f, 300.0f, 1.0f, 0.0f, 0.0f, 0, 0);\n        {\n            PlayerRequestFn fn = (PlayerRequestFn)self->lastMessage.fn;\n            if (fn != 0) {\n                self->lastMessage.fn = 0;\n                fn((void*)self->lastMessage.data, self);",
+     "the request's data is the object that sent it, which its callback takes as a pointer"),
+    ("src/main/player_request.cpp",
+     "    case 6:\n        {\n            PlayerRequestFn fn = (PlayerRequestFn)self->lastMessage.fn;\n            if (fn != 0) {\n                self->lastMessage.fn = 0;\n                fn(self->lastMessage.data, self);",
+     "    case 6:\n        {\n            PlayerRequestFn fn = (PlayerRequestFn)self->lastMessage.fn;\n            if (fn != 0) {\n                self->lastMessage.fn = 0;\n                fn((void*)self->lastMessage.data, self);",
+     "the request's data is the object that sent it, which its callback takes as a pointer"),
 ]
 
 
