@@ -97,7 +97,7 @@ are used:
 | Bytes | Reading |
 | --- | --- |
 | `00 x S`, `02 x S` | if the sound level is at least x, or under x, statement S |
-| `16 r v S`, `06 r v S`, `07 r v S` | if register r is v, over v, under v |
+| `16 r v S`, `06 r v S`, `07 r v S` | if register r is v, under v, over v (`07 00 00 S` is used, which under 0 would never do; the title level's first loop goes on to the next only once register 1, its count of the sound level's dips, is over 2) |
 | `04 ... 05` | statements as one |
 | `13 r v` | register r set to v |
 | `11 n` | go on with sequence n in this one's place |
@@ -123,8 +123,7 @@ one-beat sequence at every beat while the level is high). The game's "every soun
 level's music ends the last one's. `SLY1_SND_LEVEL=s,v,s,v` sets the sound level to v from
 second s on, for hearing the changes on the host.
 
-**Readings to put right by ear:** velocity and volumes taken as straight factors; `06` and `07`
-as over and under; the channel switch as between the two levels inclusive; a release when a
+**Readings to put right by ear:** velocity and volumes taken as straight factors; the channel switch as between the two levels inclusive; a release when a
 sequence is stopped of a twentieth of a second; no reverb.
 
 ## Not yet

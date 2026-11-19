@@ -413,14 +413,14 @@ struct Song {
                 const bool is = op == 0x00 ? g_soundLevel >= p[0] : g_soundLevel < p[0];
                 return Statement(p + 1, end, run && is, track, depth + 1);
             }
-        case 0x06:   // if a register is over a value, under it, or it
+        case 0x06:   // if a register is under a value, over it, or it (`07 00 00 S` is used: over 0)
         case 0x07:
         case 0x16:
             if (!need(2))
                 return nullptr;
             {
                 const std::int32_t r = p[0] < 8 ? reg[p[0]] : 0, v = p[1];
-                const bool is = op == 0x06 ? r > v : op == 0x07 ? r < v : r == v;
+                const bool is = op == 0x06 ? r < v : op == 0x07 ? r > v : r == v;
                 return Statement(p + 2, end, run && is, track, depth + 1);
             }
         case 0x04:   // statements up to 0x05, as one
