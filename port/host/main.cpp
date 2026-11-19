@@ -920,6 +920,16 @@ int main(int argc, char** argv)
                               },
                               nullptr, true) != 0)
             std::fprintf(stderr, "sly1: cannot start the movies' decoding thread\n");
+        static pthread_t movieHelper;
+        static unsigned char movieHelperStack[1 << 18] __attribute__((aligned(16384)));
+        if (port::StartThread(&movieHelper, movieHelperStack, sizeof movieHelperStack,
+                              [](void*) -> void* {
+                                  port::PlaceThread(port::ThreadRole::Gs);   // the GS thread's core: little to do in a movie
+                                  port::movie::HelperMain();
+                                  return nullptr;
+                              },
+                              nullptr, true) != 0)
+            std::fprintf(stderr, "sly1: cannot start the movies' second decoding thread: one alone\n");
     }
     port::StartSampler();
     if (port::StartThread(&render, g_renderStack, sizeof g_renderStack,

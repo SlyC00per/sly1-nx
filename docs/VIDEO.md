@@ -61,6 +61,15 @@ game keeps its video ring (an eighth of a second) and its sound ring (a quarter)
 bytes taken further ahead leave the sound's full while the video's is empty, which the game
 answers by filling the video with zeros, as at a movie's end.
 
+With the one worker a movie ran at 17 to 19 ms a display frame on the Switch where it has
+16.7 (14 ms a picture decoding and 5 converting, more for the heavy ones: 25 of 409 pictures
+were waited for), and the sound still broke up at times. So a picture's work is halved with a
+helper thread (on the GS thread's core, which has little to do in a movie): a picture's slices
+are each their own run of bits and their own rows, and every other one is the helper's; the
+conversion's rows likewise. The decoder also reads its bits eight bytes at a time and gives a
+block with only its first coefficient its one value without the transform. On the host that
+is 0.4 ms a picture decoding and 0.2 converting, from 0.8 and 0.4, with the same pictures.
+
 ## The patches (`tools/patches.py`)
 
 - `IpuDmaSink::Put`: the bytes it sends the IPU are given to the port's decoder.

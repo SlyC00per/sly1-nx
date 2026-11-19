@@ -20,8 +20,14 @@ struct Mpeg2::Bits {
 
     std::uint32_t Peek(int n) const
     {
-        std::size_t byte = at >> 3;
-        std::uint64_t w = 0;
+        const std::size_t byte = at >> 3;
+        std::uint64_t w;
+        if (byte + 8 <= size) {   // eight bytes at once, the first the most significant
+            std::memcpy(&w, p + byte, 8);
+            w = __builtin_bswap64(w);
+            return (std::uint32_t)((w >> (64 - (int)(at & 7) - n)) & ((1ull << n) - 1));
+        }
+        w = 0;
         for (int k = 0; k < 5; k++)
             w = w << 8 | (byte + (std::size_t)k < size ? p[byte + (std::size_t)k] : 0);
         return (std::uint32_t)((w >> (40 - (int)(at & 7) - n)) & ((1ull << n) - 1));
@@ -244,9 +250,16 @@ inline bool Read(Mpeg2::Bits& b, const Table& t, int* value);
 
 // The inverse transform of a block, in place: rows then columns, each by the 8-point cosines.
 // Rows that are all zero are passed over.
-void InverseTransform(std::int16_t* block)
+void InverseTransform(std::int16_t* block, int last)
 {
     const Tables& t = T();
+    if (last == 0) {   // only the first coefficient: every sample is an eighth of it
+        const long r = std::lrintf((float)block[0] * 0.125f);
+        const std::int16_t v = (std::int16_t)(r < -256 ? -256 : r > 255 ? 255 : r);
+        for (int k = 0; k < 64; k++)
+            block[k] = v;
+        return;
+    }
     float tmp[64];
     for (int r = 0; r < 8; r++) {
         const std::int16_t* in = block + r * 8;
@@ -292,6 +305,8 @@ inline bool Read(Mpeg2::Bits& b, const Table& t, int* value)
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------
+
+static Mpeg2::Pair g_pair;
 
 void Mpeg2::Reset()
 {
@@ -518,8 +533,9 @@ bool Mpeg2::DecodePicture(const std::uint8_t* p, std::size_t n)
         return false;
     }
     // the picture's own extensions, then its slices
-    std::vector<std::uint8_t> view;   // (the unit as a vector, for the start code search)
-    view.assign(p, p + n);
+    unit_.assign(p, p + n);
+    const std::vector<std::uint8_t>& view = unit_;
+    jobs_.clear();
     std::size_t at = 4, q;
     bool begun = false;
     while (StartCode(view, at, &q)) {
@@ -550,15 +566,48 @@ bool Mpeg2::DecodePicture(const std::uint8_t* p, std::size_t n)
                         return false;
                 }
             }
-            Bits b{&view[q + 4], next - q - 4};
-            Slice(b, code - 1);
+            jobs_.push_back({&view[q + 4], next - q - 4, code - 1});
         }
         at = next;
         if (next >= n)
             break;
     }
+    // the slices: each its own run of bits and its own macroblocks, so half of them on another
+    // thread where there is one
+    struct Halves {
+        Mpeg2* self;
+        SliceState state[2];
+        bool both;
+    } halves;
+    halves.self = this;
+    halves.both = g_pair != nullptr && jobs_.size() > 1;
+    if (halves.both) {
+        g_pair(SliceHalf, &halves);
+    } else {
+        for (const SliceJob& job : jobs_) {
+            Bits b{job.data, job.size};
+            Slice(b, job.row, halves.state[0]);
+        }
+    }
+    errors_ += halves.state[0].errors + halves.state[1].errors;
     return begun;
 }
+
+void Mpeg2::SliceHalf(void* arg, int which)
+{
+    struct Halves {
+        Mpeg2* self;
+        SliceState state[2];
+        bool both;
+    }* h = static_cast<Halves*>(arg);
+    Mpeg2& d = *h->self;
+    for (std::size_t k = (std::size_t)which; k < d.jobs_.size(); k += 2) {
+        Bits b{d.jobs_[k].data, d.jobs_[k].size};
+        d.Slice(b, d.jobs_[k].row, h->state[which]);
+    }
+}
+
+void Mpeg2::SetPair(Pair run) { g_pair = run; }
 
 // One motion vector component: the code and its residual added to the prediction, kept in
 // range (7.6.3.1).
@@ -587,8 +636,15 @@ static int VectorComponent(Mpeg2::Bits& b, int fcode, int pred, bool* bad)
     return v;
 }
 
-void Mpeg2::Slice(Bits& b, int row)
+void Mpeg2::Slice(Bits& b, int row, SliceState& st)
 {
+    int& qscale_ = st.qscale;
+    int* dcPred_ = st.dcPred;
+    int (*pmv_)[2] = st.pmv;
+    long& errors_ = st.errors;
+    std::uint8_t* predY_ = st.predY;
+    std::uint8_t* predCb_ = st.predCb;
+    std::uint8_t* predCr_ = st.predCr;
     if (row >= mbh_) {
         errors_++;
         return;
@@ -600,7 +656,7 @@ void Mpeg2::Slice(Bits& b, int row)
         b.Skip(8);
     const int dcReset = 1 << (dcPrecision_ + 7);
     dcPred_[0] = dcPred_[1] = dcPred_[2] = dcReset;
-    std::memset(pmv_, 0, sizeof pmv_);
+    std::memset(st.pmv, 0, sizeof st.pmv);
     int address = row * mbw_ - 1;
     bool first = true;
     int lastFlags = kForward;   // the motion of the macroblock before, for a B picture's skipped ones
@@ -636,10 +692,10 @@ void Mpeg2::Slice(Bits& b, int row)
                     break;
                 const int mbx = a % mbw_, mby = a / mbw_;
                 if (type_ == 2) {
-                    Predict(mbx, mby, true, false, zero, zero);
-                    std::memset(pmv_, 0, sizeof pmv_);
+                    Predict(mbx, mby, true, false, zero, zero, st);
+                    std::memset(st.pmv, 0, sizeof st.pmv);
                 } else {
-                    Predict(mbx, mby, (lastFlags & kForward) != 0, (lastFlags & kBackward) != 0, pmv_[0], pmv_[1]);
+                    Predict(mbx, mby, (lastFlags & kForward) != 0, (lastFlags & kBackward) != 0, pmv_[0], pmv_[1], st);
                 }
                 for (int y = 0; y < 16; y++)
                     std::memcpy(&cur.y[(std::size_t)(mby * 16 + y) * (std::size_t)(mbw_ * 16) + (std::size_t)mbx * 16], predY_ + y * 16, 16);
@@ -685,10 +741,10 @@ void Mpeg2::Slice(Bits& b, int row)
         if (flags & kIntra) {
             pattern = 63;
             if (!concealment_)
-                std::memset(pmv_, 0, sizeof pmv_);
-            std::memset(predY_, 0, sizeof predY_);
-            std::memset(predCb_, 0, sizeof predCb_);
-            std::memset(predCr_, 0, sizeof predCr_);
+                std::memset(st.pmv, 0, sizeof st.pmv);
+            std::memset(st.predY, 0, sizeof st.predY);
+            std::memset(st.predCb, 0, sizeof st.predCb);
+            std::memset(st.predCr, 0, sizeof st.predCr);
         } else {
             dcPred_[0] = dcPred_[1] = dcPred_[2] = dcReset;
             if (flags & kPattern) {
@@ -699,10 +755,10 @@ void Mpeg2::Slice(Bits& b, int row)
             }
             if (type_ == 2) {
                 if (!(flags & kForward))
-                    std::memset(pmv_, 0, sizeof pmv_);   // no vector: none, and the prediction of it forgotten
-                Predict(mbx, mby, true, false, pmv_[0], zero);
+                    std::memset(st.pmv, 0, sizeof st.pmv);   // no vector: none, and the prediction of it forgotten
+                Predict(mbx, mby, true, false, pmv_[0], zero, st);
             } else {
-                Predict(mbx, mby, (flags & kForward) != 0, (flags & kBackward) != 0, pmv_[0], pmv_[1]);
+                Predict(mbx, mby, (flags & kForward) != 0, (flags & kBackward) != 0, pmv_[0], pmv_[1], st);
             }
             lastFlags = flags;
         }
@@ -723,11 +779,12 @@ void Mpeg2::Slice(Bits& b, int row)
             }
             const int predStride = k < 4 ? 16 : 8;
             if (pattern & (32 >> k)) {
-                if (!Block(b, k < 4 ? 0 : k - 3, (flags & kIntra) != 0, block)) {
+                int last = 0;
+                if (!Block(b, k < 4 ? 0 : k - 3, (flags & kIntra) != 0, block, st, &last)) {
                     errors_++;
                     return;
                 }
-                InverseTransform(block);
+                InverseTransform(block, last);
                 for (int y = 0; y < 8; y++)
                     for (int x = 0; x < 8; x++)
                         dst[y * stride + x] = Clip(pred[y * predStride + x] + block[y * 8 + x]);
@@ -740,8 +797,11 @@ void Mpeg2::Slice(Bits& b, int row)
 }
 
 // A block's coefficients, read, scaled back and put in their places (7.2, 7.3, 7.4).
-bool Mpeg2::Block(Bits& b, int component, bool intra, std::int16_t* out)
+bool Mpeg2::Block(Bits& b, int component, bool intra, std::int16_t* out, SliceState& st, int* last)
 {
+    const int qscale_ = st.qscale;
+    int* dcPred_ = st.dcPred;
+    int highest = 0;   // the furthest place a coefficient was put
     std::memset(out, 0, 64 * sizeof(std::int16_t));
     const std::uint8_t* scan = alternate_ ? kAlternate : kZigzag;
     const std::uint8_t* matrix = intra ? intraQ_ : nonIntraQ_;
@@ -801,11 +861,16 @@ bool Mpeg2::Block(Bits& b, int component, bool intra, std::int16_t* out)
             value = (2 * level + (level > 0 ? 1 : -1)) * (int)matrix[at] * qscale_ / 32;
         value = value < -2048 ? -2048 : value > 2047 ? 2047 : value;
         out[at] = (std::int16_t)value;
+        if (at > highest)
+            highest = at;
         sum += value;
         index++;
     }
-    if ((sum & 1) == 0)   // the mismatch control: the sum made odd by the last coefficient's lowest bit
+    if ((sum & 1) == 0) {   // the mismatch control: the sum made odd by the last coefficient's lowest bit
         out[63] ^= 1;
+        highest = 63;
+    }
+    *last = highest;
     return !b.Over();
 }
 
@@ -853,8 +918,11 @@ void Mpeg2::Fetch(const Frame& ref, int mbx, int mby, const int mv[2], std::uint
     plane(ref.cr.data(), w / 2, w / 2, h / 2, mbx * 8 + (cx >> 1), mby * 8 + (cy >> 1), cx & 1, cy & 1, 8, cr);
 }
 
-void Mpeg2::Predict(int mbx, int mby, bool forward, bool backward, const int fwd[2], const int bwd[2])
+void Mpeg2::Predict(int mbx, int mby, bool forward, bool backward, const int fwd[2], const int bwd[2], SliceState& st)
 {
+    std::uint8_t* predY_ = st.predY;
+    std::uint8_t* predCb_ = st.predCb;
+    std::uint8_t* predCr_ = st.predCr;
     // a P picture's reference is the last one decoded; a B picture's are the two around it
     const int fwdFrame = forward_, bwdFrame = backward_;
     if (forward && backward && fwdFrame >= 0 && bwdFrame >= 0) {
@@ -872,9 +940,9 @@ void Mpeg2::Predict(int mbx, int mby, bool forward, bool backward, const int fwd
     } else if (fwdFrame >= 0) {
         Fetch(frames_[fwdFrame], mbx, mby, fwd, predY_, predCb_, predCr_);
     } else {
-        std::memset(predY_, 0, sizeof predY_);
-        std::memset(predCb_, 128, sizeof predCb_);
-        std::memset(predCr_, 128, sizeof predCr_);
+        std::memset(st.predY, 0, sizeof st.predY);
+        std::memset(st.predCb, 128, sizeof st.predCb);
+        std::memset(st.predCr, 128, sizeof st.predCr);
     }
 }
 

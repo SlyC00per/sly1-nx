@@ -115,9 +115,10 @@ inline std::uint8_t Clip(int v) { return (std::uint8_t)(v < 0 ? 0 : v > 255 ? 25
 // sends them to the GS so; the IPU's own conversion wrote 16 by 16 blocks). The conversion is
 // ITU-R BT.601's from the video range, each colour sample for the four pixels it covers; alpha
 // 0x80, the GS's 1.
-void Convert(const port::video::Picture& pic, std::uint8_t* out)
+void ConvertRows(const port::video::Picture& pic, std::uint8_t* out, int from, int to)
 {   // (out: width * height * 4 bytes)
-    for (int y = 0; y < pic.height; y++) {
+    out += (std::size_t)from * (std::size_t)pic.width * 4;
+    for (int y = from; y < to; y++) {
         const std::uint8_t* ys = pic.y + (std::size_t)y * (std::size_t)pic.stride;
         const std::uint8_t* cbs = pic.cb + (std::size_t)(y / 2) * (std::size_t)pic.chromaStride;
         const std::uint8_t* crs = pic.cr + (std::size_t)(y / 2) * (std::size_t)pic.chromaStride;
@@ -134,6 +135,55 @@ void Convert(const port::video::Picture& pic, std::uint8_t* out)
             }
         }
     }
+}
+
+// Two threads for the worker's work: its own and a helper's (port::movie::HelperMain, started with
+// the program). RunPair calls fn(arg, 0) here and fn(arg, 1) on the helper and returns when both
+// have: the decoder halves a picture's slices so (port/mpeg2.h), and the conversion its rows.
+struct PairWork {
+    std::mutex lock;
+    std::condition_variable go, finished;
+    void (*fn)(void*, int) = nullptr;
+    void* arg = nullptr;
+    bool waiting = false, done = true, alive = false;
+};
+PairWork g_pair;
+
+void RunPair(void (*fn)(void*, int), void* arg)
+{
+    PairWork& w = g_pair;
+    {
+        std::lock_guard<std::mutex> lk(w.lock);
+        if (!w.alive) {
+            fn(arg, 0);
+            fn(arg, 1);
+            return;
+        }
+        w.fn = fn;
+        w.arg = arg;
+        w.waiting = true;
+        w.done = false;
+    }
+    w.go.notify_one();
+    fn(arg, 0);
+    std::unique_lock<std::mutex> lk(w.lock);
+    w.finished.wait(lk, [&] { return w.done; });
+}
+
+struct ConvertWork {
+    const port::video::Picture* pic;
+    std::uint8_t* out;
+};
+void ConvertHalf(void* arg, int which)
+{
+    const ConvertWork& c = *static_cast<const ConvertWork*>(arg);
+    const int middle = (c.pic->height / 2) & ~1;
+    ConvertRows(*c.pic, c.out, which ? middle : 0, which ? c.pic->height : middle);
+}
+void Convert(const port::video::Picture& pic, std::uint8_t* out)
+{
+    ConvertWork c = {&pic, out};
+    RunPair(ConvertHalf, &c);
 }
 
 // The decoding runs on a thread of its own (port::movie::WorkerMain, started with the program):
@@ -169,8 +219,27 @@ constexpr std::size_t kStreamAhead = 24 * 1024;   // bytes of the stream kept be
 namespace port {
 namespace movie {
 
+void HelperMain()
+{
+    PairWork& w = g_pair;
+    std::unique_lock<std::mutex> lk(w.lock);
+    w.alive = true;
+    for (;;) {
+        w.go.wait(lk, [&] { return w.waiting; });
+        w.waiting = false;
+        void (*fn)(void*, int) = w.fn;
+        void* arg = w.arg;
+        lk.unlock();
+        fn(arg, 1);
+        lk.lock();
+        w.done = true;
+        w.finished.notify_all();
+    }
+}
+
 void WorkerMain()
 {
+    port::video::Mpeg2::SetPair(RunPair);
     Worker& w = g_worker;
     std::unique_lock<std::mutex> lk(w.lock);
     std::vector<std::uint8_t> bytes;

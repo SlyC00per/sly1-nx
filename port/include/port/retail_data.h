@@ -117,6 +117,8 @@ bool Direct();
 unsigned PictureNumber();
 // The decoding thread, started with the program (port/host/main.cpp); it does not return.
 void WorkerMain();
+// Its helper, for half of each picture's work; started the same way.
+void HelperMain();
 }  // namespace movie
 // A level load's request, written to the log (tools/patches.py).
 void NoteWorldLoad(int arrivalA, int arrivalB, int flags);
