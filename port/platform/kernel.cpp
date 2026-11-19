@@ -33,6 +33,7 @@
 #include "port/ptr32.h"
 #include "port/system.h"
 #include "port/dmac.h"
+#include "port/gs.h"
 
 namespace port {
 
@@ -335,8 +336,33 @@ void NoteFade(long from, int kind, int value, int count, int mode)
         std::fprintf(stderr, "world: a fade asked for from StartScreenFade%+ld: kind %d, value %d, style %d, the fade's mode %d\n", from, kind, value, count, mode);
 }
 
+namespace {
+struct AnimStart {
+    int animation, flags;
+    long from;
+    float length;
+    std::uint64_t frame;
+};
+AnimStart g_animStarts[48];
+unsigned g_animStartCount;
+}  // namespace
+
+void NoteAnimStart(int animation, long from, float length, int flags)
+{
+    g_animStarts[g_animStartCount++ % 48] = {animation, flags, from, length, gs::FramesShown()};
+}
+
 void NoteAnimEvent(int event, int animation, int object, float time, float length, float speed)
 {
+    if (event == 25) {
+        const unsigned n = g_animStartCount < 48 ? g_animStartCount : 48;
+        for (unsigned k = 0; k < n; k++) {
+            const AnimStart& a = g_animStarts[(g_animStartCount - n + k) % 48];
+            std::fprintf(stderr, "world: (frame %llu: animation %d of %.2f s started from CreateAnimationPlayer%+ld, flags 0x%X)\n",
+                         (unsigned long long)a.frame, a.animation, (double)a.length, a.from, (unsigned)a.flags);
+        }
+        std::fprintf(stderr, "world: (now frame %llu)\n", (unsigned long long)gs::FramesShown());
+    }
     std::fprintf(stderr, "world: animation %d (object %d) at %.2f s of %.2f, speed %.2f: event %d (%s)\n", animation, object, (double)time, (double)length, (double)speed, event,
                  event == 25 ? "a fade to a level" : "a movie queued");
 }

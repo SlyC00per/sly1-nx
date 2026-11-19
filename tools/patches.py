@@ -288,6 +288,14 @@ PATCHES = [
 
     # A line in the log when an animation's event starts a fade to a level or queues a movie: which
     # animation, and where in it.
+    # Every animation started, kept in a short list the fade event's line prints: which animations
+    # started before a fade to a level, and from where in the game's code.
+    ("src/main/placed_object.cpp",
+     "    obj = NewAnimationPlayer(world);\n    if (out != 0) *out = obj;\n    obj->time = fa;",
+     "    obj = NewAnimationPlayer(world);\n"
+     "    port::NoteAnimStart(self->id, (long)((char*)__builtin_return_address(0) - (char*)&CreateAnimationPlayer), self->length, flags);\n"
+     "    if (out != 0) *out = obj;\n    obj->time = fa;",
+     "an animation's start noted for the log"),
     ("src/main/placed_object.cpp",
      "    case 25:\n        StartScreenFade(&g_screenFade, (FadeRequest*)msg->aC.i, msg->a8.h.lo);",
      "    case 25:\n        port::NoteAnimEvent(25, owner->id, self->object ? ((BaseObject*)self->object)->id : -1, self->time, owner->length, self->speed);\n        StartScreenFade(&g_screenFade, (FadeRequest*)msg->aC.i, msg->a8.h.lo);",
