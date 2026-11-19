@@ -67,6 +67,15 @@ movie has 59.94 fields.
   its speed.
 - `PassMovieDataToStream` returns `FeedMovieStream`'s result (above).
 
+Where there is a GPU renderer (the Switch) the picture does not go through the GS's memory at
+all: the decoder hands it to the GS model with a number (`gs::DirectPicturePut`), the upload
+packet only writes that number to register 0x7F, which no GS has, and a draw with the movie's
+texture is given the picture as it is, copied into the corner of the texture
+(`SLY1_MOVIE_DIRECT=0`: the upload instead). The movie's texture is 1,024 by 1,024 to the GS;
+writing a picture into the GS's memory, reading the whole texture back out and sending it took
+the GS thread some 30 ms a picture, with 20 ms of decoding on the game's thread: 52 ms where a
+picture has 33.
+
 ## Checked
 
 - `port/video/mpeg2.cpp` against a reference decoder on the first movie's 409 pictures: the

@@ -19,6 +19,7 @@
 
 #include "common.h"
 #include "port/mpeg2.h"
+#include "port/gs.h"
 #include "port/ptr32.h"
 #include "port/retail_data.h"
 
@@ -54,6 +55,7 @@ struct State {
     double decodeSeconds = 0.0, convertSeconds = 0.0;
 };
 State* g_state;
+std::uint32_t g_pictureNumber;   // the last picture decoded
 
 std::uint32_t Be16(const std::uint8_t* p) { return (std::uint32_t)p[0] << 8 | p[1]; }
 
@@ -138,6 +140,8 @@ void Convert(const port::video::Picture& pic, std::uint8_t* out)
 namespace port {
 namespace movie {
 
+bool Direct();
+
 // The video stream's bytes on their way to the IPU (a named patch in IpuDmaSink::Put).
 void VideoBytes(const void* bytes, int size)
 {
@@ -148,6 +152,15 @@ void VideoBytes(const void* bytes, int size)
 }
 
 float Zoom() { return WideFactor(); }
+
+// Whether a picture goes to the renderer as it is (there is one, and SLY1_MOVIE_DIRECT is not 0)
+// and the game's packet only names it, or is uploaded to the GS's memory.
+bool Direct()
+{
+    static const bool off = std::getenv("SLY1_MOVIE_DIRECT") && std::getenv("SLY1_MOVIE_DIRECT")[0] == '0';
+    return !off && gs::HasBackend();
+}
+std::uint32_t PictureNumber() { return g_pictureNumber; }
 
 }  // namespace movie
 }  // namespace port
@@ -295,6 +308,9 @@ s32 DecodeMpegPicture(MpegHandle* handle, void* picture, s32 blocks)
             head[1] = pic.height;
             head[2] = 0;
             s->pictures++;
+            if (port::movie::Direct())
+                port::gs::DirectPicturePut((std::uint32_t)s->pictures, static_cast<const std::uint32_t*>(picture), pic.width, pic.height);
+            g_pictureNumber = (std::uint32_t)s->pictures;
             return 0;
         }
         if (s->decoder.Over() || !s->event[1]) {

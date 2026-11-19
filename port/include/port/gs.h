@@ -41,6 +41,16 @@ void Image(const std::uint32_t* q);
 // A run of IMAGE data: count quadwords, as Image would take them one by one.
 void ImageRun(const std::uint32_t* q, std::uint32_t count);
 
+// A movie's picture given to the renderer as it is (docs/VIDEO.md): the decoder puts each
+// picture, numbered, with DirectPicturePut (any thread); the game's packet then writes the
+// number and the texture's place to register 0x7F, which no GS has, and from there on a draw
+// with that texture is given the picture (DirectPicture, for the renderer) until anything is
+// uploaded to the GS again. HasBackend says whether there is a renderer to take one.
+void DirectPicturePut(std::uint32_t number, const std::uint32_t* rgba, int width, int height);
+struct DrawState;
+bool DirectPicture(const DrawState& state, const std::uint32_t** rgba, int* width, int* height, std::uint32_t* serial);
+bool HasBackend();
+
 // The display (the game's double buffer, sceGsSwapDBuff's): DISPFB and DISPLAY's values.
 void SetDisplay(std::uint64_t dispfb, std::uint64_t display);
 

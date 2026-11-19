@@ -112,6 +112,9 @@ void VideoBytes(const void* bytes, int size);
 // How much larger than the 4:3 screen a movie's picture is drawn: 4/3 in the 16:9 picture (its own
 // black bands go off the screen), 1 with SLY1_WIDE=0.
 float Zoom();
+// Whether a movie's picture is handed to the renderer as it is, and the number of the last decoded.
+bool Direct();
+unsigned PictureNumber();
 }  // namespace movie
 // A level load's request, written to the log (tools/patches.py).
 void NoteWorldLoad(int arrivalA, int arrivalB, int flags);

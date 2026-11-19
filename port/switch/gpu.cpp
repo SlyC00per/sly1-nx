@@ -25,6 +25,7 @@
 #include <switch.h>
 #include <deko3d.h>
 
+#include "port/gs.h"
 #include "port/gs_backend.h"
 #include "port/system.h"
 #include "gs_vsh_dksh.h"
@@ -121,6 +122,7 @@ struct Texture {
     std::uint64_t hash;
     int width, height;
     std::uint8_t alphaMin = 0, alphaMax = 255;   // of its texels (a small target's: not known)
+    std::uint32_t direct = 0;                    // the movie picture last put in it (gs::DirectPicture's serial)
 };
 
 class Renderer : public gs::Backend {
@@ -840,6 +842,36 @@ const Texture* Renderer::TextureFor(const gs::DrawState& state)
     // what names the texels: TBP0, TBW, PSM, TW, TH and the palette's CBP, CPSM, CSM, CSA
     std::uint64_t key = state.tex0 & 0x1FFFFFE3FFFFFFFFull;
     std::uint32_t generation = gs::TextureGeneration(state);
+    {   // a movie's picture: copied into the texture's corner as it is, with no reading of the GS's memory
+        const std::uint32_t* picture;
+        int pw, ph;
+        std::uint32_t serial;
+        if (gs::DirectPicture(state, &picture, &pw, &ph, &serial)) {
+            auto found = textures_.find(key);
+            if (found != textures_.end() && found->second.width >= pw && found->second.height >= ph) {
+                Texture& t = found->second;
+                if (t.direct != serial) {
+                    FlushPending();
+                    const std::uint32_t bytes = (std::uint32_t)pw * (std::uint32_t)ph * 4;
+                    if (frameUsed_ + bytes > kFrameMemory)
+                        Send(true);
+                    std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(frameMem_) + frameUsed_, picture, bytes);
+                    DkImageView view;
+                    dkImageViewDefaults(&view, &t.image);
+                    DkCopyBuf from = {dkMemBlockGetGpuAddr(frameMem_) + frameUsed_, 0, 0};
+                    DkImageRect rect = {0, 0, 0, (std::uint32_t)pw, (std::uint32_t)ph, 1};
+                    dkCmdBufCopyBufferToImage(cmd_, &from, &view, &rect, 0);
+                    frameUsed_ = Align(frameUsed_ + bytes, 64);
+                    uploads_++;
+                    t.direct = serial;
+                    t.alphaMin = t.alphaMax = 0x80;
+                }
+                t.generation = generation;
+                return &t;
+            }
+            // (the texture is not made yet: made below from the GS's memory, this once)
+        }
+    }
     // the last textures found, by their keys, before the map (its lookup is memory not seen lately)
     Recent& recent = recent_[(key * 0x9E3779B97F4A7C15ull) >> 58];
     if (recent.texture && recent.key == key && recent.texture->generation == generation)

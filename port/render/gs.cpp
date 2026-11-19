@@ -1109,8 +1109,38 @@ std::uint64_t g_snapshotKey;                  // not 0: its pages are to be kept
 bool g_snapshotVerify;
 std::uint64_t g_uploadsRestoredWrong;
 
+// A movie's pictures on their way to the renderer (port/gs.h, DirectPicturePut).
+struct DirectPictures {
+    std::mutex lock;
+    std::map<std::uint32_t, std::vector<std::uint32_t>> waiting;   // by number
+    int waitingWidth = 0, waitingHeight = 0;
+    // the one being shown (the GS's thread only)
+    std::uint32_t tbp = ~0u, serial = 0;
+    int width = 0, height = 0;
+    std::vector<std::uint32_t> pixels;
+};
+DirectPictures g_direct;
+
+void TakeDirectPicture(std::uint32_t number, std::uint32_t tbp)
+{
+    FlushRun();   // what was drawn with the picture before
+    std::lock_guard<std::mutex> lk(g_direct.lock);
+    auto it = g_direct.waiting.find(number);
+    if (it == g_direct.waiting.end())
+        return;
+    g_direct.pixels.swap(it->second);
+    g_direct.width = g_direct.waitingWidth;
+    g_direct.height = g_direct.waitingHeight;
+    g_direct.tbp = tbp;
+    g_direct.serial++;
+    g_uploads++;   // (the renderer looks its texture up again)
+    g_direct.waiting.erase(g_direct.waiting.begin(), ++it);   // it and any before it
+    g_stateChanged = true;
+}
+
 void StartTransfer()
 {
+    g_direct.tbp = ~0u;   // an upload: the GS's memory is what textures are again
     std::uint64_t bb = g_regs.bitbltbuf, pos = g_regs.trxpos, reg = g_regs.trxreg;
     std::uint32_t dir = (std::uint32_t)Bits(g_regs.trxdir, 0, 2);
     g_trx = Transfer();
@@ -1447,6 +1477,7 @@ void Write(std::uint32_t reg, std::uint64_t value)
     case 0x51: r.trxpos = value; break;
     case 0x52: r.trxreg = value; break;
     case 0x53: r.trxdir = value; StartTransfer(); break;
+    case 0x7F: TakeDirectPicture((std::uint32_t)value, (std::uint32_t)(value >> 32)); break;   // (the port's own: a movie's picture)
     default: break;   // TEXFLUSH, SIGNAL, FINISH (port/platform/dmac.cpp), LABEL, HWREG
     }
 }
@@ -2096,6 +2127,29 @@ void DecodeTexture(const DrawState& state, std::vector<std::uint32_t>& rgba, int
                          (unsigned long long)differed);
     }
 }
+
+void DirectPicturePut(std::uint32_t number, const std::uint32_t* rgba, int width, int height)
+{
+    std::lock_guard<std::mutex> lk(g_direct.lock);
+    while (g_direct.waiting.size() > 4)   // (never taken: a movie stopped)
+        g_direct.waiting.erase(g_direct.waiting.begin());
+    g_direct.waiting[number].assign(rgba, rgba + (std::size_t)width * (std::size_t)height);
+    g_direct.waitingWidth = width;
+    g_direct.waitingHeight = height;
+}
+
+bool DirectPicture(const DrawState& state, const std::uint32_t** rgba, int* width, int* height, std::uint32_t* serial)
+{
+    if (g_direct.tbp == ~0u || g_direct.pixels.empty() || (std::uint32_t)Bits(state.tex0, 0, 14) != g_direct.tbp)
+        return false;
+    *rgba = g_direct.pixels.data();
+    *width = g_direct.width;
+    *height = g_direct.height;
+    *serial = g_direct.serial;
+    return true;
+}
+
+bool HasBackend() { return g_backend != nullptr; }
 
 std::uint64_t TextureSource(const DrawState& state)
 {
