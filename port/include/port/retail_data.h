@@ -109,6 +109,9 @@ float WideFactor();
 namespace movie {
 // The video stream's bytes on their way to the IPU (port/video/movie.cpp; tools/patches.py).
 void VideoBytes(const void* bytes, int size);
+// How much larger than the 4:3 screen a movie's picture is drawn: 4/3 in the 16:9 picture (its own
+// black bands go off the screen), 1 with SLY1_WIDE=0.
+float Zoom();
 }  // namespace movie
 // A level load's request, written to the log (tools/patches.py).
 void NoteWorldLoad(int arrivalA, int arrivalB, int flags);

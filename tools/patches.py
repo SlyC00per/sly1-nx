@@ -228,12 +228,57 @@ PATCHES = [
      "        port_DrainRing(&self->videoRing, 0, &dma);",
      "the video ring drained to the IPU's channel by the sink's own class"),
 
-    # Widescreen: a movie is drawn across the whole 4:3 screen; in the 16:9 picture it keeps its
-    # shape, in the middle (the sides stay as the fade before it left them: black).
+    # Widescreen: a movie's picture is 4:3 with its own black bands above and below (60 lines of
+    # 480 in 14 of the 17: a 16:9 picture inside). In the port's 16:9 picture it is drawn larger by
+    # port::movie::Zoom() (4/3) about the middle, which fills the screen and leaves those bands
+    # off it. The picture's last column and row are sampled at their own middles, not half a
+    # texel past them, where the GS's memory has something else (a line of colours at the edge).
     ("src/main/movie_player.cpp",
      "    AddGifXyzfEntry(&buf, 0x6C00, 0x7900, 0, 0);\n    AddGifUvEntry(&buf, (a1 << 4) | 8, (a2 << 4) | 8);\n    AddGifXyzfEntry(&buf, 0x9400, 0x8700, 0, 0);",
-     "    AddGifXyzfEntry(&buf, 0x8000 - (s32)(0x1400 / port::WideFactor()), 0x7900, 0, 0);\n    AddGifUvEntry(&buf, (a1 << 4) | 8, (a2 << 4) | 8);\n    AddGifXyzfEntry(&buf, 0x8000 + (s32)(0x1400 / port::WideFactor()), 0x8700, 0, 0);",
-     "a movie's picture in its own shape in the 16:9 picture"),
+     "    AddGifXyzfEntry(&buf, 0x8000 - (s32)(0x1400 * port::movie::Zoom() / port::WideFactor()), 0x8000 - (s32)(0x700 * port::movie::Zoom()), 0, 0);\n"
+     "    AddGifUvEntry(&buf, (a1 << 4) - 8, (a2 << 4) - 8);\n"
+     "    AddGifXyzfEntry(&buf, 0x8000 + (s32)(0x1400 * port::movie::Zoom() / port::WideFactor()), 0x8000 + (s32)(0x700 * port::movie::Zoom()), 0, 0);",
+     "a movie's picture filling the 16:9 screen"),
+    # A movie's picture goes to the GS in one transfer of its rows, where the game sends 1,200 of 16
+    # by 16 pixels (the IPU's blocks): the port's decoder writes rows (port/video/movie.cpp), and
+    # one transfer costs the port's GS a small part of what 1,200 do.
+    ("src/main/movie_player.cpp",
+     "    AddGifRegisterWrite(&f, 0x52, ((u64)0x10 << 32) | 0x10);\n"
+     "    for (y = 0; y < ny; y++) {\n"
+     "        for (x = 0; x < nx; x++) {\n"
+     "            BeginGifTag(&f, 0, 1, 0xE);\n"
+     "            AddGifRegisterWrite(&f, 0x51, ((u64)(y << 4) << 32) | ((u64)(x << 4) << 48));\n"
+     "            AddGifRegisterWrite(&f, 0x53, 0);\n"
+     "            AddGifImageTag(&f, 0x40);\n"
+     "            AddDmaRefTag(&f, 0x40, addr & 0xFFFFFFF);\n"
+     "            addr += 0x400;\n"
+     "        }\n"
+     "    }\n",
+     "    AddGifRegisterWrite(&f, 0x52, ((u64)h << 32) | (u64)w);\n"
+     "    BeginGifTag(&f, 0, 1, 0xE);\n"
+     "    AddGifRegisterWrite(&f, 0x51, 0);\n"
+     "    AddGifRegisterWrite(&f, 0x53, 0);\n"
+     "    (void)ny; (void)nx; (void)x;\n"
+     "    for (y = 0; y < h; y += 192) {   // (an image tag counts up to 0x7FFF quadwords: 192 rows of 640 pixels)\n"
+     "        s32 port_rows = h - y < 192 ? h - y : 192;\n"
+     "        s32 port_qw = port_rows * w / 4;\n"
+     "        AddGifImageTag(&f, port_qw);\n"
+     "        AddDmaRefTag(&f, port_qw, addr & 0xFFFFFFF);\n"
+     "        addr += port_qw * 16;\n"
+     "    }\n",
+     "a movie's picture sent to the GS in one transfer"),
+    # The sound packets' handler is declared as returning nothing and its caller, the demultiplexer,
+    # goes by what it returns (in retail the register still holds FeedMovieStream's result: 0 when
+    # the sound's ring has no room, and the packet is then given again). Without it a packet that
+    # found no room was lost, and the two channels' blocks after it were out of step: noise.
+    ("src/main/movie_player.cpp",
+     "void PassMovieDataToStream(void* a0, MovieDataBlock* a1, MoviePlayer* a2);",
+     "s32 PassMovieDataToStream(void* a0, MovieDataBlock* a1, MoviePlayer* a2);",
+     "the sound handler's result declared"),
+    ("src/main/movie_player.cpp",
+     "void PassMovieDataToStream(void* a0, MovieDataBlock* a1, MoviePlayer* a2)\n{\n    FeedMovieStream(&a2->stream, a1->size, a1->data);\n}",
+     "s32 PassMovieDataToStream(void* a0, MovieDataBlock* a1, MoviePlayer* a2)\n{\n    return FeedMovieStream(&a2->stream, a1->size, a1->data);\n}",
+     "the sound handler's result given"),
 
     # A line in the log when an animation's event starts a fade to a level or queues a movie: which
     # animation, and where in it.

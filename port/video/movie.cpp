@@ -9,15 +9,18 @@
 //  - the decoder's side: the game sends the video stream on to the IPU by DMA
 //    (IpuDmaSink::Put, where a named patch calls port::movie::VideoBytes), and asks for a
 //    picture at a time; the pictures come from port/video/mpeg2.cpp, in display order, and
-//    are written as the IPU's colour conversion left them: 16 by 16 blocks of 32-bit pixels,
-//    a column of the picture after another, which the game uploads to the GS and draws.
+//    are written as rows of 32-bit pixels, which the game uploads to the GS (in one transfer:
+//    a named patch, where the IPU's conversion left 16 by 16 blocks) and draws.
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
 #include "common.h"
 #include "port/mpeg2.h"
 #include "port/ptr32.h"
+#include "port/retail_data.h"
 
 struct MpegHandle;
 struct MpegStreamPacket;
@@ -48,6 +51,7 @@ struct State {
     std::uint32_t carried = 0;      // bytes of such a packet held in it
     bool ended = false;
     long pictures = 0, fed = 0, packets[2] = {};
+    double decodeSeconds = 0.0, convertSeconds = 0.0;
 };
 State* g_state;
 
@@ -84,8 +88,8 @@ std::uint32_t UnitLength(const std::uint8_t* p, std::uint32_t have, int* stream,
     return length;
 }
 
-// A whole packet offered to its stream's handler; false when the handler refuses it. The sound's
-// handler (PassMovieDataToStream) returns nothing, so its packets always count as taken.
+// A whole packet offered to its stream's handler; false when the handler refuses it (no room
+// yet: it is offered again).
 bool Offer(State& s, MpegHandle* handle, int stream, const std::uint8_t* p, std::uint32_t length, std::uint32_t payload)
 {
     if (stream < 0 || !s.stream[stream])
@@ -96,7 +100,7 @@ bool Offer(State& s, MpegHandle* handle, int stream, const std::uint8_t* p, std:
     packet.payload = port::AddrOf(const_cast<std::uint8_t*>(p + payload));
     packet.payloadSize = (std::int32_t)(length - payload);
     const s32 taken = s.stream[stream](handle, &packet, s.streamArg[stream]);
-    if (stream == 0 && taken == 0)
+    if (taken == 0)
         return false;
     s.packets[stream == 0 ? 0 : 1]++;
     return true;
@@ -104,27 +108,26 @@ bool Offer(State& s, MpegHandle* handle, int stream, const std::uint8_t* p, std:
 
 inline std::uint8_t Clip(int v) { return (std::uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
 
-// A picture written as the IPU's colour conversion writes one (the game's UploadMovieFrame reads
-// it so): a 16 by 16 block of R, G, B, A bytes for each macroblock, down a column and then the
-// next column. The conversion is ITU-R BT.601's from the video range, each colour sample for the
-// four pixels it covers; alpha 0x80, the GS's 1.
+// A picture written as 32-bit pixels, a row after another (the game's UploadMovieFrame, as patched,
+// sends them to the GS so; the IPU's own conversion wrote 16 by 16 blocks). The conversion is
+// ITU-R BT.601's from the video range, each colour sample for the four pixels it covers; alpha
+// 0x80, the GS's 1.
 void Convert(const port::video::Picture& pic, std::uint8_t* out)
 {
-    const int columns = pic.width / 16, rows = pic.height / 16;
-    for (int mx = 0; mx < columns; mx++) {
-        for (int my = 0; my < rows; my++) {
-            for (int y = 0; y < 16; y++) {
-                const std::uint8_t* ys = pic.y + (std::size_t)(my * 16 + y) * (std::size_t)pic.stride + (std::size_t)mx * 16;
-                const std::uint8_t* cbs = pic.cb + (std::size_t)(my * 8 + y / 2) * (std::size_t)pic.chromaStride + (std::size_t)mx * 8;
-                const std::uint8_t* crs = pic.cr + (std::size_t)(my * 8 + y / 2) * (std::size_t)pic.chromaStride + (std::size_t)mx * 8;
-                for (int x = 0; x < 16; x++) {
-                    const int c = 298 * (ys[x] - 16) + 128, d = cbs[x >> 1] - 128, e = crs[x >> 1] - 128;
-                    out[0] = Clip((c + 409 * e) >> 8);
-                    out[1] = Clip((c - 100 * d - 208 * e) >> 8);
-                    out[2] = Clip((c + 516 * d) >> 8);
-                    out[3] = 0x80;
-                    out += 4;
-                }
+    for (int y = 0; y < pic.height; y++) {
+        const std::uint8_t* ys = pic.y + (std::size_t)y * (std::size_t)pic.stride;
+        const std::uint8_t* cbs = pic.cb + (std::size_t)(y / 2) * (std::size_t)pic.chromaStride;
+        const std::uint8_t* crs = pic.cr + (std::size_t)(y / 2) * (std::size_t)pic.chromaStride;
+        for (int x = 0; x < pic.width; x += 2) {
+            const int d = cbs[x >> 1] - 128, e = crs[x >> 1] - 128;
+            const int r = 409 * e + 128, g = -100 * d - 208 * e + 128, b = 516 * d + 128;
+            for (int k = 0; k < 2; k++) {
+                const int c = 298 * (ys[x + k] - 16);
+                out[0] = Clip((c + r) >> 8);
+                out[1] = Clip((c + g) >> 8);
+                out[2] = Clip((c + b) >> 8);
+                out[3] = 0x80;
+                out += 4;
             }
         }
     }
@@ -144,6 +147,8 @@ void VideoBytes(const void* bytes, int size)
     }
 }
 
+float Zoom() { return WideFactor(); }
+
 }  // namespace movie
 }  // namespace port
 
@@ -162,8 +167,9 @@ s32 CreateMpegDecoder(MpegHandle* handle, u8* work, u32 size)
 s32 DeleteMpegDecoder(MpegHandle*)
 {
     if (g_state)
-        std::fprintf(stderr, "movie: %ld pictures shown from %ld bytes of video in %ld packets, and %ld packets of sound; %ld errors in the stream\n",
-                     g_state->pictures, g_state->fed, g_state->packets[0], g_state->packets[1], g_state->decoder.Errors());
+        std::fprintf(stderr, "movie: %ld pictures shown from %ld bytes of video in %ld packets, and %ld packets of sound; %ld errors in the stream; %.1f ms a picture decoding, %.1f converting\n",
+                     g_state->pictures, g_state->fed, g_state->packets[0], g_state->packets[1], g_state->decoder.Errors(),
+                     g_state->pictures ? g_state->decodeSeconds * 1000.0 / (double)g_state->pictures : 0.0, g_state->pictures ? g_state->convertSeconds * 1000.0 / (double)g_state->pictures : 0.0);
     delete g_state;
     g_state = nullptr;
     return 1;
@@ -272,13 +278,18 @@ s32 DecodeMpegPicture(MpegHandle* handle, void* picture, s32 blocks)
     int dry = 0;
     for (;;) {
         port::video::Picture pic;
-        if (s->decoder.Next(&pic)) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool got = s->decoder.Next(&pic);
+        s->decodeSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (got) {
             if ((pic.width / 16) * (pic.height / 16) > blocks || (pic.width & 15) || (pic.height & 15)) {
                 std::fprintf(stderr, "movie: a picture of %d by %d is not one the player has room for\n", pic.width, pic.height);
                 s->ended = true;
                 return -1;
             }
+            const auto t1 = std::chrono::steady_clock::now();
             Convert(pic, static_cast<std::uint8_t*>(picture));
+            s->convertSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
             s32* head = reinterpret_cast<s32*>(handle);
             head[0] = pic.width;    // MovieDecoder::width, height, and skipPicture: 0, it is to be shown
             head[1] = pic.height;
