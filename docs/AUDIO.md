@@ -70,10 +70,58 @@ The game sends commands to two services of the IOP (`port/platform/iop.cpp`):
   start each one-shot again as soon as it ended: 6,000 voices in the opening's first 50
   seconds, where there are 130.
 
+## The level music
+
+A level's bank (`SBv2`) is its instruments and its sequences; the game starts its record 0 once
+(command 0x11) and from then on only sends the sound level (0x27) and eight registers (0x29).
+Everything below is read from the 45 banks' bytes and the game's calls; none of it is measured
+against the driver. It is in `port/audio/audio.cpp` (`Song`).
+
+**Instruments.** A record (8 bytes) is a tone count, a volume of 127 and the place of its
+tones; a MIDI program number is a record. A tone (24 bytes) is a sample over a range of keys:
+volume +1, note +2 and fine +3 (as the global banks' tones: 48,000 Hz where the key equals
+them), pan +4 (degrees, signed), the lowest and highest key +6 and +7, the bend's range down and
+up in semitones +8 and +9, the SPU's two envelope words +0xA and +0xC, the sample's place
++0x10. Every envelope read has an instant attack and a full sustain, so only the release is
+played: the low five bits of the second word, as the SPU's linear release (8 of 32,768 each
+2^(rate - 11) samples).
+
+**Sequences.** The third chunk: a count at +0x17, an offset each from +0x20 (from +0x10), and
+each sequence a 0xDC-byte header (the tempo in microseconds a beat at +0x20, 480 ticks a beat at
++0x24) and a MIDI event stream: note on 0x9n, a note's end 0xDn with its key, program 0xCn, bend
+0xEn, tempo and end as MIDI's meta events. All 259 sequences parse so, with nothing left over.
+
+**The control messages** (`F0 75 ... F7`), 180 distinct ones over the game. Read from how they
+are used:
+
+| Bytes | Reading |
+| --- | --- |
+| `00 x S`, `02 x S` | if the sound level is at least x, or under x, statement S |
+| `16 r v S`, `06 r v S`, `07 r v S` | if register r is v, over v, under v |
+| `04 ... 05` | statements as one |
+| `13 r v` | register r set to v |
+| `11 n` | go on with sequence n in this one's place |
+| `0D r` | the same, the sequence register r names (the registers keep a sequence's number and one) |
+| `12 n` | sequence n started beside this one |
+| `03 n` | sequence n stopped |
+| `0B n ...` | (first sequence) the rest of the part kept as block n; `0C n` does it |
+| `0F g m (c lo hi)...` | (first sequence) group g: channels and the sound levels each sounds between; `10 g` switches a sequence's channels by it |
+| `14 n`, `0E n` | not understood: passed over |
+
+The first sequence is messages only, in parts ended by `F7`: it sets registers, keeps blocks
+and groups and starts a sequence. A Stealthy Approach: an intro (11) into a loop of four
+(1 to 4), each asking at every beat whether the sound level has reached 110 and then starting a
+one-beat sequence (10) that stops them and goes on with the alarm loop (5 to 8), which at each
+bar goes to a wind-down (9) once the level is under 110; registers 0 and 1 keep where each loop
+was left. The values the levels are compared with (18, 19, 30, 50, 110, 119, 120) are what the
+game sends as the sound level: its own level plus 20.
+
+**Readings to put right by ear:** velocity and volumes taken as straight factors; `06` and `07`
+as over and under; the channel switch as between the two levels inclusive; a release when a
+sequence is stopped of a twentieth of a second; no reverb.
+
 ## Not yet
 
-- The level banks' sounds (`SBv2`): a voice is given a handle and is at once over.
-- The level banks' sequences (the level music).
 - Stereo streams, if there are any (the first one, the opening's narration, is mono 44.1 kHz).
 - Unmeasured: the unit of a fade's time (0x22: a fifth of a second is used); the volume
   channels' effect on streams (0x09 is kept, not applied); commands 0x0E, 0x0F, 0x51 (answered

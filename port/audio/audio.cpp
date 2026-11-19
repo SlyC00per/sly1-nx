@@ -179,6 +179,8 @@ struct Bank {
     bool global = false;
     std::vector<std::uint8_t> block, samples;
     std::uint32_t records = 0, tones = 0, recordAt = 0, toneAt = 0;
+    bool level = false;                   // a level's bank (`SBv2`): instruments and sequences
+    std::vector<std::uint8_t> sequences;  // its third chunk
 };
 
 // One sample of a bank playing: a part of a voice.
@@ -293,6 +295,463 @@ struct Voice {
     void Step(int frames);
 };
 
+// ---------------------------------------------------------------------------------------------
+// A level's music (docs/AUDIO.md, "The level music"). A level bank holds instruments (a record
+// each: tones, each a sample over a range of keys) and sequences: MIDI event streams (a note's
+// end is 0xDn and its key) at 480 ticks a beat, with the music's own control messages in
+// `F0 75 ... F7`. The first sequence is only such messages: it sets the bank's registers,
+// keeps blocks of messages and groups of channels, and starts a sequence. The sequences then
+// go from one to the next by their own messages, some by the game's sound level (command
+// 0x27) and the eight registers the game sets (command 0x29). All of it is read from the 45
+// banks' bytes and the game's calls, not measured: see the notes for what each reading rests on.
+int g_soundLevel = 0x14;   // what the game last sent as the sound level (0x14 is its 0)
+
+struct Song {
+    struct Playing {   // a note sounding
+        Note note;
+        int track = 0, channel = 0, key = 0;
+        const std::uint8_t* tone = nullptr;
+        float left = 0.0f, right = 0.0f, gain = 1.0f, release = 0.0f;
+        bool released = false;
+    };
+    struct Track {     // a sequence being played
+        int index = 0;
+        std::size_t at = 0, end = 0;   // in the bank's sequences
+        double ticks = 0.0;            // run, since the last event
+        std::uint32_t wait = 0;        // ticks from the last event to the next
+        std::uint32_t tempo = 500000, perBeat = 480;
+        std::uint8_t status = 0;
+        std::uint8_t program[16] = {};
+        float bend[16] = {};           // of the range, -1 to 1
+        bool on[16];
+        bool done = false, waiting = false;
+        int id = 0;
+        int next = -1;                 // the sequence its messages chose to go on with
+    };
+    std::shared_ptr<Bank> bank;
+    std::vector<Track> tracks;
+    std::vector<Playing> notes;
+    std::map<int, std::vector<std::uint8_t>> blocks;
+    std::map<int, std::vector<std::uint8_t>> groups;   // triples: a channel and the levels it sounds between
+    std::int32_t reg[8] = {};
+    float volume = 1.0f, fade = 1.0f, fadeStep = 0.0f;
+    bool paused = false, over = false;
+    int nextId = 1;
+    std::vector<int> starts;   // sequences to start once the messages being read are done
+
+    bool Sequence(int index, std::size_t* at, std::size_t* end, std::uint32_t* tempo, std::uint32_t* perBeat) const
+    {
+        const std::vector<std::uint8_t>& q = bank->sequences;
+        auto le = [&](std::size_t o) { return (std::uint32_t)q[o] | (std::uint32_t)q[o + 1] << 8 | (std::uint32_t)q[o + 2] << 16 | (std::uint32_t)q[o + 3] << 24; };
+        if (q.size() < 0x24)
+            return false;
+        const int count = q[0x17];
+        if (index < 0 || index >= count || 0x20 + (std::size_t)count * 4 > q.size())
+            return false;
+        const std::size_t from = 0x10 + le(0x20 + (std::size_t)index * 4);
+        const std::size_t to = index + 1 < count ? 0x10 + le(0x20 + (std::size_t)(index + 1) * 4) : q.size();
+        if (from + 0xDC > to || to > q.size())
+            return false;
+        *at = from + 0xDC;
+        *end = to;
+        *tempo = le(from + 0x20);
+        *perBeat = le(from + 0x24);
+        return *tempo != 0 && *perBeat != 0;
+    }
+
+    void StartTrack(int index)
+    {
+        Track t;
+        if (!Sequence(index, &t.at, &t.end, &t.tempo, &t.perBeat) || tracks.size() >= 8)
+            return;
+        t.index = index;
+        t.id = nextId++;
+        for (bool& b : t.on)
+            b = true;
+        t.waiting = false;
+        tracks.push_back(t);
+        static const bool log = std::getenv("SLY1_SND_LOG") != nullptr;
+        if (log)
+            std::fprintf(stderr, "sndlog: music: sequence %d started (sound level %d; registers %d %d %d %d)\n", index, g_soundLevel, reg[0], reg[1], reg[2], reg[3]);
+    }
+
+    void ReleaseTrack(int id)
+    {
+        for (Playing& n : notes)
+            if (n.track == id && !n.released) {
+                n.released = true;
+                n.release = 1.0f / (kRate * 0.05f);
+            }
+    }
+
+    void StopSequence(int index)
+    {
+        for (Track& t : tracks)
+            if (t.index == index && !t.done) {
+                t.done = true;
+                ReleaseTrack(t.id);
+            }
+    }
+
+    // The control messages: one statement at p, done or only passed over. Returns the place
+    // after it, or null where the bytes are not understood (the rest is left).
+    const std::uint8_t* Statement(const std::uint8_t* p, const std::uint8_t* end, bool run, Track* track, int depth)
+    {
+        if (p >= end || depth > 8)
+            return nullptr;
+        const std::uint8_t op = *p++;
+        auto need = [&](int n) { return p + n <= end; };
+        switch (op) {
+        case 0x00:   // if the sound level is at least this
+        case 0x02:   // if it is under this
+            if (!need(1))
+                return nullptr;
+            {
+                const bool is = op == 0x00 ? g_soundLevel >= p[0] : g_soundLevel < p[0];
+                return Statement(p + 1, end, run && is, track, depth + 1);
+            }
+        case 0x06:   // if a register is over a value, under it, or it
+        case 0x07:
+        case 0x16:
+            if (!need(2))
+                return nullptr;
+            {
+                const std::int32_t r = p[0] < 8 ? reg[p[0]] : 0, v = p[1];
+                const bool is = op == 0x06 ? r > v : op == 0x07 ? r < v : r == v;
+                return Statement(p + 2, end, run && is, track, depth + 1);
+            }
+        case 0x04:   // statements up to 0x05, as one
+            while (p < end && *p != 0x05) {
+                p = Statement(p, end, run, track, depth + 1);
+                if (!p)
+                    return nullptr;
+            }
+            return p < end ? p + 1 : nullptr;
+        case 0x13:   // a register set
+            if (!need(2))
+                return nullptr;
+            if (run && p[0] < 8)
+                reg[p[0]] = p[1];
+            return p + 2;
+        case 0x11:   // the sequence to go on with, in this one's place
+        case 0x0D:   // the same, the one a register names (kept as the sequence's number and one)
+            if (!need(1))
+                return nullptr;
+            if (run) {
+                const int to = op == 0x11 ? p[0] : (p[0] < 8 ? reg[p[0]] - 1 : -1);
+                if (track)
+                    track->next = to;
+                else
+                    starts.push_back(to);
+            }
+            return p + 1;
+        case 0x12:   // a sequence started beside this one
+            if (!need(1))
+                return nullptr;
+            if (run)
+                starts.push_back(p[0]);
+            return p + 1;
+        case 0x03:   // a sequence stopped
+            if (!need(1))
+                return nullptr;
+            if (run) {
+                if (track && track->index == p[0])
+                    track->done = true, ReleaseTrack(track->id);
+                else
+                    StopSequence(p[0]);
+            }
+            return p + 1;
+        case 0x0C:   // a kept block's statements
+            if (!need(1))
+                return nullptr;
+            if (run) {
+                auto b = blocks.find(p[0]);
+                if (b != blocks.end()) {
+                    const std::uint8_t* q = b->second.data();
+                    const std::uint8_t* qEnd = q + b->second.size();
+                    while (q && q < qEnd)
+                        q = Statement(q, qEnd, true, track, depth + 1);
+                }
+            }
+            return p + 1;
+        case 0x10:   // a group's channels switched by the sound level
+            if (!need(1))
+                return nullptr;
+            if (run && track) {
+                auto g = groups.find(p[0]);
+                if (g != groups.end())
+                    for (std::size_t k = 0; k + 3 <= g->second.size(); k += 3) {
+                        const std::uint8_t* c = &g->second[k];
+                        if (c[0] < 16)
+                            track->on[c[0]] = g_soundLevel >= c[1] && g_soundLevel <= c[2];
+                    }
+            }
+            return p + 1;
+        case 0x14:   // not understood, one byte each
+        case 0x0E:
+            return need(1) ? p + 1 : nullptr;
+        default:
+            return nullptr;
+        }
+    }
+
+    void Script(const std::uint8_t* p, const std::uint8_t* end, Track* track)
+    {
+        while (p && p < end)
+            p = Statement(p, end, true, track, 0);
+    }
+
+    // The first sequence: messages only, in parts ended by 0xF7. 0x0B keeps the rest of its part
+    // as a block, 0x0F as a group; the others are done at once.
+    void Begin()
+    {
+        std::size_t at, end;
+        std::uint32_t tempo, perBeat;
+        if (!Sequence(0, &at, &end, &tempo, &perBeat))
+            return;
+        const std::uint8_t* q = bank->sequences.data();
+        std::size_t p = at;
+        while (p + 2 < end && !(q[p] == 0xF0 && q[p + 1] == 0x75))
+            p++;
+        p += 2;
+        while (p < end) {
+            std::size_t stop = p;
+            while (stop < end && q[stop] != 0xF7)
+                stop++;
+            if (stop >= end)
+                break;
+            const std::uint8_t* s = q + p;
+            const std::uint8_t* e = q + stop;
+            while (s && s < e) {
+                if (*s == 0x0B && s + 2 <= e) {
+                    blocks[s[1]].assign(s + 2, e);
+                    break;
+                }
+                if (*s == 0x0F && s + 3 <= e) {
+                    groups[s[1]].assign(s + 3, e);
+                    break;
+                }
+                s = Statement(s, e, true, nullptr, 0);
+            }
+            p = stop + 1;
+        }
+        Starts();
+    }
+
+    void Starts()
+    {
+        std::vector<int> now;
+        now.swap(starts);
+        for (int index : now)
+            StartTrack(index);
+    }
+
+    void NoteOn(Track& t, int channel, int key, int velocity)
+    {
+        if (!t.on[channel] || notes.size() >= 48)
+            return;
+        const std::uint32_t program = t.program[channel];
+        const std::vector<std::uint8_t>& b = bank->block;
+        if (program >= bank->records || bank->recordAt + (program + 1) * 8 > b.size())
+            return;
+        const std::uint8_t* r = &b[bank->recordAt + program * 8];
+        const std::uint32_t first = (std::uint32_t)r[4] | (std::uint32_t)r[5] << 8 | (std::uint32_t)r[6] << 16 | (std::uint32_t)r[7] << 24;
+        for (int k = 0; k < r[0]; k++) {
+            const std::size_t o = (std::size_t)first + (std::size_t)k * 24;
+            if (o + 24 > b.size())
+                break;
+            const std::uint8_t* tone = &b[o];
+            if (key < tone[6] || key > tone[7])
+                continue;
+            Playing n;
+            n.track = t.id;
+            n.channel = channel;
+            n.key = key;
+            n.tone = tone;
+            n.note.bank = bank;
+            n.note.at = (std::uint32_t)tone[0x10] | (std::uint32_t)tone[0x11] << 8 | (std::uint32_t)tone[0x12] << 16 | (std::uint32_t)tone[0x13] << 24;
+            n.note.rate = Rate(tone, key, t.bend[channel]);
+            const float level = (float)velocity / 127.0f * (float)tone[1] / 127.0f * (float)r[1] / 127.0f;
+            const float sine = std::sin((float)(std::int16_t)(tone[4] | tone[5] << 8) * 3.14159265f / 180.0f);
+            n.left = level * std::sqrt(0.5f * (1.0f - sine));
+            n.right = level * std::sqrt(0.5f * (1.0f + sine));
+            notes.push_back(n);
+        }
+    }
+
+    // A tone's rate for a key: the SPU's 48,000 Hz where the key is the tone's note (the negative
+    // of its signed byte at +2, less its fine part at +3 in 128ths), a semitone a key; a bend
+    // moves it by the tone's range (+8 down, +9 up, in semitones).
+    static float Rate(const std::uint8_t* tone, int key, float bend)
+    {
+        const float centre = (float)-(std::int8_t)tone[2] - (float)tone[3] / 128.0f;
+        const float range = bend < 0.0f ? (float)tone[8] : (float)tone[9];
+        return 48000.0f * std::pow(2.0f, ((float)key - centre + bend * range) / 12.0f);
+    }
+
+    void NoteOff(Track& t, int channel, int key)
+    {
+        for (Playing& n : notes)
+            if (n.track == t.id && n.channel == channel && n.key == key && !n.released) {
+                // the release from the tone's second envelope word: its low five bits a rate, a
+                // step of 8 of 32,768 each 2^(rate - 11) samples (the SPU's linear release)
+                const int rate = n.tone[0x0C] & 0x1F;
+                const float frames = 4096.0f * std::pow(2.0f, (float)(rate - 11));
+                n.released = true;
+                n.release = 1.0f / (frames < 96.0f ? 96.0f : frames > kRate * 4.0f ? kRate * 4.0f : frames);
+            }
+    }
+
+    // A track's events up to now.
+    void Run(Track& t, double ticks)
+    {
+        const std::vector<std::uint8_t>& q = bank->sequences;
+        t.ticks += ticks;
+        int guard = 0;
+        while (!t.done && guard++ < 4096) {
+            if (!t.waiting) {   // the next event's time
+                std::uint32_t v = 0;
+                while (t.at < t.end) {
+                    const std::uint8_t c = q[t.at++];
+                    v = v << 7 | (c & 0x7F);
+                    if (c < 0x80)
+                        break;
+                }
+                t.wait = v;
+                t.waiting = true;
+            }
+            if (t.ticks < (double)t.wait)
+                return;
+            t.ticks -= (double)t.wait;
+            t.waiting = false;
+            if (t.at >= t.end) {
+                t.done = true;
+                break;
+            }
+            std::uint8_t c = q[t.at];
+            if (c == 0xF0) {
+                std::size_t stop = t.at + 1;
+                while (stop < t.end && q[stop] != 0xF7)
+                    stop++;
+                if (stop < t.end && t.at + 2 <= stop && q[t.at + 1] == 0x75)
+                    Script(&q[t.at + 2], &q[stop], &t);
+                t.at = stop + 1;
+                continue;
+            }
+            if (c == 0xFF) {
+                if (t.at + 3 > t.end) {
+                    t.done = true;
+                    break;
+                }
+                const std::uint8_t type = q[t.at + 1], size = q[t.at + 2];
+                if (type == 0x51 && size == 3 && t.at + 6 <= t.end)
+                    t.tempo = (std::uint32_t)q[t.at + 3] << 16 | (std::uint32_t)q[t.at + 4] << 8 | q[t.at + 5];
+                t.at += 3 + (std::size_t)size;
+                if (type == 0x2F)
+                    t.done = true;
+                continue;
+            }
+            if (c >= 0x80) {
+                t.status = c;
+                t.at++;
+            }
+            const int kind = t.status >> 4, channel = t.status & 15;
+            const int size = kind == 0xC || kind == 0xD ? 1 : 2;
+            if (kind < 8 || t.at + (std::size_t)size > t.end) {
+                t.done = true;
+                break;
+            }
+            const std::uint8_t a = q[t.at], b = size == 2 ? q[t.at + 1] : 0;
+            t.at += (std::size_t)size;
+            if (kind == 9 && b != 0)
+                NoteOn(t, channel, a, b);
+            else if (kind == 9 || kind == 8 || kind == 0xD)
+                NoteOff(t, channel, a);
+            else if (kind == 0xC)
+                t.program[channel] = a;
+            else if (kind == 0xE) {
+                t.bend[channel] = (float)((a | b << 7) - 8192) / 8192.0f;
+                for (Playing& n : notes)
+                    if (n.track == t.id && n.channel == channel)
+                        n.note.rate = Rate(n.tone, n.key, t.bend[channel]);
+            }
+        }
+        if (t.done) {
+            if (t.next >= 0)
+                starts.push_back(t.next);
+        } else if (t.next >= 0) {   // its messages chose another before its end
+            t.done = true;
+            ReleaseTrack(t.id);
+            starts.push_back(t.next);
+        }
+    }
+
+    void Mix(std::int32_t* out, int frames, float master)
+    {
+        if (paused || over)
+            return;
+        constexpr int kStep = 96;   // the events' grain: 2 ms
+        for (int from = 0; from < frames; from += kStep) {
+            const int n = frames - from < kStep ? frames - from : kStep;
+            for (std::size_t k = 0; k < tracks.size(); k++) {
+                Track& t = tracks[k];
+                if (!t.done)
+                    Run(t, (double)n / kRate * 1e6 / (double)t.tempo * (double)t.perBeat);
+            }
+            Starts();
+            for (std::size_t k = 0; k < tracks.size();)
+                if (tracks[k].done)
+                    tracks.erase(tracks.begin() + (std::ptrdiff_t)k);
+                else
+                    k++;
+            const float g = volume * master * fade;
+            for (Playing& p : notes) {
+                Note& note = p.note;
+                if (note.over)
+                    continue;
+                const double step = (double)note.rate / kRate;
+                for (int k = 0; k < n; k++) {
+                    while (note.phase >= 1.0) {
+                        note.prev = note.next;
+                        if (!note.Sample(&note.next)) {
+                            note.over = true;
+                            break;
+                        }
+                        note.phase -= 1.0;
+                    }
+                    if (note.over)
+                        break;
+                    const float v = ((float)note.prev + (float)(note.next - note.prev) * (float)note.phase) * p.gain * g;
+                    out[(from + k) * 2] += (std::int32_t)(v * p.left);
+                    out[(from + k) * 2 + 1] += (std::int32_t)(v * p.right);
+                    note.phase += step;
+                    if (p.released) {
+                        p.gain -= p.release;
+                        if (p.gain <= 0.0f) {
+                            note.over = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            for (std::size_t k = 0; k < notes.size();)
+                if (notes[k].note.over)
+                    notes.erase(notes.begin() + (std::ptrdiff_t)k);
+                else
+                    k++;
+            if (fadeStep != 0.0f) {
+                fade -= fadeStep * (float)n;
+                if (fade <= 0.0f) {
+                    over = true;
+                    return;
+                }
+            }
+        }
+    }
+};
+
+std::map<std::uint32_t, std::shared_ptr<Song>> g_songs;
+
 std::mutex g_lock;
 std::map<std::uint32_t, std::shared_ptr<Bank>> g_banks;
 std::map<std::uint32_t, std::shared_ptr<Voice>> g_voices;
@@ -323,6 +782,8 @@ void MixChunk(std::int16_t* out)
         std::lock_guard<std::mutex> lk(g_lock);
         for (auto& kv : g_streams)
             kv.second->Mix(sum, kChunk, 0.6f);   // (a finished stream stays until the game has asked and been told it is over, or stops it)
+        for (auto& kv : g_songs)
+            kv.second->Mix(sum, kChunk, 0.3f);
         int sounding = 0;
         for (auto it = g_voices.begin(); it != g_voices.end();) {
             Voice& v = *it->second;
@@ -454,7 +915,8 @@ std::uint32_t LoadBank(std::uint32_t sector)
         const std::uint32_t chunks = le(head + 4);
         if (chunks >= 2 && chunks <= 4) {
             const std::uint32_t blockAt = le(head + 8), blockSize = le(head + 12), samplesAt = le(head + 16), samplesSize = le(head + 20);
-            const std::uint32_t total = samplesAt + samplesSize;
+            const std::uint32_t seqAt = chunks >= 3 ? le(head + 24) : 0, seqSize = chunks >= 3 ? le(head + 28) : 0;
+            const std::uint32_t total = seqSize && seqSize < (8u << 20) && seqAt >= samplesAt + samplesSize ? seqAt + seqSize : samplesAt + samplesSize;
             if (blockAt < total && blockSize < (8u << 20) && samplesSize < (64u << 20)) {
                 std::vector<std::uint8_t> whole(((std::size_t)total + 2047) / 2048 * 2048);
                 if (ReadSectors(sector, (std::uint32_t)(whole.size() / 2048), whole.data())) {
@@ -467,6 +929,14 @@ std::uint32_t LoadBank(std::uint32_t sector)
                         bank->tones = b[0x18] | b[0x19] << 8;
                         bank->recordAt = le(b + 0x1C);
                         bank->toneAt = le(b + 0x20);
+                    } else if (bank->block.size() >= 0x50 && std::memcmp(bank->block.data(), "SBv2", 4) == 0 && seqSize && seqAt + seqSize <= whole.size()) {
+                        const std::uint8_t* b = bank->block.data();
+                        bank->level = true;
+                        bank->records = b[0x16] | b[0x17] << 8;
+                        bank->tones = b[0x18] | b[0x19] << 8;
+                        bank->recordAt = le(b + 0x20);
+                        bank->toneAt = le(b + 0x24);
+                        bank->sequences.assign(whole.begin() + seqAt, whole.begin() + seqAt + seqSize);
                     }
                 }
             }
@@ -477,7 +947,7 @@ std::uint32_t LoadBank(std::uint32_t sector)
     g_banks[handle] = bank;
     static const bool log = std::getenv("SLY1_SND_LOG") != nullptr;
     if (log)
-        std::fprintf(stderr, "sndlog: bank %u at sector %u: %s, %u records, %u tones, %zu bytes of samples\n", handle, sector, bank->global ? "global" : "a level's (not played yet)",
+        std::fprintf(stderr, "sndlog: bank %u at sector %u: %s, %u records, %u tones, %zu bytes of samples\n", handle, sector, bank->global ? "global" : bank->level ? "a level's" : "not understood",
                      bank->records, bank->tones, bank->samples.size());
     return handle;
 }
@@ -640,8 +1110,10 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
     case 0x0B:   // the sound option
     case 0x0D:
     case 0x4E:   // a channel's set-up
-    case 0x27:   // the sound level
     case 0x3B: case 0x3C: case 0x3D:
+        return 0;
+    case 0x27:   // the sound level: what the level's music goes by
+        g_soundLevel = (std::int32_t)a;
         return 0;
     case 0x09:   // a volume channel's value, 0x400 is 1
         if (a < 16)
@@ -651,6 +1123,17 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
         return a < 16 ? (std::uint32_t)(g_channelVolume[a] * 1024.0f) : 0;
     case 0x11: { // a bank's sound started: the bank's handle, the record, a volume (0x400 is 1; 0: set after), a pan, a pitch
         auto bank = g_banks.find(a);
+        if (bank != g_banks.end() && bank->second->level) {   // a level bank's: its music
+            auto song = std::make_shared<Song>();
+            song->bank = bank->second;
+            if (c != 0)
+                song->volume = (float)(std::int32_t)c / 1024.0f;
+            song->Begin();
+            const std::uint32_t handle = g_nextHandle++;
+            g_songs[handle] = song;
+            g_voicesStarted++;
+            return handle;
+        }
         std::shared_ptr<Voice> v = StartVoice(bank == g_banks.end() ? nullptr : bank->second, b);
         const std::uint32_t handle = g_nextHandle++;
         g_voicesStarted++;
@@ -699,15 +1182,20 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
             s->paused = true;
         if (g_voices.count(a))
             g_voices[a]->paused = true;
+        if (g_songs.count(a))
+            g_songs[a]->paused = true;
         return 0;
     case 0x14:   // and resumed
         if (Stream* s = Find(a))
             s->paused = false;
         if (g_voices.count(a))
             g_voices[a]->paused = false;
+        if (g_songs.count(a))
+            g_songs[a]->paused = false;
         return 0;
     case 0x15:   // a voice stopped: a bank's over a hundredth of a second, with no click
         g_streams.erase(a);
+        g_songs.erase(a);
         if (g_voices.count(a))
             g_voices[a]->gainStep = 1.0f / (kRate * 0.01f);
         return 0;
@@ -716,16 +1204,22 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
             kv.second->paused = true;
         for (auto& kv : g_voices)
             kv.second->paused = true;
+        for (auto& kv : g_songs)
+            kv.second->paused = true;
         return 0;
     case 0x17:
         for (auto& kv : g_streams)
             kv.second->paused = false;
         for (auto& kv : g_voices)
             kv.second->paused = false;
+        for (auto& kv : g_songs)
+            kv.second->paused = false;
         return 0;
     case 0x19:   // whether a voice is still playing
     case 0x2E:
     case 0x4F: {
+        if (g_songs.count(a))
+            return g_songs[a]->over ? 0 : 1;
         auto voice = g_voices.find(a);
         if (voice != g_voices.end()) {
             if (voice->second->over) {
@@ -759,24 +1253,31 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
             g_voices[a]->volume = (float)(std::int32_t)b / 1024.0f;
             SetPan(*g_voices[a], (std::int32_t)c);
         }
+        if (g_songs.count(a))
+            g_songs[a]->volume = (float)(std::int32_t)b / 1024.0f;
         return 0;
     case 0x1E:   // a voice's pitch: 1,524 an octave (the game adds what it asked for as the sound's base, answered 0)
         if (g_voices.count(a))
             g_voices[a]->pitch = std::pow(2.0f, (float)(std::int32_t)b / 1524.0f);
         return 0;
-    case 0x29:   // a voice's parameter set
+    case 0x29:   // one of the music's eight registers set: the voice, the register, the value
+        if (g_songs.count(a) && b < 8)
+            g_songs[a]->reg[b] = (std::int32_t)c;
         return 0;
     case 0x22:   // a voice faded out: over a fifth of a second until its time's unit is known
         if (Stream* s = Find(a))
             s->fadeStep = 1.0f / (kRate * 0.2f);
         if (g_voices.count(a))
             g_voices[a]->gainStep = 1.0f / (kRate * 0.2f);
+        if (g_songs.count(a))
+            g_songs[a]->fadeStep = 1.0f / (kRate * 0.2f);
         return 0;
-    case 0x28:   // a voice's parameter asked for
-        return 0;
+    case 0x28:   // a register asked for
+        return g_songs.count(a) && b < 8 ? (std::uint32_t)g_songs[a]->reg[b] : 0;
     case 0x34:   // every sound stopped
         g_streams.clear();
         g_voices.clear();
+        g_songs.clear();
         return 0;
     case 0x06:   // a bank unloaded
         g_banks.erase(a);
