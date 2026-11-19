@@ -56,10 +56,15 @@ thread could not make its display flips: each picture took three display frames 
 two, and the sound broke up. The decoding is on a thread of its own (`port::movie::WorkerMain`,
 on the render thread's core, which has nothing to do in a movie): the game's thread gives it
 the stream's bytes and takes its pictures, and lets the game's other threads run while it
-waits for one. The worker goes one picture and about one more in bytes ahead, no further: the
-game keeps its video ring (an eighth of a second) and its sound ring (a quarter) in step, and
-bytes taken further ahead leave the sound's full while the video's is empty, which the game
-answers by filling the video with zeros, as at a movie's end.
+waits for one. The worker goes one decoded picture ahead, and is given the stream up to the
+start of the fourth picture past the last one decoded (counted from the picture start codes as
+the bytes pass): a picture can only be decoded once the next one's start is there, and one is
+held back for the display order. Counted in bytes (24 KB), a large picture left the worker
+without its end until the game asked for it, and the game then waited the whole decoding: 257
+of the hideout cinematic's 3,259 pictures on the Switch, heard as hiccups; by pictures it is 1.
+No further ahead than that: the game keeps its video ring (an eighth of a second) and its sound
+ring (a quarter) in step, and bytes taken further ahead leave the sound's full while the
+video's is empty, which the game answers by filling the video with zeros, as at a movie's end.
 
 With the one worker a movie ran at 17 to 19 ms a display frame on the Switch where it has
 16.7 (14 ms a picture decoding and 5 converting, more for the heavy ones: 25 of 409 pictures
