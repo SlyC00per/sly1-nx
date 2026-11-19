@@ -101,6 +101,25 @@ const std::uint32_t* At(std::uint32_t addr, bool spr)
     return reinterpret_cast<const std::uint32_t*>(Native(addr & 0x7FFFFFF0));
 }
 
+// SLY1_FINISH_LAG (on where there is a GS thread; 0: off): the game is told a list is finished
+// when the render thread has done with it, not when the GS thread has drawn it. The game's own
+// render thread waits for FINISH after each of a frame's three packets before it waits for the
+// vertical blank, so a frame cost the handing over, the render thread's work, what the GS thread
+// had left and the two packets after, one after the other: with each of the three threads at
+// 12 ms a frame took two blanks. Now the GS thread may run a frame behind (no further: the render
+// thread does not start a list while the GS thread still owes more than one frame's FINISHes),
+// and a frame fits a blank when each thread's own work does.
+// g_finishAhead: FINISH writes the game has been told of that the GS thread has yet to reach.
+std::atomic<int> g_finishAhead{0};
+std::atomic<std::uint64_t> g_finishesEarly{0}, g_finishesLate{0};
+// (the GS thread's) the item being run ends with a FINISH the game has been told of already
+bool g_itemFinishTold;
+bool FinishLag()
+{
+    static const bool off = std::getenv("SLY1_FINISH_LAG") && std::getenv("SLY1_FINISH_LAG")[0] == '0';
+    return !off;
+}
+
 // A GIF packet stream, a quadword at a time.
 class Gif {
 public:
@@ -108,6 +127,8 @@ public:
 
     // Quadwords still owed to the current tag's data (0: the next quadword is a tag).
     std::uint32_t Left() const { return left_; }
+    // (FinishEarly, on the render thread)
+    static void RaiseFinish() { Raise(); }
 
     void Qword(const std::uint32_t* q)
     {
@@ -204,6 +225,17 @@ private:
     // (the game unmasks it before it waits).
     static void Finish()
     {
+        // one the game was told of when the render thread passed it (FinishEarly): only counted off
+        if (g_itemFinishTold) {
+            g_itemFinishTold = false;
+            g_finishAhead.fetch_sub(1, std::memory_order_acq_rel);
+            return;
+        }
+        g_finishesLate++;
+        Raise();
+    }
+    static void Raise()
+    {
         TIMELINE("FINISH raised");
         *static_cast<volatile std::uint64_t*>(Native(kGsCsr)) |= 2;
         g_counts.finishes++;
@@ -280,6 +312,8 @@ struct GsItem {
     std::uint64_t a = 0, b = 0;
     // path 6, a part run beside the render thread (PartJob): its items come in this one's place
     std::shared_ptr<struct PartJob> job;
+    // paths 2 and 3: its last tag is the game's FINISH, and the game has been told (FinishEarly)
+    bool finishTold = false;
 };
 // On a thread running a part's job: where what it queues for the GS goes. The items stay where
 // they are from job to job, and each one's buffer is used again for the item that comes in its
@@ -359,6 +393,56 @@ void PartRecordItem(const GsItem& item);
 bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow);
 void PartDone();
 
+// FINISH writes among what the render thread has queued for the GS thread in its current item
+// (the game ends each of a frame's packets with one: a tag of one A+D register and the write).
+int g_finishSeen;
+bool EndsWithFinish(const std::vector<std::uint32_t>& w)
+{
+    if (w.size() < 8 || (w.size() & 3))
+        return false;
+    // the tags walked from the first (a packet starts at one): the last must be the FINISH's and
+    // its one quadword of data the item's last
+    const std::size_t quads = w.size() / 4;
+    std::size_t at = 0;
+    for (int tags = 0; tags < 4096; tags++) {
+        const std::uint32_t* tag = &w[at * 4];
+        const std::uint32_t nloop = tag[0] & 0x7FFF, flg = (tag[1] >> 26) & 3;
+        std::uint32_t nreg = (tag[1] >> 28) & 0xF;
+        if (nreg == 0)
+            nreg = 16;
+        const std::size_t n = flg == 0 ? (std::size_t)nloop * nreg : flg == 1 ? ((std::size_t)nloop * nreg + 1) / 2 : nloop;
+        const std::size_t next = at + 1 + n;
+        if (next > quads)
+            return false;
+        if (next == quads)
+            return nloop == 1 && flg == 0 && nreg == 1 && (tag[2] & 0xF) == 0xE && (tag[6] & 0xFF) == 0x61;
+        at = next;
+    }
+    return false;
+}
+// At the end of an item of the render thread's: the game told of the FINISHes it held, now that
+// everything before them has been through the render thread (its VU1 work and the interrupts of
+// its list among it). The GS thread counts each off when it comes to it (Gif::Finish).
+void GsPassOn();
+void FinishEarly()
+{
+    if (g_finishSeen == 0)
+        return;
+    GsPassOn();
+    for (; g_finishSeen > 0; g_finishSeen--) {
+        g_finishesEarly++;
+        Gif::RaiseFinish();
+    }
+}
+// Before a list of VIF1's is begun: the GS thread no more than a frame behind (a frame has three
+// FINISHes; it is given a tenth of a second at most).
+void FinishLagWait()
+{
+    const std::uint64_t until = NowNs() + 100000000ull;
+    while (g_finishAhead.load(std::memory_order_acquire) > 3 && NowNs() < until)
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+}
+
 void GsEnqueue(GsItem&& item)
 {
     if (Collect* c = t_collect) {
@@ -373,6 +457,11 @@ void GsEnqueue(GsItem&& item)
         PartRecordItem(item);
     if (g_partObserving && (item.path == 0 || item.path == 3 || item.path == 5))
         g_observeBad = true;
+    if ((item.path == 2 || item.path == 3) && FinishLag() && EndsWithFinish(item.words)) {
+        item.finishTold = true;
+        g_finishAhead.fetch_add(1, std::memory_order_acq_rel);
+        g_finishSeen++;
+    }
     g_gsPending.push_back(std::move(item));
     if (g_gsPending.size() >= 24)
         GsPassOn();
@@ -3084,6 +3173,19 @@ void GsThreadMain()
             itemp = &jobNow->out.items[jobAt++];
         }
         GsItem& item = *itemp;
+        g_itemFinishTold = item.finishTold;
+        struct ToldCheck {   // (an item marked whose FINISH the GIF did not come to: the count put right, and said)
+            ~ToldCheck()
+            {
+                if (!g_itemFinishTold)
+                    return;
+                g_itemFinishTold = false;
+                g_finishAhead.fetch_sub(1, std::memory_order_acq_rel);
+                static int said;
+                if (said++ < 4)
+                    std::fprintf(stderr, "dmac: a FINISH told to the game early was not in its item\n");
+            }
+        } toldCheck;
         const std::uint64_t gsStarted = NowNs();
         struct Busy {
             std::uint64_t from;
@@ -3209,6 +3311,8 @@ void RenderThreadMain()
         const std::uint64_t started = NowNs();
         const int kind = (int)item.kind;
         TIMELINE("render starts %s", kind == 0 ? "VIF1 (copy)" : kind == 3 ? "VIF1 (in place)" : kind == 1 ? "GIF" : "a call");
+        if (gsThread && item.kind == RenderItem::Vif1 && FinishLag())
+            FinishLagWait();
         switch (item.kind) {
         case RenderItem::Vif1: {
             std::optional<gs::Hold> hold;
@@ -3273,6 +3377,8 @@ void RenderThreadMain()
         }
         GsPassOn();
         HashPassOn();
+        if (gsThread)
+            FinishEarly();
         {   // SLY1_SLOW_RENDER=ms: each list of VIF1's takes that much longer (a slow machine's frames, on a fast one)
             static const int slow = std::getenv("SLY1_SLOW_RENDER") ? std::atoi(std::getenv("SLY1_SLOW_RENDER")) : 0;
             if (slow > 0 && (kind == 0 || kind == 3))
@@ -3291,6 +3397,15 @@ void RenderThreadMain()
                 const double n = (double)(shown - shownWas) * 1e6;
                 const std::uint64_t idle = KernelIdleNs();
                 if (since)
+                    {
+                        static std::uint64_t earlyWas, lateWas;
+                        const std::uint64_t early = g_finishesEarly.load(), late = g_finishesLate.load();
+                        if (FinishLag() && gsThread)
+                            std::fprintf(stderr, "perffinish: to %llu: FINISH told to the game %llu times from the render thread, %llu from the GS thread; the GS thread owes %d now\n",
+                                         (unsigned long long)shown, (unsigned long long)(early - earlyWas), (unsigned long long)(late - lateWas), g_finishAhead.load());
+                        earlyWas = early;
+                        lateWas = late;
+                    }
                     std::fprintf(stderr, "perf: frames to %llu: %.1f ms a frame; render thread %.1f, GS thread %.1f, the game's threads %.1f\n",
                                  (unsigned long long)shown, (now - since) / n, (render - renderWas) / n, (gsNs - gsWas) / n,
                                  ((double)(now - since) - (double)(idle - idleWas)) / n);

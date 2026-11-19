@@ -1054,3 +1054,28 @@ is drawn.
 the level: 1,438,611 handler runs compared with the interpreter's, 9,360 of them this one,
 0 differed. On the host the level's VU1 time went from 2.35 s to 2.02 s in 15 s of play (the
 handler takes 0.21 s for what the translated code took about 0.5 s for).
+
+## FINISH told to the game from the render thread (2026-11-19)
+
+`SLY1_TIMELINE` on the Switch in A Stealthy Approach, one frame from its vertical blank: the
+game's render thread swaps the buffers and sends an upload and the frame's list of VIF1's
+(2 ms); the port's render thread does the list; FINISH is raised when the GS thread has drawn
+it (0.5 ms after); the game sends two more packets, each waited for the same way (2.3 ms); then
+it waits for the next blank. A frame cost those one after the other. With the particle streaks
+in native code the three threads took 13, 14 and 12 ms a frame there, and the frame still two
+blanks.
+
+The game is now told a packet is finished when the port's render thread has done with it. The
+render thread marks an item for the GS thread whose last tag is the game's FINISH (the tags are
+walked from the first: a tag of one A+D register, the write of 0x61, the item's last quadword),
+and raises FINISH at the end of its own item, after the parts run beside it are in; the GS
+thread, coming to that write, only counts it off. A FINISH not found that way is raised by the
+GS thread as before. The GS thread may then run a frame behind, and no further: the render
+thread does not begin a list while more than three FINISHes (a frame's) are owed. What is shown
+comes a frame later. `SLY1_FINISH_LAG=0`: as before. `SLY1_PERF_LOG=1` says how many were told
+from each thread (`perffinish:`).
+
+Checked on the host with the GS thread: 1,299 frames of the level under lockstep hash the same
+with it and without; in real time every FINISH (three a frame) is told from the render thread
+and none owed at the end; the opening movie plays to its end with no error in the stream. Not
+yet measured on the Switch.
