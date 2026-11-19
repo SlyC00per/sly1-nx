@@ -88,6 +88,9 @@ std::vector<std::uint32_t> g_samples[2];
 std::atomic<bool> g_sampling;
 Thread g_sampler;
 
+}  // namespace
+void SamplerReport();
+namespace {
 void Sampler(void*)
 {
     svcSleepThread(12000000000ll);
@@ -116,6 +119,12 @@ void Sampler(void*)
             svcSetThreadActivity(g_sampled[k], ThreadActivity_Runnable);
             if (got)
                 g_samples[k].push_back((std::uint32_t)std::min<std::uint64_t>(ctx.pc.x - base, 0xFFFFFFFFu));
+        }
+        // the report as soon as there are 60,000 samples of each (a minute): a run that is stopped
+        // from outside, or left by the player, never reaches the one at the program's end
+        if (g_samples[0].size() >= 60000 && g_samples[1].size() >= 60000) {
+            SamplerReport();
+            return;
         }
     }
 }
