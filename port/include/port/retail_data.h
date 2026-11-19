@@ -111,6 +111,8 @@ void NoteWorldLoad(int arrivalA, int arrivalB, int flags);
 // A fade that is to load a level: where StartScreenFade was called from (bytes from its own start;
 // -1 for the completion fade, whose two values are then its kind and the completion mask).
 void NoteFade(long from, int kind, int value, int count, int mode);
+// An animation's event 25 (a fade to a level) or 51 (a movie queued): the animation, its object, its time.
+void NoteAnimEvent(int event, int animation, int object, float time, float length, float speed);
 // The 2D elements in the 16:9 picture (tools/patches.py). Wide2D(middle): what is drawn from now
 // is one element whose middle rests at that x of the 640 (it is drawn 3/4 as wide about the
 // left edge, the middle or the right edge of the screen, by the third the middle is in);

@@ -173,6 +173,17 @@ PATCHES = [
      "    s32 s0 = -1;\n\n    port::NoteFade(-1, kind, ComputeCompletionMask(), -1, -1);\n    if (kind != 4) { if (kind < 5) { if (kind == 2) { s0 = 0xD; } } } else { s0 = 0xE; }",
      "the completion fade noted in the log"),
 
+    # A line in the log when an animation's event starts a fade to a level or queues a movie: which
+    # animation, and where in it.
+    ("src/main/placed_object.cpp",
+     "    case 25:\n        StartScreenFade(&g_screenFade, (FadeRequest*)msg->aC.i, msg->a8.h.lo);",
+     "    case 25:\n        port::NoteAnimEvent(25, owner->id, self->object ? ((BaseObject*)self->object)->id : -1, self->time, owner->length, self->speed);\n        StartScreenFade(&g_screenFade, (FadeRequest*)msg->aC.i, msg->a8.h.lo);",
+     "an animation's fade event noted in the log"),
+    ("src/main/placed_object.cpp",
+     "    case 51:\n        QueueMovie((MoviePlayer*)g_moviePlayer, (void*)msg->a8.i);",
+     "    case 51:\n        port::NoteAnimEvent(51, owner->id, self->object ? ((BaseObject*)self->object)->id : -1, self->time, owner->length, self->speed);\n        QueueMovie((MoviePlayer*)g_moviePlayer, (void*)msg->a8.i);",
+     "an animation's movie event noted in the log"),
+
     # A line in the log for each level load: the two arrival keys and the flags of the request
     # (what the level it was asked from gave), for reproducing a way into a level on the host
     # (SLY1_ARRIVAL).

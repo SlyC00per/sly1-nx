@@ -1160,6 +1160,13 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
             return handle;
         }
         std::shared_ptr<Voice> v = StartVoice(bank == g_banks.end() ? nullptr : bank->second, b);
+        {   // SLY1_SND_LOG: each sound started, with when (for naming a sound heard at a known moment)
+            static const bool log = std::getenv("SLY1_SND_LOG") != nullptr;
+            static const auto t0 = std::chrono::steady_clock::now();
+            if (log)
+                std::fprintf(stderr, "sndlog: %.1f s: sound %u of bank %u (sector %u) started, volume %d\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), b, a,
+                             bank == g_banks.end() ? 0 : bank->second->sector, (int)c);
+        }
         const std::uint32_t handle = g_nextHandle++;
         g_voicesStarted++;
         g_startedBy[a << 16 | (b & 0xFFFF)]++;

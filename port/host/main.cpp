@@ -51,6 +51,8 @@ struct Player;
 struct Vec4;
 void func_00178008(Player*, Vec4*);   // the game's SetPlayerPosition (SLY1_WARP)
 struct GameProgress;
+struct IdentityKey;
+void func_001F0428(IdentityKey*, std::int32_t, std::int32_t);   // the game's StartObjectFade (SLY1_FADE_TO)
 std::int32_t func_001602A0();                 // the game's ComputeCompletionMask (SLY1_COMPLETION)
 std::int32_t func_00160B28(GameProgress*);    // and ComputeCompletionPercent
 struct WarpPage;
@@ -280,6 +282,19 @@ void VerifyLevels()
         static const int perLevel = std::getenv("SLY1_LEVEL_FRAMES") ? std::max(60, std::atoi(std::getenv("SLY1_LEVEL_FRAMES"))) : 60;
         if (!waitFor([&] { return word(kFrames) - frames >= perLevel; }, 60 + perLevel / 10))
             fail("60 frames did not run within 60 s of the load", i + 1);
+        if (const char* to = std::getenv("SLY1_FADE_TO")) {
+            // SLY1_FADE_TO=n[,style[,frames]]: from this level, the game's own fade to level n (as its map
+            // page asks for it: StartObjectFade, style 2), and frames more (1,800) run there
+            static std::uint32_t key;
+            static int style;
+            int n = 0, more = 1800;
+            style = 2;
+            std::sscanf(to, "%d,%d,%d", &n, &style, &more);
+            key = kLevels + (std::uint32_t)(n - 1) * 0x2C;
+            port::CallOnGameThread([] { ::func_001F0428((::IdentityKey*)port::Native(key), -1, style); });
+            const std::int32_t from = word(kFrames);
+            waitFor([&] { return word(kFrames) - from >= more; }, 60 + more / 10);
+        }
         if (std::getenv("SLY1_COMPLETION")) {
             // SLY1_COMPLETION=1: the game's own completion mask and percentage for the save as it is
             port::CallOnGameThread([] {

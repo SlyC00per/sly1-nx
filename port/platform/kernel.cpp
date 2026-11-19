@@ -335,6 +335,12 @@ void NoteFade(long from, int kind, int value, int count, int mode)
         std::fprintf(stderr, "world: a fade asked for from StartScreenFade%+ld: kind %d, value %d, style %d, the fade's mode %d\n", from, kind, value, count, mode);
 }
 
+void NoteAnimEvent(int event, int animation, int object, float time, float length, float speed)
+{
+    std::fprintf(stderr, "world: animation %d (object %d) at %.2f s of %.2f, speed %.2f: event %d (%s)\n", animation, object, (double)time, (double)length, (double)speed, event,
+                 event == 25 ? "a fade to a level" : "a movie queued");
+}
+
 void CallOnGameThread(void (*fn)()) { g_gameThreadCall.store(fn, std::memory_order_release); }
 
 void PreemptSlow()
