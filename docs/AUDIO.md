@@ -38,14 +38,23 @@ The game sends commands to two services of the IOP (`port/platform/iop.cpp`):
   hundredth of a second.
 
   **Readings, not measurements** (to be put right by ear against a PS2):
-  - the word at +0x0A of a tone as the sample's rate in Hz (17,066 for most, about 31,920 for
-    the rest, the second 15/8 of the first);
+  - the word at +0x0A of a tone as the sample's pitch on a scale of equal ratios: its
+    commonest value (0x42AA, 1,242 of the 1,429 sample tones) is taken as 22,050 Hz and its
+    second (0x7CB0) as the octave above, 44,100 Hz, which puts the values between near 24,000,
+    32,000 and 37,800 Hz. (Read first as a rate in Hz, 17,066: too low by ear.);
   - kinds 27, 20, 5, 26, 21, 22 and the others (27 comes before a sample with 100, 70, 65: a
     chance or a level; 20 stands where a pick may fall on nothing; 21 and 22 look like a
     round's start and end, 26 a wait): passed over;
   - the tone's bytes at +0x04, +0x10, +0x11, +0x16: not used;
-  - how many of one sound may play at once: the opening starts two short records 48 and 38
-    times a second, and every one is played.
+
+  **Whether a sound loops** (command 0x1A, asked once for each sound when its bank is loaded).
+  The game keeps the answer as the sound's "kept" flag (0x1BE268) and, for a sound with it, keeps
+  the record when the driver says the voice is over and starts the voice again (0x1BFCD8): so
+  the answer is whether the sound goes on until stopped, not whether the bank has it. Answered
+  from the record's word at +6, which is set for the records whose samples loop (118 of the
+  119 in the seven global banks) and for no other. Answering 1 for every sound made the game
+  start each one-shot again as soon as it ended: 6,000 voices in the opening's first 50
+  seconds, where there are 130.
 
 ## Not yet
 

@@ -474,6 +474,16 @@ void SetPan(Voice& v, std::int32_t degrees)
     v.right = std::sqrt(0.5f * (1.0f + s));
 }
 
+// A tone's sample rate from its word at +0x0A. A reading (docs/AUDIO.md): the word is taken as a
+// pitch on a scale of equal ratios, its commonest value (0x42AA, 1,242 of 1,429 tones) as
+// 22,050 Hz and its second (0x7CB0) as an octave above, 44,100 Hz; the values between then fall
+// near 24,000, 32,000 and 37,800 Hz.
+float ToneRate(const std::uint8_t* tone)
+{
+    const int word = tone[10] | tone[11] << 8;
+    return 22050.0f * std::pow(2.0f, (float)(word - 0x42AA) / (float)(0x7CB0 - 0x42AA));
+}
+
 // A bank's record started: a voice of its tones. Of the tones' kinds only two are acted on: 1
 // plays a sample; 25 is followed by a count of tones of which one is played, taken at random
 // (docs/AUDIO.md: a reading of the bytes). The others are passed over.
@@ -509,8 +519,7 @@ std::shared_ptr<Voice> StartVoice(const std::shared_ptr<Bank>& bank, std::uint32
                     note.bank = bank;
                     note.at = le(c + 0x18);
                     note.volume = recordVolume * (float)c[9] / 127.0f;
-                    const std::uint32_t rate = c[10] | c[11] << 8;
-                    note.rate = rate >= 4000 ? (float)rate : 22050.0f;
+                    note.rate = ToneRate(c);
                     v->notes.push_back(note);
                 }
                 k += n;
@@ -525,17 +534,37 @@ std::shared_ptr<Voice> StartVoice(const std::shared_ptr<Bank>& bank, std::uint32
         note.bank = bank;
         note.at = le(t + 0x18);
         note.volume = recordVolume * (float)t[9] / 127.0f;
-        const std::uint32_t rate = t[10] | t[11] << 8;
-        note.rate = rate >= 4000 ? (float)rate : 22050.0f;
+        note.rate = ToneRate(t);
         v->notes.push_back(note);
     }
     return v;
 }
 }  // namespace
 
+namespace {
+std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int32_t size);
+}
+
 std::uint32_t Command(std::int32_t cmd, const std::uint8_t* data, std::int32_t size)
 {
     std::lock_guard<std::mutex> lk(g_lock);
+    // SLY1_SND_VOICES=1: every command about a bank's voice with its answer and the time, for
+    // reading how the game drives them
+    static const bool trace = std::getenv("SLY1_SND_VOICES") != nullptr;
+    const std::uint32_t result = CommandInner(cmd, data, size);
+    if (trace && cmd != 0x1A && cmd != 0x4E && cmd != 0x09) {
+        static const auto t0 = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "sndv: %8.3f cmd %02X", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), (unsigned)cmd);
+        for (int k = 0; k * 4 + 4 <= size && k < 6; k++)
+            std::fprintf(stderr, " %08X", Word(data, size, k));
+        std::fprintf(stderr, " -> %08X\n", result);
+    }
+    return result;
+}
+
+namespace {
+std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int32_t size)
+{
     g_commands++;
     if (!g_channelSet) {
         for (float& v : g_channelVolume)
@@ -594,8 +623,19 @@ std::uint32_t Command(std::int32_t cmd, const std::uint8_t* data, std::int32_t s
         g_voices[handle] = v;
         return handle;
     }
-    case 0x1A:   // whether a sound is in a bank
-        return 1;
+    case 0x1A: { // whether a bank's sound goes on until it is stopped: the game keeps such a sound's
+                 // record and starts it again whenever it is found over (0x1BFCD8), so a sound
+                 // that ends by itself must answer 0. Read from the record's word at +6, which is
+                 // set for the records whose samples loop (118 of 119 in the seven global banks)
+        auto bank = g_banks.find(a);
+        if (bank == g_banks.end() || !bank->second->global || b >= bank->second->records)
+            return 0;
+        const Bank& k = *bank->second;
+        const std::size_t at = k.recordAt + (std::size_t)b * 12;
+        if (at + 12 > k.block.size())
+            return 0;
+        return (k.block[at + 6] | k.block[at + 7] << 8) != 0 ? 1 : 0;
+    }
     case 0x1C:   // a sound's base pitch
         return 0;
     case 0x2A:   // the driver to read the disc for the game: not taken (the game reads it itself)
@@ -706,6 +746,7 @@ std::uint32_t Command(std::int32_t cmd, const std::uint8_t* data, std::int32_t s
         return 0;
     }
 }
+}  // namespace
 
 }  // namespace audio
 }  // namespace port
