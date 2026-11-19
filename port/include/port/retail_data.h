@@ -108,6 +108,9 @@ void PreemptSlow();
 float WideFactor();
 // A level load's request, written to the log (tools/patches.py).
 void NoteWorldLoad(int arrivalA, int arrivalB, int flags);
+// A fade that is to load a level: where StartScreenFade was called from (bytes from its own start;
+// -1 for the completion fade, whose two values are then its kind and the completion mask).
+void NoteFade(long from, int kind, int value, int count, int mode);
 // The 2D elements in the 16:9 picture (tools/patches.py). Wide2D(middle): what is drawn from now
 // is one element whose middle rests at that x of the 640 (it is drawn 3/4 as wide about the
 // left edge, the middle or the right edge of the screen, by the third the middle is in);

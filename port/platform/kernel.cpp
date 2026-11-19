@@ -327,6 +327,14 @@ void NoteWorldLoad(int arrivalA, int arrivalB, int flags)
     std::fprintf(stderr, "world: a level load, arrival keys %d %d, flags 0x%X\n", arrivalA, arrivalB, (unsigned)flags);
 }
 
+void NoteFade(long from, int kind, int value, int count, int mode)
+{
+    if (from == -1)
+        std::fprintf(stderr, "world: the completion fade, kind %d, completion mask 0x%X\n", kind, (unsigned)value);
+    else
+        std::fprintf(stderr, "world: a fade asked for from StartScreenFade%+ld: kind %d, value %d, style %d, the fade's mode %d\n", from, kind, value, count, mode);
+}
+
 void CallOnGameThread(void (*fn)()) { g_gameThreadCall.store(fn, std::memory_order_release); }
 
 void PreemptSlow()

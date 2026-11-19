@@ -116,6 +116,13 @@ bar goes to a wind-down (9) once the level is under 110; registers 0 and 1 keep 
 was left. The values the levels are compared with (18, 19, 30, 50, 110, 119, 120) are what the
 game sends as the sound level: its own level plus 20.
 
+A message's choice of another sequence is taken at once, not at the sequence's end, and a
+sequence that is playing is not started again beside itself (the calm loop asks for the
+one-beat sequence at every beat while the level is high). The game's "every sound stopped"
+(0x34) leaves the music: after a restart of the level the game does not start it again. A new
+level's music ends the last one's. `SLY1_SND_LEVEL=s,v,s,v` sets the sound level to v from
+second s on, for hearing the changes on the host.
+
 **Readings to put right by ear:** velocity and volumes taken as straight factors; `06` and `07`
 as over and under; the channel switch as between the two levels inclusive; a release when a
 sequence is stopped of a twentieth of a second; no reverb.

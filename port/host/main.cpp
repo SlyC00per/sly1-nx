@@ -50,6 +50,9 @@
 struct Player;
 struct Vec4;
 void func_00178008(Player*, Vec4*);   // the game's SetPlayerPosition (SLY1_WARP)
+struct GameProgress;
+std::int32_t func_001602A0();                 // the game's ComputeCompletionMask (SLY1_COMPLETION)
+std::int32_t func_00160B28(GameProgress*);    // and ComputeCompletionPercent
 struct WarpPage;
 void func_001F1590(WarpPage*, int, int);   // the game's SetWarpCursor (SLY1_MAP)
 #include "port/system.h"
@@ -277,6 +280,15 @@ void VerifyLevels()
         static const int perLevel = std::getenv("SLY1_LEVEL_FRAMES") ? std::max(60, std::atoi(std::getenv("SLY1_LEVEL_FRAMES"))) : 60;
         if (!waitFor([&] { return word(kFrames) - frames >= perLevel; }, 60 + perLevel / 10))
             fail("60 frames did not run within 60 s of the load", i + 1);
+        if (std::getenv("SLY1_COMPLETION")) {
+            // SLY1_COMPLETION=1: the game's own completion mask and percentage for the save as it is
+            port::CallOnGameThread([] {
+                std::fprintf(stderr, "completion: mask 0x%X, %d%%\n", (unsigned)::func_001602A0(),
+                             (int)::func_00160B28((::GameProgress*)port::Native(*(std::uint32_t*)port::Native(0x002623C0))));
+            });
+            const std::int32_t from = word(kFrames);
+            waitFor([&] { return word(kFrames) - from >= 30; }, 30);
+        }
         if (const char* at = std::getenv("SLY1_WARP")) {
             // SLY1_WARP=x,y,z[,frames]: the player placed there (the game's own SetPlayerPosition, on its
             // thread) once the level has run, and that many frames more (300) run after: for looking

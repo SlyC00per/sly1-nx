@@ -364,6 +364,9 @@ struct Song {
         Track t;
         if (!Sequence(index, &t.at, &t.end, &t.tempo, &t.perBeat) || tracks.size() >= 8)
             return;
+        for (const Track& playing : tracks)   // one that is playing is not started again beside itself
+            if (playing.index == index && !playing.done)
+                return;
         t.index = index;
         t.id = nextId++;
         for (bool& b : t.on)
@@ -621,7 +624,7 @@ struct Song {
                 t.waiting = true;
             }
             if (t.ticks < (double)t.wait)
-                return;
+                break;
             t.ticks -= (double)t.wait;
             t.waiting = false;
             if (t.at >= t.end) {
@@ -782,6 +785,27 @@ void MixChunk(std::int16_t* out)
         std::lock_guard<std::mutex> lk(g_lock);
         for (auto& kv : g_streams)
             kv.second->Mix(sum, kChunk, 0.6f);   // (a finished stream stays until the game has asked and been told it is over, or stops it)
+        {   // SLY1_SND_LEVEL=s,v,s,v...: the sound level set to v from second s on (for hearing the music's changes on the host)
+            static const char* plan = std::getenv("SLY1_SND_LEVEL");
+            static long chunk;
+            chunk++;
+            if (plan && chunk % 100 == 0) {
+                int value = -1;
+                for (const char* p = plan; p && *p;) {
+                    int at = 0, v = 0;
+                    if (std::sscanf(p, "%d,%d", &at, &v) != 2)
+                        break;
+                    if (chunk / 100 >= at)
+                        value = v;
+                    p = std::strchr(p, ',');
+                    p = p ? std::strchr(p + 1, ',') : nullptr;
+                    if (p)
+                        p++;
+                }
+                if (value >= 0)
+                    g_soundLevel = value;
+            }
+        }
         for (auto& kv : g_songs)
             kv.second->Mix(sum, kChunk, 0.3f);
         int sounding = 0;
@@ -1129,6 +1153,7 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
             if (c != 0)
                 song->volume = (float)(std::int32_t)c / 1024.0f;
             song->Begin();
+            g_songs.clear();   // one level's music at a time: the last level's ends where the next one's starts
             const std::uint32_t handle = g_nextHandle++;
             g_songs[handle] = song;
             g_voicesStarted++;
@@ -1275,9 +1300,10 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
     case 0x28:   // a register asked for
         return g_songs.count(a) && b < 8 ? (std::uint32_t)g_songs[a]->reg[b] : 0;
     case 0x34:   // every sound stopped
+        // (the level's music goes on: the game stops it by its voice, and after a restart of the
+        // level it does not start it again)
         g_streams.clear();
         g_voices.clear();
-        g_songs.clear();
         return 0;
     case 0x06:   // a bank unloaded
         g_banks.erase(a);

@@ -154,6 +154,25 @@ PATCHES = [
      "    BuildUniformScaleAboutPoint(0, mat, (1.0f - t) * (1280.0f / self->width) + t * (4.0f / self->width));\n    mat[0] /= port::WideFactor();\n",
      "the scene-change emblem's shape in the 16:9 picture"),
 
+    # screen_element.cpp declares the completion percentage as returning a pointer; it returns a
+    # number (game_progress.cpp). As a pointer the port made it an address of its own memory,
+    # and the saving line at a level's start showed that as the percentage.
+    ("src/main/screen_element.cpp",
+     "void* ComputeCompletionPercent(GameProgress* progress);",
+     "s32 ComputeCompletionPercent(GameProgress* progress);",
+     "the completion percentage's return type, as its definition has it"),
+
+    # A line in the log for each fade that is to load a level (where it was asked from) and each
+    # movie queued by the completion fade: for finding what sends the game to another level.
+    ("src/main/warp_menu.cpp",
+     "void StartScreenFade(ScreenFade* dst, FadeRequest* args, s32 count)\n{\n    IdentityKey* p;\n    s32 mode;\n",
+     "void StartScreenFade(ScreenFade* dst, FadeRequest* args, s32 count)\n{\n    IdentityKey* p;\n    s32 mode;\n    port::NoteFade((const char*)__builtin_return_address(0) - (const char*)&StartScreenFade, args->kind, args->f08, count, dst->mode);\n",
+     "each fade to a level noted in the log"),
+    ("src/main/game_progress.cpp",
+     "    s32 s0 = -1;\n\n    if (kind != 4) { if (kind < 5) { if (kind == 2) { s0 = 0xD; } } } else { s0 = 0xE; }",
+     "    s32 s0 = -1;\n\n    port::NoteFade(-1, kind, ComputeCompletionMask(), -1, -1);\n    if (kind != 4) { if (kind < 5) { if (kind == 2) { s0 = 0xD; } } } else { s0 = 0xE; }",
+     "the completion fade noted in the log"),
+
     # A line in the log for each level load: the two arrival keys and the flags of the request
     # (what the level it was asked from gave), for reproducing a way into a level on the host
     # (SLY1_ARRIVAL).
