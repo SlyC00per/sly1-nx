@@ -26,7 +26,9 @@ int StartThread(pthread_t* thread, void* stack, std::size_t size, void* (*entry)
 // clock, both at the game's priority. Nothing on the
 // host, whose scheduler shares the cores.
 enum class ThreadRole { Game, Clock, Watch, Render, Gs, Helper };
-void PlaceThread(ThreadRole role);
+// (sampled: whether SLY1_SAMPLE's sampler is to watch it as that role's thread; not the movie's
+// threads, which only borrow the render and GS threads' cores)
+void PlaceThread(ThreadRole role, bool sampled = true);
 
 // SLY1_SAMPLE=1 (the Switch): a thread that stops the render thread and the GS thread a thousand
 // times a second and notes where each is, from the 12th second; SamplerReport prints the places

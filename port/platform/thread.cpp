@@ -152,9 +152,9 @@ void SamplerReport()
     }
 }
 
-void PlaceThread(ThreadRole role)
+void PlaceThread(ThreadRole role, bool sampled)
 {
-    if (role == ThreadRole::Render || role == ThreadRole::Gs)
+    if (sampled && (role == ThreadRole::Render || role == ThreadRole::Gs))
         g_sampled[role == ThreadRole::Gs ? 1 : 0] = threadGetCurHandle();
     if (role == ThreadRole::Helper) {
         // The render thread's helper (the parts' hashes): the fourth core where the system lets
@@ -188,7 +188,7 @@ void PlaceThread(ThreadRole role)
 
 #else
 
-void PlaceThread(ThreadRole) {}
+void PlaceThread(ThreadRole, bool) {}
 void StartSampler() {}
 void SamplerReport() {}
 

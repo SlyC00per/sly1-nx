@@ -914,7 +914,7 @@ int main(int argc, char** argv)
         static unsigned char movieStack[1 << 18] __attribute__((aligned(16384)));
         if (port::StartThread(&movie, movieStack, sizeof movieStack,
                               [](void*) -> void* {
-                                  port::PlaceThread(port::ThreadRole::Render);   // the render thread's core: it has nothing to do in a movie
+                                  port::PlaceThread(port::ThreadRole::Render, false);   // the render thread's core: it has nothing to do in a movie
                                   port::movie::WorkerMain();
                                   return nullptr;
                               },
@@ -924,7 +924,7 @@ int main(int argc, char** argv)
         static unsigned char movieHelperStack[1 << 18] __attribute__((aligned(16384)));
         if (port::StartThread(&movieHelper, movieHelperStack, sizeof movieHelperStack,
                               [](void*) -> void* {
-                                  port::PlaceThread(port::ThreadRole::Gs);   // the GS thread's core: little to do in a movie
+                                  port::PlaceThread(port::ThreadRole::Gs, false);   // the GS thread's core: little to do in a movie
                                   port::movie::HelperMain();
                                   return nullptr;
                               },
