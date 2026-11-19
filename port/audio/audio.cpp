@@ -491,14 +491,17 @@ void SetPan(Voice& v, std::int32_t degrees)
     v.right = std::sqrt(0.5f * (1.0f + s));
 }
 
-// A tone's sample rate from its word at +0x0A. A reading (docs/AUDIO.md): the word is taken as a
-// pitch on a scale of equal ratios, its commonest value (0x42AA, 1,242 of 1,429 tones) as
-// 22,050 Hz and its second (0x7CB0) as an octave above, 44,100 Hz; the values between then fall
-// near 24,000, 32,000 and 37,800 Hz.
+// A tone's sample rate from its two bytes at +0x0A: a note (a signed byte, negative: the note the
+// sample plays at its own speed, less one) and a fine part in 128ths of a semitone, read as the
+// level banks' tones show them (docs/AUDIO.md): a sound is played as note 60, and the SPU's
+// 48,000 Hz is note and fine equal. The commonest pair (86, 66) is then 11,025 Hz, and the
+// others 22,050 (74, 66), 16,000 (80, 124) and 8,000 (92, 98). SLY1_SFX_OCTAVE=1 plays them
+// an octave up, for telling by ear whether a sound is played as note 72.
 float ToneRate(const std::uint8_t* tone)
 {
-    const int word = tone[10] | tone[11] << 8;
-    return 22050.0f * std::pow(2.0f, (float)(word - 0x42AA) / (float)(0x7CB0 - 0x42AA));
+    static const float octave = std::getenv("SLY1_SFX_OCTAVE") ? 2.0f : 1.0f;
+    const float centre = (float)-(std::int8_t)tone[10] - (float)tone[11] / 128.0f;
+    return 48000.0f * octave * std::pow(2.0f, (60.0f - centre) / 12.0f);
 }
 
 // A bank's record started: a voice that runs the record's tones as a program, a step each

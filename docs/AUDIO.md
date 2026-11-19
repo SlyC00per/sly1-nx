@@ -42,10 +42,15 @@ The game sends commands to two services of the IOP (`port/platform/iop.cpp`):
   hundredth of a second.
 
   **Readings, not measurements** (to be put right by ear against a PS2):
-  - the word at +0x0A of a tone as the sample's pitch on a scale of equal ratios: its
-    commonest value (0x42AA, 1,242 of the 1,429 sample tones) is taken as 22,050 Hz and its
-    second (0x7CB0) as the octave above, 44,100 Hz, which puts the values between near 24,000,
-    32,000 and 37,800 Hz. (Read first as a rate in Hz, 17,066: too low by ear.);
+  - a tone's two bytes at +0x0A as the note its sample plays at its own speed (a signed byte,
+    negative) and a fine part in 128ths of a semitone, with 48,000 Hz (the SPU's rate) where
+    the played note equals them, and a sound played as note 60. This comes from the level
+    banks, whose tones have the same two bytes beside a range of keys: a drum's note is its key
+    plus 12 (24,000 Hz), and an instrument over every key has 62 and 0x44, which is 44,094 Hz
+    at key 60. With it the global banks' pairs are standard rates: (86, 66) 11,013 Hz for 761
+    tones, (74, 66) 22,026, (80, 124) 15,990, (92, 98) 7,900. What is not shown is the note a
+    sound is played as: 72 would put all of them an octave up (`SLY1_SFX_OCTAVE=1`). Read
+    before as a 16-bit rate (17,066 Hz) and as a scale with 22,050 Hz for the commonest value;
   - the kinds themselves (1, 25, 26, 21, 22), read from the sequences the records are made of;
   - a wait's unit, 1/240 s: with it a record of 0.03 s clicks 10 apart is a rattle, and a
     one-second creak comes back every 7 to 11 seconds; at 1/60 s the same would be four times
