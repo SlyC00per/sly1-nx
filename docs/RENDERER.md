@@ -1079,3 +1079,12 @@ Checked on the host with the GS thread: 1,299 frames of the level under lockstep
 with it and without; in real time every FINISH (three a frame) is told from the render thread
 and none owed at the end; the opening movie plays to its end with no error in the stream. Not
 yet measured on the Switch.
+
+On the Switch (9269bda) it made the game unusable, and it is off unless `SLY1_FINISH_LAG=1`: the
+controls answered about a second late. `perffinish:` showed why: the GS thread owed 108 FINISHes
+(36 frames) and took 27.9 ms a frame where it had taken 14. Its buffer swap waits for the
+display, so by itself it shows little more than 30 frames a second; told to go on, the game made
+frames faster than that, and the wait that was to keep the GS thread within a frame gives up
+after a tenth of a second. Before this is tried again the swap must not hold the GS thread (the
+next frame drawn while the last waits for the display), and the bound must hold without a time
+limit. The host showed none of it: its GS thread does not wait for a display.

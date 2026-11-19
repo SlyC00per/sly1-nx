@@ -101,7 +101,7 @@ const std::uint32_t* At(std::uint32_t addr, bool spr)
     return reinterpret_cast<const std::uint32_t*>(Native(addr & 0x7FFFFFF0));
 }
 
-// SLY1_FINISH_LAG (on where there is a GS thread; 0: off): the game is told a list is finished
+// SLY1_FINISH_LAG=1 (off otherwise: see docs/RENDERER.md for why): the game is told a list is finished
 // when the render thread has done with it, not when the GS thread has drawn it. The game's own
 // render thread waits for FINISH after each of a frame's three packets before it waits for the
 // vertical blank, so a frame cost the handing over, the render thread's work, what the GS thread
@@ -116,8 +116,8 @@ std::atomic<std::uint64_t> g_finishesEarly{0}, g_finishesLate{0};
 bool g_itemFinishTold;
 bool FinishLag()
 {
-    static const bool off = std::getenv("SLY1_FINISH_LAG") && std::getenv("SLY1_FINISH_LAG")[0] == '0';
-    return !off;
+    static const bool on = std::getenv("SLY1_FINISH_LAG") && std::getenv("SLY1_FINISH_LAG")[0] == '1';
+    return on;
 }
 
 // A GIF packet stream, a quadword at a time.
