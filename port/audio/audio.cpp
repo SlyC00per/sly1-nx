@@ -226,6 +226,13 @@ struct Note {
 // pan and the pitch of, asks about, and stops.
 struct Voice {
     std::vector<Note> notes;
+    // the record's program (docs/AUDIO.md): its tones taken in order, a step each
+    std::shared_ptr<Bank> bank;
+    std::size_t toneAt = 0;       // the first tone's place in the bank's block
+    std::uint32_t tones = 0, pc = 0;
+    std::int32_t loopPc = -1;     // the step a round starts at, once passed
+    std::int32_t waitFrames = 0;  // output frames until the next step
+    float recordVolume = 1.0f;
     float volume = 1.0f, left = 0.7071f, right = 0.7071f, pitch = 1.0f;
     float gain = 1.0f, gainStep = 0.0f;   // a stop or a fade: the gain and what it loses a frame
     int wait = 2;                          // chunks before it sounds (its volume comes in the commands after its start)
@@ -240,6 +247,8 @@ struct Voice {
             wait--;
             return;
         }
+        Step(frames);
+        program = pc < tones;
         bool any = program;
         for (Note& n : notes) {
             if (n.over)
@@ -273,7 +282,15 @@ struct Voice {
         gain -= gainStep * (float)frames;
         if (!any || gain <= 0.0f)
             over = true;
+        for (std::size_t k = 0; k < notes.size();)   // (a round goes on adding notes)
+            if (notes[k].over)
+                notes.erase(notes.begin() + (std::ptrdiff_t)k);
+            else
+                k++;
     }
+
+    void Play(const std::uint8_t* tone);
+    void Step(int frames);
 };
 
 std::mutex g_lock;
@@ -484,62 +501,87 @@ float ToneRate(const std::uint8_t* tone)
     return 22050.0f * std::pow(2.0f, (float)(word - 0x42AA) / (float)(0x7CB0 - 0x42AA));
 }
 
-// A bank's record started: a voice of its tones. Of the tones' kinds only two are acted on: 1
-// plays a sample; 25 is followed by a count of tones of which one is played, taken at random
-// (docs/AUDIO.md: a reading of the bytes). The others are passed over.
+// A bank's record started: a voice that runs the record's tones as a program, a step each
+// (docs/AUDIO.md; the kinds are readings of the bytes):
+//    1  a sample started (the program goes on at once)
+//   26  a wait: the word at +8 and a random part up to the word at +4, in 240ths of a second
+//   25  one of the next n tones taken at random (n at +8), the others passed over; one that is
+//       not a sample is silence
+//   21  a round's start, 22 its end: back to the start
+// The others (27, 31, 4, 5, 20 and the rare ones) are passed over.
 std::shared_ptr<Voice> StartVoice(const std::shared_ptr<Bank>& bank, std::uint32_t record)
 {
     auto v = std::make_shared<Voice>();
     if (!bank || !bank->global || record >= bank->records)
         return v;
     auto le = [](const std::uint8_t* p) { return (std::uint32_t)p[0] | (std::uint32_t)p[1] << 8 | (std::uint32_t)p[2] << 16 | (std::uint32_t)p[3] << 24; };
-    const std::uint8_t* r = bank->block.data() + bank->recordAt + record * 12;
     if (bank->recordAt + (record + 1) * 12 > bank->block.size())
         return v;
+    const std::uint8_t* r = bank->block.data() + bank->recordAt + record * 12;
     const std::uint32_t count = r[4] | r[5] << 8;
     const std::int32_t first = (std::int32_t)le(r + 8);
-    if (first < 0)
+    if (first < 0 || bank->toneAt + (std::size_t)first + (std::size_t)count * 0x28 > bank->block.size())
         return v;
-    const float recordVolume = (float)r[0] / 127.0f;
-    static std::uint32_t seed = 12345;
-    for (std::uint32_t k = 0; k < count; k++) {
-        const std::size_t at = bank->toneAt + (std::size_t)first + (std::size_t)k * 0x28;
-        if (at + 0x28 > bank->block.size())
-            break;
-        const std::uint8_t* t = bank->block.data() + at;
-        const std::uint32_t kind = le(t);
-        if (kind == 25) {   // one of the next n
-            const std::uint32_t n = t[8] | t[9] << 8;
-            if (n >= 1 && k + n < count + 1) {
-                seed = seed * 1664525u + 1013904223u;
-                const std::uint32_t pick = (seed >> 16) % n;
-                const std::uint8_t* c = t + (std::size_t)(1 + pick) * 0x28;
-                if (at + (std::size_t)(2 + pick) * 0x28 <= bank->block.size() && le(c) == 1) {
-                    Note note;
-                    note.bank = bank;
-                    note.at = le(c + 0x18);
-                    note.volume = recordVolume * (float)c[9] / 127.0f;
-                    note.rate = ToneRate(c);
-                    v->notes.push_back(note);
-                }
-                k += n;
-            }
-            continue;
-        }
-        if (kind == 21)
-            v->program = true;   // a record that goes round (21 to 22) and plays nothing here: held until stopped
-        if (kind != 1)
-            continue;
-        Note note;
-        note.bank = bank;
-        note.at = le(t + 0x18);
-        note.volume = recordVolume * (float)t[9] / 127.0f;
-        note.rate = ToneRate(t);
-        v->notes.push_back(note);
-    }
+    v->bank = bank;
+    v->toneAt = bank->toneAt + (std::size_t)first;
+    v->tones = count;
+    v->recordVolume = (float)r[0] / 127.0f;
+    v->Step(0);   // what starts with the voice
+    v->program = v->pc < v->tones;
     return v;
 }
 }  // namespace
+
+void Voice::Play(const std::uint8_t* tone)
+{
+    Note note;
+    note.bank = bank;
+    note.at = (std::uint32_t)tone[0x18] | (std::uint32_t)tone[0x19] << 8 | (std::uint32_t)tone[0x1A] << 16 | (std::uint32_t)tone[0x1B] << 24;
+    note.volume = recordVolume * (tone[9] > 127 ? 1.0f : (float)tone[9] / 127.0f);
+    note.rate = ToneRate(tone);
+    notes.push_back(note);
+}
+
+void Voice::Step(int frames)
+{
+    static std::uint32_t seed = 12345;
+    auto random = [&](std::uint32_t n) {   // 0 to n - 1
+        seed = seed * 1664525u + 1013904223u;
+        return n ? (seed >> 8) % n : 0;
+    };
+    auto word = [](const std::uint8_t* p) { return (std::int32_t)((std::uint32_t)p[0] | (std::uint32_t)p[1] << 8 | (std::uint32_t)p[2] << 16 | (std::uint32_t)p[3] << 24); };
+    waitFrames -= frames;
+    int steps = 0;
+    while (pc < tones && waitFrames <= 0 && steps++ < 256) {
+        const std::uint8_t* t = bank->block.data() + toneAt + (std::size_t)pc * 0x28;
+        const std::int32_t kind = word(t);
+        pc++;
+        if (kind == 1) {
+            if (notes.size() < 16)
+                Play(t);
+        } else if (kind == 26) {
+            const std::int32_t base = word(t + 8), more = word(t + 4);
+            const std::int32_t ticks = (base > 0 ? base : 0) + (more > 0 ? (std::int32_t)random((std::uint32_t)more + 1) : 0);
+            waitFrames += (std::int32_t)((std::int64_t)ticks * kRate / 240);
+        } else if (kind == 25) {
+            const std::uint32_t n = t[8] | t[9] << 8;
+            if (n >= 1 && pc + n <= tones) {
+                const std::uint8_t* c = t + (std::size_t)(1 + random(n)) * 0x28;
+                if (word(c) == 1 && notes.size() < 16)
+                    Play(c);
+                pc += n;
+            }
+        } else if (kind == 21) {
+            loopPc = (std::int32_t)pc;
+        } else if (kind == 22) {
+            if (loopPc >= 0) {
+                pc = (std::uint32_t)loopPc;
+                if (waitFrames <= 0)
+                    waitFrames = kRate / 240;   // (a round with no wait in it)
+            }
+        }
+    }
+}
 
 namespace {
 std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int32_t size);

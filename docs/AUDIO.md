@@ -27,11 +27,15 @@ The game sends commands to two services of the IOP (`port/platform/iop.cpp`):
   the host to the WAV file `SLY1_AUDIO_WAV` names (written at the end).
 
 - **The global banks' sounds** (command 0x11: the bank's handle, the record, a volume, a pan,
-  a pitch). A bank is read whole when it is loaded. A voice is the record's tones: a tone of
-  kind 1 plays a sample (its place at +0x18, its volume of 127 at +0x09, times the record's
-  first byte of 127); kind 25 is followed by a count of tones of which one is taken at random
-  (one that is not a sample is silence); a record with kind 21 in it and no sample to play is
-  held, silent, until it is stopped. A sample loops where its frames' flags say (bit 2 the
+  a pitch). A bank is read whole when it is loaded. A voice runs the record's tones as a program, a step each: a tone of
+  kind 1 starts a sample (its place at +0x18, its volume of 127 at +0x09, times the record's
+  first byte of 127) and the program goes on at once; kind 26 waits (the word at +8 and a
+  random part up to the word at +4, taken as 240ths of a second); kind 25 takes one of the
+  next n tones at random (one that is not a sample is silence); kind 21 starts a round and 22
+  goes back to it. So a record can be one sample, several spaced out (a rattle: clicks 10 apart),
+  or a bed that loops with others over it at random times (the rain of A Stealthy Approach: a
+  looping sample, then one of eight drips every 200 to 275). Before, every sample of a record
+  was started at once. A sample loops where its frames' flags say (bit 2 the
   loop's start, bits 0 and 1 its end). The voice's volume is 0x400 for 1, its pan an angle in
   degrees (0 ahead, 90 right, 270 left: the game's own arithmetic), its pitch 1,524 an octave
   (the game multiplies its own pitch by 1,524, which is 12 times 127), and a stop takes a
@@ -42,9 +46,14 @@ The game sends commands to two services of the IOP (`port/platform/iop.cpp`):
     commonest value (0x42AA, 1,242 of the 1,429 sample tones) is taken as 22,050 Hz and its
     second (0x7CB0) as the octave above, 44,100 Hz, which puts the values between near 24,000,
     32,000 and 37,800 Hz. (Read first as a rate in Hz, 17,066: too low by ear.);
-  - kinds 27, 20, 5, 26, 21, 22 and the others (27 comes before a sample with 100, 70, 65: a
-    chance or a level; 20 stands where a pick may fall on nothing; 21 and 22 look like a
-    round's start and end, 26 a wait): passed over;
+  - the kinds themselves (1, 25, 26, 21, 22), read from the sequences the records are made of;
+  - a wait's unit, 1/240 s: with it a record of 0.03 s clicks 10 apart is a rattle, and a
+    one-second creak comes back every 7 to 11 seconds; at 1/60 s the same would be four times
+    as slow;
+  - kinds 27 (a value before a sample, 100 for most, else 75, 50, 65: a level or a chance),
+    31 (two values such as 80 and 120: a range, of volume or pitch), 4, 5, 20 and the rare
+    ones: passed over;
+  - a tone's volume byte over 127 (38 tones): played at 1;
   - the tone's bytes at +0x04, +0x10, +0x11, +0x16: not used;
 
   **Whether a sound loops** (command 0x1A, asked once for each sound when its bank is loaded).
