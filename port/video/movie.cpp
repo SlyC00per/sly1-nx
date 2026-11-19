@@ -12,9 +12,12 @@
 //    are written as rows of 32-bit pixels, which the game uploads to the GS (in one transfer:
 //    a named patch, where the IPU's conversion left 16 by 16 blocks) and draws.
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <mutex>
 #include <vector>
 
 #include "common.h"
@@ -42,7 +45,6 @@ typedef s32 (*StreamFn)(MpegHandle*, void*, void*);
 typedef s32 (*EventFn)(void*, void*, void*);
 
 struct State {
-    port::video::Mpeg2 decoder;
     StreamFn stream[4] = {};
     void* streamArg[4] = {};
     EventFn event[8] = {};
@@ -51,8 +53,7 @@ struct State {
     std::uint32_t workSize = 0;
     std::uint32_t carried = 0;      // bytes of such a packet held in it
     bool ended = false;
-    long pictures = 0, fed = 0, packets[2] = {};
-    double decodeSeconds = 0.0, convertSeconds = 0.0;
+    long pictures = 0, fed = 0, packets[2] = {}, waits = 0;
 };
 State* g_state;
 std::uint32_t g_pictureNumber;   // the last picture decoded
@@ -115,7 +116,7 @@ inline std::uint8_t Clip(int v) { return (std::uint8_t)(v < 0 ? 0 : v > 255 ? 25
 // ITU-R BT.601's from the video range, each colour sample for the four pixels it covers; alpha
 // 0x80, the GS's 1.
 void Convert(const port::video::Picture& pic, std::uint8_t* out)
-{
+{   // (out: width * height * 4 bytes)
     for (int y = 0; y < pic.height; y++) {
         const std::uint8_t* ys = pic.y + (std::size_t)y * (std::size_t)pic.stride;
         const std::uint8_t* cbs = pic.cb + (std::size_t)(y / 2) * (std::size_t)pic.chromaStride;
@@ -135,20 +136,110 @@ void Convert(const port::video::Picture& pic, std::uint8_t* out)
     }
 }
 
+// The decoding runs on a thread of its own (port::movie::WorkerMain, started with the program):
+// the game's threads share a core and take turns, and a picture decoded on the game's thread kept
+// the movie's own thread from its display flips for 20 ms at a time on the Switch. The game's
+// thread gives the worker the stream's bytes and takes its pictures, a few ahead.
+struct Ready {
+    std::vector<std::uint32_t> rgba;
+    int width = 0, height = 0;
+};
+struct Worker {
+    std::mutex lock;
+    std::condition_variable wake, done;   // the worker's, and the game's thread's
+    port::video::Mpeg2 decoder;           // the worker's alone while busy; anyone's under the lock otherwise
+    std::vector<std::uint8_t> staged;     // bytes for the decoder, from the game's thread
+    std::deque<Ready> ready;
+    std::vector<std::vector<std::uint32_t>> spare;   // pictures' memory to use again
+    std::size_t held = 0;                 // bytes the decoder has and has not decoded
+    bool active = false, busy = false, over = false, hungry = false, finish = false;
+    long errors = 0;
+    double decodeSeconds = 0.0, convertSeconds = 0.0;
+};
+Worker g_worker;
+// How far ahead of the pictures shown the worker goes: one picture decoded and about one more in
+// bytes. The game keeps its two rings in step (video for an eighth of a second, sound for a
+// quarter); bytes taken further ahead than that leave the sound's ring full while the video's
+// is empty, and the game then fills the video with zeros, as it does at a movie's end.
+constexpr std::size_t kAhead = 2;                 // pictures decoded, the one asked for among them
+constexpr std::size_t kStreamAhead = 24 * 1024;   // bytes of the stream kept before the decoder
+
 }  // namespace
 
 namespace port {
 namespace movie {
 
-bool Direct();
+void WorkerMain()
+{
+    Worker& w = g_worker;
+    std::unique_lock<std::mutex> lk(w.lock);
+    std::vector<std::uint8_t> bytes;
+    for (;;) {
+        w.wake.wait(lk, [&] { return w.active && !w.over && w.ready.size() < kAhead && (!w.hungry || !w.staged.empty() || w.finish); });
+        bytes.clear();
+        bytes.swap(w.staged);
+        const bool finish = w.finish;
+        Ready out;
+        if (!w.spare.empty()) {
+            out.rgba.swap(w.spare.back());
+            w.spare.pop_back();
+        }
+        w.busy = true;
+        w.hungry = false;
+        lk.unlock();
+
+        if (!bytes.empty())
+            w.decoder.Feed(bytes.data(), bytes.size());
+        if (finish)
+            w.decoder.Finish();
+        port::video::Picture pic;
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool got = w.decoder.Next(&pic);
+        const auto t1 = std::chrono::steady_clock::now();
+        if (got) {
+            out.width = pic.width;
+            out.height = pic.height;
+            out.rgba.resize((std::size_t)pic.width * (std::size_t)pic.height);
+            Convert(pic, reinterpret_cast<std::uint8_t*>(out.rgba.data()));
+        }
+        const auto t2 = std::chrono::steady_clock::now();
+        const bool over = !got && w.decoder.Over();
+        const std::size_t held = w.decoder.Buffered();
+        const long errors = w.decoder.Errors();
+
+        lk.lock();
+        w.busy = false;
+        w.decodeSeconds += std::chrono::duration<double>(t1 - t0).count();
+        w.convertSeconds += std::chrono::duration<double>(t2 - t1).count();
+        w.held = held;
+        w.errors = errors;
+        if (!w.active) {   // the movie was ended meanwhile
+            w.done.notify_all();
+            continue;
+        }
+        if (got)
+            w.ready.push_back(std::move(out));
+        else if (over)
+            w.over = true;
+        else
+            w.hungry = true;   // it needs more of the stream before it can go on
+        w.done.notify_all();
+    }
+}
 
 // The video stream's bytes on their way to the IPU (a named patch in IpuDmaSink::Put).
 void VideoBytes(const void* bytes, int size)
 {
-    if (g_state && size > 0) {
-        g_state->decoder.Feed(static_cast<const std::uint8_t*>(bytes), (std::size_t)size);
-        g_state->fed += size;
+    if (!g_state || size <= 0)
+        return;
+    Worker& w = g_worker;
+    {
+        std::lock_guard<std::mutex> lk(w.lock);
+        const std::uint8_t* b = static_cast<const std::uint8_t*>(bytes);
+        w.staged.insert(w.staged.end(), b, b + size);
     }
+    w.wake.notify_one();
+    g_state->fed += size;
 }
 
 float Zoom() { return WideFactor(); }
@@ -160,10 +251,29 @@ bool Direct()
     static const bool off = std::getenv("SLY1_MOVIE_DIRECT") && std::getenv("SLY1_MOVIE_DIRECT")[0] == '0';
     return !off && gs::HasBackend();
 }
-std::uint32_t PictureNumber() { return g_pictureNumber; }
+unsigned PictureNumber() { return g_pictureNumber; }
 
 }  // namespace movie
 }  // namespace port
+
+namespace {
+// The worker stopped and emptied, for a movie's start or its end.
+void StopWorker(bool active)
+{
+    Worker& w = g_worker;
+    std::unique_lock<std::mutex> lk(w.lock);
+    w.active = false;
+    w.done.wait(lk, [&] { return !w.busy; });
+    w.decoder.Reset();
+    w.staged.clear();
+    for (Ready& r : w.ready)
+        w.spare.push_back(std::move(r.rgba));
+    w.ready.clear();
+    w.held = 0;
+    w.over = w.hungry = w.finish = false;
+    w.active = active;
+}
+}  // namespace
 
 void InitMpegLibrary() {}
 
@@ -173,16 +283,22 @@ s32 CreateMpegDecoder(MpegHandle* handle, u8* work, u32 size)
     g_state = new State();
     g_state->work = work;
     g_state->workSize = size;
+    g_worker.decodeSeconds = g_worker.convertSeconds = 0.0;
+    StopWorker(true);
     std::memset(handle, 0, 0x48);
     return 1;
 }
 
 s32 DeleteMpegDecoder(MpegHandle*)
 {
-    if (g_state)
-        std::fprintf(stderr, "movie: %ld pictures shown from %ld bytes of video in %ld packets, and %ld packets of sound; %ld errors in the stream; %.1f ms a picture decoding, %.1f converting\n",
-                     g_state->pictures, g_state->fed, g_state->packets[0], g_state->packets[1], g_state->decoder.Errors(),
-                     g_state->pictures ? g_state->decodeSeconds * 1000.0 / (double)g_state->pictures : 0.0, g_state->pictures ? g_state->convertSeconds * 1000.0 / (double)g_state->pictures : 0.0);
+    if (g_state) {
+        const long errors = g_worker.errors;
+        StopWorker(false);
+        std::fprintf(stderr, "movie: %ld pictures shown from %ld bytes of video in %ld packets, and %ld packets of sound; %ld errors in the stream; %.1f ms a picture decoding, %.1f converting; %ld waits for a picture\n",
+                     g_state->pictures, g_state->fed, g_state->packets[0], g_state->packets[1], errors,
+                     g_state->pictures ? g_worker.decodeSeconds * 1000.0 / (double)g_state->pictures : 0.0,
+                     g_state->pictures ? g_worker.convertSeconds * 1000.0 / (double)g_state->pictures : 0.0, g_state->waits);
+    }
     delete g_state;
     g_state = nullptr;
     return 1;
@@ -191,7 +307,7 @@ s32 DeleteMpegDecoder(MpegHandle*)
 void ResetMpegDecoder(MpegHandle*)
 {
     if (g_state) {
-        g_state->decoder.Reset();
+        StopWorker(true);
         g_state->carried = 0;
     }
 }
@@ -280,50 +396,94 @@ s32 DemultiplexBuffer(MpegHandle* handle, s32 address, s32 count)
     return (s32)taken;
 }
 
-// The next picture, converted into `picture` (as many 16 by 16 blocks as the picture has, of at
-// most `blocks`): 0, or -1 when the sequence is over. More of the stream is asked for through
-// callback 1 until a picture is whole.
+// The next picture: 0, or -1 when the sequence is over. It is taken from the worker, which is
+// kept in the stream's bytes through callback 1 (the game's FlushMovieToIpu); where the renderer
+// takes pictures as they are it is handed over (gs::DirectPictureTake), else copied into `picture`
+// for the game's upload.
 s32 DecodeMpegPicture(MpegHandle* handle, void* picture, s32 blocks)
 {
     State* s = g_state;
     if (!s || s->ended)
         return -1;
+    Worker& w = g_worker;
+    Ready got;
     int dry = 0;
+    bool waited = false;
     for (;;) {
-        port::video::Picture pic;
-        const auto t0 = std::chrono::steady_clock::now();
-        const bool got = s->decoder.Next(&pic);
-        s->decodeSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        if (got) {
-            if ((pic.width / 16) * (pic.height / 16) > blocks || (pic.width & 15) || (pic.height & 15)) {
-                std::fprintf(stderr, "movie: a picture of %d by %d is not one the player has room for\n", pic.width, pic.height);
+        bool feed = false;
+        {
+            std::unique_lock<std::mutex> lk(w.lock);
+            if (!w.ready.empty()) {
+                got = std::move(w.ready.front());
+                w.ready.pop_front();
+                w.wake.notify_one();
+                break;
+            }
+            if (w.over) {
                 s->ended = true;
                 return -1;
             }
-            const auto t1 = std::chrono::steady_clock::now();
-            Convert(pic, static_cast<std::uint8_t*>(picture));
-            s->convertSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
-            s32* head = reinterpret_cast<s32*>(handle);
-            head[0] = pic.width;    // MovieDecoder::width, height, and skipPicture: 0, it is to be shown
-            head[1] = pic.height;
-            head[2] = 0;
-            s->pictures++;
-            if (port::movie::Direct())
-                port::gs::DirectPicturePut((std::uint32_t)s->pictures, static_cast<const std::uint32_t*>(picture), pic.width, pic.height);
-            g_pictureNumber = (std::uint32_t)s->pictures;
-            return 0;
+            feed = w.hungry || w.staged.size() + w.held < kStreamAhead;
+            if (!feed) {   // the worker is on a picture: its turn (the game's other threads go on meanwhile)
+                waited = true;
+                w.done.wait_for(lk, std::chrono::milliseconds(1));
+            }
         }
-        if (s->decoder.Over() || !s->event[1]) {
-            s->ended = true;
-            return -1;
+        if (feed) {
+            if (!s->event[1]) {
+                s->ended = true;
+                return -1;
+            }
+            const long before = s->fed;
+            s->event[1](handle, nullptr, s->eventArg[1]);
+            // (a stream that ends without its end code: nothing new comes; what is held is given out)
+            dry = s->fed == before ? dry + 1 : 0;
+            if (dry > 64) {
+                std::lock_guard<std::mutex> lk(w.lock);
+                w.finish = true;
+                w.wake.notify_one();
+            }
+        }
+        port::Preempt();
+    }
+    if (waited)
+        s->waits++;
+    if ((got.width / 16) * (got.height / 16) > blocks || (got.width & 15) || (got.height & 15)) {
+        std::fprintf(stderr, "movie: a picture of %d by %d is not one the player has room for\n", got.width, got.height);
+        s->ended = true;
+        return -1;
+    }
+    s32* head = reinterpret_cast<s32*>(handle);
+    head[0] = got.width;    // MovieDecoder::width, height, and skipPicture: 0, it is to be shown
+    head[1] = got.height;
+    head[2] = 0;
+    s->pictures++;
+    g_pictureNumber = (std::uint32_t)s->pictures;
+    if (port::movie::Direct()) {
+        port::gs::DirectPictureTake(g_pictureNumber, got.rgba, got.width, got.height);
+    } else {
+        std::memcpy(picture, got.rgba.data(), got.rgba.size() * 4);
+    }
+    {   // the picture's memory for the worker to use again, and the stream kept ahead of it
+        std::lock_guard<std::mutex> lk(w.lock);
+        if (!got.rgba.empty() && w.spare.size() < 8)
+            w.spare.push_back(std::move(got.rgba));
+    }
+    for (int k = 0; k < 64 && s->event[1]; k++) {
+        {
+            std::lock_guard<std::mutex> lk(w.lock);
+            if (w.over || w.staged.size() + w.held >= kStreamAhead)
+                break;
         }
         const long before = s->fed;
         s->event[1](handle, nullptr, s->eventArg[1]);
-        // (a stream that ends without its end code: nothing new comes; what is held is given out)
-        dry = s->fed == before ? dry + 1 : 0;
-        if (dry > 64)
-            s->decoder.Finish();
+        // less than a whole transfer came: the game's own ring of video is nearly empty, and asking
+        // again would have it wait for the stream (and, where the sound has no room yet, fill the
+        // video with zeros, as it does at a movie's end). Only a picture that is needed asks that.
+        if (s->fed - before < 0x1000)
+            break;
     }
+    return 0;
 }
 
 // Non-zero once the sequence is over.

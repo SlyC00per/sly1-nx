@@ -48,6 +48,19 @@ The sound is mixed at its own rate, a little faster or slower (half a percent at
 ring fills or empties: the pictures go by the display, 60 a second on the Switch where the
 movie has 59.94 fields.
 
+## The decoding's own thread
+
+The game's threads share a core and take turns at the points the port gives them. A picture
+decoded on the game's thread took it 20 ms on the Switch, and for that long the movie's own
+thread could not make its display flips: each picture took three display frames where it has
+two, and the sound broke up. The decoding is on a thread of its own (`port::movie::WorkerMain`,
+on the render thread's core, which has nothing to do in a movie): the game's thread gives it
+the stream's bytes and takes its pictures, and lets the game's other threads run while it
+waits for one. The worker goes one picture and about one more in bytes ahead, no further: the
+game keeps its video ring (an eighth of a second) and its sound ring (a quarter) in step, and
+bytes taken further ahead leave the sound's full while the video's is empty, which the game
+answers by filling the video with zeros, as at a movie's end.
+
 ## The patches (`tools/patches.py`)
 
 - `IpuDmaSink::Put`: the bytes it sends the IPU are given to the port's decoder.

@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace port {
 namespace gs {
@@ -47,6 +48,8 @@ void ImageRun(const std::uint32_t* q, std::uint32_t count);
 // with that texture is given the picture (DirectPicture, for the renderer) until anything is
 // uploaded to the GS again. HasBackend says whether there is a renderer to take one.
 void DirectPicturePut(std::uint32_t number, const std::uint32_t* rgba, int width, int height);
+// The same without a copy: the picture's memory is taken, and rgba left with memory to use again.
+void DirectPictureTake(std::uint32_t number, std::vector<std::uint32_t>& rgba, int width, int height);
 struct DrawState;
 bool DirectPicture(const DrawState& state, const std::uint32_t** rgba, int* width, int* height, std::uint32_t* serial);
 bool HasBackend();

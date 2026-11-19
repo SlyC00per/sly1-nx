@@ -1118,6 +1118,7 @@ struct DirectPictures {
     std::uint32_t tbp = ~0u, serial = 0;
     int width = 0, height = 0;
     std::vector<std::uint32_t> pixels;
+    std::vector<std::uint32_t> spare;   // a picture's memory no longer shown, to be used again
 };
 DirectPictures g_direct;
 
@@ -1129,6 +1130,8 @@ void TakeDirectPicture(std::uint32_t number, std::uint32_t tbp)
     if (it == g_direct.waiting.end())
         return;
     g_direct.pixels.swap(it->second);
+    if (!it->second.empty())
+        g_direct.spare.swap(it->second);   // the one shown until now
     g_direct.width = g_direct.waitingWidth;
     g_direct.height = g_direct.waitingHeight;
     g_direct.tbp = tbp;
@@ -2136,6 +2139,22 @@ void DirectPicturePut(std::uint32_t number, const std::uint32_t* rgba, int width
     g_direct.waiting[number].assign(rgba, rgba + (std::size_t)width * (std::size_t)height);
     g_direct.waitingWidth = width;
     g_direct.waitingHeight = height;
+}
+
+void DirectPictureTake(std::uint32_t number, std::vector<std::uint32_t>& rgba, int width, int height)
+{
+    std::lock_guard<std::mutex> lk(g_direct.lock);
+    std::vector<std::uint32_t> old;
+    while (g_direct.waiting.size() > 4) {   // (never taken: a movie stopped)
+        old.swap(g_direct.waiting.begin()->second);
+        g_direct.waiting.erase(g_direct.waiting.begin());
+    }
+    if (old.empty())
+        old.swap(g_direct.spare);
+    g_direct.waiting[number].swap(rgba);
+    g_direct.waitingWidth = width;
+    g_direct.waitingHeight = height;
+    rgba.swap(old);
 }
 
 bool DirectPicture(const DrawState& state, const std::uint32_t** rgba, int* width, int* height, std::uint32_t* serial)

@@ -909,6 +909,18 @@ int main(int argc, char** argv)
                               nullptr, true) != 0)
             std::fprintf(stderr, "sly1: cannot start the sound mixer's thread: no sound\n");
     }
+    {   // the movies' decoding (port/video/movie.cpp): idle but while a movie plays
+        static pthread_t movie;
+        static unsigned char movieStack[1 << 18] __attribute__((aligned(16384)));
+        if (port::StartThread(&movie, movieStack, sizeof movieStack,
+                              [](void*) -> void* {
+                                  port::PlaceThread(port::ThreadRole::Render);   // the render thread's core: it has nothing to do in a movie
+                                  port::movie::WorkerMain();
+                                  return nullptr;
+                              },
+                              nullptr, true) != 0)
+            std::fprintf(stderr, "sly1: cannot start the movies' decoding thread\n");
+    }
     port::StartSampler();
     if (port::StartThread(&render, g_renderStack, sizeof g_renderStack,
                           [](void*) -> void* {

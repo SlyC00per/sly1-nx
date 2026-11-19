@@ -115,6 +115,8 @@ float Zoom();
 // Whether a movie's picture is handed to the renderer as it is, and the number of the last decoded.
 bool Direct();
 unsigned PictureNumber();
+// The decoding thread, started with the program (port/host/main.cpp); it does not return.
+void WorkerMain();
 }  // namespace movie
 // A level load's request, written to the log (tools/patches.py).
 void NoteWorldLoad(int arrivalA, int arrivalB, int flags);
