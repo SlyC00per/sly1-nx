@@ -68,6 +68,7 @@ struct Stream {
     std::uint32_t rate = 44100;
     std::uint32_t at = 0;           // bytes of ADPCM decoded
     float volume = 1.0f, pan = 0.0f;
+    int channel = 2;                // the game's volume channel it is under (docs/AUDIO.md)
     float fade = 1.0f, fadeStep = 0.0f;   // a fade out: the gain and what it loses each frame mixed
     bool paused = false, done = false, opened = false;
     std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();   // (for the host without a mixer)
@@ -235,6 +236,7 @@ struct Voice {
     std::int32_t loopPc = -1;     // the step a round starts at, once passed
     std::int32_t waitFrames = 0;  // output frames until the next step
     float recordVolume = 1.0f;
+    int channel = 0;              // the game's volume channel: the record's second byte
     float volume = 1.0f, left = 0.7071f, right = 0.7071f, pitch = 1.0f;
     float gain = 1.0f, gainStep = 0.0f;   // a stop or a fade: the gain and what it loses a frame
     int wait = 2;                          // chunks before it sounds (its volume comes in the commands after its start)
@@ -325,6 +327,7 @@ struct Song {
         float bend[16] = {};           // of the range, -1 to 1
         bool on[16];
         bool done = false, waiting = false;
+        bool ended = false;            // it reached its end (it was not stopped)
         int id = 0;
         int next = -1;                 // the sequence its messages chose to go on with
     };
@@ -651,7 +654,7 @@ struct Song {
                     t.tempo = (std::uint32_t)q[t.at + 3] << 16 | (std::uint32_t)q[t.at + 4] << 8 | q[t.at + 5];
                 t.at += 3 + (std::size_t)size;
                 if (type == 0x2F)
-                    t.done = true;
+                    t.done = t.ended = true;
                 continue;
             }
             if (c >= 0x80) {
@@ -682,6 +685,8 @@ struct Song {
         if (t.done) {
             if (t.next >= 0)
                 starts.push_back(t.next);
+            else if (t.ended)
+                starts.push_back(t.index);   // its end with no other chosen: again
         } else if (t.next >= 0) {   // its messages chose another before its end
             t.done = true;
             ReleaseTrack(t.id);
@@ -764,6 +769,15 @@ std::map<std::uint32_t, std::shared_ptr<Stream>> g_streams;
 std::uint32_t g_nextHandle = 0x100, g_nextBank = 1;
 float g_channelVolume[16];
 bool g_channelSet;
+// A volume channel's gain: its own value times channel 8's, which the game takes to 0 around a
+// level's load. (SLY1_SND_CHANNELS=0: the channels left out.)
+float Channel(int channel)
+{
+    static const bool off = std::getenv("SLY1_SND_CHANNELS") && std::getenv("SLY1_SND_CHANNELS")[0] == '0';
+    if (off || !g_channelSet)
+        return 1.0f;
+    return g_channelVolume[channel & 15] * g_channelVolume[8];
+}
 std::atomic<bool> g_started, g_mixing;
 std::atomic<bool> g_quit;
 std::vector<std::int16_t> g_wav;   // the host's file, kept in memory until the end
@@ -784,7 +798,7 @@ void MixChunk(std::int16_t* out)
     {
         std::lock_guard<std::mutex> lk(g_lock);
         for (auto& kv : g_streams)
-            kv.second->Mix(sum, kChunk, 0.6f);   // (a finished stream stays until the game has asked and been told it is over, or stops it)
+            kv.second->Mix(sum, kChunk, 0.6f * Channel(kv.second->channel));   // (a finished stream stays until the game has asked and been told it is over, or stops it)
         {   // SLY1_SND_LEVEL=s,v,s,v...: the sound level set to v from second s on (for hearing the music's changes on the host)
             static const char* plan = std::getenv("SLY1_SND_LEVEL");
             static long chunk;
@@ -807,11 +821,11 @@ void MixChunk(std::int16_t* out)
             }
         }
         for (auto& kv : g_songs)
-            kv.second->Mix(sum, kChunk, 0.3f);
+            kv.second->Mix(sum, kChunk, 0.45f * Channel(1));
         int sounding = 0;
         for (auto it = g_voices.begin(); it != g_voices.end();) {
             Voice& v = *it->second;
-            v.Mix(sum, kChunk, 0.35f);
+            v.Mix(sum, kChunk, 0.45f * Channel(v.channel));
             if (v.over)
                 v.overFor++;
             else
@@ -1023,6 +1037,7 @@ std::shared_ptr<Voice> StartVoice(const std::shared_ptr<Bank>& bank, std::uint32
     v->toneAt = bank->toneAt + (std::size_t)first;
     v->tones = count;
     v->recordVolume = (float)r[0] / 127.0f;
+    v->channel = r[1] & 15;
     v->Step(0);   // what starts with the voice
     v->program = v->pc < v->tones;
     return v;
@@ -1140,6 +1155,12 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
         g_soundLevel = (std::int32_t)a;
         return 0;
     case 0x09:   // a volume channel's value, 0x400 is 1
+                {
+            static const bool log = std::getenv("SLY1_SND_LOG") != nullptr;
+            static const auto t0 = std::chrono::steady_clock::now();
+            if (log && a < 16 && g_channelVolume[a] != (float)(std::int32_t)b / 1024.0f)
+                std::fprintf(stderr, "sndlog: %.1f s: volume channel %u set to %d of 1024\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), a, (int)b);
+        }
         if (a < 16)
             g_channelVolume[a] = (float)(std::int32_t)b / 1024.0f;
         return 0;
@@ -1205,6 +1226,7 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
         s->handle = g_nextHandle++;
         s->sector = a;
         s->volume = (float)(c >> 16) / 1024.0f;
+        s->channel = (int)(Word(data, size, 4) & 15);
         s->phase = 1.0;
         g_streams[s->handle] = s;
         return s->handle;

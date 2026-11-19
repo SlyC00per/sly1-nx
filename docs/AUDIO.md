@@ -70,6 +70,22 @@ The game sends commands to two services of the IOP (`port/platform/iop.cpp`):
   start each one-shot again as soon as it ended: 6,000 voices in the opening's first 50
   seconds, where there are 130.
 
+## The volume channels
+
+The game keeps four volume channels and a fifth over them all, each a product of factors it
+sets for its own reasons (`ApplyVolumeChannelFactors`), sent as command 0x09 (1,024 is 1):
+
+| Channel | What is under it | How it is known |
+| --- | --- | --- |
+| 0, 3 | a global bank's sound, by the record's second byte (0 for 771 of them, 3 for 30) | a reading of that byte: the only two values, and the game's `SilenceVolumeChannel3` |
+| 1 | the level's music | the game takes it to 0 when the opening's narration starts and back to 512 when it ends; an animation's events 2 and 3 switch it; the sound level's ducking scales it |
+| 2 | a stream | the fifth word of command 0x2C is 2 |
+| 8 | everything | taken to 0 around a level's load |
+
+The music's channel is at 512, a half, in play. Without the channels the title level's music
+played over the opening's own sound (`SLY1_SND_CHANNELS=0` leaves them out). The mix puts a
+stream at 0.6 and a bank's sound and the music at 0.45, each times its channel.
+
 ## The level music
 
 A level's bank (`SBv2`) is its instruments and its sequences; the game starts its record 0 once
@@ -120,7 +136,8 @@ A message's choice of another sequence is taken at once, not at the sequence's e
 sequence that is playing is not started again beside itself (the calm loop asks for the
 one-beat sequence at every beat while the level is high). The game's "every sound stopped"
 (0x34) leaves the music: after a restart of the level the game does not start it again. A new
-level's music ends the last one's. `SLY1_SND_LEVEL=s,v,s,v` sets the sound level to v from
+level's music ends the last one's. A sequence that reaches its end with no other chosen starts
+again (the title level's loops have no message at their end). `SLY1_SND_LEVEL=s,v,s,v` sets the sound level to v from
 second s on, for hearing the changes on the host.
 
 **Readings to put right by ear:** velocity and volumes taken as straight factors; the channel switch as between the two levels inclusive; a release when a
@@ -129,6 +146,5 @@ sequence is stopped of a twentieth of a second; no reverb.
 ## Not yet
 
 - Stereo streams, if there are any (the first one, the opening's narration, is mono 44.1 kHz).
-- Unmeasured: the unit of a fade's time (0x22: a fifth of a second is used); the volume
-  channels' effect on streams (0x09 is kept, not applied); commands 0x0E, 0x0F, 0x51 (answered
+- Unmeasured: the unit of a fade's time (0x22: a fifth of a second is used); commands 0x0E, 0x0F, 0x51 (answered
   0, their meaning not looked for yet); a stream's pan.
