@@ -12,6 +12,7 @@
 
 #include "common.h"
 #include "remote_call_client.h"
+#include "port/audio.h"
 #include "port/iop.h"
 #include "port/system.h"
 
@@ -22,7 +23,15 @@ void SyncDataCache(s32) {}
 
 // Transfers to the IOP complete at once: a transfer's id is never still running.
 s32 GetIopDmaStatus(void*) { return -1; }
-void* StartIopDma(void*, s32) { return (void*)1; }
+void* StartIopDma(void* transfers, s32 count)
+{
+    // a transfer is four words: the address here, the IOP's, the size, a flag. The only ones the
+    // game makes are a movie's sound into the driver's ring (movie_player.cpp, WriteIopRingBlock).
+    const u32* t = (const u32*)transfers;
+    for (s32 k = 0; k < count; k++, t += 4)
+        port::audio::MovieRingWrite(t[1], (const std::uint8_t*)port::Native(t[0]), t[2]);
+    return (void*)1;
+}
 
 // --- the IOP's remote calls
 

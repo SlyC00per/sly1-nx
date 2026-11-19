@@ -106,6 +106,10 @@ void PreemptSlow();
 // extent is that much wider, the vertical kept; tools/patches.py's camera patch), 1 with
 // SLY1_WIDE=0.
 float WideFactor();
+namespace movie {
+// The video stream's bytes on their way to the IPU (port/video/movie.cpp; tools/patches.py).
+void VideoBytes(const void* bytes, int size);
+}  // namespace movie
 // A level load's request, written to the log (tools/patches.py).
 void NoteWorldLoad(int arrivalA, int arrivalB, int flags);
 // A fade that is to load a level: where StartScreenFade was called from (bytes from its own start;

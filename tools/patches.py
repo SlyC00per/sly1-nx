@@ -173,6 +173,68 @@ PATCHES = [
      "    s32 s0 = -1;\n\n    port::NoteFade(-1, kind, ComputeCompletionMask(), -1, -1);\n    if (kind != 4) { if (kind < 5) { if (kind == 2) { s0 = 0xD; } } } else { s0 = 0xE; }",
      "the completion fade noted in the log"),
 
+    # Movies (docs/VIDEO.md). The game sends the video stream to the IPU by starting a DMA transfer
+    # on its channel; the port has no IPU, and takes the bytes there for its own decoder.
+    ("src/main/movie_player.cpp",
+     "    *(volatile u32*)0x1000B400 = 0x101;\n    *(volatile u32*)0x1000F590 = old;\n    return n;",
+     "    *(volatile u32*)0x1000B400 = 0x101;\n    *(volatile u32*)0x1000F590 = old;\n    port::movie::VideoBytes(buf, n);\n    return n;",
+     "the video stream's bytes taken where the game sends them to the IPU"),
+    # The movie player's two sinks are C++ classes with virtual functions, and the ring buffer's
+    # drain (ring_buffer.cpp) calls a sink through GCC 2.95's method table, which this compiler's
+    # classes do not have. The player's three drains call the classes themselves, by the same steps.
+    ("src/main/movie_player.cpp",
+     "// A block of data the decoder hands a stream callback.",
+     "// (the port: DrainRingBuffer's steps, on a sink of this file's classes: tools/patches.py)\n"
+     "static s32 port_DrainRing(RingBuffer* self, s32 n, TransferSink* o)\n"
+     "{\n"
+     "    s32 total = 0;\n"
+     "    s32 rem = n;\n"
+     "    if (rem <= 0 || self->filled < rem)\n"
+     "        rem = self->filled;\n"
+     "    for (;;) {\n"
+     "        if (rem == 0)\n"
+     "            break;\n"
+     "        s32 chunk = self->size - self->readPos;\n"
+     "        if (rem < chunk)\n"
+     "            chunk = rem;\n"
+     "        s32 s0 = o->Put(chunk, self->buf + self->readPos);\n"
+     "        if (s0 == 0)\n"
+     "            break;\n"
+     "        self->readPos = (self->readPos += s0) % self->size;\n"
+     "        self->filled -= s0;\n"
+     "        if (o->Idle() != 0)\n"
+     "            self->held += s0;\n"
+     "        else\n"
+     "            self->space += s0;\n"
+     "        rem -= s0;\n"
+     "        total += s0;\n"
+     "        if (n <= 0)\n"
+     "            break;\n"
+     "    }\n"
+     "    return total;\n"
+     "}\n\n"
+     "// A block of data the decoder hands a stream callback.",
+     "the ring's drain for the movie player's own sink classes"),
+    ("src/main/movie_player.cpp",
+     "        DrainRingBuffer(&self->dataRing, self->sink.freeBytes, (StreamSink*)&self->sink);",
+     "        port_DrainRing(&self->dataRing, self->sink.freeBytes, &self->sink);",
+     "the sound ring drained to the IOP's by the sink's own class"),
+    ("src/main/movie_player.cpp",
+     "        DrainRingBuffer(&self->dataRing, self->sink.freeBytes, (StreamSink*)s0);",
+     "        port_DrainRing(&self->dataRing, self->sink.freeBytes, s0);",
+     "the sound ring drained to the IOP's by the sink's own class (while playing)"),
+    ("src/main/movie_player.cpp",
+     "        DrainRingBuffer(&self->videoRing, 0, (StreamSink*)&dma);",
+     "        port_DrainRing(&self->videoRing, 0, &dma);",
+     "the video ring drained to the IPU's channel by the sink's own class"),
+
+    # Widescreen: a movie is drawn across the whole 4:3 screen; in the 16:9 picture it keeps its
+    # shape, in the middle (the sides stay as the fade before it left them: black).
+    ("src/main/movie_player.cpp",
+     "    AddGifXyzfEntry(&buf, 0x6C00, 0x7900, 0, 0);\n    AddGifUvEntry(&buf, (a1 << 4) | 8, (a2 << 4) | 8);\n    AddGifXyzfEntry(&buf, 0x9400, 0x8700, 0, 0);",
+     "    AddGifXyzfEntry(&buf, 0x8000 - (s32)(0x1400 / port::WideFactor()), 0x7900, 0, 0);\n    AddGifUvEntry(&buf, (a1 << 4) | 8, (a2 << 4) | 8);\n    AddGifXyzfEntry(&buf, 0x8000 + (s32)(0x1400 / port::WideFactor()), 0x8700, 0, 0);",
+     "a movie's picture in its own shape in the 16:9 picture"),
+
     # A line in the log when an animation's event starts a fade to a level or queues a movie: which
     # animation, and where in it.
     ("src/main/placed_object.cpp",

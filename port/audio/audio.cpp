@@ -760,6 +760,58 @@ struct Song {
 
 std::map<std::uint32_t, std::shared_ptr<Song>> g_songs;
 
+// ---------------------------------------------------------------------------------------------
+// A movie's sound (docs/VIDEO.md). The game asks the driver for a ring buffer in the IOP's
+// memory (command 0x3B), copies the movie's sound into it as it reads the movie (a transfer to
+// the IOP: MovieRingWrite), asks where the driver has played to (0x40) and so keeps it filled.
+// The sound is as the movie's header says, and every movie says the same: 16-bit samples at
+// 48,000 Hz, the two channels in turn, 0x200 bytes of the left and then 0x200 of the right.
+struct MovieRing {
+    static constexpr std::uint32_t kBase = 0x00100000;   // the address the game is told the ring is at
+    std::vector<std::uint8_t> data;
+    std::uint64_t written = 0;    // bytes copied in
+    std::uint64_t played = 0;     // frames mixed out
+    double phase = 0.0;
+    bool open = false, playing = false;
+
+    std::uint64_t Frames() const { return written / 0x400 * 256; }   // whole blocks of both channels
+
+    // The game is to be told the place played to, as the driver gives it: a block at a time.
+    std::uint32_t Position() const
+    {
+        if (data.empty())
+            return kBase;
+        return kBase + (std::uint32_t)(played / 256 * 0x400 % data.size());
+    }
+
+    void Mix(std::int32_t* out, int frames, float gain)
+    {
+        if (!playing || data.empty())
+            return;
+        // the movie's pictures are shown at the display's rate, a thousandth off the movie's own:
+        // the sound keeps to them by going a little faster or slower as the ring fills or empties
+        const std::int64_t held = (std::int64_t)(Frames() - played);
+        const double half = (double)(data.size() / 0x400 * 256) * 0.5;
+        double rate = 1.0 + ((double)held - half) / half * 0.005;
+        rate = rate < 0.995 ? 0.995 : rate > 1.005 ? 1.005 : rate;
+        for (int k = 0; k < frames; k++) {
+            if (played >= Frames())
+                return;   // nothing more yet: silence until there is
+            const std::size_t block = (std::size_t)(played / 256) * 0x400 % data.size(), at = (std::size_t)(played % 256) * 2;
+            const std::int16_t l = (std::int16_t)(data[block + at] | data[block + at + 1] << 8);
+            const std::int16_t r = (std::int16_t)(data[block + 0x200 + at] | data[block + 0x200 + at + 1] << 8);
+            out[k * 2] += (std::int32_t)((float)l * gain);
+            out[k * 2 + 1] += (std::int32_t)((float)r * gain);
+            phase += rate;
+            while (phase >= 1.0) {
+                phase -= 1.0;
+                played++;
+            }
+        }
+    }
+};
+MovieRing g_movieRing;
+
 std::mutex g_lock;
 std::map<std::uint32_t, std::shared_ptr<Bank>> g_banks;
 std::map<std::uint32_t, std::shared_ptr<Voice>> g_voices;
@@ -820,6 +872,7 @@ void MixChunk(std::int16_t* out)
                     g_soundLevel = value;
             }
         }
+        g_movieRing.Mix(sum, kChunk, Channel(2));
         for (auto& kv : g_songs)
             kv.second->Mix(sum, kChunk, 0.45f * Channel(1));
         int sounding = 0;
@@ -903,6 +956,20 @@ Stream* Find(std::uint32_t handle)
 }
 
 }  // namespace
+
+void MovieRingWrite(std::uint32_t iopAddress, const std::uint8_t* from, std::uint32_t size)
+{
+    std::lock_guard<std::mutex> lk(g_lock);
+    MovieRing& ring = g_movieRing;
+    if (ring.data.empty() || iopAddress < MovieRing::kBase)
+        return;
+    std::size_t at = (iopAddress - MovieRing::kBase) % ring.data.size();
+    for (std::uint32_t k = 0; k < size; k++) {
+        ring.data[at] = from[k];
+        at = at + 1 == ring.data.size() ? 0 : at + 1;
+    }
+    ring.written += size;
+}
 
 bool Wanted()
 {
@@ -1149,8 +1216,26 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
     case 0x0B:   // the sound option
     case 0x0D:
     case 0x4E:   // a channel's set-up
-    case 0x3B: case 0x3C: case 0x3D:
         return 0;
+    case 0x3B:   // a movie's ring asked for: its size; the answer is its address
+        g_movieRing = MovieRing();
+        g_movieRing.data.assign(a >= 0x800 && a <= (1u << 20) ? (a & ~0x3FFu) : 0x6000, 0);
+        g_movieRing.open = true;
+        return MovieRing::kBase;
+    case 0x3D:   // the ring emptied
+        g_movieRing.written = g_movieRing.played = 0;
+        g_movieRing.phase = 0.0;
+        return 0;
+    case 0x3E:   // the ring's sound started
+        g_movieRing.playing = true;
+        return 0;
+    case 0x3C:   // and stopped
+        g_movieRing.playing = false;
+        return 0;
+    case 0x40:   // where the ring has been played to
+        if (!g_mixing.load())
+            g_movieRing.played = g_movieRing.Frames();   // (no mixer: it is taken as fast as it comes)
+        return g_movieRing.Position();
     case 0x27:   // the sound level: what the level's music goes by
         g_soundLevel = (std::int32_t)a;
         return 0;

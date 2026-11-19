@@ -5,8 +5,7 @@
 // Memory and strings: the C library's. Random numbers: the library's own generator, exact
 // (state * 0x41C64E6D + 0x3039, the low 31 bits), seeded with the record's initial seed from the
 // player's executable. Files and IOP modules: the port has no IOP; module loads and resets
-// succeed, the console file handles go to the log. MPEG: no decoder yet (milestone 3):
-// every movie ends at once. The GS paths: always idle.
+// succeed, the console file handles go to the log. MPEG: port/video/movie.cpp. The GS paths: always idle.
 #include <cstdio>
 #include <cstring>
 
@@ -130,20 +129,4 @@ s32 WaitGsPaths(s32, s32) { return 0; }
 
 // The memory card: port/platform/memory_card.cpp.
 
-// --- MPEG: no decoder yet
-
-s32 DemultiplexBuffer(MpegHandle*, s32, s32) { return 0; }
-// Returns the callback it replaces: none.
-void* SetStreamCallback(MpegHandle*, s32, s32, s32 (*)(MpegHandle*, MpegStreamPacket*, void*), void*) { return nullptr; }
-void InitMpegLibrary() {}
-s32 CreateMpegDecoder(MpegHandle*, u8*, u32)
-{
-    std::fprintf(stderr, "movie: one asked for (none is played yet: it ends at once)\n");
-    return 1;
-}
-s32 DeleteMpegDecoder(MpegHandle*) { return 1; }
-s32 DecodeMpegPicture(MpegHandle*, void*, s32) { return 0; }
-// The stream has ended: with no decoder yet, every movie ends at once (PlayMovie's loop stops).
-s32 GetMpegDecoderStatus(MpegHandle*) { return 1; }
-void ResetMpegDecoder(MpegHandle*) {}
-void* SetMpegCallback(MpegHandle*, s32, void*, void*) { return nullptr; }
+// MPEG: port/video/movie.cpp.
