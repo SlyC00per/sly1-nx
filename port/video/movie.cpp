@@ -54,6 +54,7 @@ struct State {
     std::uint32_t carried = 0;      // bytes of such a packet held in it
     bool ended = false;
     long pictures = 0, fed = 0, packets[2] = {}, waits = 0;
+    double waitSeconds = 0.0, longestWait = 0.0;
 };
 State* g_state;
 std::uint32_t g_pictureNumber;   // the last picture decoded
@@ -202,17 +203,30 @@ struct Worker {
     std::deque<Ready> ready;
     std::vector<std::vector<std::uint32_t>> spare;   // pictures' memory to use again
     std::size_t held = 0;                 // bytes the decoder has and has not decoded
+    long begun = 0, given = 0;            // pictures whose start the stream's bytes have reached, and pictures decoded
+    std::uint32_t last4 = 0xFFFFFFFF;     // the stream's last four bytes (a start code may be cut by a transfer's end)
     bool active = false, busy = false, over = false, hungry = false, finish = false;
     long errors = 0;
     double decodeSeconds = 0.0, convertSeconds = 0.0;
 };
 Worker g_worker;
-// How far ahead of the pictures shown the worker goes: one picture decoded and about one more in
-// bytes. The game keeps its two rings in step (video for an eighth of a second, sound for a
-// quarter); bytes taken further ahead than that leave the sound's ring full while the video's
-// is empty, and the game then fills the video with zeros, as it does at a movie's end.
-constexpr std::size_t kAhead = 2;                 // pictures decoded, the one asked for among them
-constexpr std::size_t kStreamAhead = 24 * 1024;   // bytes of the stream kept before the decoder
+// How far ahead of the pictures shown the worker goes: one picture decoded, and the stream up to
+// the start of the fourth picture past the last one decoded. A picture can only be decoded once
+// the next one's start is there (that is its end) and one is held back for the display order, so
+// that is two whole pictures in hand; counted in bytes instead, a large picture left the worker
+// without its end until the game asked for it, and the game then waited the whole decoding.
+// The game keeps its two rings in step (video for an eighth of a second, sound for a quarter);
+// bytes taken further ahead than that leave the sound's ring full while the video's is empty, and
+// the game then fills the video with zeros, as it does at a movie's end.
+constexpr std::size_t kAhead = 2;                  // pictures decoded, the one asked for among them
+constexpr long kStartsAhead = 4;                   // pictures begun in the stream past the last decoded
+constexpr std::size_t kStreamAhead = 192 * 1024;   // and no more bytes than this, whatever they hold
+
+// Whether the worker is to be given more of the stream (its lock held).
+bool Short(const Worker& w)
+{
+    return w.begun - w.given < kStartsAhead && w.staged.size() + w.held < kStreamAhead;
+}
 
 }  // namespace
 
@@ -286,9 +300,10 @@ void WorkerMain()
             w.done.notify_all();
             continue;
         }
-        if (got)
+        if (got) {
             w.ready.push_back(std::move(out));
-        else if (over)
+            w.given++;
+        } else if (over)
             w.over = true;
         else
             w.hungry = true;   // it needs more of the stream before it can go on
@@ -306,6 +321,13 @@ void VideoBytes(const void* bytes, int size)
         std::lock_guard<std::mutex> lk(w.lock);
         const std::uint8_t* b = static_cast<const std::uint8_t*>(bytes);
         w.staged.insert(w.staged.end(), b, b + size);
+        std::uint32_t last = w.last4;
+        for (int i = 0; i < size; i++) {
+            last = last << 8 | b[i];
+            if (last == 0x00000100)   // a picture's start code
+                w.begun++;
+        }
+        w.last4 = last;
     }
     w.wake.notify_one();
     g_state->fed += size;
@@ -339,6 +361,8 @@ void StopWorker(bool active)
         w.spare.push_back(std::move(r.rgba));
     w.ready.clear();
     w.held = 0;
+    w.begun = w.given = 0;
+    w.last4 = 0xFFFFFFFF;
     w.over = w.hungry = w.finish = false;
     w.active = active;
 }
@@ -363,10 +387,11 @@ s32 DeleteMpegDecoder(MpegHandle*)
     if (g_state) {
         const long errors = g_worker.errors;
         StopWorker(false);
-        std::fprintf(stderr, "movie: %ld pictures shown from %ld bytes of video in %ld packets, and %ld packets of sound; %ld errors in the stream; %.1f ms a picture decoding, %.1f converting; %ld waits for a picture\n",
+        std::fprintf(stderr, "movie: %ld pictures shown from %ld bytes of video in %ld packets, and %ld packets of sound; %ld errors in the stream; %.1f ms a picture decoding, %.1f converting; %ld waits for a picture, %.1f ms each and %.1f the longest\n",
                      g_state->pictures, g_state->fed, g_state->packets[0], g_state->packets[1], errors,
                      g_state->pictures ? g_worker.decodeSeconds * 1000.0 / (double)g_state->pictures : 0.0,
-                     g_state->pictures ? g_worker.convertSeconds * 1000.0 / (double)g_state->pictures : 0.0, g_state->waits);
+                     g_state->pictures ? g_worker.convertSeconds * 1000.0 / (double)g_state->pictures : 0.0, g_state->waits,
+                     g_state->waits ? g_state->waitSeconds * 1000.0 / (double)g_state->waits : 0.0, g_state->longestWait * 1000.0);
     }
     delete g_state;
     g_state = nullptr;
@@ -478,6 +503,7 @@ s32 DecodeMpegPicture(MpegHandle* handle, void* picture, s32 blocks)
     Ready got;
     int dry = 0;
     bool waited = false;
+    const auto asked = std::chrono::steady_clock::now();
     for (;;) {
         bool feed = false;
         {
@@ -492,7 +518,7 @@ s32 DecodeMpegPicture(MpegHandle* handle, void* picture, s32 blocks)
                 s->ended = true;
                 return -1;
             }
-            feed = w.hungry || w.staged.size() + w.held < kStreamAhead;
+            feed = w.hungry || Short(w);
             if (!feed) {   // the worker is on a picture: its turn (the game's other threads go on meanwhile)
                 waited = true;
                 w.done.wait_for(lk, std::chrono::milliseconds(1));
@@ -515,8 +541,13 @@ s32 DecodeMpegPicture(MpegHandle* handle, void* picture, s32 blocks)
         }
         port::Preempt();
     }
-    if (waited)
+    if (waited) {
+        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - asked).count();
         s->waits++;
+        s->waitSeconds += t;
+        if (t > s->longestWait)
+            s->longestWait = t;
+    }
     if ((got.width / 16) * (got.height / 16) > blocks || (got.width & 15) || (got.height & 15)) {
         std::fprintf(stderr, "movie: a picture of %d by %d is not one the player has room for\n", got.width, got.height);
         s->ended = true;
@@ -541,7 +572,7 @@ s32 DecodeMpegPicture(MpegHandle* handle, void* picture, s32 blocks)
     for (int k = 0; k < 64 && s->event[1]; k++) {
         {
             std::lock_guard<std::mutex> lk(w.lock);
-            if (w.over || w.staged.size() + w.held >= kStreamAhead)
+            if (w.over || !Short(w))
                 break;
         }
         const long before = s->fed;
