@@ -322,6 +322,11 @@ int WideX(int x)
 // A call for the game's own thread to make (the host's diagnosis: placing the player), taken at
 // the next point where a game thread lets others in.
 std::atomic<void (*)()> g_gameThreadCall{nullptr};
+void NoteWorldLoad(int arrivalA, int arrivalB, int flags)
+{
+    std::fprintf(stderr, "world: a level load, arrival keys %d %d, flags 0x%X\n", arrivalA, arrivalB, (unsigned)flags);
+}
+
 void CallOnGameThread(void (*fn)()) { g_gameThreadCall.store(fn, std::memory_order_release); }
 
 void PreemptSlow()

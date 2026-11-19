@@ -146,6 +146,14 @@ PATCHES = [
      "m->p = (u16*)((u8*)m->p + (s32)(m->addr - start));",
      "the morph target's words move by the difference of two u32 addresses, which may be negative"),
 
+    # A line in the log for each level load: the two arrival keys and the flags of the request
+    # (what the level it was asked from gave), for reproducing a way into a level on the host
+    # (SLY1_ARRIVAL).
+    ("src/main/on_off_object.cpp",
+     "    OwnedStream sub;\n    SetScreenOwner(2);\n    if (self->key != 0) {",
+     "    OwnedStream sub;\n    SetScreenOwner(2);\n    port::NoteWorldLoad(self->arrivalKeyA, self->arrivalKeyB, self->flags);\n    if (self->key != 0) {",
+     "each level load noted in the log"),
+
     # Widescreen (docs/PS3_PARITY.md): the camera's horizontal extent over the vertical is 4/3 wider
     # for the 16:9 picture (Hor+: the vertical field of view kept). The projection, the frustum's
     # sides and what is culled by them all come from this one number.

@@ -252,6 +252,15 @@ void VerifyLevels()
         word(kRequest + 0x08) = -1;
         word(kRequest + 0x0C) = -1;
         word(kRequest + 0x10) = 0;
+        if (const char* arrival = std::getenv("SLY1_ARRIVAL")) {
+            // SLY1_ARRIVAL=a,b[,flags]: the request's two arrival keys and flags, as a level's own way
+            // in gives them (a level entered from another starts elsewhere, with its own sequence)
+            int a = -1, b = -1, fl = 0;
+            std::sscanf(arrival, "%d,%d,%d", &a, &b, &fl);
+            word(kRequest + 0x08) = a;
+            word(kRequest + 0x0C) = b;
+            word(kRequest + 0x10) = fl;
+        }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         word(kRequest) = 1;
         if (!waitFor([&] { return word(kRequest) == 0; }, 120))

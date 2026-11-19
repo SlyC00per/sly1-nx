@@ -136,7 +136,11 @@ s32 DemultiplexBuffer(MpegHandle*, s32, s32) { return 0; }
 // Returns the callback it replaces: none.
 void* SetStreamCallback(MpegHandle*, s32, s32, s32 (*)(MpegHandle*, MpegStreamPacket*, void*), void*) { return nullptr; }
 void InitMpegLibrary() {}
-s32 CreateMpegDecoder(MpegHandle*, u8*, u32) { return 1; }
+s32 CreateMpegDecoder(MpegHandle*, u8*, u32)
+{
+    std::fprintf(stderr, "movie: one asked for (none is played yet: it ends at once)\n");
+    return 1;
+}
 s32 DeleteMpegDecoder(MpegHandle*) { return 1; }
 s32 DecodeMpegPicture(MpegHandle*, void*, s32) { return 0; }
 // The stream has ended: with no decoder yet, every movie ends at once (PlayMovie's loop stops).
