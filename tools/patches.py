@@ -288,6 +288,62 @@ PATCHES = [
 
     # A line in the log when an animation's event starts a fade to a level or queues a movie: which
     # animation, and where in it.
+    # SLY1_SCRIPT_TRACE=N: the script machine's calls (built-in or host function, arguments, result)
+    # kept in a ring, printed when animation N starts: what a level's script did before it.
+    ("src/main/script_machine.cpp",
+     "    CopyConstructScriptValue(ret, &b);\n    p = &t;\n    while (arr != p) {",
+     "    port::NoteScriptCall(a.tag, a.tag == 0x1D ? (void*)ent->fn : a.tag == 0x21 ? (void*)host->fn : (void*)0, count, (const int*)arr, (const int*)&b);\n"
+     "    CopyConstructScriptValue(ret, &b);\n    p = &t;\n    while (arr != p) {",
+     "a script call noted for the trace"),
+    # SLY1_TICK_TRACE=N: object N's script timer at each of its tick events (0: every object's running timer).
+    ("src/main/base_object.cpp",
+     "        f32 f = ((PlacedObject*)self)->eventTimer;\n",
+     "        f32 f = ((PlacedObject*)self)->eventTimer;\n        port::NoteTick(self->id, f, *(f32*)p[0]);\n",
+     "a script timer's countdown noted for the trace"),
+    # SLY1_EVENT_TRACE=N: each script event raised on object N (its key, where from).
+    ("src/main/base_object.cpp",
+     "    if (SuppressScriptEvent(self, idx, flag, out) == 0) {",
+     "    port::NoteScriptEvent(self->id, idx, (long)((char*)__builtin_return_address(0) - (char*)&TriggerScriptEvent));\n"
+     "    if (SuppressScriptEvent(self, idx, flag, out) == 0) {",
+     "a script event noted for the trace"),
+    # SLY1_FREEZE_TRACE=N: object N frozen or let go (the host prints the call stack).
+    ("src/main/game_progress.cpp",
+     "void SetPlacedObjectFrozen(PlacedObject* self, s32 flag)\n{\n",
+     "void SetPlacedObjectFrozen(PlacedObject* self, s32 flag)\n{\n    port::NoteFreeze(self->id, flag);\n",
+     "an object's freezing noted for the trace"),
+    # SLY1_CAMERA_TRACE=A,B: the camera's position and area each frame of the world, frames A to B.
+    ("src/main/game_progress.cpp",
+     "void UpdateGroupsNearCamera(World* self)\n{\n",
+     "void UpdateGroupsNearCamera(World* self)\n{\n    port::NoteCamera((const float*)((Camera*)g_camera)->position, ((Camera*)g_camera)->areaMask);\n",
+     "the camera's position noted for the trace"),
+    # The camera's push out of geometry kept in the world. ComputeConstrainedPushOut solves a weight
+    # for each of up to 64 hit points; from a place inside solid geometry the system is degenerate
+    # and the weights run to the largest float, so the camera is put some 1e21 units away and takes
+    # ten seconds to come back. Retail's code does the same sums; it is reached when a level's
+    # opening fly-over ends on its last pose in the very step a script cuts it (A Stealthy
+    # Approach: the camera ends inside the van), which a step of 1/60 s never does and the port's
+    # longer steps often do. The level then freezes the van (it is out of the camera's range),
+    # the van's script timer is cleared, and its script runs again and leaves for the hideout:
+    # the blue screen after Sly comes out of the van. A push that lands beyond any level's size
+    # is not taken: the camera stays where it was going.
+    ("src/main/camera.cpp",
+     "    Vu0::Q(*out) = Vu0::MulAddX(Vu0::Q(*origin), Vu0::Q(hit), Vu0::ScalarAt(clock->step));\n    PopBackMemoryMark();",
+     "    {\n"
+     "        Vec4 pushed;\n"
+     "        Vu0::Q(pushed) = Vu0::MulAddX(Vu0::Q(*origin), Vu0::Q(hit), Vu0::ScalarAt(clock->step));\n"
+     "        if (port::CameraPushInWorld((const float*)&pushed, (const float*)dest))\n"
+     "            *out = pushed;\n"
+     "        else\n"
+     "            *out = *(Vec4*)dest;\n"
+     "    }\n"
+     "    PopBackMemoryMark();",
+     "a camera push beyond the world not taken"),
+    # SLY1_PROP_TRACE=N: each read of property N by a script: the object, its class, the descriptor.
+    ("src/main/object_properties.cpp",
+     "        PropertyDescriptor* r = FindPropertyDescriptor(p, n);\n        ReadPropertyValue(self, p, r);",
+     "        PropertyDescriptor* r = FindPropertyDescriptor(p, n);\n        ReadPropertyValue(self, p, r);\n"
+     "        port::NotePropertyRead(n, p->id, p->desc->id, (const int*)r, (const int*)self);",
+     "a script's read of a property noted for the trace"),
     # Every animation started, kept in a short list the fade event's line prints: which animations
     # started before a fade to a level, and from where in the game's code.
     ("src/main/placed_object.cpp",

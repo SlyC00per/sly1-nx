@@ -3273,6 +3273,11 @@ void RenderThreadMain()
         }
         GsPassOn();
         HashPassOn();
+        {   // SLY1_SLOW_RENDER=ms: each list of VIF1's takes that much longer (a slow machine's frames, on a fast one)
+            static const int slow = std::getenv("SLY1_SLOW_RENDER") ? std::atoi(std::getenv("SLY1_SLOW_RENDER")) : 0;
+            if (slow > 0 && (kind == 0 || kind == 3))
+                std::this_thread::sleep_for(std::chrono::milliseconds(slow));
+        }
         TIMELINE("render ends it");
         g_renderNs[kind < 3 ? kind : 0] += NowNs() - started;
         // SLY1_PERF_LOG=1: every 60 frames shown, the mean time a frame took and how much of it
@@ -3308,6 +3313,14 @@ void RenderThreadMain()
                             float pos[3];
                             std::memcpy(pos, Native(player + 0x100), sizeof pos);
                             std::fprintf(stderr, "perfpos: to %llu: the player at %.0f %.0f %.0f\n", (unsigned long long)shown, (double)pos[0], (double)pos[1], (double)pos[2]);
+                            const std::uint32_t cam = *static_cast<const std::uint32_t*>(Native(0x00261990));   // g_camera
+                            if (cam >= 0x00100000 && cam < kRamSize - 0x300) {
+                                float at[3];
+                                std::int32_t mask;
+                                std::memcpy(at, Native(cam + 0x40), sizeof at);
+                                std::memcpy(&mask, Native(cam + 0x21C), 4);
+                                std::fprintf(stderr, "perfpos: to %llu: the camera at %.0f %.0f %.0f, its area mask 0x%X\n", (unsigned long long)shown, (double)at[0], (double)at[1], (double)at[2], (unsigned)mask);
+                            }
                         }
                     }
                     std::memcpy(timesWas, times, sizeof timesWas);

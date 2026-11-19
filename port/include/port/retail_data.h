@@ -130,6 +130,25 @@ void NoteAnimEvent(int event, int animation, int object, float time, float lengt
 // An animation started (its id, where from as an offset from CreateAnimationPlayer, its length):
 // kept, and printed with the next fade event.
 void NoteAnimStart(int animation, long from, float length, int flags);
+// SLY1_SCRIPT_TRACE=N: a call the script machine made (the callee's tag and function, the
+// arguments' and the result's tag and word); the last ones are printed when animation N starts.
+void NoteScriptCall(int tag, void* fn, int count, const int* args, const int* result);
+// SLY1_PROP_TRACE=N: a script read property N of an object (its id, its class's, the descriptor's
+// words, the value read).
+// SLY1_TICK_TRACE=N: object N's script timer at a tick event (its value, the frame's time), or with
+// 0 every object's running timer.
+void NoteTick(int object, float timer, float step);
+// SLY1_EVENT_TRACE=N: a script event raised on object N (its key, the caller as an offset from
+// TriggerScriptEvent).
+void NoteScriptEvent(int object, int key, long from);
+// SLY1_FREEZE_TRACE=N: object N frozen (flag non-zero) or let go.
+void NoteFreeze(int object, int flag);
+// SLY1_CAMERA_TRACE=A,B: the camera's position and area mask, each world frame from shown frame A to B.
+void NoteCamera(const float* position, int areaMask);
+// Whether the place the camera's push out of geometry gives is one to take: finite, and within
+// 10,000 units of where the camera was going (tools/patches.py says why it can be neither).
+bool CameraPushInWorld(const float* pushed, const float* dest);
+void NotePropertyRead(int property, int object, int cls, const int* descriptor, const int* value);
 // The 2D elements in the 16:9 picture (tools/patches.py). Wide2D(middle): what is drawn from now
 // is one element whose middle rests at that x of the 640 (it is drawn 3/4 as wide about the
 // left edge, the middle or the right edge of the screen, by the third the middle is in);

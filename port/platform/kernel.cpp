@@ -34,6 +34,11 @@
 #include "port/system.h"
 #include "port/dmac.h"
 #include "port/gs.h"
+#include <cmath>
+#if defined(__APPLE__)
+#include <dlfcn.h>
+#include <execinfo.h>
+#endif
 
 namespace port {
 
@@ -347,9 +352,175 @@ AnimStart g_animStarts[48];
 unsigned g_animStartCount;
 }  // namespace
 
+namespace {
+struct ScriptCall {
+    std::uint64_t frame;
+    void* fn;
+    int tag, count;
+    int args[5][2], result[2];
+};
+constexpr unsigned kScriptCalls = 3000;
+ScriptCall* g_scriptCalls;
+unsigned g_scriptCallCount;
+int ScriptTrace()
+{
+    static const int n = std::getenv("SLY1_SCRIPT_TRACE") ? std::atoi(std::getenv("SLY1_SCRIPT_TRACE")) : -2;
+    return n;
+}
+// A function's name where the host can give it (the Mac), for the script trace.
+const char* FunctionName(void* fn, int tag)
+{
+#if defined(__APPLE__)
+    Dl_info info{};
+    if (fn && dladdr(fn, &info) && info.dli_sname)
+        return info.dli_sname;
+#endif
+    return tag == 0x1F ? "(a script function)" : fn ? "(a host function)" : "?";
+}
+void PrintScriptWord(const int* v)
+{
+    float f;
+    std::memcpy(&f, &v[1], 4);
+    if (v[0] == 0x15)
+        std::fprintf(stderr, " %g", (double)f);
+    else if (v[0] == 0x14 || v[0] == 0x1B)
+        std::fprintf(stderr, " %d", v[1]);
+    else
+        std::fprintf(stderr, " <%X:%X>", (unsigned)v[0], (unsigned)v[1]);
+}
+}  // namespace
+
+void NoteTick(int object, float timer, float step)
+{
+    static const int traced = std::getenv("SLY1_TICK_TRACE") ? std::atoi(std::getenv("SLY1_TICK_TRACE")) : -2;
+    if (traced == object || (traced == 0 && timer > 0.0f))
+        std::fprintf(stderr, "script: frame %llu: object %d's timer %g less %g\n", (unsigned long long)gs::FramesShown(), object, (double)timer, (double)step);
+}
+
+void NoteScriptEvent(int object, int key, long from)
+{
+    static const int traced = std::getenv("SLY1_EVENT_TRACE") ? std::atoi(std::getenv("SLY1_EVENT_TRACE")) : -2;
+    if (traced == object || traced == -1)
+        std::fprintf(stderr, "script: frame %llu: event %d raised on object %d from TriggerScriptEvent%+ld\n", (unsigned long long)gs::FramesShown(), key, object, from);
+}
+
+void NoteFreeze(int object, int flag)
+{
+    static const int traced = std::getenv("SLY1_FREEZE_TRACE") ? std::atoi(std::getenv("SLY1_FREEZE_TRACE")) : -2;
+    if (traced != object)
+        return;
+    std::fprintf(stderr, "world: frame %llu: object %d %s\n", (unsigned long long)gs::FramesShown(), object, flag ? "frozen" : "let go");
+#if defined(__APPLE__)
+    void* at[96];
+    backtrace_symbols_fd(at, backtrace(at, 96), 2);
+#endif
+}
+
+void NoteCamera(const float* position, int areaMask)
+{
+    static long from = -1, to = -1;
+    static const bool on = std::getenv("SLY1_CAMERA_TRACE") && std::sscanf(std::getenv("SLY1_CAMERA_TRACE"), "%ld,%ld", &from, &to) == 2;
+    const long shown = (long)gs::FramesShown();
+    if (on && shown >= from && shown <= to)
+    {
+        const std::uint32_t player = *static_cast<const std::uint32_t*>(Native(0x00262E10));   // g_player
+        float at[3] = {};
+        if (player >= 0x00100000)
+            std::memcpy(at, Native(player + 0x100), sizeof at);
+        int snap[3];
+        std::memcpy(snap, reinterpret_cast<const char*>(position) - 0x40 + 0x220, sizeof snap);   // snapQueued, snapping, hasSnapValue
+        std::fprintf(stderr, "world: frame %ld: the camera at %g %g %g, area mask 0x%X, snap queued %d snapping %d; the player at %g %g %g\n", shown, (double)position[0], (double)position[1],
+                     (double)position[2], (unsigned)areaMask, snap[0], snap[1], (double)at[0], (double)at[1], (double)at[2]);
+    }
+}
+
+bool CameraPushInWorld(const float* pushed, const float* dest)
+{
+    float far = 0.0f;
+    for (int k = 0; k < 3; k++) {
+        const float d = std::fabs(pushed[k] - dest[k]);
+        if (!(d < 10000.0f))   // (a NaN fails this too)
+            far = d;
+    }
+    if (far == 0.0f)
+        return true;
+    static int said = 0;
+    if (said++ < 4)
+        std::fprintf(stderr, "world: frame %llu: the camera's push out of geometry gave %g %g %g; not taken\n", (unsigned long long)gs::FramesShown(),
+                     (double)pushed[0], (double)pushed[1], (double)pushed[2]);
+    return false;
+}
+
+void NotePropertyRead(int property, int object, int cls, const int* d, const int* value)
+{
+    static const int traced = std::getenv("SLY1_PROP_TRACE") ? std::atoi(std::getenv("SLY1_PROP_TRACE")) : -2;
+    if (property != traced)
+        return;
+    std::fprintf(stderr, "script: frame %llu: property %d of object %d (class %d) read: descriptor type %d flags 0x%X getter 0x%X argCount %d offset 0x%X; value <%X:%X>\n",
+                 (unsigned long long)gs::FramesShown(), property, object, cls, d ? d[0] : -1, d ? (unsigned)d[1] : 0, d ? (unsigned)d[3] : 0, d ? d[5] : 0, d ? (unsigned)d[6] : 0,
+                 (unsigned)value[0], (unsigned)value[1]);
+}
+
+void NoteScriptCall(int tag, void* fn, int count, const int* args, const int* result)
+{
+    if (ScriptTrace() == -2)
+        return;
+    if (!g_scriptCalls)
+        g_scriptCalls = new ScriptCall[kScriptCalls];
+    ScriptCall& c = g_scriptCalls[g_scriptCallCount++ % kScriptCalls];
+    c.frame = gs::FramesShown();
+    c.fn = fn;
+    c.tag = tag;
+    c.count = count;
+    for (int k = 0; k < 5 && k < count; k++) {
+        c.args[k][0] = args[2 * k];
+        c.args[k][1] = args[2 * k + 1];
+    }
+    c.result[0] = result[0];
+    c.result[1] = result[1];
+    if (ScriptTrace() == -1) {   // every call as it is made
+        std::fprintf(stderr, "script: %llu %s(", (unsigned long long)c.frame, FunctionName(fn, tag));
+        for (int a = 0; a < 5 && a < count; a++)
+            PrintScriptWord(c.args[a]);
+        std::fprintf(stderr, " ) =");
+        PrintScriptWord(c.result);
+        std::fprintf(stderr, "\n");
+    }
+}
+
 void NoteAnimStart(int animation, long from, float length, int flags)
 {
+#if defined(__APPLE__)
+    {   // SLY1_ANIM_STACK=N: who started animation N, as the host's call stack
+        static const int stack = std::getenv("SLY1_ANIM_STACK") ? std::atoi(std::getenv("SLY1_ANIM_STACK")) : -2;
+        if (animation == stack) {
+            void* at[96];
+            const int n = backtrace(at, 96);
+            std::fprintf(stderr, "world: frame %llu: animation %d started by:\n", (unsigned long long)gs::FramesShown(), animation);
+            backtrace_symbols_fd(at, n, 2);
+        }
+    }
+#endif
+    if (animation == ScriptTrace() && g_scriptCalls) {
+        const unsigned n = g_scriptCallCount < kScriptCalls ? g_scriptCallCount : kScriptCalls;
+        for (unsigned k = 0; k < n; k++) {
+            const ScriptCall& c = g_scriptCalls[(g_scriptCallCount - n + k) % kScriptCalls];
+            std::fprintf(stderr, "script: %llu %s(", (unsigned long long)c.frame, FunctionName(c.fn, c.tag));
+            for (int a = 0; a < 5 && a < c.count; a++)
+                PrintScriptWord(c.args[a]);
+            std::fprintf(stderr, " ) =");
+            PrintScriptWord(c.result);
+            std::fprintf(stderr, "\n");
+        }
+    }
     g_animStarts[g_animStartCount++ % 48] = {animation, flags, from, length, gs::FramesShown()};
+    // SLY1_ANIM_LOG=1: each one as it starts, but those of the callers named in SLY1_ANIM_LOG_SKIP
+    // (an offset; the walkers' own start many a second)
+    static const bool on = std::getenv("SLY1_ANIM_LOG") != nullptr;
+    static const long skip = std::getenv("SLY1_ANIM_LOG_SKIP") ? std::atol(std::getenv("SLY1_ANIM_LOG_SKIP")) : 0;
+    if (on && from != skip)
+        std::fprintf(stderr, "world: frame %llu: animation %d of %.2f s started from CreateAnimationPlayer%+ld, flags 0x%X\n",
+                     (unsigned long long)gs::FramesShown(), animation, (double)length, from, (unsigned)flags);
 }
 
 void NoteAnimEvent(int event, int animation, int object, float time, float length, float speed)
