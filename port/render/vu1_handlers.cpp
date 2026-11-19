@@ -3314,6 +3314,231 @@ bool Quads(Runner& r)
     return true;
 }
 
+// --- 0x073 of chunk 19FE9C91 (set B), running on into 1AE4A8D6 to 0x10F: particles as streaks.
+//
+// As 0x000, but each particle is a quad stretched along its motion (rain is drawn with it): the
+// quadratics in its distance give size, alpha and frame as there; its velocity at quadword 1,
+// through 7-9 and scaled by 4.z times 6.w, is the streak's length (made at least twice the size
+// long: the test is the X sign flag of length^2^2 - (2 size)^2, read four instructions on); the
+// width is across both the streak and the view direction (the w's of data memory's 4-6), one
+// size long. The two ends go through 4-7 of data memory, each end with its own Q; a quad with a
+// corner outside the guard band marks its vertices (ADC), else its corners go to the screen.
+// The packet at 48 is kicked.
+bool Streaks(Runner& r)
+{
+    State& st = r.s;
+    std::uint16_t top = (std::uint16_t)r.ctx.top;
+    V h0 = Load(r, top);
+    std::uint16_t vi06 = (std::uint16_t)(Half(h0.x) + top), vi07 = (std::uint16_t)(Half(h0.y) + top);
+    std::uint16_t span = (std::uint16_t)(vi07 - vi06);
+    if (span == 0 || span % 10 || span > 0x400)
+        return false;
+    float (*vf)[4] = st.vf;
+    auto g = [&](int k) { V x = {}; std::memcpy(&x, vf[k], 16); return x; };
+    auto set = [&](int k, const V& x) { std::memcpy(vf[k], &x, 16); };
+    const std::uint16_t vi05 = 32768;
+    set(2, Load(r, 0));
+    set(3, Load(r, 1));
+    set(4, Load(r, (std::uint16_t)(top + 5)));
+    std::uint16_t vi09 = (std::uint16_t)(Half(Load(r, (std::uint16_t)(top + 6)).z) - 1);
+    std::uint16_t vi08 = Half(Load(r, (std::uint16_t)(top + 6)).x);
+    for (int k = 0; k < 4; k++)
+        set(5 + k, Load(r, (std::uint16_t)(top + 1 + k)));
+    r.Qword((std::uint16_t)(vi06 - 1))[0] = FromBits((std::uint16_t)(Half(h0.z) + vi05));
+    for (int k = 0; k < 4; k++)
+        set(10 + k, Load(r, (std::uint16_t)(4 + k)));
+    for (int c = 0; c < 3; c++)
+        vf[14][c] = Add(0.0f, vf[10 + c][3]);
+    for (int k = 0; k < 4; k++)
+        set(25 + k, Load(r, (std::uint16_t)(top + 7 + k)));
+    const float* one = vf[1];
+    float acc[4];
+    float p = st.p, q = st.q;
+    std::uint32_t clip = st.clip;
+    // vf19 = vf18 x vf14 (OPMULA ACC, 18, 14; OPMSUB 19, 14, 18)
+    auto cross = [&] {
+        const float a0 = Mul(vf[18][1], vf[14][2]), a1 = Mul(vf[18][2], vf[14][0]), a2 = Mul(vf[18][0], vf[14][1]);
+        vf[19][0] = Sub(a0, Mul(vf[14][1], vf[18][2]));
+        vf[19][1] = Sub(a1, Mul(vf[14][2], vf[18][0]));
+        vf[19][2] = Sub(a2, Mul(vf[14][0], vf[18][1]));
+    };
+    // vf[k] = 10 * its x + 11 * its y + 12 * its z + 13
+    auto through = [&](int k) {
+        V s = g(k);
+        F4 a = Mul4(g(10).v, Splat(s.x));
+        a = Add4(a, Mul4(g(11).v, Splat(s.y)));
+        a = Add4(a, Mul4(g(12).v, Splat(s.z)));
+        V o;
+        o.v = Add4(a, Mul4(g(13).v, Splat(1.0f)));
+        set(k, o);
+    };
+    // vf[k].xyz = scale * it + vf01 * vf03, and its w the bits given (MFIR)
+    auto toScreen = [&](int k, int scale, std::uint32_t wbits) {
+        for (int c = 0; c < 3; c++)
+            vf[k][c] = Add(Mul(vf[scale][c], vf[k][c]), Mul(one[c], vf[3][c]));
+        vf[k][3] = FromBits(wbits);
+    };
+    do {
+        set(20, Load(r, (std::uint16_t)(vi06 + 3)));
+        vf[31][3] = Sub(vf[4][3], vf[20][3]);
+        vf[30][0] = one[0];
+        vf[30][1] = Add(0.0f, vf[31][3]);
+        vf[30][2] = Add(0.0f, vf[31][3]);
+        set(18, Load(r, (std::uint16_t)(vi06 + 1)));
+        vf[30][2] = Mul(vf[30][2], vf[30][2]);
+        std::uint16_t vi11 = Half(Load(r, (std::uint16_t)(vi06 + 2)).x);
+        auto times30 = [&](int dst, int src) {
+            for (int c = 0; c < 3; c++)
+                vf[dst][c] = Mul(vf[src][c], vf[30][c]);
+        };
+        times30(21, 5);
+        times30(22, 8);
+        times30(23, 7);
+        times30(24, 6);
+        acc[1] = Add(vf[21][1], vf[21][0]);
+        vf[17][1] = Add(acc[1], Mul(one[1], vf[21][2]));
+        acc[2] = Add(vf[22][2], vf[22][0]);
+        vf[17][2] = Add(acc[2], Mul(one[2], vf[22][1]));
+        acc[3] = Mul(one[3], vf[23][0]);
+        acc[3] = Add(acc[3], Mul(one[3], vf[23][1]));
+        vf[17][3] = Add(acc[3], Mul(one[3], vf[23][2]));
+        vf[17][1] = Mini(vf[17][1], 1.0f);
+        vf[17][2] = Mini(vf[17][2], 1.0f);
+        acc[0] = Add(vf[24][0], vf[24][1]);
+        vf[17][0] = Add(acc[0], Mul(one[0], vf[24][2]));
+        vf[17][1] = Max(vf[17][1], 0.0f);
+        vf[17][2] = Max(vf[17][2], 0.0f);
+        vf[17][3] = Ftoi0(vf[17][3]);
+        vf[30][3] = Load(r, (std::uint16_t)(top + 6)).w;
+        {   // the velocity through 7-9
+            V s = g(18);
+            F4 a = Mul4(g(25).v, Splat(s.x));
+            a = Add4(a, Mul4(g(26).v, Splat(s.y)));
+            V o;
+            o.v = Add4(a, Mul4(g(27).v, Splat(s.z)));
+            set(18, o);
+        }
+        std::uint16_t vi01 = Half(Load(r, (std::uint16_t)(vi06 + 2)).y);
+        std::uint16_t vi02 = Half(vf[17][3]);
+        vf[30][2] = Mul(vf[4][2], vf[30][3]);
+        {   // the centre through 7-10
+            V s = g(20);
+            F4 a = Mul4(g(25).v, Splat(s.x));
+            a = Add4(a, Mul4(g(26).v, Splat(s.y)));
+            a = Add4(a, Mul4(g(27).v, Splat(s.z)));
+            V o;
+            o.v = Add4(a, Mul4(g(28).v, Splat(1.0f)));
+            set(20, o);
+        }
+        std::uint16_t vi10 = (std::uint16_t)(((vi01 + vi02) & vi09) + top);
+        for (int c = 0; c < 3; c++)
+            vf[18][c] = Mul(vf[18][c], vf[30][2]);
+        for (int c = 0; c < 3; c++)
+            vf[30][c] = Mul(vf[18][c], vf[18][c]);
+        cross();
+        acc[0] = Add(vf[30][0], vf[30][1]);
+        set(15, Load(r, (std::uint16_t)(vi10 + 15)));
+        vf[30][0] = Add(acc[0], Mul(one[0], vf[30][2]));
+        vf[31][0] = Add(vf[17][0], vf[17][0]);
+        vf[30][0] = Mul(vf[30][0], vf[30][0]);
+        vf[31][0] = Mul(vf[31][0], vf[31][0]);
+        Store(r, vi06, g(15));
+        if (std::signbit(Sub(vf[30][0], vf[31][0]))) {   // shorter than twice the size: made that long
+            vf[30][0] = Erleng(g(18));
+            for (int c = 0; c < 3; c++)
+                vf[18][c] = Mul(vf[18][c], vf[30][0]);
+            vf[30][0] = Add(vf[17][0], vf[17][0]);
+            for (int c = 0; c < 3; c++)
+                vf[18][c] = Mul(vf[18][c], vf[30][0]);
+            cross();
+        }
+        p = Erleng(g(19));
+        vi01 = (std::uint16_t)(top - vi11);
+        set(16, Load(r, (std::uint16_t)(vi01 + 47)));
+        if (vi08 & 1) {
+            V c = g(16);
+            for (int k = 0; k < 4; k++)
+                c[k] = Itof0(c[k]);
+            set(16, c);
+            vf[31][2] = Sub(one[2], vf[17][2]);
+            vi01 = (std::uint16_t)(vi01 - 1);
+            F4 a = Mul4(g(16).v, Splat(vf[31][2]));
+            V n = Load(r, (std::uint16_t)(vi01 + 47));
+            for (int k = 0; k < 4; k++)
+                n[k] = Itof0(n[k]);
+            n.v = Add4(a, Mul4(n.v, Splat(vf[17][2])));
+            for (int k = 0; k < 4; k++)
+                n[k] = Ftoi0(n[k]);
+            set(16, n);
+        }
+        vf[16][3] = Itof0(vf[16][3]);
+        vf[31][0] = Load(r, (std::uint16_t)(top + 11)).x;
+        vf[16][3] = Mul(vf[16][3], vf[17][1]);
+        vf[16][3] = Mul(vf[16][3], vf[31][0]);
+        vf[16][3] = Ftoi0(vf[16][3]);
+        Store(r, (std::uint16_t)(vi06 + 2), g(16));
+        for (int c = 0; c < 3; c++)
+            vf[18][c] = Add(vf[20][c], vf[18][c]);
+        vf[30][0] = p;
+        for (int c = 0; c < 3; c++)
+            vf[19][c] = Mul(vf[19][c], vf[30][0]);
+        for (int c = 0; c < 3; c++)
+            vf[19][c] = Mul(vf[19][c], vf[17][0]);
+        for (int c = 0; c < 3; c++)
+            vf[23][c] = Add(vf[20][c], vf[19][c]);
+        vf[29][1] = one[1];
+        vf[29][2] = one[2];
+        for (int c = 0; c < 3; c++)
+            vf[24][c] = Sub(vf[20][c], vf[19][c]);
+        vf[29][0] = 0.0f;
+        for (int c = 0; c < 3; c++)
+            vf[21][c] = Add(vf[18][c], vf[19][c]);
+        for (int c = 0; c < 3; c++)
+            vf[22][c] = Sub(vf[18][c], vf[19][c]);
+        through(23);
+        Store(r, (std::uint16_t)(vi06 + 4), g(1));
+        Store(r, (std::uint16_t)(vi06 + 1), g(29));
+        vf[29][0] = 0.0f;
+        vf[29][1] = 0.0f;
+        through(21);
+        const float q1 = Reciprocal(r, vf[23][3]);
+        Store(r, (std::uint16_t)(vi06 + 6), g(29));
+        vf[29][0] = one[0];
+        through(24);
+        for (int c = 0; c < 3; c++)
+            vf[30][c] = Mul(vf[2][c], q1);
+        q = Reciprocal(r, vf[21][3]);
+        Store(r, (std::uint16_t)(vi06 + 8), g(29));
+        through(22);
+        clip = ((clip << 6) | ClipCode(g(23))) & 0xFFFFFF;
+        clip = ((clip << 6) | ClipCode(g(24))) & 0xFFFFFF;
+        toScreen(23, 30, 0u);
+        for (int c = 0; c < 3; c++)
+            vf[31][c] = Mul(vf[2][c], q);
+        toScreen(24, 30, 0u);
+        clip = ((clip << 6) | ClipCode(g(21))) & 0xFFFFFF;
+        clip = ((clip << 6) | ClipCode(g(22))) & 0xFFFFFF;
+        toScreen(21, 31, 0xFFFF8000u);
+        toScreen(22, 31, 0xFFFF8000u);
+        Store(r, (std::uint16_t)(vi06 + 3), g(21));
+        if (clip) {
+            for (int k = 1; k < 4; k++)
+                r.Qword((std::uint16_t)(vi06 + 3 + 2 * k))[3] = FromBits(vi05);
+        } else {
+            Store(r, (std::uint16_t)(vi06 + 5), g(22));
+            Store(r, (std::uint16_t)(vi06 + 7), g(23));
+            Store(r, (std::uint16_t)(vi06 + 9), g(24));
+        }
+        vi06 = (std::uint16_t)(vi06 + 10);
+    } while (vi06 != vi07);
+    st.p = p;
+    st.q = q;
+    st.clip = clip;
+    Kick(r, (std::uint16_t)(top + 48));
+    st.pc = 0x110;
+    return true;
+}
+
 // --- 0x45C of chunk 2DDC9AA2 (from 0x477 with vi05 = 13.x - 1, and 0x47B with 0): a morph
 // target added. The weight is 11.w + 22.x's x; when it is 0 (the Z flag, read four instructions
 // on) nothing is added, though the first delta is still loaded in the branch's delay slot. Each
@@ -3650,6 +3875,7 @@ const HandlerEntry kHandlers[] = {
     {0xE1624411, 0x051, BatchSetup, "batch setup", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q I"},
     {0x6744EAB9, 0x1DE, SpotLight, "spot light", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q P I clip"},
     {0x19FE9C91, 0x000, Quads, "particle quads", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q clip"},
+    {0x19FE9C91, 0x073, Streaks, "particle streaks", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "Q P clip"},
     {0x2DDC9AA2, 0x477, MorphFromStride, "morph (from the stride)", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31},
     {0x2DDC9AA2, 0x47B, MorphFromStart, "morph (from the start)", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31},
     {0x2DDC9AA2, 0x47E, UnitNormals, "unit normals", VF_2_TO_9 VF_10_TO_19 VF_20_TO_31 "P"},

@@ -1039,3 +1039,18 @@ so it leaves the building out for that frame too: a sixtieth of a second there, 
 where the port takes two vertical blanks a frame. Left as it is (the port's gameplay is
 retail's); it shortens with the frame.
 
+
+## Particle streaks in native code (2026-11-19)
+
+`SLY1_SAMPLE=1` on the Switch in A Stealthy Approach (a minute of play, 9c1f6cf): of the render
+thread's samples that were not waiting, 47% were in one translated chunk of microcode,
+`chunk_000_19FE9C91`. `SLY1_VU1_PROFILE=1` on the host names the entry: 0x073 of set B's first
+chunk, 97.5% of the instructions the translated microcode ran in the level (4,600 a call, 14,000
+calls in 15 s). It is the third of the particle programs, beside 0x000 (upright quads) and 0x110
+(turned quads): each particle a quad stretched along its motion, which is how the level's rain
+is drawn.
+
+`Streaks` (port/render/vu1_handlers.cpp) is its handler. `SLY1_VU1_CHECK=1` over 600 frames of
+the level: 1,438,611 handler runs compared with the interpreter's, 9,360 of them this one,
+0 differed. On the host the level's VU1 time went from 2.35 s to 2.02 s in 15 s of play (the
+handler takes 0.21 s for what the translated code took about 0.5 s for).
