@@ -146,6 +146,14 @@ PATCHES = [
      "m->p = (u16*)((u8*)m->p + (s32)(m->addr - start));",
      "the morph target's words move by the difference of two u32 addresses, which may be negative"),
 
+    # Widescreen: the emblem that closes and opens over the picture between scenes is drawn straight
+    # into the GS packet with one scale for both axes; across the screen it is 3/4 of that, about
+    # its own centre, so that it keeps its shape in the 16:9 picture.
+    ("src/main/colored_triangle_set.cpp",
+     "    BuildUniformScaleAboutPoint(0, mat, (1.0f - t) * (1280.0f / self->width) + t * (4.0f / self->width));\n",
+     "    BuildUniformScaleAboutPoint(0, mat, (1.0f - t) * (1280.0f / self->width) + t * (4.0f / self->width));\n    mat[0] /= port::WideFactor();\n",
+     "the scene-change emblem's shape in the 16:9 picture"),
+
     # A line in the log for each level load: the two arrival keys and the flags of the request
     # (what the level it was asked from gave), for reproducing a way into a level on the host
     # (SLY1_ARRIVAL).
