@@ -325,12 +325,14 @@ struct Collect {
     std::size_t used = 0;
 };
 thread_local Collect* t_collect = nullptr;
+std::atomic<std::uint64_t> g_jobStaleCodes{0};   // interrupts and microcode loads a job's stale run came to, and left alone
 std::mutex g_gsLock;
 std::condition_variable g_gsWake, g_gsIdle;
 std::deque<GsItem> g_gsQueue;
 std::vector<std::vector<std::uint32_t>> g_gsSpare;
 constexpr std::size_t kGsSpareMost = 2048;   // (SLY1_PERF_LOG's perfjobs line says how often the stock was empty)
-std::atomic<std::uint64_t> g_gsSpareNone{0}, g_gsSpareHad{0};
+std::atomic<std::uint64_t> g_gsSpareNone{0}, g_gsSpareHad{0}, g_gsSpareGrown{0};
+constexpr std::size_t kGsSpareWords = 4096 + 64;
 bool g_gsBusy, g_gsWaiting;
 std::atomic<bool> g_gsStarted;
 // The render thread's items for the GS, passed on together at the end of each of its own items
@@ -367,13 +369,22 @@ std::vector<std::uint32_t> GsSpare()
         }
         if (g_gsLocalSpare.empty()) {
             g_gsSpareNone.fetch_add(1, std::memory_order_relaxed);
-            return {};
+            std::vector<std::uint32_t> fresh;
+            fresh.reserve(kGsSpareWords);
+            return fresh;
         }
     }
     g_gsSpareHad.fetch_add(1, std::memory_order_relaxed);
     std::vector<std::uint32_t> v = std::move(g_gsLocalSpare.back());
     g_gsLocalSpare.pop_back();
     v.clear();
+    // Room for the largest packet or batch (VU1's data memory is 1,024 quadwords): a buffer from
+    // the stock that was too small for what it was taken for grew, an allocation, a copy and a
+    // free each time, a sixth of the render thread's work walking on the Switch.
+    if (v.capacity() < kGsSpareWords) {
+        g_gsSpareGrown.fetch_add(1, std::memory_order_relaxed);
+        v.reserve(kGsSpareWords);
+    }
     return v;
 }
 
@@ -844,7 +855,10 @@ private:
             if (cmd_ == 0x4A) {
                 if (!vu0_ && g_survey.On())
                     SurveyMicrocode();
-                LoadMicrocode();
+                if (t_collect)   // (as the interrupt below: never from a job)
+                    g_jobStaleCodes.fetch_add(1, std::memory_order_relaxed);
+                else
+                    LoadMicrocode();
             } else if (cmd_ == 0x20) {
                 mask_ = data_.empty() ? 0 : data_[0];
             } else if (cmd_ == 0x30 || cmd_ == 0x31) {
@@ -856,6 +870,16 @@ private:
         }
         if (irq_) {
             irq_ = false;
+            // Not from a part's job. A job's packet has no interrupt (its shape says so), but a thread
+            // set aside in the middle of a job goes on with it after the render thread has run the job
+            // itself and the game has been told the list is finished: the packet's memory is then the
+            // next frame's, and what the stale run reads there may be any VIFcode. Its items are
+            // dropped; an interrupt it raised ran the game's handler on the helper thread, a fault on
+            // the Switch (2026-11-20, with the blank's slack on, which lets the game write sooner).
+            if (t_collect) {
+                g_jobStaleCodes.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
             g_counts.vifInterrupts++;
             RaiseInterrupt(cause_);
         }
@@ -3509,7 +3533,7 @@ void RenderThreadMain()
                                      (is[2] - was[2]) / f, (is[3] - was[3]) / f, (is[4] - was[4]) / f, (is[5] - was[5]) / f, (is[6] - was[6]) / f,
                                      (is[7] - was[7]) / f, (times[0] - timesWas[0]) / f / 1e6, (times[1] - timesWas[1]) / f / 1e6);
                     {   // the parts' jobs: how many each thread ran and for how long, and the render thread's wait at its list's end
-                        static std::uint64_t jobsWas[3], nsWas[3], drainWas, waitedWas, spareWas[2];
+                        static std::uint64_t jobsWas[3], nsWas[3], drainWas, waitedWas, spareWas[3];
                         std::uint64_t jobs[3], ns[3];
                         for (int k = 0; k < 3; k++) {
                             jobs[k] = g_jobsBy[k].load();
@@ -3517,10 +3541,11 @@ void RenderThreadMain()
                         }
                         if (since)
                             std::fprintf(stderr, "perfjobs: to %llu, a frame: jobs by the helper %.1f (%.2f ms), the render thread %.1f (%.2f ms), the GS thread %.1f (%.2f ms); "
-                                         "the render thread waited %.2f ms for jobs at its list's end (a job begun elsewhere run again here after %d us); parts waiting to be the same twice %.1f; buffers from the stock %.0f, allocated %.0f\n",
+                                         "the render thread waited %.2f ms for jobs at its list's end (a job begun elsewhere run again here after %d us); parts waiting to be the same twice %.1f; buffers from the stock %.0f, allocated %.0f, grown %.0f; codes a stale job left alone %llu\n",
                                          (unsigned long long)shown, (jobs[0] - jobsWas[0]) / f, (ns[0] - nsWas[0]) / f / 1e6, (jobs[1] - jobsWas[1]) / f, (ns[1] - nsWas[1]) / f / 1e6,
                                          (jobs[2] - jobsWas[2]) / f, (ns[2] - nsWas[2]) / f / 1e6, (g_jobDrainWaitNs - drainWas) / f / 1e6, (int)(JobWaitNs() / 1000),
-                                         (g_partsWaited - waitedWas) / f, (g_gsSpareHad.load() - spareWas[0]) / f, (g_gsSpareNone.load() - spareWas[1]) / f);
+                                         (g_partsWaited - waitedWas) / f, (g_gsSpareHad.load() - spareWas[0]) / f, (g_gsSpareNone.load() - spareWas[1]) / f, (g_gsSpareGrown.load() - spareWas[2]) / f, (unsigned long long)g_jobStaleCodes.load());
+                        spareWas[2] = g_gsSpareGrown.load();
                         spareWas[0] = g_gsSpareHad.load();
                         spareWas[1] = g_gsSpareNone.load();
                         for (int k = 0; k < 3; k++) {

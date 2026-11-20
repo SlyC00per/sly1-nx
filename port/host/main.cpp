@@ -206,6 +206,37 @@ void* Clock(void*)
         {
         next += std::chrono::microseconds(16683);
         std::this_thread::sleep_until(next);
+        // SLY1_VBLANK_SLACK=us: a blank the game is not yet waiting for is held back up to that long,
+        // and given the moment the game comes to wait; the blanks after are counted from then. A
+        // frame that needs 18 ms is then shown after 18, not after 33.4: the game steps by the time
+        // measured (AdvanceGameClock: the cycle counter, between a sixtieth and a thirtieth of a
+        // second), and this clock is not the display's in any case. Only after a blank the game was
+        // waiting for (a load's blanks come on time), and a blank that runs out of slack is given
+        // without moving the ones after it, so a frame of two blanks still takes two.
+        {
+            static const long slack = std::getenv("SLY1_VBLANK_SLACK") ? std::atol(std::getenv("SLY1_VBLANK_SLACK")) : 0;
+            static bool waitedLast = false;
+            static std::uint64_t held, heldUs, blanks;
+            auto waiting = [] { return *(const volatile std::int32_t*)port::Native(0x002BE46C) != 0; };   // g_vblankWaiting
+            const bool was = waitedLast;
+            waitedLast = g_started && waiting();
+            if (slack > 0 && g_started && was && !waitedLast) {
+                const auto until = next + std::chrono::microseconds(slack);
+                while (!waiting() && std::chrono::steady_clock::now() < until)
+                    std::this_thread::sleep_for(std::chrono::microseconds(150));
+                if (waiting()) {
+                    waitedLast = true;
+                    heldUs += (std::uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - next).count();
+                    held++;
+                    next = std::chrono::steady_clock::now();
+                }
+            }
+            if (slack > 0 && ++blanks % 600 == 0 && std::getenv("SLY1_PERF_LOG")) {
+                std::fprintf(stderr, "perfblank: of the last 600 blanks %llu were held back for the game, %.1f ms each\n", (unsigned long long)held,
+                             held ? heldUs / 1000.0 / (double)held : 0.0);
+                held = heldUs = 0;
+            }
+        }
         }
         if (g_started) {
             port::TimelineEvent("vblank");
