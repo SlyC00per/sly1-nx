@@ -477,3 +477,32 @@ Left: movies end at once until the decoder (milestone 3); the room audit covers 
 The pointer model and the float handling follow OpenRAC's port design (its
 `docs/port/DESIGN.md` and `hostgen`), read for this note; no code is taken yet. Anything
 borrowed later is credited in the commit and in `THIRD_PARTY_NOTICES.md`.
+
+## Indirect calls checked without running them (2026-11-20)
+
+`python3 tools/call_types.py --gen=build-fast/gen` reads the generated copy (or the
+decompilation itself without `--gen`) and the class map, and reports where an indirect call's
+declared argument types disagree, pointer against integer, with the functions it reaches: a
+class's method slot against every function a class of that family has in it and against the
+descriptor struct's member; calls through a function-pointer cast, those through `descNN()->mXX`
+against the slot's functions; function-pointer members with the functions assigned to a member of
+that name. Floats are left out of the comparison (they have registers of their own on both
+machines). Three such calls had been found by faulting (docs/RENDERER.md has none of them: "Last
+Call", a scripted jump's target, and FinishPlayerRequest in "Into the Machine").
+
+Its first list, read through on the generated code:
+
+- **A fault waiting**: a trail effect's callback added and removed on its anchor with game
+  addresses for pointers (slots 25 and 26). Patched.
+- **Wrong output**: `GetDecimalDigit`, written on the register view the PS2's soft-float calls give
+  a double; every digit of a printed float was wrong here. Patched to take the double.
+- **Harmless as they are**: the argument is unused by the function that disagrees (slot 37's
+  second argument, slot 58's, slot 81's, `MoveWorld5ModeCollider`'s third), is a flag passed on
+  for its truth (`MoveCollider` to `MovePlacedObject`), or is a constant 0 for a pointer
+  (`PlaceOnTargetPoint`, `PlaceOnTargetCurve`). Slot 27 holds two kinds of function, a mover
+  (self, flag, dt) and a message's receiver (self, message), each called by its own callers.
+- A second check, of every `extern "C"` function declared in more than one way: five names, all
+  an int against a pointer for a semaphore's id or an unused result; none a float or a 64-bit value.
+
+Not covered: a function stored in data the tool cannot follow to its call (the 20 queued calls
+whose function is a variable; the property table's setters, which every level's load runs).

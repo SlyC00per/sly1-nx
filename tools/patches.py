@@ -994,6 +994,48 @@ PATCHES = [
      "        ((void (*)(void*, Player*))fn)((void*)self->lastMessage.data, self);",
      "the request's data is the object that sent it, which its callback takes as a pointer"),
 
+    # Found by tools/call_types.py (indirect calls whose declared argument types disagree with the
+    # functions they reach). A trail effect adds and removes its callback on an anchor through the
+    # object's slots 25 and 26 (AddObjectCallback, RemoveObjectCallback: self, the function, its
+    # context, both pointers); the slots' types said s32 for the context, and for the function too
+    # in the removal, so game addresses went where pointers were expected.
+    ("include/base_object.h",
+     "    void (*m19)(BaseObject* self, void* fn, s32 ctx);",
+     "    void (*m19)(BaseObject* self, void* fn, void* ctx);",
+     "a callback's context is a pointer, as AddObjectCallback takes it"),
+    ("include/base_object.h",
+     "    void (*m1A)(BaseObject* self, s32 fn, s32 ctx);",
+     "    void (*m1A)(BaseObject* self, void* fn, void* ctx);",
+     "a callback and its context are pointers, as RemoveObjectCallback takes them"),
+    ("src/main/effect.cpp",
+     "        anchor->desc->m1A(anchor, (s32)OnTrailAnchorEnded, (s32)self);",
+     "        anchor->desc->m1A(anchor, (void*)OnTrailAnchorEnded, (void*)self);",
+     "a callback and its context are pointers, as RemoveObjectCallback takes them"),
+    ("src/main/effect.cpp",
+     "        other->desc->m19(other, (void*)OnTrailAnchorEnded, (s32)self);",
+     "        other->desc->m19(other, (void*)OnTrailAnchorEnded, (void*)self);",
+     "a callback's context is a pointer, as AddObjectCallback takes it"),
+    # The same tool: a float's digits for printing (%e, %f, %g). GetDecimalDigit is written on the
+    # view the PS2's soft-float calls give a double (a general register), and calls them through
+    # casts to that view; here a double goes in a floating-point register, so the digit function
+    # read its exponent arguments as the value and every digit was wrong. It takes the double.
+    ("src/main/text_format.cpp",
+     "s8 GetDecimalDigit(RegDouble* self0, s32 a, s32 b)\n{\n    RegDouble* self = self0;",
+     "s8 GetDecimalDigit(double self0, s32 a, s32 b)\n{\n    double self = self0;",
+     "the digit function takes the double it is called with"),
+    ("src/main/text_format.cpp",
+     "        RegDouble* p = ((RegDouble* (*)(RegDouble*, double))MultiplyDoubles)(self, ConvertFloatToDouble(t));\n"
+     "        self = ((RegDouble* (*)(RegDouble*))TruncateDouble)(p);\n"
+     "        p = ((RegDouble* (*)(RegDouble*))TruncateDouble)(((RegDouble* (*)(RegDouble*, double))MultiplyDoubles)(self, 0.1));\n"
+     "        p = ((RegDouble* (*)(RegDouble*, u64))MultiplyDoubles)(p, (u64)0x4024000000000000ULL);\n"
+     "        idx = ((s32 (*)(RegDouble*))ConvertDoubleToS32)(((RegDouble* (*)(RegDouble*, RegDouble*))SubtractDoubles)(self, p));",
+     "        double p = MultiplyDoubles(self, ConvertFloatToDouble(t));\n"
+     "        self = TruncateDouble(p);\n"
+     "        p = TruncateDouble(MultiplyDoubles(self, 0.1));\n"
+     "        p = MultiplyDoubles(p, 10.0);\n"
+     "        idx = ConvertDoubleToS32(SubtractDoubles(self, p));",
+     "the same arithmetic on the double itself (0x4024000000000000 is 10.0)"),
+
     # The card is the port's save folder and cannot be taken out: once it is known and its save
     # files are read or made (state 5), the game no longer asks for it three times a second on a
     # thread started for each asking. Until then, and in every other state, it asks as before.
