@@ -2368,7 +2368,30 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
 // helper thread takes jobs in their order, and the render thread the rest when its list is
 // walked; it does not begin the next list before every job of this one is done (a part's packet
 // may lie in the frame's own memory). SLY1_PART_JOBS=0: every part in its turn as before.
+// A job's own copy of its part's packet, as VIF1 would be given it (WalkPart into this in place of
+// a VIF): the job then reads nothing of the game's memory, and the game may be told its list is
+// finished before the job is done. Of a fixed size, made once: a thread set aside in the middle
+// of a job may still be reading it when the job is another part's (it reads other words, and what
+// it makes of them is dropped). A packet too long for it is read where it lies, as before.
+constexpr std::uint32_t kJobWords = 48 * 1024;
+struct JobCopy {
+    std::uint32_t* words;
+    std::uint32_t used = 0;
+    bool over = false;
+    void Words(const std::uint32_t* p, int n)
+    {
+        if (over || used + (std::uint32_t)n > kJobWords) {
+            over = true;
+            return;
+        }
+        std::memcpy(words + used, p, (std::size_t)n * 4);
+        used += (std::uint32_t)n;
+    }
+};
 struct PartJob {
+    std::unique_ptr<std::uint32_t[]> words{new std::uint32_t[kJobWords]};
+    std::uint32_t wordCount = 0;
+    bool copied = false;
     vu1::Lane* lane = vu1::LaneNew();
     std::uint32_t target = 0, key = 0;
     bool tte = false;
@@ -2396,7 +2419,8 @@ std::mutex g_jobFreeLock;   // (the render thread and the GS thread: never the h
 std::vector<std::uint32_t> g_jobWrongKeys;         // parts whose job left other registers than foretold
 std::atomic<std::uint32_t> g_jobsOut;              // jobs made and not yet done
 std::atomic<std::uint64_t> g_jobsBy[3], g_jobNsBy[3], g_jobsWrong;   // by the helper, the render thread, the GS thread
-std::uint64_t g_jobsMade, g_jobsShape, g_jobSerial;
+std::uint64_t g_jobsMade, g_jobsShape, g_jobSerial, g_jobWordsCopied, g_jobsNotCopied, g_drainsLater;
+bool g_listJobsLive, g_drainOwed;   // (the render thread's) a job of this list reads the game's memory; the list's jobs are yet to be seen done
 std::atomic<std::uint64_t> g_jobsAgain, g_jobsChecked, g_jobsDiffered;   // jobs run a second time by a thread that needed them
 std::uint64_t g_jobDrainWaitNs;
 std::uint64_t g_jobMakeNs[4];   // making a job: the shape's hash, the job taken, VU1 copied, queued
@@ -2408,7 +2432,7 @@ bool PartJobsOn()
 }
 
 // The part's packet through vif: the walk PartHash makes, the data given to the VIF.
-bool WalkPart(std::uint32_t target, bool tte, Vif& vif)
+template <class Sink> bool WalkPart(std::uint32_t target, bool tte, Sink& vif)
 {
     bool wild = false;
     auto inMemory = [&](std::uint32_t addr, std::uint32_t quads) {
@@ -2485,7 +2509,14 @@ bool PartJobWork(PartJob& j, Collect& out)
     vu1::LaneEnter(work);
     t_collect = &out;
     vif->SetRegs(j.before);
-    const bool right = WalkPart(j.target, j.tte, *vif) && vif->BetweenCodes() && vif->GetRegs() == j.after;
+    bool walked;
+    if (j.copied) {
+        vif->Words(j.words.get(), (int)std::min<std::uint32_t>(j.wordCount, kJobWords));
+        walked = true;
+    } else {
+        walked = WalkPart(j.target, j.tte, *vif);
+    }
+    const bool right = walked && vif->BetweenCodes() && vif->GetRegs() == j.after;
     if (!vif->BetweenCodes()) {   // left inside a code: not used again
         delete vif;
         vif = nullptr;
@@ -2595,6 +2626,7 @@ void PartJobsBegin()
     g_listJobCount.store(0, std::memory_order_release);
     for (std::uint32_t k = 0; k < had; k++)
         g_listJobs[k].reset();
+    g_listJobsLive = false;
     if (g_jobsWrong.load(std::memory_order_acquire) == 0)
         return;
     std::vector<std::uint32_t> keys;
@@ -2724,6 +2756,21 @@ bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
         job->hasRef = check;
         if (check)
             PartJobWork(*job, job->ref);
+    }
+    {   // the packet copied for the job (SLY1_JOB_COPY=0: read where it lies, and the list's end waits for the jobs)
+        static const bool copy = !std::getenv("SLY1_JOB_COPY") || std::getenv("SLY1_JOB_COPY")[0] != '0';
+        job->copied = false;
+        if (copy) {
+            JobCopy c{job->words.get()};
+            const bool ok = WalkPart(job->target, job->tte, c) && !c.over;
+            job->wordCount = c.used;
+            job->copied = ok;
+            g_jobWordsCopied += c.used;
+        }
+        if (!job->copied) {
+            g_listJobsLive = true;
+            g_jobsNotCopied++;
+        }
     }
     job->gen.fetch_add(1, std::memory_order_seq_cst);   // made: threads may run it
     const std::uint64_t tQueue = NowNs();
@@ -3415,6 +3462,14 @@ void RenderThreadMain()
         {
             std::unique_lock<std::mutex> lk(g_renderLock);
             g_renderBusy = false;
+            if (g_renderQueue.empty() && g_drainOwed) {   // nothing queued: the last list's jobs seen done now
+                g_renderBusy = true;
+                lk.unlock();
+                PartJobsDrain();
+                g_drainOwed = false;
+                TIMELINE("render: the jobs are done");
+                continue;
+            }
             if (g_renderQueue.empty()) {
                 g_renderIdle.notify_all();
                 g_renderWaiting = true;
@@ -3430,6 +3485,10 @@ void RenderThreadMain()
         const std::uint64_t started = NowNs();
         const int kind = (int)item.kind;
         TIMELINE("render starts %s", kind == 0 ? "VIF1 (copy)" : kind == 3 ? "VIF1 (in place)" : kind == 1 ? "GIF" : "a call");
+        if ((kind == 0 || kind == 3) && g_drainOwed) {   // (a list begins with the last one's jobs done: PartJobsBegin)
+            PartJobsDrain();
+            g_drainOwed = false;
+        }
         if (kind == 0 || kind == 3)
             g_listAt = started;
         if (gsThread && (kind == 0 || kind == 3) && FinishLag())
@@ -3463,7 +3522,16 @@ void RenderThreadMain()
             g_listWalked.store(false, std::memory_order_release);
             if (g_jobsOut.load(std::memory_order_acquire) != 0) {
                 GsPassOn();   // (the GS thread may take what is left as it comes to it)
-                PartJobsDrain();
+                // With every job on a copy of its packet the game is told the list is finished now, and
+                // the jobs are seen done after: when this thread has nothing queued, and before its
+                // next list in any case. Waiting for them here was 3 ms of a frame on the Switch
+                // standing and 7 to 8 walking, with the game's frame held for as long.
+                if (g_listJobsLive) {
+                    PartJobsDrain();
+                } else {
+                    g_drainOwed = true;
+                    g_drainsLater++;
+                }
             }
             TIMELINE("render: the parts are in");
             break;
@@ -3559,7 +3627,7 @@ void RenderThreadMain()
                                      (is[2] - was[2]) / f, (is[3] - was[3]) / f, (is[4] - was[4]) / f, (is[5] - was[5]) / f, (is[6] - was[6]) / f,
                                      (is[7] - was[7]) / f, (times[0] - timesWas[0]) / f / 1e6, (times[1] - timesWas[1]) / f / 1e6);
                     {   // the parts' jobs: how many each thread ran and for how long, and the render thread's wait at its list's end
-                        static std::uint64_t jobsWas[3], nsWas[3], drainWas, waitedWas, spareWas[3];
+                        static std::uint64_t jobsWas[3], nsWas[3], drainWas, waitedWas, spareWas[3], copiedWas;
                         std::uint64_t jobs[3], ns[3];
                         for (int k = 0; k < 3; k++) {
                             jobs[k] = g_jobsBy[k].load();
@@ -3567,10 +3635,11 @@ void RenderThreadMain()
                         }
                         if (since)
                             std::fprintf(stderr, "perfjobs: to %llu, a frame: jobs by the helper %.1f (%.2f ms), the render thread %.1f (%.2f ms), the GS thread %.1f (%.2f ms); "
-                                         "the render thread waited %.2f ms for jobs at its list's end (a job begun elsewhere run again here after %d us); parts waiting to be the same twice %.1f; buffers from the stock %.0f, allocated %.0f, grown %.0f; codes a stale job left alone %llu\n",
+                                         "the render thread waited %.2f ms for jobs at its list's end (a job begun elsewhere run again here after %d us); parts waiting to be the same twice %.1f; buffers from the stock %.0f, allocated %.0f, grown %.0f; codes a stale job left alone %llu; jobs not on a copy %llu, words copied a frame %.0f\n",
                                          (unsigned long long)shown, (jobs[0] - jobsWas[0]) / f, (ns[0] - nsWas[0]) / f / 1e6, (jobs[1] - jobsWas[1]) / f, (ns[1] - nsWas[1]) / f / 1e6,
                                          (jobs[2] - jobsWas[2]) / f, (ns[2] - nsWas[2]) / f / 1e6, (g_jobDrainWaitNs - drainWas) / f / 1e6, (int)(JobWaitNs() / 1000),
-                                         (g_partsWaited - waitedWas) / f, (g_gsSpareHad.load() - spareWas[0]) / f, (g_gsSpareNone.load() - spareWas[1]) / f, (g_gsSpareGrown.load() - spareWas[2]) / f, (unsigned long long)g_jobStaleCodes.load());
+                                         (g_partsWaited - waitedWas) / f, (g_gsSpareHad.load() - spareWas[0]) / f, (g_gsSpareNone.load() - spareWas[1]) / f, (g_gsSpareGrown.load() - spareWas[2]) / f, (unsigned long long)g_jobStaleCodes.load(), (unsigned long long)g_jobsNotCopied, (g_jobWordsCopied - copiedWas) / f);
+                        copiedWas = g_jobWordsCopied;
                         spareWas[2] = g_gsSpareGrown.load();
                         spareWas[0] = g_gsSpareHad.load();
                         spareWas[1] = g_gsSpareNone.load();

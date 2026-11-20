@@ -1221,3 +1221,22 @@ on the Switch at 3e85119 plus the tour: 20.2, 17.4, 16.7, 17.3, 16.9 and 20.8 ms
 the mean. It is lighter than play: walked by hand the same level's slow stretches are 24 to 27 ms
 with the render thread at 15 to 17 ms and the GS thread at 16 to 19. The tour compares builds; it
 does not say what a player gets.
+
+### The jobs off the frame's path (2026-11-20)
+
+`SLY1_TIMELINE` over 229 frames walked on the Switch (211 of one blank, 18 of two), from the
+game's swap: the list queued at 1.7 ms, walked by 7.4 (8.2 in the frames of two blanks), the
+parts' jobs in by 10.7 (15.8), FINISH told at 11.0 (16.1), the game's frame done at 12.5 (17.4).
+The render thread's wait for the jobs at its list's end, 3 ms standing and 7 to 8 walking, was
+what took a frame past its blank: no thread's own work did. (The averages of `SLY1_PERF_LOG`
+and the samples had not shown it: three cuts made from them changed nothing a player could
+measure.)
+
+The wait was there because a job reads its part's packet where it lies, in memory the game
+writes again once it is told the list is finished. A job now has a copy of its packet, made
+when the job is (`JobCopy`: WalkPart into a buffer of 48 K words that the job keeps; a longer
+packet is read where it lies and the list waits as before). With every job of a list on a copy
+the game is told at once, and the render thread sees the jobs done when it has nothing queued,
+and before its next list in any case. `SLY1_JOB_COPY=0`: as before. In Ryujinx at A Stealthy
+Approach's start: every job on a copy, 102,000 words copied a frame, and a lockstep capture of
+frame 1290 the same picture to the last value.
