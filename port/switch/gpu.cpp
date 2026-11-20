@@ -200,6 +200,7 @@ private:
     // 3 the right half of the frame, 4 the batches that do not add (the surfaces themselves),
     // 5 every run that is not a batch, 6 every batch, 7 the runs and the batches that add
     long mergedTwoPass_ = 0, mergedOnePass_ = 0;   // (SLY1_GPU_VARY=3's count of merged draws by their alpha test's passes)
+    std::unordered_map<std::uint64_t, bool> doubledKept_;   // (Doubled's answers for kept batches, by their keys)
     int vary_ = -1, varyRuns_ = -1;   // (varyRuns_: SLY1_GPU_VARY=2, kinds of the runs that are not batches)
     std::uint64_t varySerialNs_ = 0, varySends_ = 0;   // (SLY1_GPU_VARY: every list waited for, and the waits' total)
     std::uint64_t varyDrainNs_ = 0, varyCpuAt_ = 0, varyCpuNs_ = 0, varyFrames_ = 0;
@@ -1214,6 +1215,22 @@ void Renderer::FlushHeld()
 // Whether two of a batch's triangles have the same three corners (a leaf's two faces).
 bool Renderer::Doubled(const gs::Batch& b)
 {
+    // A kept batch (a part drawn again from what was kept of it) has the vertices it had: the answer
+    // is kept by its key. Looking each frame was 7% of the GS thread, walking on the Switch.
+    if (b.keep != 0) {
+        auto it = doubledKept_.find(b.keep);
+        if (it != doubledKept_.end()) {
+            doubledBatches_ += it->second ? 1 : 0;
+            return it->second;
+        }
+        if (doubledKept_.size() > 200000)
+            doubledKept_.clear();
+        gs::Batch plain = b;
+        plain.keep = 0;
+        const bool is = Doubled(plain);
+        doubledKept_[b.keep] = is;
+        return is;
+    }
     const std::uint32_t step = b.stride * 4, at = b.positionAt * 4;
     std::size_t size = 64;
     while (size < (std::size_t)b.count * 2)
@@ -1300,7 +1317,8 @@ void Renderer::Layer(const gs::DrawState& s, const Source& src, const gs::Batch&
         }
         {
             static int why;
-            if (std::getenv("SLY1_GPU_LAYER_LOG") && share && why++ < 12)
+            static const bool log = std::getenv("SLY1_GPU_LAYER_LOG") != nullptr;   // (read once: getenv for each batch was 5% of the GS thread)
+            if (log && share && why++ < 12)
                 std::fprintf(stderr, "layer: not taken: layers %u id %d count %d cull %d texture %d tme %d fge %d fba %d tex0 %d (%llX %llX) tex1 %d clamp %d frame %d zbuf %d scissor %d texa %d fogcol %d matrix %d\n",
                              surface_.src.layers, b.id == surface_.batch.id, b.count == surface_.batch.count, b.cull == surface_.batch.cull, texture_ == surface_.texture, s.tme == h.tme,
                              s.fge == h.fge, s.fba == h.fba, s.tex0 == h.tex0, (unsigned long long)s.tex0, (unsigned long long)h.tex0, s.tex1 == h.tex1, s.clamp == h.clamp, s.frame == h.frame,
@@ -1310,7 +1328,8 @@ void Renderer::Layer(const gs::DrawState& s, const Source& src, const gs::Batch&
     }
     {
         static int said;
-        if (std::getenv("SLY1_GPU_LAYER_LOG") && frames_ > 1000 && said < 40 && said++ >= 0)
+        static const bool log = std::getenv("SLY1_GPU_LAYER_LOG") != nullptr;
+        if (log && frames_ > 1000 && said < 40 && said++ >= 0)
             std::fprintf(stderr, "layer: id %u count %u abe %u alpha %llX test %llX tme %u tfx %u target %d view %d vary %d rec %d\n", b.id, b.count, s.abe, (unsigned long long)s.alpha,
                          (unsigned long long)s.test, s.tme, (unsigned)((s.tex0 >> 35) & 3), TargetFor(s), view_, vary_, (int)recording_);
     }
