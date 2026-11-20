@@ -338,6 +338,11 @@ PATCHES = [
      "    }\n"
      "    PopBackMemoryMark();",
      "a camera push beyond the world not taken"),
+    # SLY1_COLOUR_TRACE=1: an object's tree given another colour (SetObjectTreeRecordValue).
+    ("src/main/placed_object.cpp",
+     "    PlacedObject* child = (PlacedObject*)object->children.head;\n    object->recordValue = value;\n    object->recordFlags |= 2;",
+     "    PlacedObject* child = (PlacedObject*)object->children.head;\n    port::NoteObjectColour(object->id, value);\n    object->recordValue = value;\n    object->recordFlags |= 2;",
+     "an object's colour noted for the trace"),
     # SLY1_PROP_TRACE=N: each read of property N by a script: the object, its class, the descriptor.
     ("src/main/object_properties.cpp",
      "        PropertyDescriptor* r = FindPropertyDescriptor(p, n);\n        ReadPropertyValue(self, p, r);",

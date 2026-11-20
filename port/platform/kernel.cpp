@@ -460,6 +460,37 @@ bool CameraPushInWorld(const float* pushed, const float* dest)
     return false;
 }
 
+void NoteObjectColour(int object, unsigned value)
+{
+    static const bool on = std::getenv("SLY1_COLOUR_TRACE") != nullptr;
+    if (!on)
+        return;
+    static int ids[64];
+    static unsigned values[64];
+    static int used, said;
+    int k = 0;
+    for (; k < used && ids[k] != object; k++) {
+    }
+    if (k == used) {
+        if (used == 64)
+            return;
+        ids[used] = object;
+        values[used++] = ~value;
+    }
+    // (a pulse changes it every frame: only a change of 24 or more in a channel is said, 400 in all)
+    const unsigned was = values[k];
+    bool far = false;
+    for (int c = 0; c < 4; c++) {
+        const int d = (int)((value >> (8 * c)) & 0xFF) - (int)((was >> (8 * c)) & 0xFF);
+        far = far || d >= 24 || d <= -24;
+    }
+    if (!far || said++ >= 400)
+        return;
+    values[k] = value;
+    std::fprintf(stderr, "world: frame %llu: object %d's colour set to %u %u %u alpha %u\n", (unsigned long long)gs::FramesShown(), object, value & 0xFF, (value >> 8) & 0xFF,
+                 (value >> 16) & 0xFF, value >> 24);
+}
+
 void NotePropertyRead(int property, int object, int cls, const int* d, const int* value)
 {
     static const int traced = std::getenv("SLY1_PROP_TRACE") ? std::atoi(std::getenv("SLY1_PROP_TRACE")) : -2;

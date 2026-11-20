@@ -148,6 +148,8 @@ void NoteCamera(const float* position, int areaMask);
 // Whether the place the camera's push out of geometry gives is one to take: finite, and within
 // 10,000 units of where the camera was going (tools/patches.py says why it can be neither).
 bool CameraPushInWorld(const float* pushed, const float* dest);
+// SLY1_COLOUR_TRACE=1: an object given a colour other than the one it was last given.
+void NoteObjectColour(int object, unsigned value);
 void NotePropertyRead(int property, int object, int cls, const int* descriptor, const int* value);
 // The 2D elements in the 16:9 picture (tools/patches.py). Wide2D(middle): what is drawn from now
 // is one element whose middle rests at that x of the 640 (it is drawn 3/4 as wide about the
