@@ -1961,6 +1961,11 @@ void PartForget(PartRecord& r)
 // what was on the game's stack.
 // A part drawn the long way is lit by VU1 from the header: its colours are right only while the
 // inverse matrix and the centre are the same too (4 to 10 whole).
+bool KeepTwice()
+{
+    static const bool twice = !std::getenv("SLY1_PART_KEEP_TWICE") || std::getenv("SLY1_PART_KEEP_TWICE")[0] != '0';
+    return twice;
+}
 bool PartHeaderSame(const std::uint32_t a[44], const std::uint32_t b[44], bool slow)
 {
     // (its mode, 9.y: -1 unlit and 0 lit by its cache alone read neither, as a part drawn from its
@@ -2145,6 +2150,27 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
         g_partHashNs += NowNs() - h0;
         return h;
     };
+    // A part whose header or registers are neither what it was kept with nor what the list before
+    // had is run as ever without being hashed: it cannot be drawn again, and it is not kept until
+    // two lists running have it the same (below). Hashing such parts here was a tenth of the render
+    // thread's work walking on the Switch (the helper's hashes come a list late for them).
+    if (!late && it != g_parts.end() && !it->second.moving && KeepTwice()) {
+        PartRecord& r = it->second;
+        const bool asKept = r.ok && r.before == regs && PartHeaderSame(r.header, header, slow);
+        const bool asSeen = r.seenList != 0 && r.seenList + 1 >= g_listSerial && r.seenRegs == regs && PartHeaderSame(r.seenHeader, header, slow);
+        if (!asKept && !asSeen) {
+            if (r.ok) {
+                g_partsStale++;
+                g_partsStaleBy[r.before == regs ? 2 : 1]++;
+            }
+            r.seenHash = 0;
+            r.seenList = g_listSerial;
+            r.seenRegs = regs;
+            std::memcpy(r.seenHeader, header, sizeof r.seenHeader);
+            g_partsWaited++;
+            return false;
+        }
+    }
     if (!late)
         hash = hashNow();
     if (it != g_parts.end() && it->second.moving && it->second.hash == hash) {
@@ -2262,7 +2288,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     // was met, which costs several times running it: 4 to 5 parts a frame and 6 ms of the render
     // thread on the Switch, walking through A Stealthy Approach. SLY1_PART_KEEP_TWICE=0: at once.
     {
-        static const bool twice = !std::getenv("SLY1_PART_KEEP_TWICE") || std::getenv("SLY1_PART_KEEP_TWICE")[0] != '0';
+        const bool twice = KeepTwice();
         const bool asSeen = r.seenList != 0 && r.seenList + 1 >= g_listSerial && r.seenHash == hash && r.seenRegs == regs && PartHeaderSame(r.seenHeader, header, slow);
         if (twice && !asSeen) {
             r.seenHash = hash;
