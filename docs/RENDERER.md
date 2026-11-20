@@ -1183,3 +1183,25 @@ is on unless `SLY1_FINISH_LAG=0`.
 The display's own vertical blank is still not had: a second opening of the display is refused
 (0x1272) and its event by the display's number too (0xE72). The game's blank stays this
 program's clock.
+
+### Walking: the render thread's allocations (2026-11-20)
+
+Played through A Stealthy Approach the Switch held 16.7 ms only standing still; walking, most
+frames took two blanks with the render thread at 16 to 18 ms and no wait for the GPU. (The game
+queues its list 2 ms after the blank and cannot end its frame before the render thread has, so
+the render thread has about 13 ms.) `SLY1_SAMPLE=2` samples the render and GS threads only
+while fewer than 48 frames a second are shown and prints each sample's callers by the frame
+records (`samplechain:`; nothing is allocated while a thread is stopped, which may be inside the
+allocator: that stopped the program). `SLY1_PERF_LOG=1` has a line for the parts' jobs
+(`perfjobs:`).
+
+- A third of the render thread's work there was the allocator (operator new 23%, free 9%, its
+  lock contended with the GS thread's frees 7%): the buffers of the items it queues for the GS
+  thread. The stock of emptied buffers held 256 and the GS thread gave back 256 of each lot it
+  took, where a frame has a thousand items: the rest were freed and allocated anew each frame.
+  Both are 2,048 now, and no buffer is allocated in a still scene (835 a frame from the stock).
+- A part is kept anew only when two lists running have it the same (`SLY1_PART_KEEP_TWICE=0`:
+  at once). Parts whose header changes with the camera were kept each time they were met, 4 to
+  5 a frame. Worth little by itself: such a part is run in full either way.
+- Not the cause: the render thread's wait for jobs at its list's end (0.1 ms a frame;
+  `SLY1_JOB_WAIT_US` sets after how long a job begun elsewhere is run again).

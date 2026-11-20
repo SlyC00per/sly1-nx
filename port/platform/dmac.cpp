@@ -329,6 +329,8 @@ std::mutex g_gsLock;
 std::condition_variable g_gsWake, g_gsIdle;
 std::deque<GsItem> g_gsQueue;
 std::vector<std::vector<std::uint32_t>> g_gsSpare;
+constexpr std::size_t kGsSpareMost = 2048;   // (SLY1_PERF_LOG's perfjobs line says how often the stock was empty)
+std::atomic<std::uint64_t> g_gsSpareNone{0}, g_gsSpareHad{0};
 bool g_gsBusy, g_gsWaiting;
 std::atomic<bool> g_gsStarted;
 // The render thread's items for the GS, passed on together at the end of each of its own items
@@ -359,13 +361,16 @@ std::vector<std::uint32_t> GsSpare()
     std::vector<std::vector<std::uint32_t>>& g_gsLocalSpare = *t_gsLocalSpare;
     if (g_gsLocalSpare.empty()) {
         std::lock_guard<std::mutex> lk(g_gsLock);
-        for (int k = 0; k < 64 && !g_gsSpare.empty(); k++) {
+        for (int k = 0; k < 256 && !g_gsSpare.empty(); k++) {
             g_gsLocalSpare.push_back(std::move(g_gsSpare.back()));
             g_gsSpare.pop_back();
         }
-        if (g_gsLocalSpare.empty())
+        if (g_gsLocalSpare.empty()) {
+            g_gsSpareNone.fetch_add(1, std::memory_order_relaxed);
             return {};
+        }
     }
+    g_gsSpareHad.fetch_add(1, std::memory_order_relaxed);
     std::vector<std::uint32_t> v = std::move(g_gsLocalSpare.back());
     g_gsLocalSpare.pop_back();
     v.clear();
@@ -1413,6 +1418,11 @@ struct PartRecord {
     // until it has been drawn again 60 times from one keeping. Keeping a part costs several
     // times running it, and a part that fades for seconds was kept anew three times a second.
     std::uint32_t lockout = 0, replays = 0;
+    // what the part was when it was last found other than kept (or new): it is kept anew only when
+    // the next list has it the same (PartCall)
+    std::uint64_t seenHash = 0, seenList = 0;
+    std::uint32_t seenHeader[44] = {};
+    Vif::Regs seenRegs = {};
     std::uint32_t ids = 0;               // the batches' ids run from firstId for this many
     std::uint32_t firstId = 0;
     // while it is recorded
@@ -1647,7 +1657,7 @@ void HashTakeResults()
     results.clear();
 }   // by the hook's packet and half
 std::uint64_t g_partTimes[2];   // ns: parts drawn again, parts run in full
-std::uint64_t g_partsTexMoved, g_partsReplayed, g_partsRecorded, g_partsRefused, g_partsStale, g_partItemsReplayed, g_partsMoving, g_partsStaleBy[3], g_partHashNs, g_partWords, g_partsCleared, g_partKey, g_partsFickle;
+std::uint64_t g_partsTexMoved, g_partsReplayed, g_partsRecorded, g_partsRefused, g_partsStale, g_partItemsReplayed, g_partsMoving, g_partsStaleBy[3], g_partHashNs, g_partWords, g_partsCleared, g_partKey, g_partsFickle, g_partsWaited;
 constexpr std::size_t kBatchHead = 1 + (sizeof(gs::Batch) + 3) / 4;
 
 bool PartReplayOn()
@@ -2223,6 +2233,22 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
         g_partsFickle++;
         return false;
     }
+    // Kept only when it is what it was in the list before. A part whose header is other each frame
+    // while the camera moves (one VU1 lights from its inverse matrix) was kept anew every time it
+    // was met, which costs several times running it: 4 to 5 parts a frame and 6 ms of the render
+    // thread on the Switch, walking through A Stealthy Approach. SLY1_PART_KEEP_TWICE=0: at once.
+    {
+        static const bool twice = !std::getenv("SLY1_PART_KEEP_TWICE") || std::getenv("SLY1_PART_KEEP_TWICE")[0] != '0';
+        const bool asSeen = r.seenList != 0 && r.seenList + 1 >= g_listSerial && r.seenHash == hash && r.seenRegs == regs && PartHeaderSame(r.seenHeader, header, slow);
+        if (twice && !asSeen) {
+            r.seenHash = hash;
+            r.seenList = g_listSerial;
+            r.seenRegs = regs;
+            std::memcpy(r.seenHeader, header, sizeof r.seenHeader);
+            g_partsWaited++;
+            return false;
+        }
+    }
     g_partWords -= std::min<std::uint64_t>(g_partWords, r.words);   // what it held before is let go
     PartForget(r);
     {
@@ -2461,12 +2487,21 @@ bool PartJobRun(PartJob& j, int who, bool again = false)
 
 // (the render thread or the GS thread) The job is needed now: run here if not begun, waited for
 // a little if begun elsewhere (a job takes a quarter of a millisecond), then run here again.
+// (SLY1_JOB_WAIT_US=N: for N microseconds; SLY1_JOB_WAIT_US=ab: 400 and 150 in turn, 600 frames each)
+std::uint64_t JobWaitNs()
+{
+    static const char* const e = std::getenv("SLY1_JOB_WAIT_US");
+    static const std::uint64_t fixed = e && e[0] != 'a' ? (std::uint64_t)std::atol(e) * 1000 : 400000;
+    if (e && e[0] == 'a')
+        return gs::FramesShown() / 600 % 2 ? 150000 : 400000;
+    return fixed;
+}
 void PartJobNeed(PartJob& j, int who)
 {
     while (j.state.load(std::memory_order_acquire) != 2) {
         if (PartJobRun(j, who))
             continue;
-        if (NowNs() - j.begunAt > 400000)
+        if (NowNs() - j.begunAt > JobWaitNs())
             PartJobRun(j, who, true);
         else
             std::this_thread::yield();
@@ -3132,8 +3167,11 @@ void GsThreadMain()
     for (;;) {
         if (!jobNow && taken.empty()) {
             std::unique_lock<std::mutex> lk(g_gsLock);
+            // (A frame has a thousand items and more where much is in sight. With a stock of 256 the
+            // render thread ran out each frame and allocated the rest: a third of its work, walking
+            // through A Stealthy Approach on the Switch, the allocator's lock among it.)
             for (auto& v : emptied)
-                if (g_gsSpare.size() < 256)
+                if (g_gsSpare.size() < kGsSpareMost)
                     g_gsSpare.push_back(std::move(v));
             emptied.clear();
             g_gsBusy = false;
@@ -3311,7 +3349,7 @@ void GsThreadMain()
                 k += (std::size_t)taken * 4;
             }
         }
-        if (itemp == &owned && item.words.capacity() && emptied.size() < 256)
+        if (itemp == &owned && item.words.capacity() && emptied.size() < kGsSpareMost)
             emptied.push_back(std::move(item.words));
     }
 }
@@ -3470,6 +3508,28 @@ void RenderThreadMain()
                                      "fickle %.0f, batches %.0f; ms: drawing again %.2f, parts in full %.2f\n", (unsigned long long)shown, (is[0] - was[0]) / f, (is[1] - was[1]) / f,
                                      (is[2] - was[2]) / f, (is[3] - was[3]) / f, (is[4] - was[4]) / f, (is[5] - was[5]) / f, (is[6] - was[6]) / f,
                                      (is[7] - was[7]) / f, (times[0] - timesWas[0]) / f / 1e6, (times[1] - timesWas[1]) / f / 1e6);
+                    {   // the parts' jobs: how many each thread ran and for how long, and the render thread's wait at its list's end
+                        static std::uint64_t jobsWas[3], nsWas[3], drainWas, waitedWas, spareWas[2];
+                        std::uint64_t jobs[3], ns[3];
+                        for (int k = 0; k < 3; k++) {
+                            jobs[k] = g_jobsBy[k].load();
+                            ns[k] = g_jobNsBy[k].load();
+                        }
+                        if (since)
+                            std::fprintf(stderr, "perfjobs: to %llu, a frame: jobs by the helper %.1f (%.2f ms), the render thread %.1f (%.2f ms), the GS thread %.1f (%.2f ms); "
+                                         "the render thread waited %.2f ms for jobs at its list's end (a job begun elsewhere run again here after %d us); parts waiting to be the same twice %.1f; buffers from the stock %.0f, allocated %.0f\n",
+                                         (unsigned long long)shown, (jobs[0] - jobsWas[0]) / f, (ns[0] - nsWas[0]) / f / 1e6, (jobs[1] - jobsWas[1]) / f, (ns[1] - nsWas[1]) / f / 1e6,
+                                         (jobs[2] - jobsWas[2]) / f, (ns[2] - nsWas[2]) / f / 1e6, (g_jobDrainWaitNs - drainWas) / f / 1e6, (int)(JobWaitNs() / 1000),
+                                         (g_partsWaited - waitedWas) / f, (g_gsSpareHad.load() - spareWas[0]) / f, (g_gsSpareNone.load() - spareWas[1]) / f);
+                        spareWas[0] = g_gsSpareHad.load();
+                        spareWas[1] = g_gsSpareNone.load();
+                        for (int k = 0; k < 3; k++) {
+                            jobsWas[k] = jobs[k];
+                            nsWas[k] = ns[k];
+                        }
+                        drainWas = g_jobDrainWaitNs;
+                        waitedWas = g_partsWaited;
+                    }
                     {   // where the player is (g_player's position), to find the place again
                         const std::uint32_t player = *static_cast<const std::uint32_t*>(Native(0x00262E10));
                         if (player >= 0x00100000 && player < kRamSize - 0x200) {

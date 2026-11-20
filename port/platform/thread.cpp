@@ -86,6 +86,7 @@ namespace {
 Handle g_sampled[3];   // the render thread's and the GS thread's; the game's main thread in its window (SampleWindow)
 std::vector<std::uint32_t> g_samples[3];
 std::map<std::vector<std::uint32_t>, std::uint32_t> g_mainStacks;   // the main thread's: what its stack holds of code addresses, counted
+std::map<std::vector<std::uint32_t>, std::uint32_t> g_chains[2];   // the render and GS threads': the callers, by the frame records
 std::atomic<std::uint64_t> g_windowFrom{0};   // (armGetSystemTick's value when the window opened; 0 shut)
 std::atomic<bool> g_sampling;
 Thread g_sampler;
@@ -106,13 +107,25 @@ void Sampler(void*)
             to = b;
         }
     }
+    // SLY1_SAMPLE=2: the render and GS threads only while fewer than 48 frames a second are shown
+    // (told each quarter of a second), and the report after 40 s of them
+    static const bool slowOnly = std::getenv("SLY1_SAMPLE")[0] == '2';
+    bool slow = false;
+    std::uint64_t markTick = armGetSystemTick(), markShown = gs::FramesShown();
     while (g_sampling.load()) {
         svcSleepThread(1000000);
         const std::uint64_t shown = gs::FramesShown();
+        if (armTicksToNs(armGetSystemTick() - markTick) >= 250000000ull) {
+            slow = shown - markShown < 12;
+            markTick = armGetSystemTick();
+            markShown = shown;
+        }
         if (shown < from || shown > to)
             continue;
         for (int k = 0; k < 3; k++) {
             if (!g_sampled[k] || g_samples[k].size() >= 120000)
+                continue;
+            if (k < 2 && slowOnly && !slow)
                 continue;
             if (k == 2) {
                 const std::uint64_t from = g_windowFrom.load();
@@ -123,6 +136,22 @@ void Sampler(void*)
             if (R_FAILED(svcSetThreadActivity(g_sampled[k], ThreadActivity_Paused)))
                 continue;
             const bool got = R_SUCCEEDED(svcGetThreadContext3(&ctx, g_sampled[k]));
+            // Its callers by the frame records (x29: the caller's record and the return address), while
+            // they lie in order above the stack pointer. Into an array: nothing is allocated while the
+            // thread is stopped (it may be stopped inside the allocator, holding its lock).
+            std::uint32_t chain[11];
+            int links = 0;
+            if (got && k < 2) {
+                chain[links++] = (std::uint32_t)std::min<std::uint64_t>(ctx.pc.x - base, 0xFFFFFFFFu);
+                chain[links++] = (std::uint32_t)std::min<std::uint64_t>(ctx.cpu_gprs[30].x - base, 0xFFFFFFFFu);
+                std::uint64_t fp = ctx.fp, low = ctx.sp;
+                for (int depth = 0; depth < 9 && fp >= low && fp < ctx.sp + 0x40000 && (fp & 15) == 0; depth++) {
+                    const std::uint64_t* record = reinterpret_cast<const std::uint64_t*>(fp);
+                    chain[links++] = (std::uint32_t)std::min<std::uint64_t>(record[1] - base, 0xFFFFFFFFu);
+                    low = fp + 16;
+                    fp = record[0];
+                }
+            }
             if (got && k == 2) {
                 // where it was called from: the link register, and the first words of its stack that
                 // point into the program's code (return addresses, with some stale ones among them)
@@ -135,12 +164,14 @@ void Sampler(void*)
                 g_mainStacks[stack]++;
             }
             svcSetThreadActivity(g_sampled[k], ThreadActivity_Runnable);
+            if (links && g_chains[k].size() < 30000)
+                g_chains[k][std::vector<std::uint32_t>(chain, chain + links)]++;
             if (got)
                 g_samples[k].push_back((std::uint32_t)std::min<std::uint64_t>(ctx.pc.x - base, 0xFFFFFFFFu));
         }
         // the report as soon as there are 60,000 samples of each (a minute): a run that is stopped
         // from outside, or left by the player, never reaches the one at the program's end
-        if (g_samples[0].size() >= 60000 && g_samples[1].size() >= 60000) {
+        if (g_samples[0].size() >= (slowOnly ? 40000u : 60000u) && g_samples[1].size() >= (slowOnly ? 40000u : 60000u)) {
             SamplerReport();
             return;
         }
@@ -177,6 +208,18 @@ void SamplerReport()
         for (std::size_t i = 0; i < top.size() && i < 400; i++)
             std::fprintf(stderr, "sample: %s %08X %u\n", kName[k], top[i].second << 6, top[i].first);
     }
+    for (int k = 0; k < 2; k++) {
+        std::vector<std::pair<std::uint32_t, std::vector<std::uint32_t>>> chains;
+        for (auto& s : g_chains[k])
+            chains.push_back({s.second, s.first});
+        std::sort(chains.rbegin(), chains.rend());
+        for (std::size_t i = 0; i < chains.size() && i < 4000; i++) {
+            std::fprintf(stderr, "samplechain: %s %u:", kName[k], chains[i].first);
+            for (std::uint32_t at : chains[i].second)
+                std::fprintf(stderr, " %08X", at);
+            std::fprintf(stderr, "\n");
+        }
+    }
     std::vector<std::pair<std::uint32_t, std::vector<std::uint32_t>>> stacks;
     for (auto& s : g_mainStacks)
         stacks.push_back({s.second, s.first});
@@ -191,7 +234,8 @@ void SamplerReport()
 
 void SampleWindow(bool open)
 {
-    if (!g_sampling.load())
+    static const bool on = std::getenv("SLY1_SAMPLE") && std::getenv("SLY1_SAMPLE")[0] == '3';   // (3: the main thread's window too)
+    if (!on || !g_sampling.load())
         return;
     if (open)
         g_sampled[2] = threadGetCurHandle();
