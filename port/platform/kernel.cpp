@@ -375,7 +375,12 @@ const char* FunctionName(void* fn, int tag)
     if (fn && dladdr(fn, &info) && info.dli_sname)
         return info.dli_sname;
 #endif
-    return tag == 0x1F ? "(a script function)" : fn ? "(a host function)" : "?";
+    if (tag == 0x1F || !fn)
+        return tag == 0x1F ? "(a script function)" : "?";
+    // elsewhere its place in the program's image, for the build's symbols to name (nm on the ELF)
+    static thread_local char at[32];
+    std::snprintf(at, sizeof at, "fn+0x%llX", (unsigned long long)(reinterpret_cast<std::uintptr_t>(fn) - reinterpret_cast<std::uintptr_t>(ImageBase())));
+    return at;
 }
 void PrintScriptWord(const int* v)
 {
@@ -385,7 +390,11 @@ void PrintScriptWord(const int* v)
         std::fprintf(stderr, " %g", (double)f);
     else if (v[0] == 0x14 || v[0] == 0x1B)
         std::fprintf(stderr, " %d", v[1]);
-    else
+    else if ((v[0] == 0x16 || v[0] == 0x18 || v[0] == 0x1A) && (std::uint32_t)v[1] >= 0x00100000u && (std::uint32_t)v[1] < 0x02000000u) {
+        float x[4];   // a vector's floats (they are in the script machine's pool: read where the value points)
+        std::memcpy(x, Native((std::uint32_t)v[1]), sizeof x);
+        std::fprintf(stderr, " (%g %g %g %g)", (double)x[0], (double)x[1], (double)x[2], (double)x[3]);
+    } else
         std::fprintf(stderr, " <%X:%X>", (unsigned)v[0], (unsigned)v[1]);
 }
 }  // namespace
