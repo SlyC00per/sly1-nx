@@ -1000,6 +1000,21 @@ void Renderer::Begin(const gs::DrawState& s)
 void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t count, const std::uint32_t* index,
                     std::size_t indices)
 {
+    {   // SLY1_GPU_TINT_LOG=1: the colour of the draws that tint where the frame's alpha is marked (a
+        // light volume's last pass: the destination alpha test on, blend 0x48), a few a second
+        static const bool on = std::getenv("SLY1_GPU_TINT_LOG") != nullptr;
+        if (on && count && s.abe && (s.alpha & 0xFF) == 0x48 && ((s.test >> 14) & 1)) {
+            static std::uint64_t frameWas;
+            static int said;
+            if (frames_ != frameWas && frames_ % 30 == 0) {
+                frameWas = frames_;
+                said = 0;
+            }
+            if (frames_ == frameWas && said++ < 4)
+                std::fprintf(stderr, "tint: frame %llu: %zu vertices, the first's colour %u %u %u alpha %u (blend 0x%llX, test 0x%llX)\n", (unsigned long long)frames_, count,
+                             v[0].r, v[0].g, v[0].b, v[0].a, (unsigned long long)s.alpha, (unsigned long long)s.test);
+        }
+    }
     static const bool noMerge = std::getenv("SLY1_GPU_NO_MERGE") != nullptr;
     if (noMerge || !index || indices == 0) {
         FlushPending();
