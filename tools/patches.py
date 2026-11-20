@@ -986,6 +986,14 @@ PATCHES = [
      "    }\n\n    if (skin != 0 && (skin->flags & 1)) {",
      "the port's hook: a part drawn the long way is a call of its own, so that it can be drawn again from what was kept of it (docs/RENDERER.md)"),
 
+    # The same callback's third caller (FinishPlayerRequest), missed when player_request.cpp's two
+    # were given the pointer: a fault in "Into the Machine" when the player was knocked into the
+    # water (LaunchPlayerAtTrackedNode read the game address as a pointer).
+    ("src/main/path_follower.cpp",
+     "        ((void (*)(s32, Player*))fn)(self->lastMessage.data, self);",
+     "        ((void (*)(void*, Player*))fn)((void*)self->lastMessage.data, self);",
+     "the request's data is the object that sent it, which its callback takes as a pointer"),
+
     # The card is the port's save folder and cannot be taken out: once it is known and its save
     # files are read or made (state 5), the game no longer asks for it three times a second on a
     # thread started for each asking. Until then, and in every other state, it asks as before.
