@@ -985,6 +985,14 @@ PATCHES = [
      "        port_span[1] = (u32)g_vifPacketWriter.cur;\n"
      "    }\n\n    if (skin != 0 && (skin->flags & 1)) {",
      "the port's hook: a part drawn the long way is a call of its own, so that it can be drawn again from what was kept of it (docs/RENDERER.md)"),
+
+    # The card is the port's save folder and cannot be taken out: once it is known and its save
+    # files are read or made (state 5), the game no longer asks for it three times a second on a
+    # thread started for each asking. Until then, and in every other state, it asks as before.
+    ("src/main/memory_card.cpp",
+     "        if (self->nextPollTime <= g_elapsedTime[0])\n",
+     "        if (self->state != 5 && self->nextPollTime <= g_elapsedTime[0])\n",
+     "the port's card cannot be removed: no poll of it once its save files are in (the user's decision, 2026-11-20)"),
 ]
 
 

@@ -179,6 +179,12 @@ s32 GetCardInfo(s32 port, s32, s32* type, s32* free, s32* format)
     if (port != 0)
         return Done(1, kNoCard);
     if (type) *type = 2;   // a PS2 card
+    {   // SLY1_CARD_TRACE=1: each asking, counted (the game stops asking once its save files are in: tools/patches.py)
+        static const bool trace = std::getenv("SLY1_CARD_TRACE") != nullptr;
+        static int asked;
+        if (trace)
+            std::fprintf(stderr, "card: asked for the card's state, time %d\n", ++asked);
+    }
     if (g_usedKilobytes < 0)
         g_usedKilobytes = UsedKilobytes(g_root);
     if (free) *free = kCardKilobytes - g_usedKilobytes;
