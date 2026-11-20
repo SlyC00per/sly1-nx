@@ -1088,3 +1088,24 @@ frames faster than that, and the wait that was to keep the GS thread within a fr
 after a tenth of a second. Before this is tried again the swap must not hold the GS thread (the
 next frame drawn while the last waits for the display), and the bound must hold without a time
 limit. The host showed none of it: its GS thread does not wait for a display.
+
+### A light volume's cone marks the frame's alpha
+
+A searchlight is drawn in three passes (the game's BuildAnimRecordGifPackets, kind 4; VU1's
+program 0x6DA): its cone, textured and added to the frame under the alpha test NEVER with
+FB_ONLY; the cone's back faces under blend 0x6A, which write alpha 0x80 and no colour; and a
+tint (blend 0x48) under the destination alpha test with DATM 0, in the record's colour halved.
+The cone's own alpha, under 0x80, is the mark the tint is tested against, and the second pass
+takes the mark away where the scene is behind the whole cone: the tint lands where the scene is
+inside it. Only the tint changes with the alarm (128 110 0 to 128 0 0); the cone's texture and
+its vertices' colours stay as they were.
+
+The cone's pass went into the effects' half-size picture, which writes nothing to the frame's
+alpha; and drawn into the frame with the blend state's factors the GPU gave the frame's alpha the
+colour's factors (over 0x80 across the cone). Either way no mark was left, the tint drew nowhere,
+and a searchlight lit nothing, in yellow or in red. Such a run (blend 0x48, the alpha test NEVER,
+FB_ONLY, no DATE) is now drawn into the frame the way a run into a small target is, the blend's
+coefficients in the pixel shader, so that the alpha written is the source's.
+
+`SLY1_GPU_TINT_LOG=1` prints the tints' colours, `2` every blended run whose first colour is not
+a grey and each cone's texture; `SLY1_GPU_BLEND_LOG=N` prints frame N's blended draws in order.

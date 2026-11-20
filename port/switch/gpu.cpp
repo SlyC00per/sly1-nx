@@ -1003,8 +1003,46 @@ void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t
     {   // SLY1_GPU_TINT_LOG=1: the colours of the draws that tint where the frame's alpha is marked (a
         // light volume's last pass: the destination alpha test on, blend 0x48): each colour once a
         // sampled frame (one frame in 30), up to 12
-        static const bool on = std::getenv("SLY1_GPU_TINT_LOG") != nullptr;
-        if (on && count && s.abe && (s.alpha & 0xFF) == 0x48 && ((s.test >> 14) & 1) && frames_ % 30 == 0) {
+        // SLY1_GPU_TINT_LOG=2: every blended run whose first colour is not a grey, by state and colour
+        static const int on = std::getenv("SLY1_GPU_TINT_LOG") ? std::atoi(std::getenv("SLY1_GPU_TINT_LOG")) : 0;
+        if (on == 2 && count && s.abe && (v[0].r != v[0].g || v[0].g != v[0].b) && frames_ % 30 == 0) {
+            static std::uint64_t frameWas;
+            static std::uint64_t seen[32];
+            static int used;
+            if (frames_ != frameWas) {
+                frameWas = frames_;
+                used = 0;
+            }
+            const std::uint64_t c = (v[0].r | v[0].g << 8 | v[0].b << 16 | (std::uint64_t)v[0].a << 24) ^ (s.alpha & 0xFF) << 32 ^ (std::uint64_t)(s.test & 0xFFFFF) << 40 ^ (std::uint64_t)s.tme << 60;
+            int k = 0;
+            for (; k < used && seen[k] != c; k++) {
+            }
+            if (k == used && used < 32) {
+                seen[used++] = c;
+                std::fprintf(stderr, "tint: frame %llu: %zu vertices, alpha %llX test %llX tme %u, the first's colour %u %u %u alpha %u\n", (unsigned long long)frames_, count,
+                             (unsigned long long)(s.alpha & 0xFF), (unsigned long long)s.test, s.tme, v[0].r, v[0].g, v[0].b, v[0].a);
+            }
+        }
+        if (on == 2 && count && s.abe && s.tme && (s.alpha & 0xFF) == 0x48 && (s.test & 0xFFFFF) == 0x71001 && frames_ % 30 == 0) {
+            // and a light volume's textured pass (its cone as it is seen), by its texture
+            static std::uint64_t frameWas;
+            static std::uint64_t seen[8];
+            static int used;
+            if (frames_ != frameWas) {
+                frameWas = frames_;
+                used = 0;
+            }
+            const std::uint64_t c = s.tex0 ^ (texture_ ? texture_->hash : 0);
+            int k = 0;
+            for (; k < used && seen[k] != c; k++) {
+            }
+            if (k == used && used < 8) {
+                seen[used++] = c;
+                std::fprintf(stderr, "cone: frame %llu: %zu vertices, TEX0 %016llX, texture %d of hash %016llX, the first's colour %u %u %u alpha %u\n", (unsigned long long)frames_, count,
+                             (unsigned long long)s.tex0, texture_ ? (int)texture_->id : -1, (unsigned long long)(texture_ ? texture_->hash : 0), v[0].r, v[0].g, v[0].b, v[0].a);
+            }
+        }
+        if (on == 1 && count && s.abe && (s.alpha & 0xFF) == 0x48 && ((s.test >> 14) & 1) && frames_ % 30 == 0) {
             static std::uint64_t frameWas;
             static std::uint32_t seen[12];
             static int used;
@@ -1021,6 +1059,12 @@ void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t
                 std::fprintf(stderr, "tint: frame %llu: %zu vertices, the first's colour %u %u %u alpha %u\n", (unsigned long long)frames_, count, v[0].r, v[0].g, v[0].b, v[0].a);
             }
         }
+    }
+    {   // SLY1_GPU_BLEND_LOG=N: frame N's blended draws, each with its state and its first colour
+        static const long at = std::getenv("SLY1_GPU_BLEND_LOG") ? std::atol(std::getenv("SLY1_GPU_BLEND_LOG")) : -1;
+        if (at >= 0 && (long)frames_ == at && s.abe && count)
+            std::fprintf(stderr, "blend: run of %zu: alpha %llX test %llX tme %u frame %llX zbuf %llX colour %u %u %u %u\n", count, (unsigned long long)s.alpha,
+                         (unsigned long long)s.test, s.tme, (unsigned long long)s.frame, (unsigned long long)s.zbuf, v[0].r, v[0].g, v[0].b, v[0].a);
     }
     static const bool noMerge = std::getenv("SLY1_GPU_NO_MERGE") != nullptr;
     if (noMerge || !index || indices == 0) {
@@ -1095,6 +1139,14 @@ void Renderer::FlushPending()
 bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
 {
     FlushPending();
+    {   // SLY1_GPU_BLEND_LOG=N (see Draw): the batches among them
+        static const long at = std::getenv("SLY1_GPU_BLEND_LOG") ? std::atol(std::getenv("SLY1_GPU_BLEND_LOG")) : -1;
+        if (at >= 0 && (long)frames_ == at && s.abe && b.count) {
+            const std::uint32_t* c = b.quads + b.colourAt * 4;
+            std::fprintf(stderr, "blend: batch of %u: alpha %llX test %llX tme %u frame %llX zbuf %llX colour %u %u %u %u\n", b.count, (unsigned long long)s.alpha,
+                         (unsigned long long)s.test, s.tme, (unsigned long long)s.frame, (unsigned long long)s.zbuf, c[0], c[1], c[2], c[3]);
+        }
+    }
     static const bool asRuns = std::getenv("SLY1_GPU_BATCH_AS_RUNS") != nullptr;
     if (asRuns) {   // diagnosis: the batch made the GS's vertices here and drawn the GS's way (nothing cut:
                     // a triangle with a vertex outside the view is left out)
@@ -1394,7 +1446,9 @@ bool Renderer::FxRun(const gs::DrawState& s, const Source& src, int target, bool
     const std::uint32_t atst = (test >> 1) & 7, afail = (test >> 12) & 3, ztst = (test >> 17) & 3;
     if (!ate || date || (zte && ztst == 0) || (s.tme && texture_ == nullptr) || (afail != 1 && afail != 3))
         return false;
-    return atst == 0 || AlphaDecided(s, src, texture_, false) == -1;
+    // (A run under the test NEVER is not one: a light volume's first pass, its cone, whose alpha
+    // written to the frame is the mark the volume's tint is tested against. See Submit.)
+    return atst != 0 && AlphaDecided(s, src, texture_, false) == -1;
 }
 
 // The effects' picture begun for a frame buffer: emptied, and the depth buffer as it stands made
@@ -1743,7 +1797,14 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         int sc = (a == 0) - (b == 0), s1 = d == 0, dc = (a == 1) - (b == 1), d1 = d == 1;
         static const bool noMark = std::getenv("SLY1_GPU_NO_ALPHA_MARK") != nullptr;
         alphaOnly = !noMark && sc == 0 && s1 == 0 && dc == 0 && d1 == 1;
-        if (!frameAlpha && target >= 2) {
+        // A light volume's first pass (its cone, added to the frame under the alpha test NEVER with
+        // FB_ONLY) marks the frame's alpha with its own, under 0x80, for the volume's tint to be
+        // tested against (DATE): drawn the same way as into a small target, so that the alpha
+        // written is the source's. With the blend state's factors the frame's alpha went over 0x80
+        // across the cone, the tint drew nowhere, and a searchlight lit nothing (its light did not
+        // turn red with the alarm: only the tint does).
+        const bool marksBySource = ate && atst == 0 && afail == 1 && !date && (s.alpha & 0xFF) == 0x48 && target < 2;
+        if (!frameAlpha && (target >= 2 || marksBySource)) {
             // A small target (a shadow's picture): the coefficients go to the pixel shader, which gives
             // the colour times its own and one less the frame's as the second output, its alpha 1
             // (gs_fsh.glsl), so that the alpha written is the source's, as on the GS. With the blend
