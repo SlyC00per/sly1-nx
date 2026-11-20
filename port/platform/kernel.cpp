@@ -491,6 +491,34 @@ void NoteObjectColour(int object, unsigned value)
                  (value >> 16) & 0xFF, value >> 24);
 }
 
+void NoteLightColour(int object, const float* hsv, int mode)
+{
+    static const bool on = std::getenv("SLY1_COLOUR_TRACE") != nullptr;
+    if (!on)
+        return;
+    static const float* seen[256];   // (by the light's own colour field: its id is often -1)
+    static float was[256][3];
+    static int used, said;
+    int k = 0;
+    for (; k < used && seen[k] != hsv; k++) {
+    }
+    if (k == used) {
+        if (used == 256)
+            return;
+        seen[used] = hsv;
+        was[used][0] = was[used][1] = was[used][2] = -1000.0f;
+        used++;
+    }
+    if (std::fabs(hsv[0] - was[k][0]) < 8.0f && std::fabs(hsv[1] - was[k][1]) < 24.0f && std::fabs(hsv[2] - was[k][2]) < 24.0f)
+        return;
+    was[k][0] = hsv[0];
+    was[k][1] = hsv[1];
+    was[k][2] = hsv[2];
+    if (said++ < 1200)
+        std::fprintf(stderr, "world: frame %llu: light %d (object %d, mode %d): hue %g saturation %g value %g\n", (unsigned long long)gs::FramesShown(), k, object, mode,
+                     (double)hsv[0], (double)hsv[1], (double)hsv[2]);
+}
+
 void NotePropertyRead(int property, int object, int cls, const int* d, const int* value)
 {
     static const int traced = std::getenv("SLY1_PROP_TRACE") ? std::atoi(std::getenv("SLY1_PROP_TRACE")) : -2;

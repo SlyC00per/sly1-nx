@@ -150,6 +150,8 @@ void NoteCamera(const float* position, int areaMask);
 bool CameraPushInWorld(const float* pushed, const float* dest);
 // SLY1_COLOUR_TRACE=1: an object given a colour other than the one it was last given.
 void NoteObjectColour(int object, unsigned value);
+// SLY1_COLOUR_TRACE=1: a light (a cone volume) rebuilt with another hue or value than it had.
+void NoteLightColour(int object, const float* hsv, int mode);
 void NotePropertyRead(int property, int object, int cls, const int* descriptor, const int* value);
 // The 2D elements in the 16:9 picture (tools/patches.py). Wide2D(middle): what is drawn from now
 // is one element whose middle rests at that x of the 640 (it is drawn 3/4 as wide about the

@@ -343,6 +343,11 @@ PATCHES = [
      "    PlacedObject* child = (PlacedObject*)object->children.head;\n    object->recordValue = value;\n    object->recordFlags |= 2;",
      "    PlacedObject* child = (PlacedObject*)object->children.head;\n    port::NoteObjectColour(object->id, value);\n    object->recordValue = value;\n    object->recordFlags |= 2;",
      "an object's colour noted for the trace"),
+    # SLY1_COLOUR_TRACE=1: a light's colour as its shape is rebuilt (RefreshConeVolumeShape).
+    ("src/main/base_object.cpp",
+     "    PacketWriter w;\n    InitPacketWriter(&w);\n    NoteConeVolumeLightingChange(self);",
+     "    PacketWriter w;\n    InitPacketWriter(&w);\n    port::NoteLightColour(self->id, (const float*)&self->hsv, self->mode);\n    NoteConeVolumeLightingChange(self);",
+     "a light's colour noted for the trace"),
     # SLY1_PROP_TRACE=N: each read of property N by a script: the object, its class, the descriptor.
     ("src/main/object_properties.cpp",
      "        PropertyDescriptor* r = FindPropertyDescriptor(p, n);\n        ReadPropertyValue(self, p, r);",
