@@ -13,11 +13,15 @@ layout (location = 0) in vec3 inPosition;
 layout (location = 1) in uint inControl;   // the control word: its low 12 bits the fog's base
 layout (location = 2) in vec3 inStq;
 layout (location = 3) in uvec4 inColour;   // R, G, B, A in each word's low byte
+layout (location = 4) in uvec4 inShare1;   // the colours of the batch's two lights' shares (u.layers says which are)
+layout (location = 5) in uvec4 inShare2;
 
 layout (location = 0) out vec4 outColour;   // 0 to 255
 layout (location = 1) out vec3 outStq;
 layout (location = 2) out float outFog;
 layout (location = 4) out float outOutside;   // 1 at a vertex outside the program's clip volume (SLY1_GPU_CAPTURE's view)
+layout (location = 5) out vec4 outAdd;      // the first share's colour times its alpha over 0x80; w: its alpha over 0x80
+layout (location = 6) out vec4 outAdd2;     // the second's
 layout (location = 3) flat out int outFlags;   // 1: the triangle this vertex closes is dropped when it faces away
 
 layout (std140, binding = 0) uniform BatchParams {
@@ -25,6 +29,7 @@ layout (std140, binding = 0) uniform BatchParams {
     vec4 toClip;   // clip x and y scaled (x, y) and w's part added (z, w)
     vec4 depth;    // clip z scaled (x) and w's part added (y): over w, the GS's depth as a fraction of 2 to the 32nd
     vec4 fog;      // x the scale, y the largest w, z 1 when backfaces are dropped
+    vec4 layers;   // x, y: 1 for each share drawn with the batch
 } u;
 
 void main()
@@ -36,6 +41,9 @@ void main()
     outFog = float((int(float(inControl & 0xFFFu) + u.fog.x * min(clip.w, u.fog.y) * over) >> 4) & 0xFF);
     outColour = vec4(inColour & 0xFFu);
     outStq = inStq;
+    vec4 s1 = vec4(inShare1 & 0xFFu) * u.layers.x, s2 = vec4(inShare2 & 0xFFu) * u.layers.y;
+    outAdd = vec4(s1.rgb * (s1.a / 128.0), s1.a / 128.0);
+    outAdd2 = vec4(s2.rgb * (s2.a / 128.0), s2.a / 128.0);
     outOutside = (clip.w <= 0.0 || abs(clip.x) > clip.w || abs(clip.y) > clip.w || abs(clip.z) > clip.w) ? 1.0 : 0.0;
     outFlags = (u.fog.z != 0.0 && (inControl & 0x4000u) != 0u) ? 1 : 0;
 }

@@ -180,8 +180,9 @@ void* Clock(void*)
     bool displayBlank = false;
     if (const char* e = std::getenv("SLY1_VSYNC")) {
         ViDisplay display;
-        displayBlank = e[0] == '1' && R_SUCCEEDED(viOpenDefaultDisplay(&display)) && R_SUCCEEDED(viGetDisplayVsyncEvent(&display, &vsync));
-        std::fprintf(stderr, "sly1: the vertical blank is %s\n", displayBlank ? "the display's" : "this program's clock (the display's event was not had)");
+        Result opened = viOpenDefaultDisplay(&display), had = R_SUCCEEDED(opened) ? viGetDisplayVsyncEvent(&display, &vsync) : opened;
+        displayBlank = e[0] == '1' && R_SUCCEEDED(had);
+        std::fprintf(stderr, "sly1: the vertical blank is %s (results 0x%X, 0x%X)\n", displayBlank ? "the display's" : "this program's clock: the display's event was not had", (unsigned)opened, (unsigned)had);
     }
 #endif
     while (g_seconds == 0 || std::chrono::steady_clock::now() < stop) {

@@ -1124,3 +1124,38 @@ coefficients in the pixel shader, so that the alpha written is the source's.
 
 `SLY1_GPU_TINT_LOG=1` prints the tints' colours, `2` every blended run whose first colour is not
 a grey and each cone's texture; `SLY1_GPU_BLEND_LOG=N` prints frame N's blended draws in order.
+
+
+## A surface drawn with its lights' shares (2026-11-20)
+
+The game draws a world surface three times: the surface itself (blend 0x44, the alpha test
+against 126 with FB_ONLY, depth GREATER) and then, with the same positions, two batches that each
+add one light's share to it (blend 0x48, the alpha test NEVER with RGB_ONLY, depth GEQUAL), each
+with its own colours and its own palette of the same texture (TEX0 differs in CBP only), and fog
+towards black. A share whose colours are all black adds nothing and is left out
+(`SLY1_GPU_NO_BLACK_SKIP=1` draws it).
+
+The surface's batch is held back (Renderer::Layer) and the shares that follow it join it: one
+draw whose vertices carry the three colours (batch_vsh.glsl's two more streams) and whose pixel
+shader adds the shares to the surface's blended colour. Anything else that goes to the GPU draws
+what is held first (FlushHeld), so the game's order stays.
+
+- **A surface with a triangle twice** (a leaf's two faces, the same three corners: Doubled) gets
+  its light twice from the game, once for each triangle of the pair under GEQUAL, where the
+  surface itself is drawn once under GREATER. It is drawn by itself and its shares after it, in
+  one draw of their own under their own depth test: two draws for three.
+- **The shader matters more than the count of draws.** gs_fsh.glsl has discards, so the GPU runs
+  it for the pixels the depth test then drops. Drawn with it, the joined surface cost the
+  Switch's GPU more than the three draws (22.5 ms a frame at A Stealthy Approach's start against
+  15.7); with gs_layers_fsh.glsl, which like gs_lite_fsh.glsl has none, 13.0 ms. The emulator
+  showed none of this (1.9 ms either way against 3.2): GPU time is measured on the Switch.
+- The picture is the three draws' within rounding: in a lockstep capture 0.06% of the colour
+  values differ by more than 8.
+
+`SLY1_GPU_NO_LAYERS=1` draws as the game does; `SLY1_GPU_SHARES_AFTER=1` draws every surface's
+shares after it. `SLY1_GPU_DRAIN=1` waits for the GPU before each present and `perfgpu:` says
+how long (what a frame costs the GPU, since a frame's commands are sent at its end);
+`SLY1_GPU_VARY=1|2|3` changes what is drawn every 120 frames and prints the GPU's time for each
+kind (`vary:`): 1 leaves kinds of batches out, 2 kinds of runs, 3 compares this section's draw
+(kind 0), the game's three (odd kinds), the joined draw with gs_fsh.glsl (2, 6) and the joined
+draw for surfaces without a doubled triangle only (4).

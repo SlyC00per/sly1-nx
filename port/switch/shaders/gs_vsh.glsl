@@ -15,6 +15,8 @@ layout (location = 1) out vec3 outStq;
 layout (location = 2) out float outFog;
 layout (location = 3) flat out int outFlags;
 layout (location = 4) out float outOutside;
+layout (location = 5) out vec4 outAdd;   // (a batch's lights' shares: none here)
+layout (location = 6) out vec4 outAdd2;
 
 layout (std140, binding = 0) uniform VertexParams {
     vec4 toClip;   // x and y scales, then the offsets
@@ -28,4 +30,6 @@ void main()
     outFog = inFog;
     outFlags = 0;
     outOutside = 0.0;
+    outAdd = vec4(0.0);
+    outAdd2 = vec4(0.0);
 }

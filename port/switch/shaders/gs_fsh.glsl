@@ -12,11 +12,16 @@ layout (location = 2) noperspective in float inFog;
 layout (location = 4) noperspective in float inOutside;   // above 0 in a triangle with a vertex outside the clip volume
 layout (location = 3) flat in int inFlags;   // 1: dropped when the triangle faces away (a batch's backfaces)
 
+layout (location = 5) noperspective in vec4 inAdd;   // a batch's lights' shares (batch_vsh.glsl), which the game adds in draws of their own
+layout (location = 6) noperspective in vec4 inAdd2;
+
 layout (location = 0, index = 0) out vec4 outColour;
 layout (location = 0, index = 1) out vec4 outFactor;
 
 layout (binding = 0) uniform sampler2D texture0;
 layout (binding = 1) uniform sampler2D frame0;   // the frame buffer being drawn into, for the destination alpha test
+layout (binding = 3) uniform sampler2D texture1;   // a batch's first share's texture, when it is not the batch's (u.mode.x has 2)
+layout (binding = 4) uniform sampler2D texture2;   // the second's (u.mode.x has 4)
 
 layout (std140, binding = 0) uniform FragmentParams {
     ivec4 mode;       // TME, TFX, TCC, FGE
@@ -51,8 +56,16 @@ void main()
     }
     vec3 rgb = inColour.rgb;
     float a = inColour.a;
+    vec3 add = inAdd.rgb + inAdd2.rgb;   // each share: its colour times its texture's (MODULATE), times its alpha over 0x80
     if (u.mode.x != 0) {
         vec4 t = texture(texture0, inStq.xy / inStq.z) * 255.0;
+        vec4 t1 = t, t2 = t;
+        if ((u.mode.x & 2) != 0 && inAdd.a != 0.0)
+            t1 = texture(texture1, inStq.xy / inStq.z) * 255.0;
+        if ((u.mode.x & 4) != 0 && inAdd2.a != 0.0)
+            t2 = texture(texture2, inStq.xy / inStq.z) * 255.0;
+        add = min(t1.rgb * inAdd.rgb / 128.0, 255.0) * (u.mode.z != 0 ? min(t1.a / 128.0, 1.0) : 1.0) +
+              min(t2.rgb * inAdd2.rgb / 128.0, 255.0) * (u.mode.z != 0 ? min(t2.a / 128.0, 1.0) : 1.0);
         if (u.mode.y == 0) {          // MODULATE
             rgb = min(t.rgb * rgb / 128.0, 255.0);
             if (u.mode.z != 0)
@@ -67,8 +80,10 @@ void main()
                 a = u.mode.y == 2 ? min(t.a + a, 255.0) : t.a;
         }
     }
-    if (u.mode.w != 0)
+    if (u.mode.w != 0) {
         rgb = mix(u.fogColour.rgb, rgb, inFog / 255.0);
+        add = add * (inFog / 255.0);   // (a share's fog is towards black: port/switch/gpu.cpp's Layer)
+    }
     float c = min(u.blend.x != 0.0 ? a / 128.0 : u.blend.y, 1.0);
     if (u.coef.x == 99.0) {   // the blend state has the factors: C as the second output
         outColour = vec4(rgb, a) / 255.0;
@@ -80,7 +95,7 @@ void main()
         // output's alpha is 1, so that what is there counts for nothing in the alpha written, which
         // is the source's as on the GS (port/switch/gpu.cpp has why).
         float ks = abs(u.coef.x * c + u.coef.y), kd = abs(u.coef.z * c + u.coef.w);
-        outColour = vec4(rgb * min(ks, 1.0), a) / 255.0;
+        outColour = vec4(rgb * min(ks, 1.0) + add, a) / 255.0;
         outFactor = vec4(vec3(1.0 - min(kd, 1.0)), 1.0);
     }
 }

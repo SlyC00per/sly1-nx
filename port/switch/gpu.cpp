@@ -31,6 +31,7 @@
 #include "gs_vsh_dksh.h"
 #include "gs_fsh_dksh.h"
 #include "gs_lite_fsh_dksh.h"
+#include "gs_layers_fsh_dksh.h"
 #include "gs_fx_fsh_dksh.h"
 #include "batch_vsh_dksh.h"
 
@@ -90,6 +91,7 @@ struct BatchParams {   // batch_vsh.glsl's
     float toClip[4];
     float depth[4];
     float fog[4];
+    float layers[4];   // x, y: 1 for each of the two lights' shares drawn with the batch
 };
 
 // What a draw's vertices are: the GS's (gs_vsh.glsl) or a batch's (batch_vsh.glsl).
@@ -106,6 +108,11 @@ struct Source {
     bool allCullable = false; // a batch's: every triangle is one dropped when it faces away (the GPU can cull)
     std::uint8_t alphaMin = 0, alphaMax = 255;   // of the vertices' alpha, where it is known
     std::uint32_t vertexAt = 0, colourAt = 0, indexAt = 0;
+    // a batch's lights' shares drawn with it (Renderer::Layer): how many, and each one's colours
+    std::uint32_t layers = 0;
+    DkGpuAddr layerColours[2] = {0, 0};
+    bool sharesOnly = false;   // the shares alone, after their surface (Renderer::FlushHeld)
+    const struct Texture* shareTextures[2] = {nullptr, nullptr};   // each share's texture (the surface's texels with a palette of its own)
 };
 
 struct FragmentParams {
@@ -144,6 +151,27 @@ private:
     void BindSource(const Source& src);
     void Submit(const gs::DrawState& s, const Source& src);
     void FlushPending();
+    // A surface and its lights' shares in one draw. The game draws a surface (blend 0x44) and then,
+    // with the same vertices on the same depth, a share for each of two lights, added to the frame
+    // (blend 0x48 under the alpha test NEVER with RGB_ONLY, the depth test GEQUAL). The surface is
+    // held until what comes next is known; a share that follows it is given to its draw as one
+    // more stream of colours, and the pixel shader adds the shares to the surface's colour
+    // (gs_fsh.glsl). One draw's pixels for three. SLY1_GPU_NO_LAYERS=1: each drawn by itself.
+    void Layer(const gs::DrawState& s, const Source& src, const gs::Batch& b);
+    void FlushHeld();
+    struct Held {
+        bool on = false;
+        gs::DrawState s;
+        Source src;
+        gs::Batch batch;
+        const Texture* texture = nullptr;
+        bool doubled = false;   // two of its triangles have the same three corners
+    } surface_;
+    bool Doubled(const gs::Batch& b);
+    std::vector<std::uint64_t> doubledSeen_;
+    std::uint64_t doubledBatches_ = 0;
+    bool flushingHeld_ = false;
+    std::uint64_t layersMerged_ = 0, layersAlone_ = 0, sharesAfter_ = 0;
     // The GS's run held back: the next is added to it when its state and texture are the same
     // (the game sends a character's outline as hundreds of runs of one line each, the registers
     // written again between them), and the whole is one draw.
@@ -166,6 +194,15 @@ private:
     // and the mean wait for the GPU (with 4 and 5 the picture is not to look at).
     int ab_ = 0;
     bool abOn_ = false;
+    // SLY1_GPU_VARY=1: every 120 frames another kind of drawing is left out, and the GPU's time for a
+    // frame (drained before each present, as SLY1_GPU_DRAIN) printed for each: 0 nothing left out,
+    // 1 nothing, and the batches that add black drawn, 2 the batches that add a light's share,
+    // 3 the right half of the frame, 4 the batches that do not add (the surfaces themselves),
+    // 5 every run that is not a batch, 6 every batch, 7 the runs and the batches that add
+    long mergedTwoPass_ = 0, mergedOnePass_ = 0;   // (SLY1_GPU_VARY=3's count of merged draws by their alpha test's passes)
+    int vary_ = -1, varyRuns_ = -1;   // (varyRuns_: SLY1_GPU_VARY=2, kinds of the runs that are not batches)
+    std::uint64_t varySerialNs_ = 0, varySends_ = 0;   // (SLY1_GPU_VARY: every list waited for, and the waits' total)
+    std::uint64_t varyDrainNs_ = 0, varyCpuAt_ = 0, varyCpuNs_ = 0, varyFrames_ = 0;
     std::uint64_t abAt_ = 0, abNs_[6] = {}, abWaitNs_[6] = {}, abFrames_[6] = {};
     std::uint64_t merged_ = 0, dropped_ = 0;
     const Texture* TextureFor(const gs::DrawState& state);
@@ -209,7 +246,7 @@ private:
                textureMem_ = nullptr;
     DkImage screen_[2], colour_[2], depth_;
     DkShader vertexShader_, fragmentShader_, batchShader_, liteShader_;
-    int fragBound_ = 0;        // the pixel shader bound: 0 gs_fsh.glsl, 1 gs_lite_fsh.glsl, 2 gs_fx_fsh.glsl
+    int fragBound_ = 0;        // the pixel shader bound: 0 gs_fsh.glsl, 1 gs_lite_fsh.glsl, 2 gs_fx_fsh.glsl, 3 gs_layers_fsh.glsl
     // The translucent effects at half size. Runs of sprites that only add their colour to the
     // frame's (a particle effect: steam, glows) are drawn into a picture of half the frame's size
     // each way, which is then laid over the frame, added to it, before anything else is drawn.
@@ -219,7 +256,7 @@ private:
     // second. SLY1_GPU_NO_FX=1: drawn into the frame, as before.
     DkImage fxImage_;
     Texture fxTexture_;
-    DkShader fxShader_;
+    DkShader fxShader_, layersShader_;
     bool fxReady_ = false, fxOpen_ = false, inComposite_ = false, depthBound_ = false;
     int fxFor_ = -1;   // the frame buffer the open picture is for
     std::uint64_t fxRuns_ = 0, fxComposites_ = 0;
@@ -382,7 +419,8 @@ private:
                   sends_ = 0, destinationAlpha_ = 0, unsupportedBlends_ = 0;
     long captureAt_ = -1;
     std::uint64_t indexNs_ = 0, copyNs_ = 0, copiedBytes_ = 0;
-    std::uint64_t drawNs_ = 0, textureNs_ = 0, presentNs_ = 0, waitNs_ = 0, acquireNs_ = 0;
+    std::uint64_t drawNs_ = 0, textureNs_ = 0, presentNs_ = 0, waitNs_ = 0, acquireNs_ = 0, drainNs_ = 0;
+    std::uint64_t blackBatches_ = 0, litBatches_ = 0;   // batches that add a light's share: all black (left out), and not
 
     // what the commands so far last bound, to bind only what changes
     struct Bound {
@@ -456,7 +494,7 @@ bool Renderer::Create()
     swapchain_ = dkSwapchainCreate(&swapchainMaker);
 
     // the shaders
-    codeMem_ = Block(64u << 10, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Code);
+    codeMem_ = Block(128u << 10, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached | DkMemBlockFlags_Code);
     std::uint32_t fragmentAt = Align((std::uint32_t)gs_vsh_dksh_size, DK_SHADER_CODE_ALIGNMENT);
     std::uint32_t batchAt = Align(fragmentAt + (std::uint32_t)gs_fsh_dksh_size, DK_SHADER_CODE_ALIGNMENT);
     std::memcpy(dkMemBlockGetCpuAddr(codeMem_), gs_vsh_dksh, gs_vsh_dksh_size);
@@ -477,6 +515,10 @@ bool Renderer::Create()
     std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(codeMem_) + fxAt, gs_fx_fsh_dksh, gs_fx_fsh_dksh_size);
     dkShaderMakerDefaults(&shaderMaker, codeMem_, fxAt);
     dkShaderInitialize(&fxShader_, &shaderMaker);
+    std::uint32_t layersAt = Align(fxAt + (std::uint32_t)gs_fx_fsh_dksh_size, DK_SHADER_CODE_ALIGNMENT);
+    std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(codeMem_) + layersAt, gs_layers_fsh_dksh, gs_layers_fsh_dksh_size);
+    dkShaderMakerDefaults(&shaderMaker, codeMem_, layersAt);
+    dkShaderInitialize(&layersShader_, &shaderMaker);
     if (std::getenv("SLY1_GPU_CULL_FLIP"))
         cullFront_ = 0.0f;
 
@@ -619,15 +661,18 @@ void Renderer::BindSource(const Source& src)
         if (b) {
             // DrawBatch's layout: a vertex's position and control word, then its STQ, in one stream;
             // its colour in a second
-            static const DkVtxAttribState attribs[4] = {
+            // (and the colours of its lights' shares, or its own again, in a third and a fourth)
+            static const DkVtxAttribState attribs[6] = {
                 {0, 0, 0, DkVtxAttribSize_3x32, DkVtxAttribType_Float, 0},
                 {0, 0, 12, DkVtxAttribSize_1x32, DkVtxAttribType_Uint, 0},
                 {0, 0, 16, DkVtxAttribSize_3x32, DkVtxAttribType_Float, 0},
                 {1, 0, 0, DkVtxAttribSize_4x32, DkVtxAttribType_Uint, 0},
+                {2, 0, 0, DkVtxAttribSize_4x32, DkVtxAttribType_Uint, 0},
+                {3, 0, 0, DkVtxAttribSize_4x32, DkVtxAttribType_Uint, 0},
             };
-            static const DkVtxBufferState buffers[2] = {{32, 0}, {16, 0}};
-            dkCmdBufBindVtxAttribState(cmd_, attribs, 4);
-            dkCmdBufBindVtxBufferState(cmd_, buffers, 2);
+            static const DkVtxBufferState buffers[4] = {{32, 0}, {16, 0}, {16, 0}, {16, 0}};
+            dkCmdBufBindVtxAttribState(cmd_, attribs, 6);
+            dkCmdBufBindVtxBufferState(cmd_, buffers, 4);
         } else {
             static const DkVtxAttribState attribs[5] = {
                 {0, 0, offsetof(gs::DrawVertex, x), DkVtxAttribSize_2x32, DkVtxAttribType_Float, 0},
@@ -679,6 +724,9 @@ void Renderer::BindSource(const Source& src)
         bp.fog[1] = b->wMax;
         bp.fog[2] = b->cull ? 1.0f : 0.0f;
         bp.fog[3] = 0.0f;
+        bp.layers[0] = src.layers >= 1 ? 1.0f : 0.0f;
+        bp.layers[1] = src.layers >= 2 ? 1.0f : 0.0f;
+        bp.layers[2] = bp.layers[3] = 0.0f;
         if (!batchSet_ || std::memcmp(&bp, &lastBatch_, sizeof bp) != 0) {
             dkCmdBufPushConstants(cmd_, data + batchUbo_, sizeof bp, 0, sizeof bp, &bp);
             lastBatch_ = bp;
@@ -697,14 +745,22 @@ void Renderer::BindSource(const Source& src)
 // is free again).
 void Renderer::Send(bool wait)
 {
+    FlushHeld();   // (its streams are in this list's memory)
     if (listAt_ >= 0 && (long)frames_ + 1 == listAt_)
         std::fprintf(stderr, "gpulist: send (wait %d) after %u draws\n", (int)wait, draws_);
     dkQueueSubmitCommands(queue_, dkCmdBufFinishList(cmd_));
     sends_++;
-    if (wait) {
+    static const bool serial = std::getenv("SLY1_GPU_VARY") != nullptr;
+    if (wait || serial) {
+        const std::uint64_t w0 = NowNs();
         dkQueueWaitIdle(queue_);
-        BeginCommands();
+        if (frames_ % 120 >= 30) {
+            varySerialNs_ += NowNs() - w0;
+            varySends_++;
+        }
     }
+    if (wait)
+        BeginCommands();
 }
 
 void Renderer::BindTarget(int target)
@@ -1000,6 +1056,7 @@ void Renderer::Begin(const gs::DrawState& s)
 void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t count, const std::uint32_t* index,
                     std::size_t indices)
 {
+    FlushHeld();
     {   // SLY1_GPU_TINT_LOG=1: the colours of the draws that tint where the frame's alpha is marked (a
         // light volume's last pass: the destination alpha test on, blend 0x48): each colour once a
         // sampled frame (one frame in 30), up to 12
@@ -1066,6 +1123,8 @@ void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t
             std::fprintf(stderr, "blend: run of %zu: alpha %llX test %llX tme %u frame %llX zbuf %llX colour %u %u %u %u\n", count, (unsigned long long)s.alpha,
                          (unsigned long long)s.test, s.tme, (unsigned long long)s.frame, (unsigned long long)s.zbuf, v[0].r, v[0].g, v[0].b, v[0].a);
     }
+    if (vary_ == 5 || vary_ == 7)
+        return;
     static const bool noMerge = std::getenv("SLY1_GPU_NO_MERGE") != nullptr;
     if (noMerge || !index || indices == 0) {
         FlushPending();
@@ -1120,8 +1179,162 @@ void Renderer::Draw(const gs::DrawState& s, const gs::DrawVertex* v, std::size_t
 
 // The run held back, drawn: before anything else that goes to the GPU (a batch, a texture's
 // upload, the frame's end), so that everything is drawn in the game's order.
+void Renderer::FlushHeld()
+{
+    if (!surface_.on || flushingHeld_)
+        return;
+    surface_.on = false;
+    flushingHeld_ = true;
+    const Texture* now = texture_;
+    texture_ = surface_.texture;
+    surface_.src.batch = &surface_.batch;
+    static const bool after = std::getenv("SLY1_GPU_SHARES_AFTER") != nullptr;   // every surface's shares after it
+    if (surface_.src.layers > 0 && (after || surface_.doubled)) {
+        // A surface with triangles seen from both sides (a leaf) has pairs of them on the same depth.
+        // The game's surface is drawn only where it is nearer than what is there (GREATER), so once;
+        // its shares where they are no further (GEQUAL), so once for each triangle of a pair: the
+        // light is added twice. One draw of surface and shares together would add it once. Such a
+        // surface is drawn by itself and its shares after it in one draw of their own, under their
+        // own depth test: two draws for the game's three.
+        Source own = surface_.src;
+        own.layers = 0;
+
+        Submit(surface_.s, own);
+        surface_.src.sharesOnly = true;
+        Submit(surface_.s, surface_.src);
+        surface_.src.sharesOnly = false;
+        sharesAfter_++;
+    } else {
+        Submit(surface_.s, surface_.src);
+    }
+    texture_ = now;
+    flushingHeld_ = false;
+}
+
+// Whether two of a batch's triangles have the same three corners (a leaf's two faces).
+bool Renderer::Doubled(const gs::Batch& b)
+{
+    const std::uint32_t step = b.stride * 4, at = b.positionAt * 4;
+    std::size_t size = 64;
+    while (size < (std::size_t)b.count * 2)
+        size *= 2;
+    doubledSeen_.assign(size, 0);
+    auto corner = [&](std::uint32_t k) {
+        const std::uint32_t* q = b.quads + k * step + at;
+        std::uint64_t h = q[0] * 0x9E3779B97F4A7C15ull;
+        h = (h ^ q[1]) * 0x9E3779B97F4A7C15ull;
+        h = (h ^ q[2]) * 0x9E3779B97F4A7C15ull;
+        return h ^ (h >> 31);
+    };
+    for (std::uint32_t k = 2; k < b.count; k++) {
+        if (b.quads[k * step + at + 3] & gs::kStripStart)
+            continue;
+        std::uint64_t x = corner(k - 2), y = corner(k - 1), z = corner(k);
+        std::uint64_t key = (x + y + z) ^ (x * y * z) ^ ((x ^ y ^ z) << 1);   // the same whatever the corners' order
+        key |= 1;
+        for (std::size_t i = (std::size_t)(key >> 20) & (size - 1);; i = (i + 1) & (size - 1)) {
+            if (doubledSeen_[i] == key) {
+                doubledBatches_++;
+                return true;
+            }
+            if (doubledSeen_[i] == 0) {
+                doubledSeen_[i] = key;
+                break;
+            }
+        }
+    }
+    return false;
+}
+
+// SLY1_GPU_LAYER_ONLY=n, diagnosis: which surfaces are held: 1 those tested 0x717EB, 2 the others, 3 those
+// whose backfaces are dropped, 4 those whose are not, 5 those kept, 6 those not
+static bool LayerTry(const gs::DrawState& s, const gs::Batch& b)
+{
+    static const int only = std::getenv("SLY1_GPU_LAYER_ONLY") ? std::atoi(std::getenv("SLY1_GPU_LAYER_ONLY")) : 0;
+    const bool usual = (s.test & 0xFFFFF) == 0x717EB;
+    return only == 0 || (only == 1 && usual) || (only == 2 && !usual) || (only == 3 && b.cull) || (only == 4 && !b.cull) || (only == 5 && b.keep != 0) ||
+           (only == 6 && b.keep == 0);
+}
+
+void Renderer::Layer(const gs::DrawState& s, const Source& src, const gs::Batch& b)
+{
+    static const bool off = std::getenv("SLY1_GPU_NO_LAYERS") != nullptr;
+    const std::uint32_t test = (std::uint32_t)s.test;
+    // (diagnosis, SLY1_GPU_LAYER_LOG: how many of the batch's vertices may be dropped as backfaces, and a sum of its positions)
+    std::uint32_t cullable = 0, sum = 0;
+    static const bool logging = std::getenv("SLY1_GPU_LAYER_LOG") != nullptr;
+    if (logging)
+        for (std::uint32_t k = 0; k < b.count; k++) {
+            const std::uint32_t* q = b.quads + (k * b.stride + b.positionAt) * 4;
+            cullable += (q[3] & gs::kCullable) ? 1 : 0;
+            sum = sum * 31 + q[0] + q[1] * 7 + q[2] * 13 + (q[3] & 0xC000);
+        }
+    static std::uint32_t heldCullable, heldSum;
+    static std::uint64_t sameStream, otherStream, otherCull;
+    if (logging && surface_.on && b.id == surface_.batch.id && s.abe && (s.alpha & 0xFF) == 0x48) {
+        (sum == heldSum ? sameStream : otherStream)++;
+        otherCull += cullable != heldCullable;
+        if ((sameStream + otherStream) % 20000 == 0)
+            std::fprintf(stderr, "layer: shares with their surface's positions and control words %llu, with others %llu (%llu with another count of cullable vertices)\n",
+                         (unsigned long long)sameStream, (unsigned long long)otherStream, (unsigned long long)otherCull);
+    }
+    if (logging && !(s.abe && (s.alpha & 0xFF) == 0x48)) {
+        heldCullable = cullable;
+        heldSum = sum;
+    }
+    if (surface_.on) {
+        const gs::DrawState& h = surface_.s;
+        const bool share = s.abe && (s.alpha & 0xFF) == 0x48 && (test & 1) && ((test >> 1) & 7) == 0 && ((test >> 12) & 3) == 3 &&
+                           ((test >> 14) & 1) == 0 && ((test >> 16) & 1) && ((test >> 17) & 3) == 2;
+        // (a share has the surface's texture with another palette, TEX0's CBP, and its fog is towards black)
+        const std::uint64_t palette = 0x3FFFull << 37;
+        if (share && surface_.src.layers < 2 && b.id == surface_.batch.id && b.count == surface_.batch.count && b.cull == surface_.batch.cull &&
+            s.tme == h.tme && s.fge == h.fge && s.fba == h.fba && ((s.tex0 ^ h.tex0) & ~palette) == 0 && s.tex1 == h.tex1 &&
+            s.clamp == h.clamp && s.frame == h.frame && s.zbuf == h.zbuf && s.scissor == h.scissor && s.texa == h.texa &&
+            (!s.fge || (s.fogcol & 0xFFFFFF) == 0) && (!s.tme || texture_ != nullptr) &&
+            std::memcmp(b.matrix, surface_.batch.matrix, sizeof b.matrix) == 0) {
+            surface_.src.shareTextures[surface_.src.layers] = texture_;
+            surface_.src.layerColours[surface_.src.layers++] = dkMemBlockGetGpuAddr(src.kept ? keepMem_ : frameMem_) + src.colourAt;
+            layersMerged_++;
+            return;
+        }
+        {
+            static int why;
+            if (std::getenv("SLY1_GPU_LAYER_LOG") && share && why++ < 12)
+                std::fprintf(stderr, "layer: not taken: layers %u id %d count %d cull %d texture %d tme %d fge %d fba %d tex0 %d (%llX %llX) tex1 %d clamp %d frame %d zbuf %d scissor %d texa %d fogcol %d matrix %d\n",
+                             surface_.src.layers, b.id == surface_.batch.id, b.count == surface_.batch.count, b.cull == surface_.batch.cull, texture_ == surface_.texture, s.tme == h.tme,
+                             s.fge == h.fge, s.fba == h.fba, s.tex0 == h.tex0, (unsigned long long)s.tex0, (unsigned long long)h.tex0, s.tex1 == h.tex1, s.clamp == h.clamp, s.frame == h.frame,
+                             s.zbuf == h.zbuf, s.scissor == h.scissor, s.texa == h.texa, s.fogcol == h.fogcol, std::memcmp(b.matrix, surface_.batch.matrix, sizeof b.matrix) == 0);
+        }
+        FlushHeld();
+    }
+    {
+        static int said;
+        if (std::getenv("SLY1_GPU_LAYER_LOG") && frames_ > 1000 && said < 40 && said++ >= 0)
+            std::fprintf(stderr, "layer: id %u count %u abe %u alpha %llX test %llX tme %u tfx %u target %d view %d vary %d rec %d\n", b.id, b.count, s.abe, (unsigned long long)s.alpha,
+                         (unsigned long long)s.test, s.tme, (unsigned)((s.tex0 >> 35) & 3), TargetFor(s), view_, vary_, (int)recording_);
+    }
+    // a surface that may have shares: blended over the frame (0x44), a texture function of MODULATE
+    // or none, into a frame buffer, without the destination alpha test
+    if (!off && !flushingHeld_ && b.id != 0 && s.abe && (s.alpha & 0xFF) == 0x44 && !((test >> 14) & 1) && (!s.tme || ((s.tex0 >> 35) & 3) == 0) &&
+        view_ == 0 && (vary_ < 0 || (vary_ >= 200 && vary_ % 2 == 0)) && !recording_ && TargetFor(s) >= 0 && TargetFor(s) < 2 && LayerTry(s, b) &&
+        (vary_ != 204 || !Doubled(b))) {
+        surface_.on = true;
+        surface_.s = s;
+        surface_.src = src;
+        surface_.doubled = Doubled(b);
+        surface_.batch = b;
+        surface_.texture = texture_;
+        return;
+    }
+    if (s.abe && (s.alpha & 0xFF) == 0x48)
+        layersAlone_++;
+    Submit(s, src);
+}
+
 void Renderer::FlushPending()
 {
+    FlushHeld();
     if (!pending_)
         return;
     pending_ = false;
@@ -1129,6 +1342,20 @@ void Renderer::FlushPending()
     texture_ = pendTexture_;
     Source src = {pendVertices_.data(), (std::uint32_t)(pendVertices_.size() * sizeof(gs::DrawVertex)), sizeof(gs::DrawVertex),
                   pendIndex_.data(), (std::uint32_t)pendIndex_.size(), nullptr};
+    {   // SLY1_GPU_RUN_LOG=N: frame N's runs that are not batches: their state, and the area their triangles cover
+        static const long at = std::getenv("SLY1_GPU_RUN_LOG") ? std::atol(std::getenv("SLY1_GPU_RUN_LOG")) : -1;
+        if (at >= 0 && (long)frames_ == at) {
+            double area = 0;
+            if (pendState_.kind == 2)
+                for (std::size_t k = 0; k + 2 < pendIndex_.size(); k += 3) {
+                    const gs::DrawVertex& p = pendVertices_[pendIndex_[k]], &q = pendVertices_[pendIndex_[k + 1]], &r = pendVertices_[pendIndex_[k + 2]];
+                    area += std::fabs((double)(q.x - p.x) * (r.y - p.y) - (double)(r.x - p.x) * (q.y - p.y)) / 2;
+                }
+            std::fprintf(stderr, "run: kind %u, %zu vertices, %zu indices, abe %u alpha %llX test %llX tme %u tex0 %llX frame %llX: %.0f pixels of the GS's\n", pendState_.kind, pendVertices_.size(),
+                         pendIndex_.size(), pendState_.abe, (unsigned long long)(pendState_.alpha & 0xFF), (unsigned long long)pendState_.test, pendState_.tme,
+                         (unsigned long long)pendState_.tex0, (unsigned long long)pendState_.frame, area);
+        }
+    }
     Submit(pendState_, src);
     texture_ = now;
 }
@@ -1138,13 +1365,43 @@ void Renderer::FlushPending()
 // that closes it last (its control word says whether a backface is dropped).
 bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
 {
-    FlushPending();
+    if (pending_)   // (not a surface held for its lights' shares: Layer)
+        FlushPending();
+    {
+        const bool adds = s.abe && (s.alpha & 0xFF) == 0x48;
+        if (vary_ == 6 || ((vary_ == 2 || vary_ == 7) && adds) || (vary_ == 4 && !adds))
+            return true;
+    }
     {   // SLY1_GPU_BLEND_LOG=N (see Draw): the batches among them
         static const long at = std::getenv("SLY1_GPU_BLEND_LOG") ? std::atol(std::getenv("SLY1_GPU_BLEND_LOG")) : -1;
         if (at >= 0 && (long)frames_ == at && s.abe && b.count) {
             const std::uint32_t* c = b.quads + b.colourAt * 4;
             std::fprintf(stderr, "blend: batch of %u: alpha %llX test %llX tme %u frame %llX zbuf %llX colour %u %u %u %u\n", b.count, (unsigned long long)s.alpha,
                          (unsigned long long)s.test, s.tme, (unsigned long long)s.frame, (unsigned long long)s.zbuf, c[0], c[1], c[2], c[3]);
+        }
+    }
+    // A batch that adds nothing is left out. The game draws a surface once for itself and again, on
+    // the same depth, for each of two lights' shares, added to the frame (blend 0x48: Cs times As
+    // plus Cd) under the alpha test NEVER with RGB_ONLY, so that neither the frame's alpha nor the
+    // depth is written. A share whose vertices' colours are all black (the light does not reach the
+    // surface) times its texture is black, and the frame is left as it was: about half of them in
+    // A Stealthy Approach, a third of a frame's batches. (Not with fog towards a colour, which
+    // is not black, nor a texture function other than MODULATE.) SLY1_GPU_NO_BLACK_SKIP=1: drawn.
+    {
+        static const bool off = std::getenv("SLY1_GPU_NO_BLACK_SKIP") != nullptr;
+        const std::uint32_t test = (std::uint32_t)s.test;
+        if (!off && vary_ != 1 && s.abe && (s.alpha & 0xFF) == 0x48 && (test & 1) && ((test >> 1) & 7) == 0 && ((test >> 12) & 3) == 3 &&
+            (!s.fge || (s.fogcol & 0xFFFFFF) == 0) && (!s.tme || ((s.tex0 >> 35) & 3) == 0) && b.count) {
+            const std::uint32_t* c = b.quads + b.colourAt * 4;
+            const std::uint32_t step = b.stride * 4;
+            std::uint32_t any = 0;
+            for (std::uint32_t k = 0; k < b.count && !any; k++, c += step)
+                any = (c[0] | c[1] | c[2]) & 0xFF;
+            if (!any) {
+                blackBatches_++;
+                return true;
+            }
+            litBatches_++;
         }
     }
     static const bool asRuns = std::getenv("SLY1_GPU_BATCH_AS_RUNS") != nullptr;
@@ -1279,7 +1536,7 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
             src.vertexAt = k.vertexAt;
             src.colourAt = k.colourAt;
             src.indexAt = k.indexAt;
-            Submit(s, src);
+            Layer(s, src, b);
             return true;
         }
     }
@@ -1374,7 +1631,7 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
     src.vertexAt = c.vertexAt;
     src.colourAt = colourAt;
     src.indexAt = c.indexAt;
-    Submit(s, src);
+    Layer(s, src, b);
     return true;
 }
 
@@ -1704,6 +1961,16 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     // the effects at half size: a run of them goes into their picture, and the picture is laid over
     // the frame before anything else is drawn into the frame
     const bool fx = !inComposite_ && FxRun(s, src, target, smallTexture != nullptr);
+    if (varyRuns_ > 0 && !src.batch && !inComposite_) {
+        // SLY1_GPU_VARY=2, of the runs that are not batches: 1 those into the effects' picture, 2 those
+        // under the destination alpha test, 3 lines, 4 those into a small target, 5 blended triangles
+        // without a texture, 6 blended triangles with one, 7 those not blended
+        const bool dated = (s.test >> 14) & 1, tri = s.kind == 2 && !fx && !dated && target < 2;
+        const int v = varyRuns_;
+        if ((v == 1 && fx) || (v == 2 && dated) || (v == 3 && s.kind == 1) || (v == 4 && target >= 2) || (v == 5 && tri && s.abe && !s.tme) ||
+            (v == 6 && tri && s.abe && s.tme) || (v == 7 && tri && !s.abe))
+            return;
+    }
     if (!inComposite_) {
         if (fxOpen_ && (!fx || fxFor_ != target))
             CompositeFx();
@@ -1804,13 +2071,19 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         // across the cone, the tint drew nowhere, and a searchlight lit nothing (its light did not
         // turn red with the alarm: only the tint does).
         const bool marksBySource = ate && atst == 0 && afail == 1 && !date && (s.alpha & 0xFF) == 0x48 && target < 2;
-        if (!frameAlpha && (target >= 2 || marksBySource)) {
+        if (!frameAlpha && (target >= 2 || marksBySource || src.layers > 0)) {
             // A small target (a shadow's picture): the coefficients go to the pixel shader, which gives
             // the colour times its own and one less the frame's as the second output, its alpha 1
             // (gs_fsh.glsl), so that the alpha written is the source's, as on the GS. With the blend
             // state's factors the GPU gives the frame's alpha the colour's factor whatever the state's
             // own for alpha: the game's clear of the picture (alpha 0, blend 0x44) left what was
             // there, and each frame's outline piled on the last's until the shadow was solid.
+            if (src.sharesOnly) {   // nothing of the surface's colour, the frame's kept: the shares are added to it
+                sc = 0;
+                s1 = 0;
+                dc = 0;
+                d1 = 1;
+            }
             fp.coef[0] = (float)sc;
             fp.coef[1] = (float)s1;
             fp.coef[2] = (float)dc;
@@ -1876,8 +2149,11 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         // dropped at all, or every one is and the rasteriser culls them (below).
         static const bool noCull = std::getenv("SLY1_GPU_NO_CULL") != nullptr;
         const bool rasterCull = src.batch && src.batch->cull && src.allCullable && !noCull && ab_ != 1 && ab_ != 3;
-        const bool lite = !noLite && (!src.batch || !src.batch->cull || rasterCull) && !dateRun && fsView == 0 && view_ == 0 && fp.coef[0] == 99.0f;
-        const int cull = rasterCull && lite ? 1 : 0;
+        const bool plain = !noLite && (!src.batch || !src.batch->cull || rasterCull) && !dateRun && fsView == 0 && view_ == 0;
+        const bool lite = plain && fp.coef[0] == 99.0f;
+        // a surface with its shares, or the shares alone: gs_layers_fsh.glsl, as short and with the shares (SLY1_GPU_VARY=3's kinds 2 and 6 without it)
+        const bool layered = plain && !lite && !fx && target < 2 && (src.layers > 0 || src.sharesOnly) && vary_ != 202 && vary_ != 206;
+        const int cull = rasterCull && (lite || layered) ? 1 : 0;
         if (cull != cullBound_) {
             // the faces the pixel shader drops (gs_fsh.glsl: front-facing ones when cullFront_ is set)
             DkRasterizerState raster;
@@ -1889,9 +2165,9 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
             cullBound_ = cull;
         }
         culledDraws_ += cull;
-        const int frag = fx ? 2 : lite ? 1 : 0;
+        const int frag = fx ? 2 : lite ? 1 : layered ? 3 : 0;
         if (frag != fragBound_) {
-            const DkShader* shader[1] = {frag == 2 ? &fxShader_ : frag == 1 ? &liteShader_ : &fragmentShader_};
+            const DkShader* shader[1] = {frag == 3 ? &layersShader_ : frag == 2 ? &fxShader_ : frag == 1 ? &liteShader_ : &fragmentShader_};
             dkCmdBufBindShaders(cmd_, DkStageFlag_Fragment, shader, 1);
             fragBound_ = frag;
         }
@@ -1904,7 +2180,8 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         }
         liteRuns_ += lite ? 1 : 0;
     }
-    fp.mode[0] = s.tme;
+    // (2 and 4: the first and the second share's texture is not the surface's: bindings 3 and 4)
+    fp.mode[0] = s.tme ? 1 | (src.layers >= 1 && src.shareTextures[0] != texture ? 2 : 0) | (src.layers >= 2 && src.shareTextures[1] != texture ? 4 : 0) : 0;
     fp.mode[1] = (std::int32_t)((s.tex0 >> 35) & 3);
     fp.mode[2] = (std::int32_t)((s.tex0 >> 34) & 1);
     fp.mode[3] = s.fge;
@@ -1927,6 +2204,12 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     } else if (fresh) {
         last_.texture = ~0u;
     }
+    for (std::uint32_t k = 0; k < src.layers && s.tme; k++)
+        if (src.shareTextures[k] && src.shareTextures[k] != texture) {
+            std::uint32_t sampler = (((s.clamp >> 0) & 3) == 1 ? 1 : 0) | (((s.clamp >> 2) & 3) == 1 ? 2 : 0);
+            DkResHandle handle = dkMakeTextureHandle(src.shareTextures[k]->id, sampler);
+            dkCmdBufBindTextures(cmd_, DkStage_Fragment, 3 + k, &handle, 1);
+        }
 
     // SCISSOR's rectangle (inclusive) in the image's pixels
     {
@@ -1939,6 +2222,8 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         sc.y = std::min((std::uint32_t)(y0 * sy), kHeight);
         sc.width = std::min((std::uint32_t)(x1 * sx + 0.5f), kWidth) - sc.x;
         sc.height = std::min((std::uint32_t)(y1 * sy + 0.5f), kHeight) - sc.y;
+        if (vary_ == 3 && target < 2)   // (SLY1_GPU_VARY: the left half of the frame only)
+            sc.width = sc.x >= kWidth / 2 ? 0 : std::min(sc.width, kWidth / 2 - sc.x);
         if (ab_ == 5) {
             sc.width /= 4;
             sc.height /= 4;
@@ -1960,8 +2245,10 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     if (src.placed) {   // the batch's two streams where DrawBatch put them
         DkGpuAddr base = dkMemBlockGetGpuAddr(src.kept ? keepMem_ : frameMem_);
         const std::uint32_t count = src.batch->count;   // the streams' sizes exactly (an emulator tracks what is bound)
-        DkBufExtents streams[2] = {{base + src.vertexAt, count * 32}, {base + src.colourAt, count * 16}};
-        dkCmdBufBindVtxBuffers(cmd_, 0, streams, 2);
+        const DkGpuAddr own = base + src.colourAt;
+        DkBufExtents streams[4] = {{base + src.vertexAt, count * 32}, {own, count * 16}, {src.layers >= 1 ? src.layerColours[0] : own, count * 16},
+                                   {src.layers >= 2 ? src.layerColours[1] : own, count * 16}};
+        dkCmdBufBindVtxBuffers(cmd_, 0, streams, 4);
         firstIndex = src.indexAt / 4;
     } else {
     frameUsed_ = (frameUsed_ + src.vertexSize - 1) / src.vertexSize * src.vertexSize;
@@ -2015,6 +2302,8 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         ds.depthCompareOp = !zte || ztst == 1 ? DkCompareOp_Always : ztst == 2 ? DkCompareOp_Gequal : DkCompareOp_Greater;
         if (always)
             ds.depthCompareOp = DkCompareOp_Always;
+        if (src.sharesOnly)
+            ds.depthCompareOp = DkCompareOp_Gequal;   // (the shares' own test)
         std::uint32_t depthKey = (std::uint32_t)ds.depthWriteEnable | (std::uint32_t)ds.depthCompareOp << 1 | (target >= 2 || fx ? 0x100u : 0u);
         if (depthKey != last_.depth) {
             dkCmdBufBindDepthStencilState(cmd_, &ds);
@@ -2027,6 +2316,10 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
                                            DkCompareOp_Equal, DkCompareOp_Gequal, DkCompareOp_Greater, DkCompareOp_NotEqual};
     static const DkCompareOp kFails[8] = {DkCompareOp_Always, DkCompareOp_Never, DkCompareOp_Gequal, DkCompareOp_Greater,
                                           DkCompareOp_NotEqual, DkCompareOp_Less, DkCompareOp_Lequal, DkCompareOp_Equal};
+    if (src.sharesOnly) {
+        pass(DkCompareOp_Always, true, false, false);
+        return;
+    }
     if (!ate || atst == 1) {
         pass(DkCompareOp_Always, true, true, true);
         return;
@@ -2043,6 +2336,9 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     // steam of the opening's vents covers the picture twenty times over with them.)
     if (decided == 0 && afail == 1 && atst != 0 && (zmsk || target >= 2))
         decided = 1;
+    if (src.layers > 0)
+        (decided == 0 ? mergedTwoPass_ : mergedOnePass_)++;
+
     if (decided == 1) {
         onePassDraws_++;
         pass(DkCompareOp_Always, true, true, true);
@@ -2396,6 +2692,38 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
     drawInFrame_ = 0;
     stopped_ = true;
     view_ = step == 0 && captureAt_ >= 0 && (long)frames_ >= captureAt_ && (long)frames_ < captureAt_ + 5 ? (int)(frames_ - captureAt_) + 1 : 0;
+    {   // SLY1_GPU_DRAIN=1: the GPU left to finish the frame before its present, and timed: what the
+        // frame costs the GPU after this thread has done with it (perfgpu). A measurement, not a way to run.
+        static const bool drain = std::getenv("SLY1_GPU_DRAIN") != nullptr;
+        static const bool vary = std::getenv("SLY1_GPU_VARY") != nullptr;
+        if (drain || vary) {
+            const std::uint64_t d0 = NowNs();
+            Send(true);
+            dkQueueWaitIdle(queue_);
+            const std::uint64_t d1 = NowNs();
+            drainNs_ += d1 - d0;
+            if (vary) {
+                const int now = (int)(frames_ / 120 % 8);
+                if (frames_ % 120 >= 30) {   // (the first frames after a change left out)
+                    varyDrainNs_ += d1 - d0;
+                    varyCpuNs_ += varyCpuAt_ ? d0 - varyCpuAt_ : 0;
+                    varyFrames_++;
+                }
+                if (now != vary_ % 100) {
+                    if (vary_ >= 0 && varyFrames_)
+                        std::fprintf(stderr, "vary: to %llu: kind %d left out: the GPU drained in %.1f ms a frame, %.1f ms from one present to the next's drain; merged draws of one pass %ld, of two %ld; GPU alone %.2f ms a frame over %.1f lists\n", (unsigned long long)frames_, vary_,
+                                     varyDrainNs_ / 1e6 / (double)varyFrames_, varyCpuNs_ / 1e6 / (double)varyFrames_, mergedOnePass_, mergedTwoPass_, varySerialNs_ / 1e6 / (double)varyFrames_, (double)varySends_ / (double)varyFrames_);
+                    mergedOnePass_ = mergedTwoPass_ = 0;
+                    static const int set = std::atoi(std::getenv("SLY1_GPU_VARY"));
+                    static const bool runs = set == 2;
+                    // (3: nothing left out; in the odd kinds each light's share is drawn by itself, as the game draws it)
+                    vary_ = set == 3 ? 200 + now : runs ? 100 + now : now;
+                    varyRuns_ = runs ? now : -1;
+                    varyDrainNs_ = varyCpuNs_ = varyFrames_ = varySerialNs_ = varySends_ = 0;
+                }
+            }
+        }
+    }
     std::uint64_t t0 = NowNs();
     int slot = dkQueueAcquireImage(queue_, swapchain_);
     acquireNs_ += NowNs() - t0;
@@ -2421,13 +2749,15 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
         dkFenceWait(&fences_[set_], -1);
     fenced_[set_] = false;
     waitNs_ += NowNs() - t1;
+    varyCpuAt_ = NowNs();
     {   // SLY1_PERF_LOG: every 300 frames, how long a frame's present waited for a screen image and for the GPU
         static const bool perfLog = std::getenv("SLY1_PERF_LOG") != nullptr;
-        static std::uint64_t acquireWas, waitWas, framesWas;
-        if (perfLog && frames_ >= framesWas + 300) {
+        static std::uint64_t acquireWas, waitWas, framesWas, drainWas;
+        if (perfLog && frames_ >= framesWas + 60) {
             const double n = (double)(frames_ - framesWas) * 1e6;
-            std::fprintf(stderr, "perfgpu: to %llu: a present waited %.1f ms for a screen image and %.1f ms for the GPU\n", (unsigned long long)frames_,
-                         (acquireNs_ - acquireWas) / n, (waitNs_ - waitWas) / n);
+            std::fprintf(stderr, "perfgpu: to %llu: a present waited %.1f ms for a screen image and %.1f ms for the GPU; the GPU drained in %.1f ms\n", (unsigned long long)frames_,
+                         (acquireNs_ - acquireWas) / n, (waitNs_ - waitWas) / n, (drainNs_ - drainWas) / n);
+            drainWas = drainNs_;
             acquireWas = acquireNs_;
             waitWas = waitNs_;
             framesWas = frames_;
@@ -2481,6 +2811,8 @@ void Renderer::Report()
                  (unsigned long long)keptNoRoom_, keepUsed_ / 1e6, kKeepMemory >> 20, keepFree_.size(), (unsigned long long)keepResets_);
     std::fprintf(stderr, "gpu: %llu runs whose alpha test was decided for the whole run (one draw), %llu drawn twice (what passes, what fails); "
                  "%llu batches culled by the rasteriser\n", (unsigned long long)onePassDraws_, (unsigned long long)twoPassDraws_, (unsigned long long)culledDraws_);
+    std::fprintf(stderr, "gpu: %llu batches adding a light's share left out as all black, %llu drawn: %llu with their surface, %llu by themselves; %llu surfaces' shares drawn after them (%llu surfaces with a triangle twice)\n", (unsigned long long)blackBatches_,
+                 (unsigned long long)litBatches_, (unsigned long long)layersMerged_, (unsigned long long)layersAlone_, (unsigned long long)sharesAfter_, (unsigned long long)doubledBatches_);
     std::fprintf(stderr, "gpu: the effects at half size: %llu runs into their picture, laid over the frame %llu times\n", (unsigned long long)fxRuns_,
                  (unsigned long long)fxComposites_);
     std::fprintf(stderr, "gpu: %llu runs with the short pixel shader\n", (unsigned long long)liteRuns_);
