@@ -41,13 +41,13 @@
 
 namespace port {
 
-// SLY1_TIMELINE=N: from the Nth frame shown, 400 events with their times in milliseconds: what the
+// SLY1_TIMELINE=N: from the Nth frame shown, 400 events (or SLY1_TIMELINE_EVENTS) with their times in milliseconds: what the
 // game's thread queues, what the render thread starts and ends, FINISH, and what else calls
 // TimelineEvent (the vertical blank, the buffer swap).
 static bool Timeline()
 {
     static const long from = std::getenv("SLY1_TIMELINE") ? std::atol(std::getenv("SLY1_TIMELINE")) : -1;
-    static std::atomic<int> left{400};
+    static std::atomic<int> left{std::getenv("SLY1_TIMELINE_EVENTS") ? std::atoi(std::getenv("SLY1_TIMELINE_EVENTS")) : 400};
     return from >= 0 && (long)gs::FramesShown() >= from && left.fetch_sub(1) > 0;
 }
 #define TIMELINE(...) do { if (Timeline()) { char line[160]; int n = std::snprintf(line, sizeof line, "timeline: %9.3f ", (NowNs() % 100000000000ull) / 1e6); \
@@ -101,7 +101,7 @@ const std::uint32_t* At(std::uint32_t addr, bool spr)
     return reinterpret_cast<const std::uint32_t*>(Native(addr & 0x7FFFFFF0));
 }
 
-// SLY1_FINISH_LAG=1 (off otherwise: see docs/RENDERER.md for why): the game is told a list is finished
+// (SLY1_FINISH_LAG=0: off.) The game is told a list is finished
 // when the render thread has done with it, not when the GS thread has drawn it. The game's own
 // render thread waits for FINISH after each of a frame's three packets before it waits for the
 // vertical blank, so a frame cost the handing over, the render thread's work, what the GS thread
@@ -116,7 +116,7 @@ std::atomic<std::uint64_t> g_finishesEarly{0}, g_finishesLate{0};
 bool g_itemFinishTold;
 bool FinishLag()
 {
-    static const bool on = std::getenv("SLY1_FINISH_LAG") && std::getenv("SLY1_FINISH_LAG")[0] == '1';
+    static const bool on = !std::getenv("SLY1_FINISH_LAG") || std::getenv("SLY1_FINISH_LAG")[0] != '0';
     return on;
 }
 
@@ -3371,11 +3371,13 @@ void RenderThreadMain()
                 LiveSink sink;
                 WalkChain(item.regs, item.tadr, sink);
             }
+            TIMELINE("render: the list walked");
             g_listWalked.store(false, std::memory_order_release);
             if (g_jobsOut.load(std::memory_order_acquire) != 0) {
                 GsPassOn();   // (the GS thread may take what is left as it comes to it)
                 PartJobsDrain();
             }
+            TIMELINE("render: the parts are in");
             break;
         }
         case RenderItem::Gif:
@@ -3411,6 +3413,8 @@ void RenderThreadMain()
         }
         GsPassOn();
         HashPassOn();
+        if (kind == 3)
+            TIMELINE("render: passed on");
         if (gsThread)
             FinishEarly();
         {   // SLY1_SLOW_RENDER=ms: each list of VIF1's takes that much longer (a slow machine's frames, on a fast one)

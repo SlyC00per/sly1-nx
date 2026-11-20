@@ -2,9 +2,11 @@
 // The player's disc image (port/iso.h): sectors, the ISO 9660 root directory's executable, and
 // its loadable segments as an ELF file. Written from the public ISO 9660 and ELF formats.
 #include "port/iso.h"
+#include "port/dmac.h"
 
 #include "port/ptr32.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -97,7 +99,14 @@ bool ReadSectors(std::uint32_t lsn, std::uint32_t count, void* dst)
             std::fprintf(stderr, "cd: seek to sector %u failed\n", lsn);
         return false;
     }
+    const auto readFrom = std::chrono::steady_clock::now();
     std::size_t got = std::fread(dst, kSectorSize, count, g_iso);
+    {   // (SLY1_TIMELINE: each read and how long it took)
+        char line[96];
+        std::snprintf(line, sizeof line, "disc: %u sectors at %u read in %.2f ms", count, lsn,
+                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - readFrom).count());
+        TimelineEvent(line);
+    }
     if (trace) {   // each read with a checksum of its bytes, to compare runs
         std::uint32_t sum = 2166136261u;
         for (std::size_t i = 0; i < got * kSectorSize; i++)

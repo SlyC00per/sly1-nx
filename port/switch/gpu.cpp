@@ -1317,7 +1317,7 @@ void Renderer::Layer(const gs::DrawState& s, const Source& src, const gs::Batch&
     // a surface that may have shares: blended over the frame (0x44), a texture function of MODULATE
     // or none, into a frame buffer, without the destination alpha test
     if (!off && !flushingHeld_ && b.id != 0 && s.abe && (s.alpha & 0xFF) == 0x44 && !((test >> 14) & 1) && (!s.tme || ((s.tex0 >> 35) & 3) == 0) &&
-        view_ == 0 && (vary_ < 0 || (vary_ >= 200 && vary_ % 2 == 0)) && !recording_ && TargetFor(s) >= 0 && TargetFor(s) < 2 && LayerTry(s, b) &&
+        view_ == 0 && (vary_ < 0 || vary_ >= 300 || (vary_ >= 200 && vary_ % 2 == 0)) && !recording_ && TargetFor(s) >= 0 && TargetFor(s) < 2 && LayerTry(s, b) &&
         (vary_ != 204 || !Doubled(b))) {
         surface_.on = true;
         surface_.s = s;
@@ -2179,6 +2179,13 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
             }
         }
         liteRuns_ += lite ? 1 : 0;
+        // SLY1_GPU_VARY=4: the draws of one pixel shader left out (1 gs_fsh.glsl's, 2 gs_lite_fsh.glsl's, 3
+        // gs_layers_fsh.glsl's, 4 gs_fx_fsh.glsl's), 5 those into a small target; never the game's clear of the depth
+        if (vary_ >= 301 && vary_ <= 305 && ((std::uint32_t)s.test & 0x7FFFF) != 0x32001) {
+            static const int kFrag[6] = {-1, 0, 1, 3, 2, -1};
+            if (vary_ == 305 ? target >= 2 : (frag == kFrag[vary_ - 300] && target < 2))
+                return;
+        }
     }
     // (2 and 4: the first and the second share's texture is not the surface's: bindings 3 and 4)
     fp.mode[0] = s.tme ? 1 | (src.layers >= 1 && src.shareTextures[0] != texture ? 2 : 0) | (src.layers >= 2 && src.shareTextures[1] != texture ? 4 : 0) : 0;
@@ -2222,7 +2229,7 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         sc.y = std::min((std::uint32_t)(y0 * sy), kHeight);
         sc.width = std::min((std::uint32_t)(x1 * sx + 0.5f), kWidth) - sc.x;
         sc.height = std::min((std::uint32_t)(y1 * sy + 0.5f), kHeight) - sc.y;
-        if (vary_ == 3 && target < 2)   // (SLY1_GPU_VARY: the left half of the frame only)
+        if ((vary_ == 3 || vary_ == 306) && target < 2)   // (SLY1_GPU_VARY: the left half of the frame only)
             sc.width = sc.x >= kWidth / 2 ? 0 : std::min(sc.width, kWidth / 2 - sc.x);
         if (ab_ == 5) {
             sc.width /= 4;
@@ -2717,7 +2724,7 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
                     static const int set = std::atoi(std::getenv("SLY1_GPU_VARY"));
                     static const bool runs = set == 2;
                     // (3: nothing left out; in the odd kinds each light's share is drawn by itself, as the game draws it)
-                    vary_ = set == 3 ? 200 + now : runs ? 100 + now : now;
+                    vary_ = set == 4 ? 300 + now : set == 3 ? 200 + now : runs ? 100 + now : now;
                     varyRuns_ = runs ? now : -1;
                     varyDrainNs_ = varyCpuNs_ = varyFrames_ = varySerialNs_ = varySends_ = 0;
                 }

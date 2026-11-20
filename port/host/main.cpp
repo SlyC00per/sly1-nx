@@ -181,6 +181,16 @@ void* Clock(void*)
     if (const char* e = std::getenv("SLY1_VSYNC")) {
         ViDisplay display;
         Result opened = viOpenDefaultDisplay(&display), had = R_SUCCEEDED(opened) ? viGetDisplayVsyncEvent(&display, &vsync) : opened;
+        // The display is open already (the program's window has it, and a second opening is refused):
+        // its event is asked for by the display's number, which the window does not give out. The
+        // numbers are small ones, tried in turn.
+        for (std::uint64_t id = 0; R_FAILED(had) && id < 4; id++) {
+            display = ViDisplay();
+            display.display_id = id;
+            display.initialized = true;
+            had = viGetDisplayVsyncEvent(&display, &vsync);
+            std::fprintf(stderr, "sly1: the event of display %llu: result 0x%X\n", (unsigned long long)id, (unsigned)had);
+        }
         displayBlank = e[0] == '1' && R_SUCCEEDED(had);
         std::fprintf(stderr, "sly1: the vertical blank is %s (results 0x%X, 0x%X)\n", displayBlank ? "the display's" : "this program's clock: the display's event was not had", (unsigned)opened, (unsigned)had);
     }

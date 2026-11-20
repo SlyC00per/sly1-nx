@@ -1080,7 +1080,7 @@ with it and without; in real time every FINISH (three a frame) is told from the 
 and none owed at the end; the opening movie plays to its end with no error in the stream. Not
 yet measured on the Switch.
 
-On the Switch (9269bda) it made the game unusable, and it is off unless `SLY1_FINISH_LAG=1`: the
+On the Switch (9269bda) it made the game unusable, and it was off unless `SLY1_FINISH_LAG=1` (on since, see below): the
 controls answered about a second late. `perffinish:` showed why: the GS thread owed 108 FINISHes
 (36 frames) and took 27.9 ms a frame where it had taken 14. Its buffer swap waits for the
 display, so by itself it shows little more than 30 frames a second; told to go on, the game made
@@ -1159,3 +1159,27 @@ how long (what a frame costs the GPU, since a frame's commands are sent at its e
 kind (`vary:`): 1 leaves kinds of batches out, 2 kinds of runs, 3 compares this section's draw
 (kind 0), the game's three (odd kinds), the joined draw with gs_fsh.glsl (2, 6) and the joined
 draw for surfaces without a doubled triangle only (4).
+
+
+## Sixty frames a second at A Stealthy Approach's start (2026-11-20)
+
+With the surfaces drawn with their shares (above) the level's first view was shown every
+17.5 ms on the Switch, not 16.7: one frame in eighteen took two blanks, exactly. `SLY1_TIMELINE`
+(now with `SLY1_TIMELINE_EVENTS=N` for more than 400 events, the GS thread's present and each
+read of the disc) showed the game's main thread busy 14 ms in that frame, between its post of
+the frame-ready semaphore and its wait for the frame-done one, where it otherwise takes a
+fiftieth of a millisecond; FINISH, raised on time, was not served until it let go. The host
+shows the same rhythm (0.35 ms). `SLY1_SAMPLE=1` now samples the main thread too in that window
+once it has been open 2 ms, with what its stack holds of code addresses (`samplestack:`): it was
+waiting, switched to the thread the game's memory card code runs its requests on. The game asks
+the card's free space three times a second, and the port walked the save folder for it each
+time, about 12 ms on the SD card, with the game's other threads held (they run in turn). The
+used space is now kept until the card is written to (port/platform/memory_card.cpp).
+
+After it: 16.7 ms a frame over 90 s, a frame held 16.0 ms from its list to the display's queue
+(16.5 at most); render thread 9.6 ms, GS thread 10.9, the game's threads 8.8. The lag of FINISH
+is on unless `SLY1_FINISH_LAG=0`.
+
+The display's own vertical blank is still not had: a second opening of the display is refused
+(0x1272) and its event by the display's number too (0xE72). The game's blank stays this
+program's clock.

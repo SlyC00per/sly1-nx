@@ -6,6 +6,7 @@
 // Coordinates are the GS's: 12.4 fixed point, less XYOFFSET, sampled at whole pixels (a sprite
 // from 0 to 640 covers pixels 0 to 639); triangles follow the top-left rule. Colours are 0 to 255
 // with 0x80 as 1.0 in texture modulation and blending.
+#include "port/dmac.h"
 #include "port/gs.h"
 #include "port/gs_backend.h"
 
@@ -2220,7 +2221,9 @@ void FrameShown()
     if (g_backend) {
         Guard lk;
         FlushRun();
+        port::TimelineEvent("GS thread presents");
         g_backend->Present(g_dispfb, g_display);
+        port::TimelineEvent("GS thread presented");
     }
     std::uint64_t n = ++g_framesShown;
     if (g_dumpDir.empty() || n % (std::uint64_t)g_dumpEvery)

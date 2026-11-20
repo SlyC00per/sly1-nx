@@ -24,7 +24,7 @@ def main():
     by = collections.defaultdict(collections.Counter)
     for line in open(log, errors="replace"):
         word = line.replace("\r", "").split()
-        if len(word) == 4 and word[0] == "sample:" and word[1] in ("render", "gs"):
+        if len(word) == 4 and word[0] == "sample:" and word[1] in ("render", "gs", "main"):
             at, n = int(word[2], 16), int(word[3])
             k = bisect.bisect_right(starts, at) - 1
             by[word[1]][symbols[k][1] if k >= 0 else "?"] += n

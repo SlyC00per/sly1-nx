@@ -83,8 +83,10 @@ int StartThread(pthread_t* thread, void* stack, std::size_t size, void* (*entry)
 }
 
 namespace {
-Handle g_sampled[2];   // the render thread's and the GS thread's
-std::vector<std::uint32_t> g_samples[2];
+Handle g_sampled[3];   // the render thread's and the GS thread's; the game's main thread in its window (SampleWindow)
+std::vector<std::uint32_t> g_samples[3];
+std::map<std::vector<std::uint32_t>, std::uint32_t> g_mainStacks;   // the main thread's: what its stack holds of code addresses, counted
+std::atomic<std::uint64_t> g_windowFrom{0};   // (armGetSystemTick's value when the window opened; 0 shut)
 std::atomic<bool> g_sampling;
 Thread g_sampler;
 
@@ -109,13 +111,29 @@ void Sampler(void*)
         const std::uint64_t shown = gs::FramesShown();
         if (shown < from || shown > to)
             continue;
-        for (int k = 0; k < 2; k++) {
+        for (int k = 0; k < 3; k++) {
             if (!g_sampled[k] || g_samples[k].size() >= 120000)
                 continue;
+            if (k == 2) {
+                const std::uint64_t from = g_windowFrom.load();
+                if (!from || armTicksToNs(armGetSystemTick() - from) < 2000000)
+                    continue;
+            }
             ThreadContext ctx;
             if (R_FAILED(svcSetThreadActivity(g_sampled[k], ThreadActivity_Paused)))
                 continue;
             const bool got = R_SUCCEEDED(svcGetThreadContext3(&ctx, g_sampled[k]));
+            if (got && k == 2) {
+                // where it was called from: the link register, and the first words of its stack that
+                // point into the program's code (return addresses, with some stale ones among them)
+                std::vector<std::uint32_t> stack;
+                stack.push_back((std::uint32_t)(ctx.cpu_gprs[30].x - base));
+                const std::uint64_t* sp = reinterpret_cast<const std::uint64_t*>(ctx.sp & ~7ull);
+                for (int w = 0; w < 600 && stack.size() < 14; w++)
+                    if (sp[w] > base && sp[w] - base < 0x500000 && ((sp[w] - base) & 3) == 0)
+                        stack.push_back((std::uint32_t)(sp[w] - base));
+                g_mainStacks[stack]++;
+            }
             svcSetThreadActivity(g_sampled[k], ThreadActivity_Runnable);
             if (got)
                 g_samples[k].push_back((std::uint32_t)std::min<std::uint64_t>(ctx.pc.x - base, 0xFFFFFFFFu));
@@ -146,8 +164,8 @@ void SamplerReport()
     if (!g_sampling.exchange(false))
         return;
     svcSleepThread(5000000);
-    static const char* const kName[2] = {"render", "gs"};
-    for (int k = 0; k < 2; k++) {
+    static const char* const kName[3] = {"render", "gs", "main"};
+    for (int k = 0; k < 3; k++) {
         std::map<std::uint32_t, std::uint32_t> count;   // by 64 bytes of code
         for (std::uint32_t at : g_samples[k])
             count[at >> 6]++;
@@ -159,6 +177,25 @@ void SamplerReport()
         for (std::size_t i = 0; i < top.size() && i < 400; i++)
             std::fprintf(stderr, "sample: %s %08X %u\n", kName[k], top[i].second << 6, top[i].first);
     }
+    std::vector<std::pair<std::uint32_t, std::vector<std::uint32_t>>> stacks;
+    for (auto& s : g_mainStacks)
+        stacks.push_back({s.second, s.first});
+    std::sort(stacks.rbegin(), stacks.rend());
+    for (std::size_t i = 0; i < stacks.size() && i < 12; i++) {
+        std::fprintf(stderr, "samplestack: %u:", stacks[i].first);
+        for (std::uint32_t at : stacks[i].second)
+            std::fprintf(stderr, " %08X", at);
+        std::fprintf(stderr, "\n");
+    }
+}
+
+void SampleWindow(bool open)
+{
+    if (!g_sampling.load())
+        return;
+    if (open)
+        g_sampled[2] = threadGetCurHandle();
+    g_windowFrom.store(open ? armGetSystemTick() : 0);
 }
 
 void PlaceThread(ThreadRole role, bool sampled)
@@ -199,6 +236,7 @@ void PlaceThread(ThreadRole role, bool sampled)
 
 void PlaceThread(ThreadRole, bool) {}
 void StartSampler() {}
+void SampleWindow(bool) {}
 void SamplerReport() {}
 
 int StartThread(pthread_t* thread, void* stack, std::size_t size, void* (*entry)(void*), void* arg,

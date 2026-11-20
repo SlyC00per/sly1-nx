@@ -848,6 +848,8 @@ s32 PostSemaphore(void* a)
 {
     ServiceInterrupts();
     TimelineSemaphore("posts", (s32)port::WordArg(a));
+    if (t_self == 1 && (s32)port::WordArg(a) == 4)
+        port::SampleWindow(true);
     return Signal((s32)port::WordArg(a), t_self != kIdle);
 }
 void PostSemaphoreFromInterrupt(s32 sema) { Signal(sema, false); }
@@ -856,6 +858,8 @@ s32 AwaitSemaphore(void* a)
 {
     ServiceInterrupts();
     s32 id = (s32)port::WordArg(a);
+    if (t_self == 1 && id == 5)
+        port::SampleWindow(false);
     std::unique_lock<std::mutex> lk(g_kernel);
     if (id < 1 || id >= kSemaphores || !g_semas[id].used)
         return -1;

@@ -161,6 +161,12 @@ void SetSaveFolder(const std::string& path)
 
 using namespace port;
 
+// What UsedKilobytes(g_root) gave, kept until the card is written to (under g_card; -1: not known).
+// The game asks for the card's free space three times a second from a thread of its own, which
+// runs in turn with the game's other threads here: walking the save folder each time held the
+// main thread about 12 ms on the Switch's SD card, one frame in eighteen (docs/RENDERER.md).
+s32 g_usedKilobytes = -1;
+
 s32 InitMemoryCardClient()
 {
     MakeRoot();
@@ -173,7 +179,9 @@ s32 GetCardInfo(s32 port, s32, s32* type, s32* free, s32* format)
     if (port != 0)
         return Done(1, kNoCard);
     if (type) *type = 2;   // a PS2 card
-    if (free) *free = kCardKilobytes - UsedKilobytes(g_root);
+    if (g_usedKilobytes < 0)
+        g_usedKilobytes = UsedKilobytes(g_root);
+    if (free) *free = kCardKilobytes - g_usedKilobytes;
     if (format) *format = 1;
     return Done(1, 0);
 }
@@ -182,6 +190,7 @@ s32 GetCardInfo(s32 port, s32, s32* type, s32* free, s32* format)
 s32 OpenCardFile(s32 port, s32, const char* name, s32 flags)
 {
     std::lock_guard<std::mutex> lk(g_card);
+    g_usedKilobytes = -1;
     if (port != 0)
         return Done(2, kNoCard);
     std::string p = HostPath(name);
@@ -224,6 +233,7 @@ s32 MakeCardDirectory(s32 port, s32 slot, const char* name)
 s32 CloseCardFile(s32 fd)
 {
     std::lock_guard<std::mutex> lk(g_card);
+    g_usedKilobytes = -1;
     if (fd < 0 || fd >= kHandles || !g_files[fd])
         return Done(3, kNotFound);
     std::fclose(g_files[fd]);
@@ -242,6 +252,7 @@ s32 ReadCardFile(s32 fd, void* buf, s32 size)
 s32 WriteCardFile(s32 fd, const void* data, s32 size)
 {
     std::lock_guard<std::mutex> lk(g_card);
+    g_usedKilobytes = -1;
     if (fd < 0 || fd >= kHandles || !g_files[fd])
         return Done(6, kNotFound);
     s32 n = (s32)std::fwrite(data, 1, (std::size_t)size, g_files[fd]);
@@ -298,6 +309,7 @@ s32 ReadCardDirectory(s32 port, s32, const char* name, s32, s32 max, void* table
 s32 RequestCardFormat(s32 port, s32)
 {
     std::lock_guard<std::mutex> lk(g_card);
+    g_usedKilobytes = -1;
     return Done(0x10, port == 0 ? 0 : kNoCard);
 }
 

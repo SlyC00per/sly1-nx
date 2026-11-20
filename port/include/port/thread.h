@@ -36,5 +36,9 @@ void PlaceThread(ThreadRole role, bool sampled = true);
 // SLY1_SAMPLE_FRAMES=A,B: only while the frame shown is one of A to B.
 void StartSampler();
 void SamplerReport();
+// The game's main thread too, while a window is open and has been for 2 ms: between its post of
+// the frame-ready semaphore and its wait for the frame-done one, which is a fiftieth of a
+// millisecond long but for one frame in eighteen (docs/RENDERER.md).
+void SampleWindow(bool open);
 
 }  // namespace port
