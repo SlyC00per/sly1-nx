@@ -1205,3 +1205,19 @@ allocator: that stopped the program). `SLY1_PERF_LOG=1` has a line for the parts
   5 a frame. Worth little by itself: such a part is run in full either way.
 - Not the cause: the render thread's wait for jobs at its list's end (0.1 ms a frame;
   `SLY1_JOB_WAIT_US` sets after how long a job begun elsewhere is run again).
+
+### A tour for timing without a player (2026-11-20)
+
+`SLY1_TOUR=frames:x,y,z;x,y,z;...` (with `--level N`, and without `SLY1_LEVEL_FRAMES`) places
+the player at each place in turn for that many frames; `SLY1_PAD_TURN=N` turns the camera from
+the Nth pad read on, the player standing; `tools/tour_report.py LOG` gives each stop's frame time
+and the threads' times from `SLY1_PERF_LOG=1`. The places are a played route's (`perfpos:`).
+`SLY1_PAD_WALK=N` holds the stick forward too, but a player walking blind dies within a stop or
+two, and a dead player's frames are no measure (50 ms a frame, not understood).
+
+A Stealthy Approach, six stops of 600 frames where the player survives
+(`600:2278,-17153,732;1436,-11947,1167;-458,-10290,600;-2802,-11291,786;-5223,-12472,729;-15741,-7938,-189`),
+on the Switch at 3e85119 plus the tour: 20.2, 17.4, 16.7, 17.3, 16.9 and 20.8 ms a frame, 18.2
+the mean. It is lighter than play: walked by hand the same level's slow stretches are 24 to 27 ms
+with the render thread at 15 to 17 ms and the GS thread at 16 to 19. The tour compares builds; it
+does not say what a player gets.

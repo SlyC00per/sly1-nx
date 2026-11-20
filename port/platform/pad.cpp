@@ -11,6 +11,7 @@
 // left sticks (0 to 255, 128 centred, down and right high), and bytes 8 to 19 the pressures (Right,
 // Left, Up, Down, Triangle, Circle, Cross, Square, L1, R1, L2, R2), 0 to 255.
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -161,6 +162,25 @@ s32 ReadPadFrame(s32 port, s32 slot, u8* out)
     if (!Connected(port, slot))
         return 0;
     PadFrame f = ReadFrame();
+    {   // SLY1_PAD_WALK=N: from the Nth read on, the left stick held forward and the camera turned
+        // slowly to the right, whatever the pad says: the player walks a circle, the same each run,
+        // for timing a moving scene with no one at the controls (docs/RENDERER.md).
+        static const long from = std::getenv("SLY1_PAD_WALK") ? std::atol(std::getenv("SLY1_PAD_WALK")) : -1;
+        static long reads;
+        // SLY1_PAD_TURN=N: the camera turned only, the player left standing (walking blind, it dies)
+        static const long turnFrom = std::getenv("SLY1_PAD_TURN") ? std::atol(std::getenv("SLY1_PAD_TURN")) : -1;
+        ++reads;
+        if (from >= 0 && reads >= from) {
+            f.ly = 0x00;
+            f.lx = 0x80;
+            f.rx = 0xB0;
+            f.ry = 0x80;
+        }
+        if (turnFrom >= 0 && reads >= turnFrom) {
+            f.rx = 0xC0;
+            f.ry = 0x80;
+        }
+    }
     std::memset(out, 0, 32);
     out[1] = 0x79;
     std::uint16_t released = (std::uint16_t)~f.buttons;

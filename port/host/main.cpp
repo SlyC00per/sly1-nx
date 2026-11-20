@@ -354,6 +354,30 @@ void VerifyLevels()
             std::memcpy(now, port::Native(player + 0x100), sizeof now);
             std::fprintf(stderr, "warp: the player now at %.0f %.0f %.0f\n", (double)now[0], (double)now[1], (double)now[2]);
         }
+        if (const char* tour = std::getenv("SLY1_TOUR")) {
+            // SLY1_TOUR=frames:x,y,z;x,y,z;...: the player placed at each place in turn for that many
+            // frames (with SLY1_PAD_WALK it walks a circle at each): a walk through a level that is the
+            // same each run, for timing. The places are a played route's (SLY1_PERF_LOG's perfpos).
+            static float pos[4] __attribute__((aligned(16)));
+            int frames = 480, stop = 0;
+            std::sscanf(tour, "%d", &frames);
+            const char* at = std::strchr(tour, ':');
+            while (at && at[1]) {
+                at++;
+                if (std::sscanf(at, "%f,%f,%f", &pos[0], &pos[1], &pos[2]) != 3)
+                    break;
+                pos[3] = 1.0f;
+                port::CallOnGameThread([] {
+                    ::func_00178008((::Player*)port::Native(*(std::uint32_t*)port::Native(0x00262E10)), (::Vec4*)pos);
+                });
+                std::fprintf(stderr, "tour: stop %d at %.0f %.0f %.0f, frame %llu shown\n", stop++, (double)pos[0], (double)pos[1], (double)pos[2],
+                             (unsigned long long)port::gs::FramesShown());
+                const std::int32_t from = word(kFrames);
+                waitFor([&] { return word(kFrames) - from >= frames; }, 120);
+                at = std::strchr(at, ';');
+            }
+            std::fprintf(stderr, "tour: over, frame %llu shown\n", (unsigned long long)port::gs::FramesShown());
+        }
         if (std::getenv("SLY1_MAP")) {
             // SLY1_MAP=1: the level's map page opened (the game's SetWarpCursor, kind 2) and 300 frames
             // run with it: for looking at the map (with --dump-fb)
