@@ -172,9 +172,30 @@ void* Clock(void*)
     }
     const auto warm = next + std::chrono::seconds(10);
     bool warmed = false;
+#if defined(__SWITCH__)
+    // SLY1_VSYNC=1: the game's vertical blank is the display's own (its event), not a clock of this
+    // program's beside it: a frame given to the display is then shown a whole number of the
+    // game's blanks later, the same number each time.
+    Event vsync;
+    bool displayBlank = false;
+    if (const char* e = std::getenv("SLY1_VSYNC")) {
+        ViDisplay display;
+        displayBlank = e[0] == '1' && R_SUCCEEDED(viOpenDefaultDisplay(&display)) && R_SUCCEEDED(viGetDisplayVsyncEvent(&display, &vsync));
+        std::fprintf(stderr, "sly1: the vertical blank is %s\n", displayBlank ? "the display's" : "this program's clock (the display's event was not had)");
+    }
+#endif
     while (g_seconds == 0 || std::chrono::steady_clock::now() < stop) {
+#if defined(__SWITCH__)
+        if (displayBlank) {
+            if (R_FAILED(eventWait(&vsync, 100000000ull)))   // (a tenth of a second without one: the clock's again)
+                std::this_thread::sleep_for(std::chrono::microseconds(100));
+            next = std::chrono::steady_clock::now();
+        } else
+#endif
+        {
         next += std::chrono::microseconds(16683);
         std::this_thread::sleep_until(next);
+        }
         if (g_started) {
             port::TimelineEvent("vblank");
             port::RaiseInterrupt(2);

@@ -2421,6 +2421,18 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
         dkFenceWait(&fences_[set_], -1);
     fenced_[set_] = false;
     waitNs_ += NowNs() - t1;
+    {   // SLY1_PERF_LOG: every 300 frames, how long a frame's present waited for a screen image and for the GPU
+        static const bool perfLog = std::getenv("SLY1_PERF_LOG") != nullptr;
+        static std::uint64_t acquireWas, waitWas, framesWas;
+        if (perfLog && frames_ >= framesWas + 300) {
+            const double n = (double)(frames_ - framesWas) * 1e6;
+            std::fprintf(stderr, "perfgpu: to %llu: a present waited %.1f ms for a screen image and %.1f ms for the GPU\n", (unsigned long long)frames_,
+                         (acquireNs_ - acquireWas) / n, (waitNs_ - waitWas) / n);
+            acquireWas = acquireNs_;
+            waitWas = waitNs_;
+            framesWas = frames_;
+        }
+    }
     if (abOn_) {
         const std::uint64_t now = NowNs();
         if (frames_ % 30 >= 6 && abAt_) {   // the first frames after a change left out

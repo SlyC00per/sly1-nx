@@ -313,7 +313,8 @@ struct GsItem {
     // path 6, a part run beside the render thread (PartJob): its items come in this one's place
     std::shared_ptr<struct PartJob> job;
     // paths 2 and 3: its last tag is the game's FINISH, and the game has been told (FinishEarly)
-    bool finishTold = false;
+    bool finishTold = false;    // a call: when the list of VIF1's before it reached the render thread (g_listAt)
+    std::uint64_t listAt = 0;
 };
 // On a thread running a part's job: where what it queues for the GS goes. The items stay where
 // they are from job to job, and each one's buffer is used again for the item that comes in its
@@ -435,13 +436,30 @@ void FinishEarly()
     }
 }
 // Before a list of VIF1's is begun: the GS thread no more than a frame behind (a frame has three
-// FINISHes; it is given a tenth of a second at most).
+// FINISHes). The wait has no limit of time: with one, the GS thread fell 36 frames behind on the
+// Switch and the controls answered a second late. The GS thread has all it was given by now
+// (GsPassOn before FinishEarly) and needs nothing more of this thread to come to its FINISHes. A
+// wait of half a second is said (a GS thread that has stopped is then seen, not silent).
+std::atomic<std::uint64_t> g_lagWaitNs{0};
 void FinishLagWait()
 {
-    const std::uint64_t until = NowNs() + 100000000ull;
-    while (g_finishAhead.load(std::memory_order_acquire) > 3 && NowNs() < until)
-        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    if (g_finishAhead.load(std::memory_order_acquire) <= 3)
+        return;
+    const std::uint64_t from = NowNs();
+    bool said = false;
+    while (g_finishAhead.load(std::memory_order_acquire) > 3) {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        if (!said && NowNs() - from > 500000000ull) {
+            said = true;
+            std::fprintf(stderr, "dmac: the render thread has waited half a second for the GS thread (%d FINISHes owed)\n", g_finishAhead.load());
+        }
+    }
+    g_lagWaitNs += NowNs() - from;
 }
+
+// SLY1_PERF_LOG: from a list of VIF1's reaching the render thread to the frame drawn from it being
+// given to the display (the swap after it, run by the GS thread): how long the port holds a frame.
+std::atomic<std::uint64_t> g_listAt{0}, g_heldNs{0}, g_heldMaxNs{0}, g_heldCount{0};
 
 void GsEnqueue(GsItem&& item)
 {
@@ -3200,7 +3218,20 @@ void GsThreadMain()
             alignas(gs::Hold) unsigned char hold[sizeof(gs::Hold)];
         } held(item.path != 0);
         if (item.path == 0) {
+            const std::uint64_t shownBefore = gs::FramesShown();
             item.fn(item.a, item.b);
+            {   // SLY1_SLOW_GS=ms: each frame's swap takes that much longer (a GS thread that cannot keep up)
+                static const int slow = std::getenv("SLY1_SLOW_GS") ? std::atoi(std::getenv("SLY1_SLOW_GS")) : 0;
+                if (slow > 0 && gs::FramesShown() != shownBefore)
+                    std::this_thread::sleep_for(std::chrono::milliseconds(slow));
+            }
+            if (item.listAt && gs::FramesShown() != shownBefore) {   // the swap: the frame is the display's now
+                const std::uint64_t held = NowNs() - item.listAt;
+                g_heldNs += held;
+                g_heldCount++;
+                if (held > g_heldMaxNs.load())
+                    g_heldMaxNs = held;
+            }
         } else if (item.path == 5) {   // a part drawn again: its kept packets and batches in turn
             float matrix[16], viewport[8];
             std::memcpy(matrix, &item.words[0], sizeof matrix);
@@ -3311,7 +3342,9 @@ void RenderThreadMain()
         const std::uint64_t started = NowNs();
         const int kind = (int)item.kind;
         TIMELINE("render starts %s", kind == 0 ? "VIF1 (copy)" : kind == 3 ? "VIF1 (in place)" : kind == 1 ? "GIF" : "a call");
-        if (gsThread && item.kind == RenderItem::Vif1 && FinishLag())
+        if (kind == 0 || kind == 3)
+            g_listAt = started;
+        if (gsThread && (kind == 0 || kind == 3) && FinishLag())
             FinishLagWait();
         switch (item.kind) {
         case RenderItem::Vif1: {
@@ -3369,6 +3402,7 @@ void RenderThreadMain()
                 g.fn = item.fn;
                 g.a = item.a;
                 g.b = item.b;
+                g.listAt = g_listAt.load();
                 GsEnqueue(std::move(g));
             } else {
                 item.fn(item.a, item.b);
@@ -3405,6 +3439,16 @@ void RenderThreadMain()
                                          (unsigned long long)shown, (unsigned long long)(early - earlyWas), (unsigned long long)(late - lateWas), g_finishAhead.load());
                         earlyWas = early;
                         lateWas = late;
+                    }
+                    {
+                        static std::uint64_t heldWas, countWas, waitWas;
+                        const std::uint64_t held = g_heldNs.load(), count = g_heldCount.load(), wait = g_lagWaitNs.load();
+                        if (count > countWas)
+                            std::fprintf(stderr, "perfheld: to %llu: a frame held %.1f ms from its list to the display's queue (%.1f at most); the render thread waited %.1f ms a frame for the GS thread\n",
+                                         (unsigned long long)shown, (held - heldWas) / 1e6 / (double)(count - countWas), g_heldMaxNs.exchange(0) / 1e6, (wait - waitWas) / n);
+                        heldWas = held;
+                        countWas = count;
+                        waitWas = wait;
                     }
                     std::fprintf(stderr, "perf: frames to %llu: %.1f ms a frame; render thread %.1f, GS thread %.1f, the game's threads %.1f\n",
                                  (unsigned long long)shown, (now - since) / n, (render - renderWas) / n, (gsNs - gsWas) / n,

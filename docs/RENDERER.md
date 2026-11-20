@@ -1089,6 +1089,21 @@ after a tenth of a second. Before this is tried again the swap must not hold the
 next frame drawn while the last waits for the display), and the bound must hold without a time
 limit. The host showed none of it: its GS thread does not wait for a display.
 
+### The lag bounded without a time limit (2026-11-20)
+
+Two faults of the first try are put right, still behind `SLY1_FINISH_LAG=1`. The wait before a
+list of VIF1's was made only for lists copied for the render thread, not for those read in place
+(the large ones, which a frame's list nearly always is): the bound was hardly ever applied. And it
+gave up after a tenth of a second. It is now made for both and has no limit of time (half a second
+of it is said). `SLY1_PERF_LOG=1` prints `perfheld:`, how long a frame is held from its list
+reaching the render thread to the swap that gives it to the display, and how long the render
+thread waited for the GS thread; `perfgpu:` (Switch), how long a present waited for a screen image
+and for the GPU. `SLY1_SLOW_GS=ms` makes each swap that much longer, for trying the bound on a
+fast machine: with 25 ms the GS thread owes four FINISHes at most and a frame is shown each
+28.8 ms (34.2 without the lag). `SLY1_VSYNC=1` (Switch) takes the game's vertical blank from the
+display's own event in place of the program's clock.
+
+
 ### A light volume's cone marks the frame's alpha
 
 A searchlight is drawn in three passes (the game's BuildAnimRecordGifPackets, kind 4; VU1's
