@@ -364,6 +364,90 @@ void ParticleFilterNative(State& s)
     s.pc = 12;
 }
 
+// The first light test (0x060 to 0x160), which the game runs once for each group of lights
+// (Vu0::NextLightGroup): from the record at vi3 on, four records at a time, each record plus the
+// sphere in vf31, squared, x + y + z - w, and whether that is below zero (the MAC flags four
+// instructions on, against vi8 = 0x80) kept in vi11 to vi14; the loop's lower half meanwhile
+// shifts the four results of the turn before into vi2, one for each of vi4's count, and leaves
+// when the count is out. Written out a turn of the microcode at a time, each register written
+// where the microcode writes it, so that what it leaves (the mask, the records read ahead, the
+// half-made sums of a turn it left) is the interpreter's to the bit.
+const std::uint32_t kLightTest[66] = {
+    0x10080080, 0x000002FF, 0x81E11B7C, 0x000002FF, 0x81E21B7C, 0x000002FF, 0x81E31B7C, 0x000002FF,
+    0x81E41B7C, 0x000002FF, 0x10042004, 0x000002FF, 0x800427F2, 0x01FF0AE8, 0x800210B0, 0x01FF1328,
+    0x5C002016, 0x01FF1B68, 0x800B10B0, 0x01FF23A8, 0x800427F2, 0x01EB5AEA, 0x800210B0, 0x01EC632A,
+    0x5C002012, 0x01ED6B6A, 0x800C10B0, 0x01EE73AA, 0x800427F2, 0x010B5AC1, 0x800210B0, 0x010C6301,
+    0x5C00200E, 0x010D6B41, 0x800D10B0, 0x010E7381, 0x800427F2, 0x010B5AC2, 0x800210B0, 0x010C6302,
+    0x5C00200A, 0x010D6B42, 0x800E10B0, 0x010E7382, 0x81E11B7C, 0x010B5AC7, 0x81E21B7C, 0x010C6307,
+    0x81E31B7C, 0x010D6B47, 0x81E41B7C, 0x010E7387, 0x300B4000, 0x000002FF, 0x300C4000, 0x000002FF,
+    0x300D4000, 0x000002FF, 0x400007E8, 0x000002FF, 0x300E4000, 0x000002FF, 0x8000033C, 0x400002FF,
+    0x8000033C, 0x000002FF,
+};
+
+void LightTestNative(State& s)
+{
+    s.vf[0][0] = s.vf[0][1] = s.vf[0][2] = 0.0f;
+    s.vf[0][3] = 1.0f;
+    std::uint16_t* vi = s.vi;
+    vi[0] = 0;
+    vi[8] = 0x80;
+    const auto load = [&](int reg) {
+        std::memcpy(s.vf[reg], s.data + (vi[3] & 0xFF) * 16, 16);
+        vi[3] = (std::uint16_t)(vi[3] + 1);
+    };
+    for (int r = 1; r <= 4; r++)
+        load(r);
+    vi[4] = (std::uint16_t)(vi[4] + 4);
+    std::uint32_t last = s.mac;   // the flags of the last arithmetic, as they settle at the end
+    // one upper instruction of block b (0 the add, 1 the square, 2 and 3 the sum, 4 the w taken off) on vf(11 + r)
+    const auto upper = [&](int b, int r) {
+        float* v = s.vf[11 + r];
+        std::uint32_t mac = 0;
+        if (b == 0) {
+            for (int k = 0; k < 4; k++) {
+                v[k] = port_vu0::Add(s.vf[1 + r][k], s.vf[31][k]);
+                mac |= FieldFlags(v[k], k);
+            }
+        } else if (b == 1) {
+            for (int k = 0; k < 4; k++) {
+                v[k] = port_vu0::Mul(v[k], v[k]);
+                mac |= FieldFlags(v[k], k);
+            }
+        } else {
+            v[0] = b == 4 ? port_vu0::Sub(v[0], v[3]) : port_vu0::Add(v[0], v[b - 1]);
+            mac = FieldFlags(v[0], 0);
+        }
+        last = mac;
+        return mac;
+    };
+    for (int guard = 0; guard < 1 << 16; guard++) {
+        for (int b = 0; b < 4; b++) {
+            upper(b, 0);
+            vi[4] = (std::uint16_t)(vi[4] - 1);
+            upper(b, 1);
+            vi[2] = (std::uint16_t)(vi[2] + vi[2]);
+            upper(b, 2);
+            const bool out = (std::int16_t)vi[4] <= 0;
+            upper(b, 3);
+            vi[2] = (std::uint16_t)(vi[2] + vi[11 + b]);
+            if (out) {
+                s.mac = last;
+                s.pc = 45;
+                return;
+            }
+        }
+        std::uint32_t mac[4];
+        for (int r = 0; r < 4; r++) {
+            mac[r] = upper(4, r);
+            load(1 + r);
+        }
+        for (int r = 0; r < 4; r++)
+            vi[11 + r] = mac[r] == vi[8] ? 1 : 0;
+    }
+    std::fprintf(stderr, "port: VU0's light test ran without ending\n");
+    std::abort();
+}
+
 void Interpret(std::uint32_t addr);
 
 }  // namespace
@@ -406,6 +490,34 @@ void Run(std::uint32_t addr)
         }
         if (runs % 100000 == 0)
             std::fprintf(stderr, "vu0check: %lu runs of the particle filter, %lu differed\n", runs, wrong);
+        return;
+    }
+    if (addr == 0x60 && native && std::memcmp(&g_state.micro[24], kLightTest, sizeof kLightTest) == 0) {
+        if (!check) {
+            LightTestNative(g_state);
+            return;
+        }
+        static State before, mine;
+        std::memcpy(&before, &g_state, offsetof(State, micro));
+        Interpret(addr);
+        std::memcpy(&mine, &before, offsetof(State, micro));
+        LightTestNative(mine);
+        static unsigned long runs, wrong;
+        runs++;
+        if (std::memcmp(&mine, &g_state, offsetof(State, data)) != 0) {
+            if (wrong++ < 8) {
+                std::fprintf(stderr, "vu0check: the light test differs (run %lu): mac %X against %X, pc %u against %u; vi", runs, mine.mac, g_state.mac, mine.pc, g_state.pc);
+                for (int k = 0; k < 16; k++)
+                    std::fprintf(stderr, " %X/%X", mine.vi[k], g_state.vi[k]);
+                std::fprintf(stderr, "; vf other:");
+                for (int k = 0; k < 32; k++)
+                    if (std::memcmp(mine.vf[k], g_state.vf[k], 16) != 0)
+                        std::fprintf(stderr, " %d", k);
+                std::fprintf(stderr, "\n");
+            }
+        }
+        if (runs % 20000 == 0)
+            std::fprintf(stderr, "vu0check: %lu runs of the light test, %lu differed\n", runs, wrong);
         return;
     }
     Interpret(addr);
