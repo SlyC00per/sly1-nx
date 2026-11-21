@@ -1411,12 +1411,35 @@ void ImageRun(const std::uint32_t* q, std::uint32_t count)
         Image(q + k * 4);
 }
 
+// TEX0's last palette load (Write): its value, the uploads there had been, and TEXCLUT.
+static std::uint64_t g_lastClutTex = ~0ull, g_lastClutTexclut;
+static std::uint32_t g_lastClutUploads;
+
 void Write(std::uint32_t reg, std::uint64_t value)
 {
     // the caller holds the GS (gs::Hold)
     Regs& r = g_regs;
-    if (reg > 0x05 && reg != 0x0A && reg != 0x0C && reg != 0x0D)
-        g_stateChanged = true;
+    // A register written with the value it has changes nothing: the run goes on. (The game's
+    // particle packets write TEX0 before each sprite, the same each time, and each write loaded
+    // the palette and began the run's state anew: a tenth of the GS thread's work in slow frames
+    // on the Switch.) The transfer's registers and the rest count as changes, as before.
+    bool changed = reg > 0x05 && reg != 0x0A && reg != 0x0C && reg != 0x0D;
+    struct Changed {
+        bool& changed;
+        ~Changed()
+        {
+            if (changed)
+                g_stateChanged = true;
+        }
+    } note{changed};
+    // SLY1_GS_WRITE_ALWAYS=1: every write a change, every TEX0 its palette's load, as before.
+    // (=ab: as before and as now in turn, 600 frames each, to compare in one played run)
+    static const char* const alwaysEnv = std::getenv("SLY1_GS_WRITE_ALWAYS");
+    const bool always = alwaysEnv && (alwaysEnv[0] != 'a' || FramesShown() / 600 % 2 == 0);
+    const auto set = [&](std::uint64_t& field) {
+        changed = always || field != value;
+        field = value;
+    };
     switch (reg) {
     case 0x00:   // PRIM: a new primitive empties the vertex queue
         if (r.prim != value)
@@ -1447,36 +1470,49 @@ void Write(std::uint32_t reg, std::uint64_t value)
         PushVertex((std::int32_t)Bits(value, 0, 16), (std::int32_t)Bits(value, 16, 16), (std::uint32_t)(value >> 32),
                    r.fog, reg == 0x05);
         break;
-    case 0x06: case 0x07: r.ctx[reg - 0x06].tex0 = value; LoadClut(value); break;
-    case 0x08: case 0x09: r.ctx[reg - 0x08].clamp = value; break;
+    case 0x06: case 0x07: {
+        // (the palette is loaded again only when this is not the load before it repeated with
+        // nothing uploaded since: the same write then loads the same palette)
+        set(r.ctx[reg - 0x06].tex0);
+        if (always || g_rasterise || value != g_lastClutTex || g_lastClutUploads != g_uploads || g_lastClutTexclut != r.texclut) {
+            LoadClut(value);
+            g_lastClutTex = value;
+            g_lastClutUploads = g_uploads;
+            g_lastClutTexclut = r.texclut;
+            changed = true;
+        }
+        break;
+    }
+    case 0x08: case 0x09: set(r.ctx[reg - 0x08].clamp); break;
     case 0x0A: r.fog = (std::uint8_t)Bits(value, 56, 8); break;
-    case 0x14: case 0x15: r.ctx[reg - 0x14].tex1 = value; break;
+    case 0x14: case 0x15: set(r.ctx[reg - 0x14].tex1); break;
     case 0x16: case 0x17: {   // TEX2: TEX0's palette fields
         std::uint64_t mask = (0x3Full << 20) | (0x7FFFFFFull << 37);
         Context& c = r.ctx[reg - 0x16];
         c.tex0 = (c.tex0 & ~mask) | (value & mask);
         LoadClut(c.tex0);
+        g_lastClutTex = ~0ull;   // (TEX0's next write loads its palette whatever it is)
         break;
     }
-    case 0x18: case 0x19: r.ctx[reg - 0x18].xyoffset = value; break;
-    case 0x1A: r.prmodecont = value; break;
-    case 0x1B: r.prmode = value; break;
-    case 0x1C: r.texclut = value; break;
-    case 0x22: r.scanmsk = value; break;
-    case 0x34: case 0x35: r.ctx[reg - 0x34].miptbp1 = value; break;
-    case 0x36: case 0x37: r.ctx[reg - 0x36].miptbp2 = value; break;
-    case 0x3B: r.texa = value; break;
-    case 0x3D: r.fogcol = value; break;
-    case 0x40: case 0x41: r.ctx[reg - 0x40].scissor = value; break;
-    case 0x42: case 0x43: r.ctx[reg - 0x42].alpha = value; break;
-    case 0x44: r.dimx = value; break;
-    case 0x45: r.dthe = value; break;
-    case 0x46: r.colclamp = value; break;
-    case 0x47: case 0x48: r.ctx[reg - 0x47].test = value; break;
-    case 0x49: r.pabe = value; break;
-    case 0x4A: case 0x4B: r.ctx[reg - 0x4A].fba = value; break;
-    case 0x4C: case 0x4D: r.ctx[reg - 0x4C].frame = value; break;
-    case 0x4E: case 0x4F: r.ctx[reg - 0x4E].zbuf = value; break;
+    case 0x18: case 0x19: set(r.ctx[reg - 0x18].xyoffset); break;
+    case 0x1A: set(r.prmodecont); break;
+    case 0x1B: set(r.prmode); break;
+    case 0x1C: set(r.texclut); break;
+    case 0x22: set(r.scanmsk); break;
+    case 0x34: case 0x35: set(r.ctx[reg - 0x34].miptbp1); break;
+    case 0x36: case 0x37: set(r.ctx[reg - 0x36].miptbp2); break;
+    case 0x3B: set(r.texa); break;
+    case 0x3D: set(r.fogcol); break;
+    case 0x40: case 0x41: set(r.ctx[reg - 0x40].scissor); break;
+    case 0x42: case 0x43: set(r.ctx[reg - 0x42].alpha); break;
+    case 0x44: set(r.dimx); break;
+    case 0x45: set(r.dthe); break;
+    case 0x46: set(r.colclamp); break;
+    case 0x47: case 0x48: set(r.ctx[reg - 0x47].test); break;
+    case 0x49: set(r.pabe); break;
+    case 0x4A: case 0x4B: set(r.ctx[reg - 0x4A].fba); break;
+    case 0x4C: case 0x4D: set(r.ctx[reg - 0x4C].frame); break;
+    case 0x4E: case 0x4F: set(r.ctx[reg - 0x4E].zbuf); break;
     case 0x50: r.bitbltbuf = value; break;
     case 0x51: r.trxpos = value; break;
     case 0x52: r.trxreg = value; break;

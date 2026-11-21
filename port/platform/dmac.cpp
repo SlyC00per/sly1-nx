@@ -141,6 +141,15 @@ public:
             if (++slot_ == nreg_)
                 slot_ = 0;
             if (reg == 0xE) {
+                {   // (SLY1_GIF_SLOW_LOG=2: the A+D writes inside vertex packets, the first of each kind)
+                    static const bool log = std::getenv("SLY1_GIF_SLOW_LOG") && std::getenv("SLY1_GIF_SLOW_LOG")[0] == '2';
+                    static int said[2];
+                    const int kind = nreg_ == 3 ? 0 : nreg_ == 10 ? 1 : -1;
+                    if (log && kind >= 0 && said[kind] < 24) {
+                        said[kind]++;
+                        std::fprintf(stderr, "gifad: nreg %u: register %02X = %08X%08X\n", nreg_, q[2] & 0xFF, q[1], q[0]);
+                    }
+                }
                 gs::Write(q[2] & 0xFF, q[0] | (std::uint64_t)q[1] << 32);
                 if ((q[2] & 0xFF) == 0x61)
                     Finish();
@@ -212,6 +221,40 @@ private:
             for (std::uint32_t k = 0; k < nreg_; k++)
                 if (((regs_ >> (4 * k)) & 0xF) == 0xE)
                     plain_ = false;
+        }
+        {   // SLY1_GIF_SLOW_LOG=1: the PACKED tags that go a quadword at a time (an A+D among their
+            // registers), by their registers, with the quadwords each kind had; printed every 400,000 tags
+            static const bool log = std::getenv("SLY1_GIF_SLOW_LOG") != nullptr;
+            if (log) {
+                struct Slow {
+                    std::mutex lock;
+                    std::map<std::pair<std::uint64_t, std::uint32_t>, std::pair<std::uint64_t, std::uint64_t>> by;
+                    std::uint64_t fast = 0;
+                    std::uint64_t tags = 0;
+                    void Say()
+                    {
+                        std::vector<std::pair<std::uint64_t, std::pair<std::uint64_t, std::uint32_t>>> top;
+                        for (auto& kv : by)
+                            top.push_back({kv.second.first, kv.first});
+                        std::sort(top.rbegin(), top.rend());
+                        std::fprintf(stderr, "gifslow: %llu quadwords in plain PACKED runs\n", (unsigned long long)fast);
+                        for (std::size_t k = 0; k < top.size() && k < 16; k++)
+                            std::fprintf(stderr, "gifslow: %llu quadwords in %llu tags: nreg %u regs %016llX\n", (unsigned long long)top[k].first,
+                                         (unsigned long long)by[top[k].second].second, top[k].second.second, (unsigned long long)top[k].second.first);
+                    }
+                };
+                static Slow slow;
+                std::lock_guard<std::mutex> lk(slow.lock);
+                if (++slow.tags % 400000 == 0)
+                    slow.Say();
+                if (flg_ == 0 && !plain_) {
+                    auto& e = slow.by[{regs_ & (nreg_ == 16 ? ~0ull : (1ull << (4 * nreg_)) - 1), nreg_}];
+                    e.first += (std::uint64_t)nloop * nreg_;
+                    e.second++;
+                } else if (flg_ == 0) {
+                    slow.fast += (std::uint64_t)nloop * nreg_;
+                }
+            }
         }
         if (flg_ == 0)
             left_ = nloop * nreg_;
