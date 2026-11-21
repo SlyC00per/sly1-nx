@@ -2850,11 +2850,11 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
         // with the pixels; the size is brought down at once when a frame at the present size took
         // longer than the time allowed, and up a step when 30 frames running would have fitted a
         // step higher. SLY1_GPU_SCALE=N: N hundredths always (100: never smaller); =abN: the whole
-        // and N in turn; SLY1_GPU_BUDGET_US: the time allowed (14,000).
+        // and N in turn; SLY1_GPU_BUDGET_US: the time allowed (14,000; at 13,000 no frame of a played run was late).
         static const char* const e = std::getenv("SLY1_GPU_SCALE");
         static const bool turns = e && e[0] == 'a';
         static const int asked = e ? std::atoi(turns ? e + 2 : e) : 0;
-        static const float budget = std::getenv("SLY1_GPU_BUDGET_US") ? (float)std::atof(std::getenv("SLY1_GPU_BUDGET_US")) : 13000.0f;
+        static const float budget = std::getenv("SLY1_GPU_BUDGET_US") ? (float)std::atof(std::getenv("SLY1_GPU_BUDGET_US")) : 14000.0f;
         static int now = 100, fits = 0;
         static std::uint64_t seen;
         int hundredths = now;
@@ -2877,7 +2877,7 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
                 while (now > 60 && timeAt(now) > budget)
                     now -= 5;
                 fits = 0;
-            } else if (now < 100 && timeAt(now + 5) < budget * 0.9f) {
+            } else if (now < 100 && timeAt(now + 5) < budget * 0.95f) {
                 if (++fits >= 20) {
                     now += 5;
                     fits = 0;

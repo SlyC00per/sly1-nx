@@ -2213,8 +2213,20 @@ std::uint32_t g_callKey, g_callHeader[44], g_callHeaderAt;
 Vif::Regs g_callRegs;
 bool g_callTte;
 
+// SLY1_PART_CEILING=1 (=ab: in turn with the usual, 600 frames each): a part once kept is drawn
+// again as it was kept whatever has changed in it since, and one seen in the list before is kept
+// whatever it was then. The picture is wrong (stale lighting, poses and fades); the work is what
+// a renderer that never ran a part's packet again would leave: the ceiling of that, measured
+// before it is built.
+bool PartCeiling()
+{
+    static const char* const e = std::getenv("SLY1_PART_CEILING");
+    return e && (e[0] != 'a' || gs::FramesShown() / 600 % 2 == 1);
+}
+
 bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
 {
+    const bool ceiling = PartCeiling();
     if (!PartReplayOn() || !g_vif1.BetweenCodes())
         return false;
     // A part drawn the long way (the game's own packets for its meshes, lit by VU1 each frame; the
@@ -2269,7 +2281,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     if (PartHashLate() && it != g_parts.end()) {
         HashTakeResults();
         PartRecord& r = it->second;
-        if (!r.ok && !r.moving && r.notBefore > gs::FramesShown()) {
+        if (!ceiling && !r.ok && !r.moving && r.notBefore > gs::FramesShown()) {
             g_partsFickle++;
             return false;   // one that keeps changing, left alone for now: no hash needed
         }
@@ -2299,8 +2311,8 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     // thread's work walking on the Switch (the helper's hashes come a list late for them).
     if (!late && it != g_parts.end() && !it->second.moving && KeepTwice()) {
         PartRecord& r = it->second;
-        const bool asKept = r.ok && r.before == regs && PartHeaderSame(r.header, header, slow);
-        const bool asSeen = r.seenList != 0 && r.seenList + 1 >= g_listSerial && r.seenRegs == regs && PartHeaderSame(r.seenHeader, header, slow);
+        const bool asKept = r.ok && (ceiling || (r.before == regs && PartHeaderSame(r.header, header, slow)));
+        const bool asSeen = r.seenList != 0 && r.seenList + 1 >= g_listSerial && (ceiling || (r.seenRegs == regs && PartHeaderSame(r.seenHeader, header, slow)));
         if (!asKept && !asSeen) {
             if (r.ok) {
                 g_partsStale++;
@@ -2376,9 +2388,13 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
                     same = same && (r.texWas[j] != r.texWas[k] || texNow[j] == v);
             }
         }
+        if (ceiling) {
+            same = r.kept != nullptr;   // (a record without its kept items faulted here at the end of the one run)
+            texMoved = false;
+        }
         if (!same)   // why, for the report: the hash, the registers, or the header
             g_partsStaleBy[r.hash != hash ? 0 : !(r.before == regs) ? 1 : 2]++;
-        const bool wholeDue = late ? r.wholeArrived : (r.verified < 8 || ((gs::FramesShown() + key) & 31) == 0);
+        const bool wholeDue = !ceiling && (late ? r.wholeArrived : (r.verified < 8 || ((gs::FramesShown() + key) & 31) == 0));
         if (same && wholeDue) {
             const std::uint64_t whole = late ? r.seenWhole : PartHash(target, true, regs.cl, regs.wl, tte, slow);
             r.wholeArrived = false;
@@ -2461,7 +2477,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     // A part found changed three times running (one that fades, its header's scales other each
     // frame) is run as ever for the next 30 frames: keeping it each frame costs more than it saves.
     const std::uint32_t stale = r.ok ? r.stale + 1 : r.stale;
-    if (r.notBefore > gs::FramesShown()) {
+    if (!ceiling && r.notBefore > gs::FramesShown()) {
         g_partsFickle++;
         return false;
     }
@@ -2471,7 +2487,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     // thread on the Switch, walking through A Stealthy Approach. SLY1_PART_KEEP_TWICE=0: at once.
     {
         const bool twice = KeepTwice();
-        const bool asSeen = r.seenList != 0 && r.seenList + 1 >= g_listSerial && r.seenHash == hash && r.seenRegs == regs && PartHeaderSame(r.seenHeader, header, slow);
+        const bool asSeen = r.seenList != 0 && r.seenList + 1 >= g_listSerial && (ceiling || (r.seenHash == hash && r.seenRegs == regs && PartHeaderSame(r.seenHeader, header, slow)));
         if (twice && !asSeen) {
             r.seenHash = hash;
             r.seenList = g_listSerial;
@@ -2508,7 +2524,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     r.slow = slow;
     r.watchUntil = watchUntil;
     r.stale = stale;
-    if (stale >= 3) {
+    if (stale >= 3 && !ceiling) {
         r.stale = 0;
         r.lockout = std::min<std::uint32_t>(std::max<std::uint32_t>(r.lockout * 2, 30), 960);
         r.notBefore = gs::FramesShown() + r.lockout;
@@ -2893,7 +2909,21 @@ void PartJobSeen(PartRecord& r, const Vif::Regs& before, bool clean)
 
 int g_fullWhy;
 std::uint64_t g_fullNsBy[7], g_fullBy[7];
+// (SLY1_PERF_LOG's perfmodes: the parts by how they are drawn (from their cache, the long way), their
+// header's lighting mode (9.y: -1, 0, 1 ...) and what became of each: drawn again as kept, made a
+// job, run here in full. A census for the renderer that is to draw them itself.)
+std::uint64_t g_modeCensus[2][8][3];
+bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow);
 bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
+{
+    const std::uint64_t jobsWas = g_jobsMade;
+    const bool skipped = PartCallInner(marker, target, slow);
+    const std::int32_t mode = (std::int32_t)g_callHeader[37];
+    const int m = mode < -1 || mode > 6 ? 7 : mode + 1;
+    g_modeCensus[slow ? 1 : 0][m][!skipped ? 2 : g_jobsMade != jobsWas ? 1 : 0]++;
+    return skipped;
+}
+bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
 {
     g_callKey = 0;
     if (PartDecide(marker, target, slow))
@@ -3922,6 +3952,21 @@ void RenderThreadMain()
                                          (jobs[2] - jobsWas[2]) / f, (ns[2] - nsWas[2]) / f / 1e6, (g_jobDrainWaitNs - drainWas) / f / 1e6, (int)(JobWaitNs() / 1000),
                                          (g_partsWaited - waitedWas) / f, (g_gsSpareHad.load() - spareWas[0]) / f, (g_gsSpareNone.load() - spareWas[1]) / f, (g_gsSpareGrown.load() - spareWas[2]) / f, (unsigned long long)g_jobStaleCodes.load(), (unsigned long long)g_jobsNotCopied, (g_jobWordsCopied - copiedWas) / f);
                         copiedWas = g_jobWordsCopied;
+                        {
+                            static std::uint64_t was[2][8][3];
+                            if (since) {
+                                std::fprintf(stderr, "perfmodes: to %llu, a frame (again/job/full):", (unsigned long long)shown);
+                                for (int w = 0; w < 2; w++)
+                                    for (int m = 0; m < 8; m++) {
+                                        const std::uint64_t* c = g_modeCensus[w][m];
+                                        const std::uint64_t* o = was[w][m];
+                                        if (c[0] + c[1] + c[2] != o[0] + o[1] + o[2])
+                                            std::fprintf(stderr, " %s mode %d %.1f/%.1f/%.1f;", w ? "long" : "cache", m - 1, (c[0] - o[0]) / f, (c[1] - o[1]) / f, (c[2] - o[2]) / f);
+                                    }
+                                std::fprintf(stderr, "\n");
+                            }
+                            std::memcpy(was, g_modeCensus, sizeof was);
+                        }
                         {
                             static std::uint64_t nsWas[7], nWas[7];
                             static const char* const kWhy[7] = {"being kept", "no key", "lit by volumes", "not known", "watched", "no shape", "shape changed"};
