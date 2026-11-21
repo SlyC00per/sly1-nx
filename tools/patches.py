@@ -181,7 +181,7 @@ PATCHES = [
      "            AddGifRegisterWrite(&f, 0x51, ((u64)(y << 4) << 32) | ((u64)(x << 4) << 48));\n"
      "            AddGifRegisterWrite(&f, 0x53, 0);\n"
      "            AddGifImageTag(&f, 0x40);\n"
-     "            AddDmaRefTag(&f, 0x40, (void*)(addr & 0xFFFFFFF));\n"
+     "            AddDmaRefTag(&f, 0x40, DMA_PHYSICAL_ADDRESS(addr));\n"
      "            addr += 0x400;\n"
      "        }\n"
      "    }\n",
@@ -200,7 +200,7 @@ PATCHES = [
      "        s32 port_rows = h - y < 192 ? h - y : 192;\n"
      "        s32 port_qw = port_rows * w / 4;\n"
      "        AddGifImageTag(&f, port_qw);\n"
-     "        AddDmaRefTag(&f, port_qw, (void*)(addr & 0xFFFFFFF));\n"
+     "        AddDmaRefTag(&f, port_qw, DMA_PHYSICAL_ADDRESS(addr));\n"
      "        addr += port_qw * 16;\n"
      "    }\n",
      "a movie's picture sent to the GS in one transfer"),
@@ -532,6 +532,14 @@ PATCHES = [
      "        if (self->nextPollTime <= g_elapsedTime[0])\n",
      "        if (self->state != 5 && self->nextPollTime <= g_elapsedTime[0])\n",
      "the port's card cannot be removed: no poll of it once its save files are in (the user's decision, 2026-11-20)"),
+    # The decompilation's macro for the address a DMA tag takes masks the pointer to its low 28
+    # bits, which on the PS2 makes a segment address physical. Here a pointer is the host's: the
+    # tag's writer (AddDmaRefTag) makes it the game address it stores, and a game address has no
+    # segment bits to take off. The pointer goes through as it is.
+    ("include/packet_writer.h",
+     "#define DMA_PHYSICAL_ADDRESS(p) ((void*)((uptr)(p) & 0xFFFFFFF))",
+     "#define DMA_PHYSICAL_ADDRESS(p) ((void*)(p))",
+     "a DMA tag's address: the pointer itself, which the tag's writer turns into the game address"),
 ]
 
 
