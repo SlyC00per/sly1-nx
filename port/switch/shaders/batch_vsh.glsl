@@ -28,8 +28,8 @@ layout (std140, binding = 0) uniform BatchParams {
     mat4 matrix;
     vec4 toClip;   // clip x and y scaled (x, y) and w's part added (z, w)
     vec4 depth;    // clip z scaled (x) and w's part added (y): over w, the GS's depth as a fraction of 2 to the 32nd
-    vec4 fog;      // x the scale, y the largest w, z 1 when backfaces are dropped
-    vec4 layers;   // x, y: 1 for each share drawn with the batch
+    vec4 fog;      // x the scale, y the largest w, z 1 when backfaces are dropped, w the alpha's scale
+    vec4 layers;   // x, y: 1 for each share drawn with the batch; z, w: added to S and T
 } u;
 
 void main()
@@ -39,9 +39,14 @@ void main()
                        (clip.z + clip.w) * 0.5, clip.w);
     float over = clip.w != 0.0 ? 1.0 / clip.w : 0.0;
     outFog = float((int(float(inControl & 0xFFFu) + u.fog.x * min(clip.w, u.fog.y) * over) >> 4) & 0xFF);
+    // (a part's own numbers, port/gs_backend.h's Batch: the alpha times its scale, truncated as the
+    // program's conversion to an integer truncates it, and the texture slid along)
     outColour = vec4(inColour & 0xFFu);
-    outStq = inStq;
+    outColour.a = floor(outColour.a * u.fog.w);
+    outStq = inStq + vec3(u.layers.zw, 0.0);
     vec4 s1 = vec4(inShare1 & 0xFFu) * u.layers.x, s2 = vec4(inShare2 & 0xFFu) * u.layers.y;
+    s1.a = floor(s1.a * u.fog.w);
+    s2.a = floor(s2.a * u.fog.w);
     outAdd = vec4(s1.rgb * (s1.a / 128.0), s1.a / 128.0);
     outAdd2 = vec4(s2.rgb * (s2.a / 128.0), s2.a / 128.0);
     outOutside = (clip.w <= 0.0 || abs(clip.x) > clip.w || abs(clip.y) > clip.w || abs(clip.z) > clip.w) ? 1.0 : 0.0;

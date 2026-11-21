@@ -789,10 +789,11 @@ void Renderer::BindSource(const Source& src)
         bp.fog[0] = b->fogScale;
         bp.fog[1] = b->wMax;
         bp.fog[2] = b->cull ? 1.0f : 0.0f;
-        bp.fog[3] = 0.0f;
+        bp.fog[3] = b->alphaScale;
         bp.layers[0] = src.layers >= 1 ? 1.0f : 0.0f;
         bp.layers[1] = src.layers >= 2 ? 1.0f : 0.0f;
-        bp.layers[2] = bp.layers[3] = 0.0f;
+        bp.layers[2] = b->stOffset[0];
+        bp.layers[3] = b->stOffset[1];
         if (!batchSet_ || std::memcmp(&bp, &lastBatch_, sizeof bp) != 0) {
             dkCmdBufPushConstants(cmd_, data + batchUbo_, sizeof bp, 0, sizeof bp, &bp);
             lastBatch_ = bp;
@@ -1632,6 +1633,10 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
             src.allCullable = k.allCullable;
             src.alphaMin = k.alphaMin;
             src.alphaMax = k.alphaMax;
+            if (b.alphaScale != 1.0f) {   // (the shader scales the alpha: where it can lie, scaled)
+                src.alphaMin = (std::uint8_t)std::max(0.0f, std::min(255.0f, std::floor(k.alphaMin * b.alphaScale)));
+                src.alphaMax = (std::uint8_t)std::max(0.0f, std::min(255.0f, std::ceil(k.alphaMax * b.alphaScale)));
+            }
             src.vertexAt = k.vertexAt;
             src.colourAt = k.colourAt;
             src.indexAt = k.indexAt;
@@ -1727,6 +1732,10 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
     src.allCullable = c.allCullable;
     src.alphaMin = (std::uint8_t)alphaLo;
     src.alphaMax = (std::uint8_t)alphaHi;
+    if (b.alphaScale != 1.0f) {
+        src.alphaMin = (std::uint8_t)std::max(0.0f, std::min(255.0f, std::floor(alphaLo * b.alphaScale)));
+        src.alphaMax = (std::uint8_t)std::max(0.0f, std::min(255.0f, std::ceil(alphaHi * b.alphaScale)));
+    }
     src.vertexAt = c.vertexAt;
     src.colourAt = colourAt;
     src.indexAt = c.indexAt;

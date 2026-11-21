@@ -639,6 +639,18 @@ void KickPath1(std::uint32_t qaddr, void*)
 }
 
 // A VIF's stream of 32-bit words: its VIFcodes and their data.
+// The unpack of a mesh's texture offset: one vector of two words to 22 from TOPS, which the
+// program at 0x4F8 adds to every vertex's S and T (a texture that slides along a surface). In a
+// part drawn from its cache the game writes the two words anew each frame and nothing else of the
+// packet changes: they are left out of the part's hash and given to the renderer as numbers
+// (docs/RENDERER.md, "A part's numbers left to the renderer"). SLY1_PART_PARAMS=0: not.
+constexpr std::uint32_t kStUnpackMask = 0x7FFF83FFu, kStUnpack = 0x64018016u;
+bool PartParamsOn()
+{
+    static const bool off = std::getenv("SLY1_PART_PARAMS") && std::getenv("SLY1_PART_PARAMS")[0] == '0';
+    return !off;
+}
+
 class Vif {
 public:
     // VIF0 feeds VU0 (port/vu0_micro.h): its MPG, UNPACK and microprogram starts take effect.
@@ -685,6 +697,8 @@ public:
         std::memcpy(col_, r.col, sizeof r.col);
     }
     bool BetweenCodes() const { return left_ == 0; }
+    // the unpacks so far of a mesh's texture offset (kStUnpack)
+    std::uint32_t StUnpacks() const { return stUnpacks_; }
 
     void Words(const std::uint32_t* w, int n)
     {
@@ -808,6 +822,8 @@ private:
         if ((cmd & 0x60) == 0x60) {   // UNPACK: num vectors of vn+1 elements of 32 >> vl bits
             std::uint32_t vn = (cmd >> 2) & 3, vl = cmd & 3, n = num ? num : 256;
             std::uint32_t vectors = n;
+            if ((w & kStUnpackMask) == kStUnpack)
+                stUnpacks_++;
             if (wl_ > cl_)   // filling: only cl of every wl written vectors come from the stream
                 vectors = cl_ * (n / wl_) + (n % wl_ < cl_ ? n % wl_ : cl_);
             std::uint32_t bits = (vn == 3 && vl == 3) ? 16 : (32u >> vl) * (vn + 1);
@@ -1322,6 +1338,7 @@ private:
     // VIF1's registers (VIF0 keeps the unpacking ones too)
     std::uint32_t row_[4] = {}, col_[4] = {}, mask_ = 0, mode_ = 0;
     std::uint32_t base_ = 0, ofst_ = 0, tops_ = 0, itops_ = 0;
+    std::uint32_t stUnpacks_ = 0;
     bool dbf_ = false;
     std::uint32_t cmd_ = 0, imm_ = 0, num_ = 0;
     std::vector<std::uint32_t> data_;
@@ -1475,7 +1492,12 @@ struct PartRecord {
     bool ok = false;
     std::uint64_t hash = 0, hashWhole = 0;   // PartHash, and with every piece whole
     std::uint32_t verified = 0;          // the times it has been drawn again with the whole hash the same
-    bool moving = false;                 // its vertices change where the hash does not look: never drawn again
+    bool moving = false;                 // its vertices change where the hash does not look: not drawn again
+    // ...until movingUntil, when it is kept anew: one whose vertices changed once (its cache's
+    // colours written again when a light changed) is then drawn again as before. Left alone for
+    // 120 frames the first time and twice as long each time after (to 3,840).
+    std::uint64_t movingUntil = 0;
+    std::uint32_t movingWait = 0;
     std::uint32_t header[44] = {};       // the part's header, 11 quadwords at TOPS
     Vif::Regs before, after;
     std::vector<PartKept> items;                          // while it is recorded
@@ -1519,6 +1541,20 @@ struct PartRecord {
     std::vector<std::uint64_t> texWas;
     std::vector<TexFix> texFix;
     bool texStrict = false;
+    // A part's numbers left to the renderer. alphaStrict: a batch kept of it has the alpha's scale
+    // in its colours, so the header's 9.x must be what it was. stAt, stWas: where the texture
+    // offsets left out of the hash are in the packet (called at stTarget) and what they were when
+    // the part was kept; each kept batch says which is its own (gs::Batch::stSource, counted from
+    // stBase of VIF1's count). stStrict: an offset no kept batch answers for, or too many: the
+    // values must be what they were.
+    bool alphaStrict = false, stStrict = false;
+    bool maskRead = true, maskSet = false;   // (PartHasher's, of the packet it was kept from)
+    struct St {
+        float s, t;
+    };
+    std::vector<const std::uint32_t*> stAt;
+    std::vector<St> stWas;
+    std::uint32_t stBase = 0, stTarget = 0;
     // For a job (PartJob): its packet's shape when it was last run here, and the registers it was
     // run from and left (two pairs: the game turns VIF1's buffers about from part to part, and a
     // part comes with either), with nothing a job must not have (an interrupt, a FINISH, a call).
@@ -1617,9 +1653,11 @@ struct PartTurns {
     }
 } g_partTurns;
 std::uint64_t g_partsSlowReplayed, g_partsSlowKept, g_partsSlowRefused;
+std::uint64_t g_partsAlphaMoved, g_partsStMoved;   // drawn again with another alpha's scale, another texture offset
 
 std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow = false,
-                       std::vector<const std::uint32_t*>* tex = nullptr, bool shape = false);
+                       std::vector<const std::uint32_t*>* tex = nullptr, bool shape = false, std::vector<const std::uint32_t*>* st = nullptr,
+                       std::uint8_t* maskUse = nullptr);
 
 }  // namespace
 
@@ -1795,6 +1833,10 @@ void PartRecordItem(const GsItem& item)
         gs::Batch b;
         std::memcpy(&b, &words[1], sizeof b);
         b.keep = ++g_partKey;
+        if (b.stApplied) {   // which of the packet's texture offsets is in its S and T: the last VIF1 unpacked
+            const std::uint32_t seen = g_vif1.StUnpacks() - r.stBase;
+            b.stSource = seen >= 1 && seen <= 64 ? (std::uint8_t)(seen - 1) : 0xFF;
+        }
         std::memcpy(&words[1], &b, sizeof b);
         r.items.push_back({item.path, std::make_shared<const std::vector<std::uint32_t>>(std::move(words))});
     } else {
@@ -1829,6 +1871,14 @@ struct PartHasher {
     bool texFree = false, adWatch = false;
     std::uint32_t adLeft = 0;
     std::vector<const std::uint32_t*>* tex = nullptr;
+    // The same for a mesh's texture offset (kStUnpack): its two words left out, and where they are
+    // noted when asked for (st), in the order VIF1 meets them.
+    bool stFree = false, stSkip = false;
+    std::vector<const std::uint32_t*>* st = nullptr;
+    // Whether the packet unpacks through the mask as it comes (a masked unpack before any STMASK
+    // of its own), and whether it sets the mask: a part that does not read the mask it is met
+    // with is the same part whatever that is.
+    bool maskRead = false, maskSet = false;
     void Mix(std::uint32_t w)
     {
         h = (h ^ w) * 0x9E3779B97F4A7C15ull;
@@ -1846,6 +1896,11 @@ struct PartHasher {
                     segs->push_back({code, 0});
                 sampled = false;
                 at = 0;
+                stSkip = stFree && (code & kStUnpackMask) == kStUnpack && wl <= cl;
+                if (cmd == 0x20)
+                    maskSet = true;
+                else if ((cmd & 0x70) == 0x70 && !maskSet)
+                    maskRead = true;
                 if ((cmd & 0x60) == 0x60) {   // UNPACK, as Vif::Code has it
                     std::uint32_t vn = (cmd >> 2) & 3, vl = cmd & 3, count = num ? num : 256;
                     std::uint32_t vectors = count;
@@ -1879,6 +1934,17 @@ struct PartHasher {
                 continue;
             }
             const std::size_t take = std::min<std::size_t>(left, n - k);
+            if (stSkip) {
+                stSkip = false;
+                if (take == 2 && left == 2) {   // (in one piece, as the game writes it)
+                    if (st)
+                        st->push_back(w + k);
+                    k += 2;
+                    at += 2;
+                    left = 0;
+                    continue;
+                }
+            }
             if (segs && !ignored && !segs->empty())
                 for (std::size_t i = 0; i < take; i++)
                     segs->back().second = (segs->back().second ^ w[k + i]) * 0x9E3779B97F4A7C15ull + 1;
@@ -1944,9 +2010,20 @@ bool PartTte() { return (static_cast<volatile std::uint32_t*>(Native(kVif1))[0] 
 // registers), 0 when it has what a part's job must not (microcode loaded, an interrupt): two
 // packets of one shape leave VIF1's registers the same.
 std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow,
-                       std::vector<const std::uint32_t*>* tex, bool shape)
+                       std::vector<const std::uint32_t*>* tex, bool shape, std::vector<const std::uint32_t*>* st, std::uint8_t* maskUse)
 {
     PartHasher hasher;
+    struct MaskOut {   // (bit 0: read as met; bit 1: set)
+        PartHasher& h;
+        std::uint8_t* out;
+        ~MaskOut()
+        {
+            if (out)
+                *out = (std::uint8_t)((h.maskRead ? 1 : 0) | (h.maskSet ? 2 : 0));
+        }
+    } maskOut{hasher, maskUse};
+    hasher.stFree = !slow && !shape && PartParamsOn();
+    hasher.st = st;
     hasher.skipHeader = slow && !shape;
     hasher.shape = shape;
     hasher.texFree = !slow && !shape;   // (a part drawn the long way has its packets in the frame's memory: no place to read again)
@@ -2058,12 +2135,13 @@ bool KeepTwice()
     return twice;
 }
 bool g_headerNearAsked;   // (perfwait's count with SLY1_PART_HDR_EXACT: what the tolerance would have passed)
-bool PartHeaderSame(const std::uint32_t a[44], const std::uint32_t b[44], bool slow)
+bool PartHeaderSame(const std::uint32_t a[44], const std::uint32_t b[44], bool slow, bool alphaFree)
 {
+    // (alphaFree: the alpha's scale, 9.x, is the renderer's to apply: any will do)
     // (its mode, 9.y: -1 unlit and 0 lit by its cache alone read neither, as a part drawn from its
     // cache; the others are lit by VU1 from them)
     if (slow && !((a[37] == 0xFFFFFFFFu || a[37] == 0) && a[37] == b[37])) {
-        if (std::memcmp(a + 16, b + 16, 28 * 4) == 0)
+        if (std::memcmp(a + 16, b + 16, 20 * 4) == 0 && (alphaFree || a[36] == b[36]) && std::memcmp(a + 37, b + 37, 7 * 4) == 0)
             return true;
         // The game makes the inverse matrix and the centre anew each frame, and while the camera
         // moves they come out other in their last digits for an object that stands still (seen
@@ -2113,11 +2191,11 @@ bool PartHeaderSame(const std::uint32_t a[44], const std::uint32_t b[44], bool s
         for (int k = 40; k < 43; k++)
             if (!near(k, tolerance.position))
                 return false;
-        return near(36, 1.0f / 512);
+        return alphaFree || near(36, 1.0f / 512);
     }
     if (std::memcmp(a + 32, b + 32, 16) != 0 || std::memcmp(a + 37, b + 37, 12) != 0 || a[43] != b[43])
         return false;
-    if (a[36] == b[36])
+    if (a[36] == b[36] || alphaFree)
         return true;
     // 9.x, the scale of the vertices' alpha: a part that fades with its distance has it other in
     // its last digits each frame while nothing moves. Within 1/512 of what the part was kept with
@@ -2147,7 +2225,9 @@ void PartDiff(std::uint32_t key, std::uint32_t target, std::uint32_t cl, std::ui
     g_diffSegs = nullptr;
     std::memcpy(now.header, header, sizeof now.header);
     auto it = g_diffSeen.find(key);
-    const char* kind = slow ? "long" : "cached";
+    char kindName[24];
+    std::snprintf(kindName, sizeof kindName, slow ? "long %d" : "cached %d", (int)header[37]);   // (with its lighting's mode)
+    const char* kind = kindName;
     g_diffCounts[std::string(kind) + " calls"]++;
     {
         char name[64];
@@ -2227,6 +2307,7 @@ bool PartCeiling()
 bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
 {
     const bool ceiling = PartCeiling();
+    const auto alphaFree = [](const PartRecord& r) { return PartParamsOn() && !r.alphaStrict; };
     if (!PartReplayOn() || !g_vif1.BetweenCodes())
         return false;
     // A part drawn the long way (the game's own packets for its meshes, lit by VU1 each frame; the
@@ -2245,11 +2326,47 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     std::uint32_t key = (marker & 0x7FFFFF) | (slow ? 0x800000u : 0u);
     {
         std::uint8_t& turn = g_partTurns[key];
-        key |= (std::uint32_t)turn << 24;
+        key |= (std::uint32_t)std::min<std::uint8_t>(turn, 127) << 24;
         if (turn < 255)
             turn++;
     }
     const Vif::Regs regs = g_vif1.GetRegs();
+    // (a part drawn the long way begins by setting BASE and OFFSET, checked below: what those
+    // registers, TOPS and the double buffer's flag were before it is nothing to it. The flag is
+    // other by how many programs the part before it ran.)
+    // (maskFree: the part's packet does not unpack through the mask it is met with)
+    const auto sameRegs = [&](const Vif::Regs& was, bool maskFree = false) {
+        Vif::Regs x = was;
+        if (maskFree)
+            x.mask = regs.mask;
+        if (slow) {
+            x.base = regs.base;
+            x.ofst = regs.ofst;
+            x.tops = regs.tops;
+            x.dbf = regs.dbf;
+        }
+        return x == regs;
+    };
+    const auto regsCensus = [&](const Vif::Regs& a) {   // SLY1_PART_REGS_LOG: which registers are other (partdiff:)
+        static const bool regsLog = std::getenv("SLY1_PART_REGS_LOG") != nullptr;
+        if (regsLog && !sameRegs(a)) {
+            char name[96];
+            std::snprintf(name, sizeof name, "regs other (%s):%s%s%s%s%s%s%s%s%s%s", slow ? "long" : "cached", a.cl != regs.cl || a.wl != regs.wl ? " cycle" : "",
+                          a.mask != regs.mask ? " mask" : "", a.mode != regs.mode ? " mode" : "", a.base != regs.base ? " base" : "", a.ofst != regs.ofst ? " ofst" : "",
+                          a.tops != regs.tops ? " tops" : "", a.itops != regs.itops ? " itops" : "", a.dbf != regs.dbf ? " dbf" : "",
+                          std::memcmp(a.row, regs.row, sizeof a.row) ? " row" : "", std::memcmp(a.col, regs.col, sizeof a.col) ? " col" : "");
+            g_diffCounts[name]++;
+        }
+    };
+    // The game turns VIF1's two buffers about from mesh to mesh, so a part comes in either half
+    // by what was drawn before it (its packet is another one then, and the registers it leaves):
+    // a part of its own for each half. Under one key a part was kept anew whenever something
+    // drawn before it came into view or left it. SLY1_PART_HALVES=0: one.
+    {
+        static const bool one = std::getenv("SLY1_PART_HALVES") && std::getenv("SLY1_PART_HALVES")[0] == '0';
+        if (!one && regs.base != 0x28)
+            key |= 0x80000000u;
+    }
     std::uint32_t header[44], headerAt = 0;
     if (slow) {
         // the header where the chain has it: its first tag's data begins BASE, OFFSET, and the
@@ -2311,12 +2428,13 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     // thread's work walking on the Switch (the helper's hashes come a list late for them).
     if (!late && it != g_parts.end() && !it->second.moving && KeepTwice()) {
         PartRecord& r = it->second;
-        const bool asKept = r.ok && (ceiling || (r.before == regs && PartHeaderSame(r.header, header, slow)));
-        const bool asSeen = r.seenList != 0 && r.seenList + 1 >= g_listSerial && (ceiling || (r.seenRegs == regs && PartHeaderSame(r.seenHeader, header, slow)));
+        const bool asKept = r.ok && (ceiling || (sameRegs(r.before, !r.maskRead) && PartHeaderSame(r.header, header, slow, alphaFree(r))));
+        const bool asSeen = r.seenList != 0 && r.seenList + 1 >= g_listSerial && (ceiling || (sameRegs(r.seenRegs, r.ok && !r.maskRead) && PartHeaderSame(r.seenHeader, header, slow, alphaFree(r))));
         if (!asKept && !asSeen) {
             if (r.ok) {
                 g_partsStale++;
-                g_partsStaleBy[r.before == regs ? 2 : 1]++;
+                g_partsStaleBy[sameRegs(r.before, !r.maskRead) ? 2 : 1]++;
+                regsCensus(r.before);
             }
             {   // (SLY1_PERF_LOG's perfwait: why it is not what the list before had)
                 const std::uint32_t* a = r.seenHeader;
@@ -2325,12 +2443,12 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
                 if (!seen) {
                     g_waitWhy[2]++;
                 } else {
-                    if (!(r.seenRegs == regs))
+                    if (!(sameRegs(r.seenRegs, r.ok && !r.maskRead)))
                         g_waitWhy[3]++;
-                    if (!PartHeaderSame(a, header, slow)) {
+                    if (!PartHeaderSame(a, header, slow, alphaFree(r))) {
                         g_waitWhy[4]++;
                         g_headerNearAsked = true;
-                        if (PartHeaderSame(a, header, slow))
+                        if (PartHeaderSame(a, header, slow, alphaFree(r)))
                             g_waitWhy[11]++;
                         g_headerNearAsked = false;
                         {   // SLY1_PART_HDR_LOG=frame: what is other in the headers, from that frame on (the first 60)
@@ -2368,12 +2486,17 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     if (!late)
         hash = hashNow();
     if (it != g_parts.end() && it->second.moving && it->second.hash == hash) {
-        g_partsMoving++;
-        return false;   // run as ever, and not kept
+        PartRecord& r = it->second;
+        if (gs::FramesShown() < r.movingUntil) {
+            g_partsMoving++;
+            return false;   // run as ever, and not kept
+        }
+        r.moving = false;   // tried again: kept anew below
+        r.ok = false;
     }
     if (it != g_parts.end() && it->second.ok) {
         PartRecord& r = it->second;
-        bool same = hash != 0 && r.hash == hash && r.before == regs && PartHeaderSame(r.header, header, slow);
+        bool same = hash != 0 && r.hash == hash && sameRegs(r.before, !r.maskRead) && PartHeaderSame(r.header, header, slow, alphaFree(r));
         std::uint64_t texNow[4];
         bool texMoved = false;
         for (std::size_t k = 0; same && k < r.texAt.size(); k++) {
@@ -2388,12 +2511,31 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
                     same = same && (r.texWas[j] != r.texWas[k] || texNow[j] == v);
             }
         }
+        // the texture offsets left out of the hash, as the packet has them now
+        PartRecord::St stNow[8];
+        std::uint32_t stCount = 0;
+        if (same && !r.stAt.empty()) {
+            same = r.stTarget == target;
+            for (std::size_t k = 0; same && k < r.stAt.size(); k++) {
+                PartRecord::St v;
+                std::memcpy(&v, r.stAt[k], 8);
+                if (r.stStrict)
+                    same = std::memcmp(&v, &r.stWas[k], 8) == 0;
+                else
+                    stNow[k] = v;
+            }
+            if (same && !r.stStrict)
+                stCount = (std::uint32_t)r.stAt.size();
+        }
         if (ceiling) {
             same = r.kept != nullptr;   // (a record without its kept items faulted here at the end of the one run)
             texMoved = false;
+            stCount = 0;
         }
+        if (!same)
+            regsCensus(r.before);
         if (!same)   // why, for the report: the hash, the registers, or the header
-            g_partsStaleBy[r.hash != hash ? 0 : !(r.before == regs) ? 1 : 2]++;
+            g_partsStaleBy[r.hash != hash ? 0 : !(sameRegs(r.before, !r.maskRead)) ? 1 : 2]++;
         const bool wholeDue = !ceiling && (late ? r.wholeArrived : (r.verified < 8 || ((gs::FramesShown() + key) & 31) == 0));
         if (same && wholeDue) {
             const std::uint64_t whole = late ? r.seenWhole : PartHash(target, true, regs.cl, regs.wl, tte, slow);
@@ -2402,6 +2544,8 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
                 r.verified++;
             } else {
                 r.moving = true;
+                r.movingWait = std::min<std::uint32_t>(std::max<std::uint32_t>(r.movingWait * 2, 120), 3840);
+                r.movingUntil = gs::FramesShown() + r.movingWait;
                 r.kept.reset();
                 PartForget(r);
                 g_partWords -= std::min<std::uint64_t>(g_partWords, r.words);
@@ -2417,7 +2561,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             item.path = 5;
             item.part = r.kept;
             item.words = GsSpare();
-            item.words.resize(26);
+            item.words.resize(28 + 2 * stCount);
             float matrix[16];
             if (r.slow) {
                 vu1::PartMatrixFrom(reinterpret_cast<const float*>(header), matrix);
@@ -2432,6 +2576,16 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             std::memcpy(&item.words[16], vu1::Data(), 32);
             item.words[24] = vu1::TakeBatchIds(r.ids);
             item.words[25] = r.firstId;
+            // this frame's numbers for the renderer: the alpha's scale, and how far each texture
+            // offset is from what the kept vertices have in them
+            item.words[26] = header[36];
+            item.words[27] = stCount;
+            for (std::uint32_t k = 0; k < stCount; k++) {
+                const float d[2] = {stNow[k].s - r.stWas[k].s, stNow[k].t - r.stWas[k].t};
+                std::memcpy(&item.words[28 + 2 * k], d, 8);
+                g_partsStMoved += d[0] != 0.0f || d[1] != 0.0f;
+            }
+            g_partsAlphaMoved += header[36] != r.header[36];
             if (texMoved) {   // the kept packets' TEX0 writes with what the packet has now
                 for (const PartRecord::TexFix& f : r.texFix) {
                     item.words.push_back(f.item);
@@ -2444,7 +2598,12 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             g_gsPending.push_back(std::move(item));
             if (g_gsPending.size() >= 24)
                 GsPassOn();
-            g_vif1.SetRegs(r.after);
+            {
+                Vif::Regs after = r.after;
+                if (!r.maskSet)   // (met with another mask than it was kept with, and it leaves the mask alone)
+                    after.mask = regs.mask;
+                g_vif1.SetRegs(after);
+            }
             vu1::PartSkipped();
             r.stale = 0;
             if (r.lockout != 0 && ++r.replays >= 60)
@@ -2487,7 +2646,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     // thread on the Switch, walking through A Stealthy Approach. SLY1_PART_KEEP_TWICE=0: at once.
     {
         const bool twice = KeepTwice();
-        const bool asSeen = r.seenList != 0 && r.seenList + 1 >= g_listSerial && (ceiling || (r.seenHash == hash && r.seenRegs == regs && PartHeaderSame(r.seenHeader, header, slow)));
+        const bool asSeen = r.seenList != 0 && r.seenList + 1 >= g_listSerial && (ceiling || (r.seenHash == hash && sameRegs(r.seenRegs, r.ok && !r.maskRead) && PartHeaderSame(r.seenHeader, header, slow, alphaFree(r))));
         if (twice && !asSeen) {
             r.seenHash = hash;
             r.seenList = g_listSerial;
@@ -2501,6 +2660,8 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     PartForget(r);
     {
         const std::uint32_t lockout = r.lockout;
+        const bool alphaStrict = r.alphaStrict;
+        const std::uint32_t movingWait = r.movingWait;
         const bool jobOk = r.jobOk;
         const std::uint64_t shape = r.shape;
         const Vif::Regs jobBefore = r.jobBefore, jobAfter = r.jobAfter, jobBefore2 = r.jobBefore2, jobAfter2 = r.jobAfter2;
@@ -2511,6 +2672,8 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             g_partGraveItems.push_back(std::move(r.items));
         r = PartRecord();
         r.lockout = lockout;
+        r.alphaStrict = alphaStrict;
+        r.movingWait = movingWait;
         r.jobOk = jobOk;
         r.shape = shape;
         r.jobBefore = jobBefore;
@@ -2540,12 +2703,24 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             r.jobOk = r.jobTwo = false;
         }
     }
-    r.hashWhole = PartHash(target, true, regs.cl, regs.wl, tte, slow, &r.texAt);
+    {
+        std::uint8_t maskUse = 1;
+        r.hashWhole = PartHash(target, true, regs.cl, regs.wl, tte, slow, &r.texAt, false, &r.stAt, &maskUse);
+        r.maskRead = (maskUse & 1) != 0 || r.hashWhole == 0;
+        r.maskSet = (maskUse & 2) != 0;
+    }
     for (const std::uint32_t* q : r.texAt) {
         std::uint64_t v;
         std::memcpy(&v, q, 8);
         r.texWas.push_back(v);
     }
+    for (const std::uint32_t* q : r.stAt) {
+        PartRecord::St v;
+        std::memcpy(&v, q, 8);
+        r.stWas.push_back(v);
+    }
+    r.stTarget = target;
+    r.stBase = g_vif1.StUnpacks();
     r.texStrict = r.texAt.size() > 4;
     std::memcpy(r.header, header, sizeof header);
     r.before = regs;
@@ -3090,11 +3265,20 @@ void PartDone()
         vu1::PartMatrix(r->before.tops, matrix);
     }
     std::uint32_t minId = ~0u, maxId = 0;
+    bool alphaStrict = false, stStrict = r->stAt.size() > 8;
+    std::uint64_t stUsed = 0;
     for (std::size_t k = 0; ok && k < r->items.size(); k++) {
         const std::vector<std::uint32_t>& w = *r->items[k].words;
         if (r->items[k].path == 4) {
             gs::Batch b;
             std::memcpy(&b, &w[1], sizeof b);
+            alphaStrict = alphaStrict || !b.alphaDeferred;
+            if (b.stApplied) {
+                if (b.stSource < r->stAt.size())
+                    stUsed |= 1ull << b.stSource;
+                else
+                    stStrict = true;
+            }
             ok = std::memcmp(b.matrix, matrix, sizeof matrix) == 0;
             if (!ok && std::getenv("SLY1_PART_DIFF")) {
                 std::uint32_t hash, entry;
@@ -3152,6 +3336,8 @@ void PartDone()
         g_diffCounts[name]++;
     }
     r->after = g_vif1.GetRegs();
+    r->alphaStrict = alphaStrict;
+    r->stStrict = stStrict || stUsed != (r->stAt.size() >= 64 ? ~0ull : (1ull << r->stAt.size()) - 1);
     r->firstId = minId == ~0u ? 0 : minId;
     r->ids = minId == ~0u ? 0 : maxId - minId + 1;
     r->keys = g_partKey + 1 - r->keyFirst;
@@ -3179,6 +3365,8 @@ void PartDone()
 void PartCountsLine(const char* what)
 {
     PartDiffReport();
+    std::fprintf(stderr, "partparams: %s: parts drawn again with another alpha's scale %llu, with a texture offset moved %llu\n", what,
+                 (unsigned long long)g_partsAlphaMoved, (unsigned long long)g_partsStMoved);
     std::fprintf(stderr, "partjobs: making them: the shape %.2f s, the job %.2f, the copy %.2f, the queue %.2f; the render thread waited %.2f s for them at its lists' ends\n",
                  g_jobMakeNs[0] / 1e9, g_jobMakeNs[1] / 1e9, g_jobMakeNs[2] / 1e9, g_jobMakeNs[3] / 1e9, g_jobDrainWaitNs / 1e9);
     std::fprintf(stderr, "partjobs: %s: %llu made (%llu not, the shape other), %llu wrong, %llu run again by a thread that needed them; run by the helper %llu (%.2f s), the render thread %llu (%.2f s), "
@@ -3678,7 +3866,10 @@ void GsThreadMain()
             const std::uint32_t firstId = item.words[24], keptFirstId = item.words[25];
             const std::size_t head = 1 + (sizeof(gs::Batch) + 3) / 4;
             const std::vector<PartKept>& part = *item.part;
-            std::size_t fix = 26;
+            float alphaNow;
+            std::memcpy(&alphaNow, &item.words[26], 4);
+            const std::uint32_t stCount = item.words[27];
+            std::size_t fix = 28 + 2 * (std::size_t)stCount;
             for (std::size_t i = 0; i < part.size(); i++) {
                 const PartKept& kept = part[i];
                 if (i + 2 < part.size()) {
@@ -3713,6 +3904,10 @@ void GsThreadMain()
                     std::memcpy(b.offset, viewport + 4, 16);
                     if (b.id != 0)
                         b.id = firstId + (b.id - keptFirstId);
+                    if (b.alphaDeferred)
+                        b.alphaScale = alphaNow;
+                    if (b.stApplied && b.stSource < stCount)
+                        std::memcpy(b.stOffset, &item.words[28 + 2 * b.stSource], 8);
                     b.quads = w + head;
                     if (!gs::DrawBatch(w[0], b))
                         g_batchesRefused++;

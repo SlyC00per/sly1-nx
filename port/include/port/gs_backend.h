@@ -52,6 +52,14 @@ struct Batch {
     std::uint64_t keep = 0;       // not 0: the same for as long as the batch's vertices and colours are
                                   // (a model part drawn again, port/platform/dmac.cpp): a renderer may keep
                                   // them in memory of its own from frame to frame, until ForgetKept
+    // What the game's programs do to every vertex of a part by one number of the part's own, left
+    // for the renderer to do, so that a part kept from frame to frame is drawn with this frame's
+    // numbers (docs/RENDERER.md, "A part's numbers left to the renderer"):
+    float alphaScale = 1.0f;      // each vertex's alpha times this, truncated (the header's 9.x, a fade)
+    float stOffset[2] = {0.0f, 0.0f};   // added to each vertex's S and T (a texture that slides: 22.x and y)
+    bool alphaDeferred = false;   // alphaScale is the header's, not yet in the colours
+    bool stApplied = false;       // the program that adds 22.x and y ran on the batch (they are in its S and T)
+    std::uint8_t stSource = 0xFF; // while a part is kept: which of its packet's unpacks to 22 the batch's is
 };
 constexpr std::uint32_t kStripStart = 0x8000, kCullable = 0x4000;   // bits of a vertex's control word
 

@@ -337,8 +337,10 @@ void VerifyLevels()
         }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         word(kRequest) = 1;
-        if (!waitFor([&] { return word(kRequest) == 0; }, 120))
-            fail("the load did not end within 120 s", i + 1);
+        // (SLY1_LOAD_WAIT=seconds: longer, for a run under lockstep with the software rasteriser)
+        static const int loadWait = std::getenv("SLY1_LOAD_WAIT") ? std::max(120, std::atoi(std::getenv("SLY1_LOAD_WAIT"))) : 120;
+        if (!waitFor([&] { return word(kRequest) == 0; }, loadWait))
+            fail("the load did not end in time (120 s, or SLY1_LOAD_WAIT)", i + 1);
         // this load's stream, before the level's own play can load another (a story level whose
         // movie ends at once goes on to the next)
         // the first close after the request is this level's (one whose movie ends at once goes on
@@ -859,9 +861,19 @@ int main(int argc, char** argv)
                 for (std::uint32_t k = 0; k < b.count; k++) {
                     const std::uint32_t* q = b.quads + k * b.stride * 4;
                     Mix(q + b.positionAt * 4, 16);
-                    Mix(q + b.stqAt * 4, 8);
+                    if (b.stOffset[0] != 0.0f || b.stOffset[1] != 0.0f) {   // (a part drawn again with its texture slid on)
+                        float st[2];
+                        std::memcpy(st, q + b.stqAt * 4, 8);
+                        st[0] += b.stOffset[0];
+                        st[1] += b.stOffset[1];
+                        Mix(st, 8);
+                    } else {
+                        Mix(q + b.stqAt * 4, 8);
+                    }
                     Mix(q + b.colourAt * 4, 16);
                 }
+                if (b.alphaScale != 1.0f)
+                    Mix(&b.alphaScale, 4);
                 Mix(b.matrix, sizeof b.matrix);
                 Mix(b.scale, sizeof b.scale);
                 Mix(b.offset, sizeof b.offset);

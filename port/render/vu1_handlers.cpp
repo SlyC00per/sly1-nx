@@ -446,7 +446,21 @@ struct Deferred {
     int stride = 0;
     Test test = Test::Guard274;
     std::uint32_t endPc = 0;
+    // A part's numbers left to the renderer (gs::Batch): the alpha's scale 0x4A9 would have put
+    // in the colours (1 when it has, or has none), whether a second pass has copied the alpha
+    // unscaled, and whether 0x4F8 has added 22.x and y to the batch's S and T (stPending: it ran
+    // at stTop before the transform that defers the batch).
+    float alphaScale = 1.0f;
+    bool alphaFromHeader = false, alphaCopied = false;
+    bool stApplied = false, stPending = false;
+    std::uint16_t stTop = 0;
 };
+// SLY1_PART_PARAMS=0: the alpha's scale put in the colours as the program does.
+bool PartParams()
+{
+    static const bool off = std::getenv("SLY1_PART_PARAMS") && std::getenv("SLY1_PART_PARAMS")[0] == '0';
+    return !off;
+}
 struct LaneCounts {
     std::map<std::uint64_t, std::uint64_t> lateBy;   // late transforms by program (hash << 12 | entry)
     std::uint64_t lateNs = 0, lateVertices = 0, skippedOverwritten = 0, notTaken = 0, taken = 0;
@@ -514,6 +528,8 @@ bool DeferTransforms()
 // read what the transform leaves there (the outlines read the screen positions of a batch already
 // drawn, 0x6DA those of the batch in the other half). Not when VIF1 has unpacked over the batch
 // since: the memory is the next batch's.
+inline float Itof0(float x);
+inline float Ftoi0(float x);
 void Materialise(Runner& r, bool always = false)
 {
     if (!Def().on)
@@ -528,6 +544,16 @@ void Materialise(Runner& r, bool always = false)
         return;
     }
     (void)always;
+    if (d.alphaScale != 1.0f) {
+        // the alpha's scale was left to the renderer and the batch is the program's again: put in
+        // the colours now, as 0x4A9 does (and in a second pass's copy of the alpha)
+        const int n = (std::uint16_t)(d.end - d.first) / d.stride;
+        for (int k = 0; k < n; k++)
+            for (int c = 1; c <= (d.alphaCopied && d.stride == 4 ? 2 : 1); c++) {
+                float* q = r.Qword((std::uint16_t)(d.first + d.stride * k + c));
+                q[3] = Ftoi0(Mul(Itof0(q[3]), d.alphaScale));
+            }
+    }
     // the batch's own half of the data memory (TOP), which need not be the program's now: a program
     // may read the batch the half before held (0x6DA does); the registers as they are
     {   // counted by the program it is done for, for the report (BatchCounts)
@@ -641,6 +667,9 @@ bool KickDeferred(Runner& r, std::uint16_t top, std::uint16_t tag)
     b.fogScale = params.y;
     b.wMax = params.z;
     b.cull = Half(Load(r, top + 9).z) != 0;
+    b.alphaScale = d.alphaScale;
+    b.alphaDeferred = d.alphaFromHeader;
+    b.stApplied = d.stApplied;
     b.id = Def().overwritten ? 0 : Def().serial;
     static const bool check = std::getenv("SLY1_GPU_BATCH_CHECK") != nullptr;
     if (check) {
@@ -731,6 +760,10 @@ bool BatchTransform(Runner& r, const int stride, const Test test, const std::uin
                              Def().on ? " (the one before never done)" : "");
             Def().on = true;
             Def().serial++;
+            Def().alphaScale = 1.0f;
+            Def().alphaFromHeader = Def().alphaCopied = false;
+            Def().stApplied = Def().stPending && Def().stTop == top;
+            Def().stPending = false;
             Def().kicked = false;
             Def().overwritten = false;
             Def().header13Written = false;
@@ -799,6 +832,7 @@ bool BatchTransform(Runner& r, const int stride, const Test test, const std::uin
             return true;
         }
     }
+    Def().stPending = false;
     return BatchTransformNow(r, stride, test, endPc);
 }
 
@@ -884,6 +918,8 @@ void Colours4C1(Runner& r, std::uint16_t top, int n)
     float scale = Load(r, top + 10).w;
     st.vf[11][3] = scale;
     bool one = IsOne(scale);
+    if (DeferredFor(top))
+        Def().alphaCopied = true;
     for (int k = 0; k < n; k++) {
         std::uint16_t at = (std::uint16_t)(first + 4 * k);
         float* c = r.Qword(at + 2);
@@ -1410,10 +1446,13 @@ bool BatchSecond(Runner& r)
 
 // 0x4A9: quadword 1 of each vertex (stride 13.x) scaled, xyz by 10.w and w by 9.x, unless both
 // are 1.
+// A batch whose transform is the renderer's has its alpha's scale left to the renderer too
+// (gs::Batch::alphaScale): a part that fades is then the same vertices from frame to frame.
 bool Scale4A9(Runner& r, std::uint16_t top)
 {
     State& st = r.s;
     float sw = Load(r, top + 9).x, sxyz = Load(r, top + 10).w;
+    const bool left = PartParams() && DeferredFor(top);
     std::uint16_t first = (std::uint16_t)(top + Half(Load(r, top + 11).x));
     std::uint16_t end = (std::uint16_t)(top + Half(Load(r, top + 11).y));
     std::uint16_t step = Half(Load(r, top + 13).x);
@@ -1423,13 +1462,24 @@ bool Scale4A9(Runner& r, std::uint16_t top)
     SetVf(st, 2, factor);
     st.vf[3][3] = sxyz;
     std::memset(st.vf[5], 0, 16);
-    if (IsOne(sw) && IsOne(sxyz))
+    const auto leave = [&] {   // (once nothing can send the batch back to the microcode)
+        if (left) {
+            Def().alphaScale = Add(0.0f, sw);
+            Def().alphaFromHeader = true;
+        }
+    };
+    if (left)
+        factor.v[3] = 1.0f;
+    if ((left || IsOne(sw)) && IsOne(sxyz)) {
+        leave();
         return true;
+    }
     // the loop stops when its pointer, before the step, is end - step
     std::uint16_t last = (std::uint16_t)(end - step);
     std::uint16_t span = (std::uint16_t)(last - first);
     if (step == 0 || span % step || span / step > 1024)
         return false;
+    leave();
     int count = span / step + 1;
     V x;
     for (int k = 0; k < count; k++) {
@@ -3681,6 +3731,14 @@ bool OffsetXy(Runner& r)
         st.vf[4][1] = Add(q[1], off.y);
         q[0] = st.vf[4][0];
         q[1] = st.vf[4][1];
+    }
+    // noted for the batch (gs::Batch::stApplied), whether its transform has been left to the
+    // renderer already or comes next
+    if (DeferredFor(top)) {
+        Def().stApplied = true;
+    } else {
+        Def().stPending = true;
+        Def().stTop = top;
     }
     st.pc = 0x507;
     return true;

@@ -2007,8 +2007,12 @@ void SoftBatch(const Batch& b)
         o.f = (std::uint8_t)bv.fog;
         const std::uint32_t* c = q + b.colourAt * 4;
         o.r = (std::uint8_t)c[0]; o.g = (std::uint8_t)c[1]; o.b = (std::uint8_t)c[2]; o.a = (std::uint8_t)c[3];
+        if (b.alphaScale != 1.0f)   // (as 0x4A9 scales it: the integer times the scale, truncated)
+            o.a = (std::uint8_t)(std::int32_t)((float)(std::int32_t)c[3] * b.alphaScale);
         float stq[3];
         std::memcpy(stq, q + b.stqAt * 4, 12);
+        stq[0] += b.stOffset[0];
+        stq[1] += b.stOffset[1];
         o.s = stq[0] / w; o.t = stq[1] / w; o.q = stq[2] / w;
         o.u = o.v = 0;
     }

@@ -1240,3 +1240,75 @@ the game is told at once, and the render thread sees the jobs done when it has n
 and before its next list in any case. `SLY1_JOB_COPY=0`: as before. In Ryujinx at A Stealthy
 Approach's start: every job on a copy, 102,000 words copied a frame, and a lockstep capture of
 frame 1290 the same picture to the last value.
+
+## A part's numbers left to the renderer (2026-11-21)
+
+The first step of the native draw path (docs/DESIGN.md, "The port's own functions"): what the
+game's programs do to every vertex of a part by one number of the part's own is done by the
+vertex shader, so the part's vertices stay the same from frame to frame and stay kept.
+
+What made a part drawn from its cache a job, walking through A Stealthy Approach
+(`SLY1_PART_DIFF=1` on the host's tour, by lighting mode): of some 150 such parts a frame, 14
+had two words of their packet other each frame, 6 the header's 9.x, and some 7 came in the
+other half of VIF1's double buffer than they were kept in. With the lockouts that follow a part
+found changed (`fickle`), that was most of the 45 jobs a frame the Switch ran for cached parts
+in play.
+
+- **The alpha's scale** (the header's 9.x: a part that fades with its distance). The program at
+  0x4A9 multiplies each vertex's alpha by it and truncates. For a batch whose transform is the
+  renderer's, `Scale4A9` now leaves the alpha as it is and the batch carries the scale
+  (`gs::Batch::alphaScale`); batch_vsh.glsl does `floor(alpha * scale)` for the colour and for
+  the two lights' shares. A batch that goes back to the program (`Materialise`) has the scale
+  put in its colours then. A kept part whose batches all carry the scale is drawn again with
+  any 9.x (`PartHeaderSame`'s `alphaFree`); one with a batch that does not is compared as before
+  (`PartRecord::alphaStrict`).
+- **A texture that slides** (22.x and y, which the program at 0x4F8 adds to every vertex's S
+  and T; the game writes them anew each frame in the cached packet, one unpack of two words:
+  `kStUnpack`). The two words are left out of the part's hash, where they lie is noted with
+  the record (`stAt`, as a TEX0 write's place is), and each kept batch the program ran on
+  (`stApplied`) knows which unpack was its own (`stSource`: the last VIF1 had met when the batch
+  was queued). Drawn again, the batch is given how far the offset now is from the one in its
+  vertices (`gs::Batch::stOffset`), which the shader adds. Not exact: (S + a) + (b - a) is S + b
+  to the last bit or two. A part with such an unpack no kept batch answers for is compared by
+  the words' values (`stStrict`).
+- **A part of its own for each half of the double buffer** (`SLY1_PART_HALVES=0`: one). The game
+  turns VIF1's two buffers about from mesh to mesh, so a part comes in either half by what was
+  drawn before it, with another packet (a cached part has two) and other registers. Under one
+  key it was kept anew whenever something drawn before it came into view or left it: 4,800
+  parts found changed by their hash over the tour's 1,200 frames, 90 with a key for each half.
+- **Registers a part does not read.** A part drawn the long way begins with BASE and OFFSET, so
+  those, TOPS and the double buffer's flag as it is met are nothing to it (the flag goes by how
+  many programs the part before ran). And a packet with no masked unpack before an STMASK of its
+  own (`PartHasher::maskRead`) is the same part whatever mask it is met with; drawn again, it
+  leaves the mask as it found it unless it sets one. 2,000 parts found changed by their
+  registers over the tour, then none.
+- **A part marked as moving** (its vertices other where the hash does not look) was run as a
+  job for as long as its sampled hash stayed the same: for good, when what changed was its
+  cache's colours written once more. The mark now ends after 120 frames, twice as long each
+  time (to 3,840), and the part is kept anew.
+
+`SLY1_PART_PARAMS=0` turns the first two off. `partparams:` (with `partcounts:`) counts the parts
+drawn again with another scale or offset; `SLY1_PART_REGS_LOG=1` says which registers were other
+when a kept part was not drawn again (`partdiff:`).
+
+On the host's tour of A Stealthy Approach (three stops of 400 frames, the camera turning, the
+counting renderer taking batches): 162,000 parts drawn again against 122,000, 2,700 kept anew
+against 3,300, and by kind a frame (drawn again / job / in full):
+
+| | before | after |
+| --- | --- | --- |
+| from its cache, unlit | 2.9 / 3.9 / 0.3 | 5.0 / 1.9 / 0.3 |
+| from its cache, lit by it | 54.7 / 10.6 / 2.3 | 64.5 / 1.5 / 2.1 |
+| the long way, unlit | 0.4 / 5.7 / 4.1 | 6.6 / 3.6 / 0.3 |
+| the long way, lit by its cache | 1.2 / 2.6 / 0.8 | 1.5 / 3.1 / 0.1 |
+| the long way, lit by VU1 (mode 4) | 1.1 / 8.0 / 3.8 | 2.4 / 10.1 / 0.5 |
+
+What is left is the next steps' work: the parts VU1 lights or skins afresh (mode 4), and the
+parts drawn the long way whose mesh data has six quadwords at 22 other each frame.
+
+Checked on the host: level 4 under lockstep with the GS thread and the software batches
+(`SLY1_GS_SOFT_BATCH=1`, `SLY1_LOAD_WAIT=900` for the load under the software rasteriser), the
+camera turning, every 60th frame to 2,340 against the same run with `SLY1_PART_REPLAY=0`: the
+25 frames in the level differ by 1 of a colour's 255 at most (the slid textures). `--verify-levels`
+with the counting renderer taking batches, 240 frames a level: all 46 levels, 254,000 parts drawn
+again with another scale and 48,000 with an offset moved. Not yet run on the Switch.
