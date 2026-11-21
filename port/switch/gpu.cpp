@@ -19,15 +19,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
+#include <pthread.h>
 #include <switch.h>
 #include <deko3d.h>
 
 #include "port/gs.h"
 #include "port/gs_backend.h"
 #include "port/system.h"
+#include "port/thread.h"
 #include "gs_vsh_dksh.h"
 #include "gs_fsh_dksh.h"
 #include "gs_lite_fsh_dksh.h"
@@ -229,6 +235,62 @@ private:
     // the bound target's size: in the GS's pixels (a field of the frame) and in the image's
     float fieldWidth_ = kFieldWidth, fieldHeight_ = kFieldHeight;
     std::uint32_t imageWidth_ = kWidth, imageHeight_ = kHeight;
+    // The part of each frame buffer's image a frame is drawn into, from its top left corner: the
+    // whole image, or fewer pixels while the GPU cannot draw the whole in a frame's time. Present
+    // stretches that part over the screen. Chosen at a present for the buffer the next frame is
+    // drawn into. SLY1_GPU_SCALE=N: N hundredths of the width and height always; =abN: the whole
+    // and that in turn, 600 frames each (to measure it in one played run).
+    std::uint32_t renderWidth_[2] = {kWidth, kWidth}, renderHeight_[2] = {kHeight, kHeight};
+    std::uint64_t scaleSum_ = 0;
+    // How long the GPU was at each frame, by its own clock: a timestamp reported at the head and
+    // at the end of each list of commands of a frame (dkCmdBufReportCounter), read back two
+    // presents later, when the frame's fence has been waited for. The time between a list's two,
+    // less what the list before still took of it, summed over the frame's lists. (A thread that
+    // waited for the frame's fence read 11 ms whatever the frame, and the fence looked at without
+    // waiting went by the display's blank, not by the GPU's work: both tried first.)
+    static constexpr int kQueryLists = 8;
+    DkMemBlock queryMem_ = nullptr;
+    int queryLists_[kSets] = {};
+    int queryHundredths_[kSets] = {100, 100, 100};
+    bool queryOpen_ = false;
+    std::uint64_t gpuUs_ = 0, gpuSumUs_ = 0, gpuCount_ = 0, gpuLate_ = 0, gpuSerial_ = 0;
+    int gpuHundredths_ = 100;
+    DkGpuAddr QueryAt(int set, int index) const { return dkMemBlockGetGpuAddr(queryMem_) + (std::uint32_t)(set * kQueryLists * 2 + index) * 16; }
+    void QueryBegin()
+    {
+        if (!queryMem_ || queryOpen_ || queryLists_[set_] >= kQueryLists)
+            return;
+        dkCmdBufReportCounter(cmd_, DkCounter_TimestampPipelineTop, QueryAt(set_, queryLists_[set_] * 2));
+        queryOpen_ = true;
+    }
+    void QueryEnd()
+    {
+        if (!queryOpen_)
+            return;
+        dkCmdBufReportCounter(cmd_, DkCounter_Timestamp, QueryAt(set_, queryLists_[set_] * 2 + 1));
+        queryLists_[set_]++;
+        queryOpen_ = false;
+    }
+    void QueryRead(int set)   // (the set's frame is done: its fence was waited for)
+    {
+        if (!queryMem_ || queryLists_[set] == 0)
+            return;
+        struct Report { std::uint64_t value, timestamp; };
+        const Report* r = static_cast<const Report*>(dkMemBlockGetCpuAddr(queryMem_)) + set * kQueryLists * 2;
+        std::uint64_t busy = 0, before = 0;
+        for (int k = 0; k < queryLists_[set]; k++) {
+            const std::uint64_t from = dkTimestampToNs(r[k * 2].timestamp), to = dkTimestampToNs(r[k * 2 + 1].timestamp);
+            if (to > std::max(from, before))
+                busy += to - std::max(from, before);
+            before = std::max(before, to);
+        }
+        gpuUs_ = busy / 1000;
+        gpuHundredths_ = queryHundredths_[set];
+        gpuSerial_++;
+        queryLists_[set] = 0;
+    }
+    std::uint64_t lastGpuWaitNs_ = 0;
+    int lastFull_ = 0;   // the frame buffer bound last: the half-size effects' picture goes by its depth
     std::uint64_t smallRuns_ = 0, smallTextured_ = 0, smallSelf_ = 0, smallSteps_ = 0;
     bool inSelf_ = false;       // drawing one step of such a run: the target is the buffer's other image
     int smallTrace_ = 0, smallSelfTrace_ = 0, smallIntoTrace_ = 0;
@@ -543,6 +605,7 @@ bool Renderer::Create()
         std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(dataMem_) + samplerSet_ + k * sizeof d, &d, sizeof d);
     }
 
+    queryMem_ = Block(4096, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
     textureMem_ = Block(kTextureMemory, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image);
     targetMem_ = Block(kTargetMemory, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image);
     if (targetMem_ && !std::getenv("SLY1_GPU_NO_FX")) {   // the effects' half-size picture, and it and the depth buffer as textures
@@ -611,6 +674,7 @@ void Renderer::BeginCommands()
 {
     dkCmdBufClear(cmd_);
     dkCmdBufAddMemory(cmd_, commandMem_, 0, kCommandMemory);
+    QueryBegin();
     frameUsed_ = 0;
     draws_ = 0;
     bound_ = -1;
@@ -750,6 +814,7 @@ void Renderer::Send(bool wait)
     FlushHeld();   // (its streams are in this list's memory)
     if (listAt_ >= 0 && (long)frames_ + 1 == listAt_)
         std::fprintf(stderr, "gpulist: send (wait %d) after %u draws\n", (int)wait, draws_);
+    QueryEnd();
     dkQueueSubmitCommands(queue_, dkCmdBufFinishList(cmd_));
     sends_++;
     static const bool serial = std::getenv("SLY1_GPU_VARY") != nullptr;
@@ -793,6 +858,9 @@ void Renderer::BindTarget(int target)
         dkImageViewDefaults(&depth, &depth_);
         const DkImageView* colours[1] = {&colour};
         dkCmdBufBindRenderTargets(cmd_, colours, 1, &depth);
+        iw = renderWidth_[target];
+        ih = renderHeight_[target];
+        lastFull_ = target;
     }
     if (fw != fieldWidth_ || fh != fieldHeight_ || iw != imageWidth_ || ih != imageHeight_) {
         fieldWidth_ = fw;
@@ -2226,7 +2294,8 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     fp.fogColour[0] = (float)(s.fogcol & 0xFF);
     fp.fogColour[1] = (float)((s.fogcol >> 8) & 0xFF);
     fp.fogColour[2] = (float)((s.fogcol >> 16) & 0xFF);
-    fp.fogColour[3] = fx ? (!zte || ztst == 1 ? 0.0f : (float)ztst)   // gs_fx_fsh.glsl's depth test
+    // (with half the frame's scale beside it: the shader reads the depth where the frame was drawn)
+    fp.fogColour[3] = fx ? (!zte || ztst == 1 ? 0.0f : (float)ztst) + 0.5f * (float)renderWidth_[lastFull_] / (float)kWidth   // gs_fx_fsh.glsl's depth test
                          : dateRun ? (((test >> 15) & 1) ? 1.0f : 2.0f) : 0.0f;
     if (fresh || std::memcmp(&fp, &last_.fp, sizeof fp) != 0) {
         dkCmdBufPushConstants(cmd_, dkMemBlockGetGpuAddr(dataMem_) + fragmentUbo_, sizeof fp, 0, sizeof fp, &fp);
@@ -2774,19 +2843,69 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
     dkCmdBufSetScissors(cmd_, 0, &all, 1);
     float black[4] = {0, 0, 0, 1};
     dkCmdBufClearColor(cmd_, 0, DkColorMask_RGBA, black);
-    DkImageRect src = {0, 0, 0, kWidth, kHeight, 1}, dst = {(kScreenWidth - kWidth) / 2, 0, 0, kWidth, kHeight, 1};
-    dkCmdBufBlitImage(cmd_, &from, &src, &screen, &dst, 0, 0);
+    DkImageRect src = {0, 0, 0, renderWidth_[target], renderHeight_[target], 1}, dst = {(kScreenWidth - kWidth) / 2, 0, 0, kWidth, kHeight, 1};
+    dkCmdBufBlitImage(cmd_, &from, &src, &screen, &dst, renderWidth_[target] != kWidth ? DkBlitFlag_FilterLinear : 0, 0);
+    {   // The size of the frame drawn next, into the other buffer: as large as the GPU draws in a
+        // frame's time. The GPU's time over a frame is taken as a fixed part and a part that goes
+        // with the pixels; the size is brought down at once when a frame at the present size took
+        // longer than the time allowed, and up a step when 30 frames running would have fitted a
+        // step higher. SLY1_GPU_SCALE=N: N hundredths always (100: never smaller); =abN: the whole
+        // and N in turn; SLY1_GPU_BUDGET_US: the time allowed (14,000).
+        static const char* const e = std::getenv("SLY1_GPU_SCALE");
+        static const bool turns = e && e[0] == 'a';
+        static const int asked = e ? std::atoi(turns ? e + 2 : e) : 0;
+        static const float budget = std::getenv("SLY1_GPU_BUDGET_US") ? (float)std::atof(std::getenv("SLY1_GPU_BUDGET_US")) : 13000.0f;
+        static int now = 100, fits = 0;
+        static std::uint64_t seen;
+        int hundredths = now;
+        if (turns || asked) {
+            hundredths = turns && frames_ / 600 % 2 == 0 ? 100 : asked;
+        } else if (gpuSerial_ != seen) {
+            seen = gpuSerial_;
+            const bool late = lastGpuWaitNs_ > 200000;   // (the last present waited for the frame two before: the GPU is behind)
+            gpuLate_ += late;
+            const float took = late ? std::max(17000.0f, (float)gpuUs_) : (float)gpuUs_;
+            const float at = (float)gpuHundredths_ / 100.0f;
+            gpuSumUs_ += gpuUs_;
+            gpuCount_++;
+            const float fixed = 3000.0f;   // (state changes, vertices, the clears: what does not go with the pixels)
+            const float perPixel = std::max(took - fixed, 500.0f) / (at * at);
+            const auto timeAt = [&](int h) { return fixed + perPixel * (float)h * (float)h / 10000.0f; };
+            if (late || timeAt(now) > budget) {
+                if (now > 60)
+                    now -= 5;
+                while (now > 60 && timeAt(now) > budget)
+                    now -= 5;
+                fits = 0;
+            } else if (now < 100 && timeAt(now + 5) < budget * 0.9f) {
+                if (++fits >= 20) {
+                    now += 5;
+                    fits = 0;
+                }
+            } else {
+                fits = 0;
+            }
+            hundredths = now;
+        }
+        hundredths = std::max(50, std::min(100, hundredths));
+        scaleSum_ += (std::uint64_t)hundredths;
+        renderWidth_[target ^ 1] = (kWidth * (std::uint32_t)hundredths / 100) & ~7u;
+        renderHeight_[target ^ 1] = (kHeight * (std::uint32_t)hundredths / 100) & ~7u;
+    }
     Send(false);
     dkQueueSignalFence(queue_, &fences_[set_], false);
     fenced_[set_] = true;
     dkQueuePresentImage(queue_, swapchain_, slot);
+    queryHundredths_[set_] = (int)(renderWidth_[target] * 100 / kWidth);
     // the next set, once the GPU has done with the frame recorded in it
     set_ = (set_ + 1) % kSets;
     std::uint64_t t1 = NowNs();
     if (fenced_[set_])
         dkFenceWait(&fences_[set_], -1);
     fenced_[set_] = false;
-    waitNs_ += NowNs() - t1;
+    lastGpuWaitNs_ = NowNs() - t1;
+    QueryRead(set_);   // (what this set's frame, two presents ago, took)
+    waitNs_ += lastGpuWaitNs_;
     varyCpuAt_ = NowNs();
     {   // SLY1_PERF_LOG: every 300 frames, how long a frame's present waited for a screen image and for the GPU
         static const bool perfLog = std::getenv("SLY1_PERF_LOG") != nullptr;
@@ -2795,6 +2914,18 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
             const double n = (double)(frames_ - framesWas) * 1e6;
             std::fprintf(stderr, "perfgpu: to %llu: a present waited %.1f ms for a screen image and %.1f ms for the GPU; the GPU drained in %.1f ms\n", (unsigned long long)frames_,
                          (acquireNs_ - acquireWas) / n, (waitNs_ - waitWas) / n, (drainNs_ - drainWas) / n);
+            {
+                static std::uint64_t usWas, countWas, scaleWas;
+                const std::uint64_t us = gpuSumUs_, count = gpuCount_;
+                static std::uint64_t lateWas;
+                std::fprintf(stderr, "perfscale: to %llu: the GPU was %.1f ms at a frame; frames drawn at %.0f hundredths of the width and height on average; %llu frames late\n", (unsigned long long)frames_,
+                             count > countWas ? (us - usWas) / 1000.0 / (double)(count - countWas) : 0.0, (scaleSum_ - scaleWas) / (double)(frames_ - framesWas),
+                             (unsigned long long)(gpuLate_ - lateWas));
+                lateWas = gpuLate_;
+                usWas = us;
+                countWas = count;
+                scaleWas = scaleSum_;
+            }
             drainWas = drainNs_;
             acquireWas = acquireNs_;
             waitWas = waitNs_;

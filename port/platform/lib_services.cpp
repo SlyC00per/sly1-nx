@@ -6,6 +6,11 @@
 // (state * 0x41C64E6D + 0x3039, the low 31 bits), seeded with the record's initial seed from the
 // player's executable. Files and IOP modules: the port has no IOP; module loads and resets
 // succeed, the console file handles go to the log. MPEG: port/video/movie.cpp. The GS paths: always idle.
+#if defined(__SWITCH__)
+namespace port { void CheckDevTable(const char* where); }
+#else
+namespace port { inline void CheckDevTable(const char*) {} }
+#endif
 #include <cstdio>
 #include <cstring>
 
@@ -109,6 +114,7 @@ void RunConstructorsOnce()
             skipped++;
         }
     }
+    port::CheckDevTable("the constructors run");
     std::fprintf(stderr, "sly1: %d global constructors run, %d the host's own\n", called, skipped);
 }
 

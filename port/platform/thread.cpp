@@ -242,8 +242,53 @@ void SampleWindow(bool open)
     g_windowFrom.store(open ? armGetSystemTick() : 0);
 }
 
+// (diagnosis of the start-up fault: newlib's table of devices, whose entries are never null, found
+// with a null one at the first read of the disc) Says where the table is first seen changed.
+extern "C" const void* devoptab_list[];
+void CheckDevTable(const char* where)
+{
+    static std::atomic<int> said{0};
+    static const void* first[8];
+    static std::atomic<bool> have{false};
+    if (!have.exchange(true)) {
+        for (int k = 0; k < 8; k++)
+            first[k] = devoptab_list[k];
+        std::fprintf(stderr, "devtable: at %s: %p %p %p %p %p %p %p %p\n", where, first[0], first[1], first[2], first[3], first[4], first[5], first[6], first[7]);
+    }
+    for (int k = 0; k < 8; k++)
+        if (devoptab_list[k] != first[k] && said.fetch_add(1) < 12) {
+            // (said through the system's debug output too: the table's device may be the one that prints)
+            char line[160];
+            std::snprintf(line, sizeof line, "devtable: at %s: entry %d is %p, was %p", where, k, devoptab_list[k], first[k]);
+            svcOutputDebugString(line, __builtin_strlen(line));
+            std::fprintf(stderr, "%s\n", line);
+        }
+}
+
+// (diagnosis) newlib's RemoveDevice, which alone sets an entry of the table to null, wrapped at the
+// link (-Wl,--wrap=RemoveDevice): who takes a device out, by the return addresses.
+extern "C" int __real_RemoveDevice(const char* name);
+extern "C" int __wrap_RemoveDevice(const char* name)
+{
+    char line[200];
+    const std::uint64_t base = (std::uint64_t)ImageBase();
+    int n = std::snprintf(line, sizeof line, "devtable: RemoveDevice(%s) called from", name ? name : "(null)");
+    const std::uint64_t* fp = reinterpret_cast<const std::uint64_t*>(__builtin_frame_address(0));
+    for (int depth = 0; depth < 8 && fp && n < (int)sizeof line - 20; depth++) {
+        n += std::snprintf(line + n, sizeof line - (std::size_t)n, " +0x%llX", (unsigned long long)(fp[1] - base));
+        const std::uint64_t* up = reinterpret_cast<const std::uint64_t*>(fp[0]);
+        if (up <= fp)
+            break;
+        fp = up;
+    }
+    svcOutputDebugString(line, __builtin_strlen(line));
+    std::fprintf(stderr, "%s\n", line);
+    return __real_RemoveDevice(name);
+}
+
 void PlaceThread(ThreadRole role, bool sampled)
 {
+    CheckDevTable("a thread placed");
     // SLY1_SAMPLE=4: the game's own threads in the render and GS threads' places (the first two
     // placed: the report's "render" and "gs" are then those)
     static const bool gameSampled = std::getenv("SLY1_SAMPLE") && std::getenv("SLY1_SAMPLE")[0] == '4';

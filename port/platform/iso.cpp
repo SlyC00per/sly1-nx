@@ -6,6 +6,11 @@
 
 #include "port/ptr32.h"
 
+#if defined(__SWITCH__)
+namespace port { void CheckDevTable(const char* where); }
+#else
+namespace port { inline void CheckDevTable(const char*) {} }
+#endif
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>

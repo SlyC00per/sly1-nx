@@ -2,6 +2,11 @@
 // The IOP's services as the port answers them (port/iop.h).
 #include "port/iop.h"
 
+#if defined(__SWITCH__)
+namespace port { void CheckDevTable(const char* where); }
+#else
+namespace port { inline void CheckDevTable(const char*) {} }
+#endif
 #include <cstring>
 
 #include "port/ptr32.h"
@@ -33,6 +38,7 @@ void BindIopService(RemoteCallClient* client, std::uint32_t service)
 {
     std::lock_guard<std::mutex> lock(g_lock);
     g_services[client] = service;
+    port::CheckDevTable("an IOP service bound");
     std::fprintf(stderr, "iop: bound service 0x%08X\n", service);
 }
 
@@ -56,6 +62,7 @@ void CallIopService(RemoteCallClient* client, std::int32_t cmd, const void* send
         }
     }
     if (g_logged.insert({service, cmd}).second)
+        port::CheckDevTable("an IOP command");
         std::fprintf(stderr, "iop: service 0x%08X command 0x%X (send %d, receive %d bytes)\n",
                      service, (unsigned)cmd, (int)sendSize, (int)recvSize);
     // The sound driver's command channel: the driver writes its reply straight into the buffer the

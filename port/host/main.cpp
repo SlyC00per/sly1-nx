@@ -14,10 +14,16 @@
 // runs on a thread of its own whose stack lies in game memory, as every game thread's must: the
 // game links stack frames into its global lists (ListFrame), and a stored pointer is a game
 // address (port/ptr32.h). The memory retail's entry clears is static here, and zero.
+#if defined(__SWITCH__)
+namespace port { void CheckDevTable(const char* where); }
+#else
+namespace port { inline void CheckDevTable(const char*) {} }
+#endif
 #include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <exception>
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -544,6 +550,7 @@ extern "C" const char* __ubsan_default_options() { return "print_stacktrace=1:ab
 extern "C" {
 alignas(16) u8 __nx_exception_stack[0x8000];
 u64 __nx_exception_stack_size = sizeof(__nx_exception_stack);
+extern "C" const void* devoptab_list[];
 void __libnx_exception_handler(ThreadExceptionDump* ctx)
 {
     char line[256];
@@ -553,6 +560,14 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
                   (unsigned long long)ctx->far.x, (unsigned long long)ctx->sp.x);
     svcOutputDebugString(line, std::strlen(line));
     std::fprintf(stderr, "%s\n", line);   // to nxlink on hardware
+    {   // (diagnosis of the start-up fault) newlib's device table as it is now, and as x1 points at it
+        const void* const* seen = reinterpret_cast<const void* const*>(ctx->cpu_gprs[1].x);
+        std::fprintf(stderr, "devtable: at the fault: %p %p %p %p %p; the table at %p, x1 %p", devoptab_list[0], devoptab_list[1], devoptab_list[2], devoptab_list[3],
+                     devoptab_list[4], (const void*)devoptab_list, (const void*)seen);
+        if (seen == devoptab_list)
+            std::fprintf(stderr, ", [3] through x1 %p", seen[3]);
+        std::fprintf(stderr, "\n");
+    }
     {   // the callers, by the frame records
         std::uintptr_t fp = ctx->fp.x;
         for (int i = 0; i < 16 && fp && fp % 8 == 0; i++) {
@@ -614,8 +629,28 @@ int main(int argc, char** argv)
     consoleDebugInit(debugDevice_SVC);
     if (__nxlink_host.s_addr != 0 && R_SUCCEEDED(socketInitializeDefault()))
         nxlinkStdio();
+    // An exception nothing catches, or any other call of std::terminate, said with where it came
+    // from before the program ends: without this the first sign was a fault elsewhere, the SD
+    // card having been unmounted by the exit while a game thread still read from it.
+    std::set_terminate([] {
+        char line[240];
+        const std::uint64_t base = (std::uint64_t)port::ImageBase();
+        int n = std::snprintf(line, sizeof line, "sly1: std::terminate called from");
+        const std::uint64_t* fp = reinterpret_cast<const std::uint64_t*>(__builtin_frame_address(0));
+        for (int depth = 0; depth < 10 && fp && n < (int)sizeof line - 20; depth++) {
+            n += std::snprintf(line + n, sizeof line - (std::size_t)n, " +0x%llX", (unsigned long long)(fp[1] - base));
+            const std::uint64_t* up = reinterpret_cast<const std::uint64_t*>(fp[0]);
+            if (up <= fp)
+                break;
+            fp = up;
+        }
+        svcOutputDebugString(line, std::strlen(line));
+        std::fprintf(stderr, "%s\n", line);
+        std::abort();
+    });
     if (argc <= 1)
         ArgsFromFile(argc, argv);
+    port::CheckDevTable("main");
     std::fprintf(stderr, "sly1: image at %p\n", (void*)port::ImageBase());   // for a debugger's addresses
     std::string iso = "sdmc:/switch/sly1/sly1.iso";
     port::SetSaveFolder("sdmc:/switch/sly1/save");

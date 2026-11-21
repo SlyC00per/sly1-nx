@@ -24,11 +24,13 @@ layout (std140, binding = 0) uniform FragmentParams {   // as gs_fsh.glsl has it
 
 void main()
 {
-    if (u.fogColour.w != 0.0) {
-        ivec2 p = ivec2(gl_FragCoord.xy) * 2;
+    // (w: the test, and beside it half the scale the frame is drawn at: 0.5 for the whole image)
+    float test = floor(u.fogColour.w), scale = fract(u.fogColour.w) * 2.0;
+    if (test != 0.0) {
+        ivec2 p = ivec2(floor(gl_FragCoord.xy) * 2.0 * scale);
         float d = max(max(texelFetch(depth0, p, 0).r, texelFetch(depth0, p + ivec2(1, 0), 0).r),
                       max(texelFetch(depth0, p + ivec2(0, 1), 0).r, texelFetch(depth0, p + ivec2(1, 1), 0).r));
-        if (u.fogColour.w == 2.0 ? gl_FragCoord.z < d : gl_FragCoord.z <= d)
+        if (test == 2.0 ? gl_FragCoord.z < d : gl_FragCoord.z <= d)
             discard;
     }
     vec3 rgb = inColour.rgb;

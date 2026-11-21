@@ -13,6 +13,11 @@
 //
 // A game thread runs on a stack of the port's in game memory (port/ptr32.h: the game links
 // stack frames into its lists), not on the stack the game gives it, which is sized for the PS2.
+#if defined(__SWITCH__)
+namespace port { void CheckDevTable(const char* where); }
+#else
+namespace port { inline void CheckDevTable(const char*) {} }
+#endif
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -213,6 +218,7 @@ void UpdatePreemptPending()
 // A game thread from its start to its return, on its slot's host thread.
 void RunGameThread(int id)
 {
+    port::CheckDevTable("a game thread begun");
     t_self = id;
     {
         std::unique_lock<std::mutex> lk(g_kernel);
