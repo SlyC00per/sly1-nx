@@ -12,6 +12,9 @@
 // microprograms are not run, so a FINISH a microprogram would send is not seen here.
 #include "port/dmac.h"
 
+#if defined(__SWITCH__)
+#include <switch.h>
+#endif
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1620,6 +1623,23 @@ std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::
 
 }  // namespace
 
+// Above the game's threads on their core (SLY1_HELPER_PRIORITY), the helper stands aside between
+// two jobs while the game needs the core at once (GameUrgent, port/platform/kernel.cpp).
+bool GameUrgent();
+std::atomic<bool> g_helperAbove{false};
+std::atomic<std::uint64_t> g_helperGaveWayNs{0};
+inline void HelperGiveWay()
+{
+#if defined(__SWITCH__)
+    if (!g_helperAbove.load(std::memory_order_relaxed) || !GameUrgent())
+        return;
+    const std::uint64_t t0 = NowNs();
+    for (int k = 0; k < 400 && GameUrgent(); k++)
+        svcSleepThread(50000);
+    g_helperGaveWayNs += NowNs() - t0;
+#endif
+}
+
 void HashHelperMain()
 {
     PlaceThread(ThreadRole::Helper);
@@ -1627,6 +1647,19 @@ void HashHelperMain()
     std::vector<HashJob> jobs;
     std::vector<HashResult> results;
     for (;;) {
+#if defined(__SWITCH__)
+        {   // SLY1_HELPER_PRIORITY=ab: below the game's threads (0x2D) and above them (0x2B) in turn,
+            // 600 frames each, to compare in one played run
+            static const bool turns = std::getenv("SLY1_HELPER_PRIORITY") && std::getenv("SLY1_HELPER_PRIORITY")[0] == 'a';
+            static int was = -1;
+            const int now = (int)(gs::FramesShown() / 600 % 2);
+            if (turns && now != was) {
+                was = now;
+                svcSetThreadPriority(CUR_THREAD_HANDLE, now ? 0x2B : 0x2D);
+                g_helperAbove.store(now != 0, std::memory_order_relaxed);
+            }
+        }
+#endif
         {
             std::unique_lock<std::mutex> lk(g_hashLock);
             for (const HashResult& r : results)
@@ -1641,17 +1674,27 @@ void HashHelperMain()
             jobs.swap(g_hashJobs);
         }
         for (;;) {   // the parts' jobs first: the GS thread waits for them
+            HelperGiveWay();
             if (PartJob* j = PartJobTake())
                 PartJobRun(*j, 0, false);
             else if (g_listWalked.load(std::memory_order_acquire) && jobs.empty() && !g_hashQueued.load(std::memory_order_acquire))
+#if defined(__SWITCH__)
+                // (asleep a moment, not a yield: above the game's threads a yield gives them nothing,
+                // and the list's walk waits for the game's interrupt handler: the screen stayed black)
+                svcSleepThread(30000);
+#else
                 std::this_thread::yield();
+#endif
             else
                 break;
         }
         const std::uint64_t t0 = NowNs();
         for (std::size_t n = 0; n < jobs.size(); n++) {
-            while (PartJob* pj = PartJobTake())
+            HelperGiveWay();
+            while (PartJob* pj = PartJobTake()) {
                 PartJobRun(*pj, 0, false);
+                HelperGiveWay();
+            }
             const HashJob& j = jobs[n];
             HashResult r = {j.key, j.serial, 0, 0, j.whole, true};
             if (!(j.slow && g_listsBegun.load(std::memory_order_acquire) != j.list)) {
@@ -2038,6 +2081,21 @@ bool PartHeaderSame(const std::uint32_t a[44], const std::uint32_t b[44], bool s
         const bool exactNow = turns ? gs::FramesShown() / 600 % 2 == 0 : exactAll;
         if ((exactNow && !g_headerNearAsked) || std::memcmp(a + 32, b + 32, 16) != 0 || std::memcmp(a + 37, b + 37, 12) != 0 || a[43] != b[43])
             return false;
+        // SLY1_PART_HDR_NEAR=rotation,position[,inverse]: how far (default 1/1024 and a quarter of a unit).
+        // A part of something that sways or turns a little each frame is then drawn with the
+        // lighting it was kept with until it has turned that far: its vertices are placed by this
+        // frame's matrix as ever, only the colours VU1 lit them with are a few frames old.
+        static const struct Near {
+            // (inverse: the inverse matrix's fourth row, which the routines that light a model's
+            // part do not read, and which moves far when an object far from the origin turns a little)
+            float rotation = 1.0f / 1024, position = 0.25f, inverse = 0.25f;
+            Near()
+            {
+                if (const char* e = std::getenv("SLY1_PART_HDR_NEAR"))
+                    if (std::sscanf(e, "%f,%f,%f", &rotation, &position, &inverse) < 3)
+                        inverse = position;
+            }
+        } tolerance;
         const auto near = [&](int k, float by) {
             if (a[k] == b[k])
                 return true;
@@ -2047,13 +2105,13 @@ bool PartHeaderSame(const std::uint32_t a[44], const std::uint32_t b[44], bool s
             return x - y < by && y - x < by;
         };
         for (int k = 16; k < 28; k++)
-            if (!near(k, 1.0f / 1024))
+            if (!near(k, tolerance.rotation))
                 return false;
         for (int k = 28; k < 32; k++)
-            if (!near(k, 0.25f))
+            if (!near(k, tolerance.inverse))
                 return false;
         for (int k = 40; k < 43; k++)
-            if (!near(k, 0.25f))
+            if (!near(k, tolerance.position))
                 return false;
         return near(36, 1.0f / 512);
     }
@@ -2833,18 +2891,26 @@ void PartJobSeen(PartRecord& r, const Vif::Regs& before, bool clean)
     }
 }
 
+int g_fullWhy;
+std::uint64_t g_fullNsBy[7], g_fullBy[7];
 bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
 {
     g_callKey = 0;
     if (PartDecide(marker, target, slow))
         return true;
+    // (g_fullWhy: why the part is run here in full, for SLY1_PERF_LOG's perffull: 0 it is being
+    // kept, 1 no key (fickle, moving, jobs off), 2 lit by volumes, 3 not known, 4 watched for its
+    // registers, 5 its shape cannot be hashed, 6 its shape changed)
+    g_fullWhy = g_partRecording ? 0 : 1;
     if (g_partRecording || g_callKey == 0 || !PartJobsOn())
         return false;
     // (a part lit by its cache and by volumes of light, mode 1, reads the volumes' packets where
     // the game writes them anew each frame: run in its turn, before the game has)
+    g_fullWhy = 2;
     if (g_callHeader[37] == 1)
         return false;
     auto it = g_parts.find(g_callKey);
+    g_fullWhy = 3;
     if (it == g_parts.end())
         return false;
     PartRecord& r = it->second;
@@ -2852,6 +2918,7 @@ bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
     if (!first && !second) {
         // run here and watched, if its shape is the one known (or none is yet)
         const std::uint64_t shape = PartHash(target, false, g_callRegs.cl, g_callRegs.wl, g_callTte, slow, nullptr, true);
+        g_fullWhy = shape != 0 ? 4 : 5;
         if (shape != 0) {
             if (r.shape != shape) {
                 r.shape = shape;
@@ -2876,6 +2943,7 @@ bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
         r.jobOk = r.jobTwo = false;   // (watched when it next comes)
         r.shape = 0;
         g_jobsShape++;
+        g_fullWhy = 6;
         return false;
     }
     const std::uint64_t tShape = NowNs();
@@ -3131,7 +3199,7 @@ struct LiveSink {
     // A model part drawn from its cache (tools/patches.py's hook: a NOP naming the cache's packet,
     // then the DMA call of it): from the NOP to the tag that returns from the call. PartCall says
     // whether the call is left out, the part drawn from what was kept of the packet.
-    int depth = 0, partDepth = -1;
+    int depth = 0, partDepth = -1, partWhy = 0;
     std::uint64_t partBegan = 0;
     bool SkipCall(std::uint32_t target)
     {
@@ -3148,6 +3216,7 @@ struct LiveSink {
         }
         partDepth = depth;
         partBegan = t0;
+        partWhy = g_fullWhy;
         return false;
     }
     void OnTagDone(std::uint32_t id)
@@ -3162,6 +3231,8 @@ struct LiveSink {
                 g_vif1.PartEnd();
                 partDepth = -1;
                 g_partTimes[1] += NowNs() - partBegan;
+                g_fullNsBy[partWhy] += NowNs() - partBegan;
+                g_fullBy[partWhy]++;
             }
         }
     }
@@ -3851,6 +3922,17 @@ void RenderThreadMain()
                                          (jobs[2] - jobsWas[2]) / f, (ns[2] - nsWas[2]) / f / 1e6, (g_jobDrainWaitNs - drainWas) / f / 1e6, (int)(JobWaitNs() / 1000),
                                          (g_partsWaited - waitedWas) / f, (g_gsSpareHad.load() - spareWas[0]) / f, (g_gsSpareNone.load() - spareWas[1]) / f, (g_gsSpareGrown.load() - spareWas[2]) / f, (unsigned long long)g_jobStaleCodes.load(), (unsigned long long)g_jobsNotCopied, (g_jobWordsCopied - copiedWas) / f);
                         copiedWas = g_jobWordsCopied;
+                        {
+                            static std::uint64_t nsWas[7], nWas[7];
+                            static const char* const kWhy[7] = {"being kept", "no key", "lit by volumes", "not known", "watched", "no shape", "shape changed"};
+                            if (since) {
+                                std::fprintf(stderr, "perffull: to %llu, parts run in full a frame:", (unsigned long long)shown);
+                                for (int k = 0; k < 7; k++)
+                                    std::fprintf(stderr, " %s %.1f (%.2f ms)%s", kWhy[k], (g_fullBy[k] - nWas[k]) / f, (g_fullNsBy[k] - nsWas[k]) / f / 1e6, k < 6 ? "," : "\n");
+                            }
+                            std::memcpy(nsWas, g_fullNsBy, sizeof nsWas);
+                            std::memcpy(nWas, g_fullBy, sizeof nWas);
+                        }
                         {
                             static std::uint64_t was[12];
                             if (since)

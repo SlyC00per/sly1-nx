@@ -84,6 +84,7 @@ int g_current = kIdle;        // the game thread that runs, or none
 std::uint64_t g_idleSince, g_idleNs;   // how long no game thread has run, for the report
 
 // The running game thread changes (under g_kernel): the time with none running is counted.
+std::atomic<int> g_currentSeen{-1};   // g_current, for GameUrgent (read without the kernel's lock)
 void SetCurrent(int next)
 {
     if (g_current == kIdle && next != kIdle && g_idleSince)
@@ -91,7 +92,9 @@ void SetCurrent(int next)
     if (next == kIdle && g_current != kIdle)
         g_idleSince = NowNs();
     g_current = next;
+    g_currentSeen.store(next, std::memory_order_relaxed);
 }
+
 
 // Each stack has a guard above it, filled with a pattern: game code has been seen writing above
 // its thread's first frame, which on the Switch reached the kernel's globals the linker put after
@@ -100,11 +103,26 @@ constexpr std::size_t kStackGuard = 64 * 1024;
 constexpr unsigned char kGuardByte = 0xA5;
 #ifdef PORT_SENTINEL
 }  // namespace
+
 // Zero, in .bss: declared just before the stacks, which GCC then places it right after (it lays
 // out a file's .bss in reverse order), the place a stray store hit on the Switch.
 volatile std::uint32_t g_stackEndSentinel[4];
 namespace {
 #endif
+
+}  // namespace
+
+// (the render thread's helper, when it runs above the game's threads on their core) Whether the
+// game needs its core now: an interrupt or a better thread waits for the running one's next
+// preemption point, or the game's own render thread (2) runs: it hands the frame's list over
+// after the blank and each packet after a FINISH, and what it is late by the frame is late by.
+bool GameUrgent()
+{
+    return g_preemptPending.load(std::memory_order_relaxed) || g_currentSeen.load(std::memory_order_relaxed) == 2;
+}
+
+namespace {
+
 alignas(16384) unsigned char g_stacks[8][kStackSize + kStackGuard];   // page-aligned (port/thread.h)
 bool g_stackUsed[8];
 bool g_guardFilled[8];
