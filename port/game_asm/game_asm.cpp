@@ -42,6 +42,10 @@ struct CollisionMesh;
 struct ImpulseRow;
 struct FacePoint;
 struct PlacedObject;
+struct SwitchedCollider;
+struct ObjectGatherer;
+struct PathFollower;
+struct BodyContact;
 
 // The game's constants and globals these functions read, at their retail addresses in main memory
 // (port/retail_data.h): unit vectors, the identity matrix, the largest-float constants, the
@@ -721,7 +725,7 @@ void InterpolateBlendEntryPosition(void* p, void* e, f32 a, f32 b, s32 i, s32 j,
 // --- contact values (the object gatherer's and the path follower's, the switched collider's mode)
 
 // Sets the mode word (0x600); entering mode 1 or 3 clears the quadword at 0x5E0 (vsub of vf0).
-void SetSwitchedColliderMode(void* self, s32 mode)
+void SetSwitchedColliderMode(SwitchedCollider* self, s32 mode)
 {
     if ((s32)W(self, 0x600) == mode)
         return;
@@ -732,7 +736,7 @@ void SetSwitchedColliderMode(void* self, s32 mode)
 
 // When the contact's normal (0x80) points up (its dot with +z, as the accumulator forms it, over
 // 0.7): the contact's two values (0x94, 0x98) become 3.0 (mode word 0x550 is 1) or 5.0, and 0.1.
-s32 ComputeObjectGathererContactValues(void* self, void* contact)
+s32 ComputeObjectGathererContactValues(ObjectGatherer* self, BodyContact* contact)
 {
     f32 up = Dot3(Ld(Q(GLOBAL(0x00248D20))), Ld(Q(contact, 0x80)));
     if (FromBits(0x3F333333) < up) {
@@ -745,7 +749,7 @@ s32 ComputeObjectGathererContactValues(void* self, void* contact)
 // Unless the contact's normal component (0x88), signed for the side (g_contactSideSigns), is under
 // 0.7 or the speed (0x61C) is not over 1e-4: the velocity (0x110) scaled by minus the speed, less
 // its part along the axis (0x130), is added to the side's record (0x30, 64 bytes a side).
-void ResolveObjectGathererContact(void* self, void* contact, s32 side)
+void ResolveObjectGathererContact(ObjectGatherer* self, BodyContact* contact, s32 side)
 {
     f32 n = Mul(F(contact, 0x88), F(GLOBAL(0x00274AD0), (u32)side * 4));
     u8* rec = B(contact) + side * 64;
@@ -763,7 +767,7 @@ void ResolveObjectGathererContact(void* self, void* contact, s32 side)
 // The path follower's contact values (0x94, 0x98): 0.15 and 0.5 when the other side's object
 // lacks flag bit 56 (0x538); else, when the side's signed normal component is over 0.7 and the
 // speed (the length of 0x150) over the threshold at 0x275618, 1.0 and 0.15; else 0 and 0.
-void ComputePathFollowerContactValue(void* self, void* contacts, s32 side)
+void ComputePathFollowerContactValue(PathFollower* self, BodyContact* contacts, s32 side)
 {
     u8* other = (u8*)port::Native(W(contacts, (u32)(1 - side) * 64));
     u64 flags;
