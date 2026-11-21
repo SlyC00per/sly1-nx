@@ -406,6 +406,7 @@ private:
     void DumpDraw(long k);
     long listAt_ = -1;
     int listed_ = 0;
+    std::unordered_map<std::uint64_t, bool> blackKept_;   // DrawBatch: whether a kept batch that adds is all black
     int view_ = 0;   // SLY1_GPU_CAPTURE's views of the batches, a frame each after the first: 1 no depth test,
                     // 2 divided by w in the shader, 3 depths clamped, 4 no backface dropped, 5 facing
     std::uint32_t frameUsed_ = 0, draws_ = 0, textureUsed_ = 0, nextTexture_ = 0;
@@ -1413,9 +1414,20 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
             (!s.fge || (s.fogcol & 0xFFFFFF) == 0) && (!s.tme || ((s.tex0 >> 35) & 3) == 0) && b.count) {
             const std::uint32_t* c = b.quads + b.colourAt * 4;
             const std::uint32_t step = b.stride * 4;
+            // (a kept batch's colours are what they were: looked at once, not met cold each frame)
             std::uint32_t any = 0;
-            for (std::uint32_t k = 0; k < b.count && !any; k++, c += step)
-                any = (c[0] | c[1] | c[2]) & 0xFF;
+            auto known = b.keep != 0 ? blackKept_.find(b.keep) : blackKept_.end();
+            if (known != blackKept_.end()) {
+                any = known->second ? 0 : 1;
+            } else {
+                for (std::uint32_t k = 0; k < b.count && !any; k++, c += step)
+                    any = (c[0] | c[1] | c[2]) & 0xFF;
+                if (b.keep != 0) {
+                    if (blackKept_.size() > 200000)   // (a key is never used again: the old ones let go)
+                        blackKept_.clear();
+                    blackKept_.emplace(b.keep, any == 0);
+                }
+            }
             if (!any) {
                 blackBatches_++;
                 return true;

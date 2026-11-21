@@ -328,7 +328,7 @@ thread_local Collect* t_collect = nullptr;
 std::atomic<std::uint64_t> g_jobStaleCodes{0};   // interrupts and microcode loads a job's stale run came to, and left alone
 std::mutex g_gsLock;
 std::condition_variable g_gsWake, g_gsIdle;
-std::deque<GsItem> g_gsQueue;
+std::vector<GsItem> g_gsQueue;   // (a deque allocated a block every few items, and the GS thread freed it)
 std::vector<std::vector<std::uint32_t>> g_gsSpare;
 constexpr std::size_t kGsSpareMost = 2048;   // (SLY1_PERF_LOG's perfjobs line says how often the stock was empty)
 std::atomic<std::uint64_t> g_gsSpareNone{0}, g_gsSpareHad{0}, g_gsSpareGrown{0};
@@ -1483,6 +1483,11 @@ struct PartRecord {
     Vif::Regs jobBefore, jobAfter;
 };
 std::unordered_map<std::uint32_t, PartRecord> g_parts;
+// What a part kept before it was found changed: let go when the render thread has nothing queued,
+// not in the list's walk (a part's packets freed one by one were 3% of the walk in slow frames on
+// the Switch, the allocator's lock shared with the GS thread).
+std::vector<std::shared_ptr<const std::vector<PartKept>>> g_partGrave;
+std::vector<std::vector<PartKept>> g_partGraveItems;
 
 // --- The parts' hashes a frame late, on a helper thread.
 //
@@ -1870,7 +1875,7 @@ std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::
     bool wild = false;
     auto inMemory = [&](std::uint32_t addr, std::uint32_t quads) {
         const std::uint32_t a = addr & 0x0FFFFFF0;
-        const bool ok = (addr & 0x40000000u) == 0 && a >= 0x10 && a < kRamSize && quads <= (kRamSize - a) / 16;
+        const bool ok = (addr & 0x50000000u) == 0 && a >= 0x10 && a < kRamSize && quads <= (kRamSize - a) / 16;
         wild = wild || !ok;
         return ok;
     };
@@ -2307,6 +2312,10 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
         const std::uint64_t shape = r.shape;
         const Vif::Regs jobBefore = r.jobBefore, jobAfter = r.jobAfter, jobBefore2 = r.jobBefore2, jobAfter2 = r.jobAfter2;
         const bool jobTwo = r.jobTwo;
+        if (r.kept)
+            g_partGrave.push_back(std::move(r.kept));
+        if (!r.items.empty())
+            g_partGraveItems.push_back(std::move(r.items));
         r = PartRecord();
         r.lockout = lockout;
         r.jobOk = jobOk;
@@ -2437,7 +2446,7 @@ template <class Sink> bool WalkPart(std::uint32_t target, bool tte, Sink& vif)
     bool wild = false;
     auto inMemory = [&](std::uint32_t addr, std::uint32_t quads) {
         const std::uint32_t a = addr & 0x0FFFFFF0;
-        const bool ok = (addr & 0x40000000u) == 0 && a >= 0x10 && a < kRamSize && quads <= (kRamSize - a) / 16;
+        const bool ok = (addr & 0x50000000u) == 0 && a >= 0x10 && a < kRamSize && quads <= (kRamSize - a) / 16;
         wild = wild || !ok;
         return ok;
     };
@@ -2604,6 +2613,7 @@ PartJob* PartJobTake()
 
 // (the render thread, its list walked) The jobs no thread has begun run here, and those begun
 // waited for.
+std::uint32_t g_drainAt;   // (the render thread's) PartJobsDrainStep: the jobs before this one are done
 void PartJobsDrain()
 {
     while (PartJob* j = PartJobTake())
@@ -2617,6 +2627,38 @@ void PartJobsDrain()
     g_jobDrainWaitNs += NowNs() - t0;
 }
 
+// The same a step at a time, true when every job is done: the render thread takes what the game
+// queues between two steps. (The game's two packets after a frame's list came while the list's
+// jobs were seen done, an eighth of the render thread's work in slow frames on the Switch, and
+// waited with their FINISHes for the end of it.)
+bool PartJobsDrainStep()
+{
+    if (PartJob* j = PartJobTake()) {
+        PartJobRun(*j, 1);
+        return false;
+    }
+    const std::uint64_t t0 = NowNs();
+    const std::uint32_t count = g_listJobCount.load(std::memory_order_acquire);
+    while (g_drainAt < count && g_listJobs[g_drainAt]->state.load(std::memory_order_acquire) == 2)
+        g_drainAt++;
+    bool done = false;
+    if (g_drainAt < count) {
+        PartJob& j = *g_listJobs[g_drainAt];
+        if (!PartJobRun(j, 1)) {
+            if (NowNs() - j.begunAt > JobWaitNs())
+                PartJobRun(j, 1, true);
+            else
+                std::this_thread::yield();
+        }
+    } else if (g_jobsOut.load(std::memory_order_acquire) != 0) {
+        std::this_thread::yield();
+    } else {
+        done = true;
+    }
+    g_jobDrainWaitNs += NowNs() - t0;
+    return done;
+}
+
 // (the render thread, a list begun) The parts whose jobs went wrong are not made jobs again.
 void PartJobsBegin()
 {
@@ -2624,6 +2666,7 @@ void PartJobsBegin()
     const std::uint32_t had = g_listJobCount.load(std::memory_order_acquire);
     g_listJobNext.store(0, std::memory_order_release);
     g_listJobCount.store(0, std::memory_order_release);
+    g_drainAt = 0;
     for (std::uint32_t k = 0; k < had; k++)
         g_listJobs[k].reset();
     g_listJobsLive = false;
@@ -3257,12 +3300,13 @@ void GsThreadMain()
     g_gsStarted.store(true, std::memory_order_release);
     // Everything queued is taken at once, and the emptied buffers given back then: the lock once a
     // lot, not twice an item.
-    std::deque<GsItem> taken;
+    std::vector<GsItem> taken;
+    std::size_t takenAt = 0;
     std::vector<std::vector<std::uint32_t>> emptied;
     std::shared_ptr<PartJob> jobNow;   // the job whose items are being taken, and the next of them
     std::size_t jobAt = 0;
     for (;;) {
-        if (!jobNow && taken.empty()) {
+        if (!jobNow && takenAt == taken.size()) {
             std::unique_lock<std::mutex> lk(g_gsLock);
             // (A frame has a thousand items and more where much is in sight. With a stock of 256 the
             // render thread ran out each frame and allocated the rest: a third of its work, walking
@@ -3278,15 +3322,28 @@ void GsThreadMain()
                 g_gsWake.wait(lk, [] { return !g_gsQueue.empty(); });
                 g_gsWaiting = false;
             }
+            taken.clear();
+            takenAt = 0;
             taken.swap(g_gsQueue);
             g_gsBusy = true;
         }
-        GsItem owned;
-        GsItem* itemp = &owned;
+        // The item where it lies, and the next one's words asked for: the render thread wrote them
+        // on another core, and a batch's vertices met cold, one line after the other, were a tenth
+        // of this thread's work in slow frames on the Switch.
+        const auto ahead = [](const GsItem& next) {
+            if (next.path == 0 || next.path > 4 || next.kept)
+                return;
+            const char* p = reinterpret_cast<const char*>(next.words.data());
+            const std::size_t n = std::min<std::size_t>(next.words.size() * 4, 8192);
+            for (std::size_t at = 0; at < n; at += 64)
+                __builtin_prefetch(p + at);
+        };
+        GsItem* itemp = nullptr;
+        bool fromQueue = false;
         if (!jobNow) {
-        owned = std::move(taken.front());
-        taken.pop_front();
-        GsItem& item = owned;
+        GsItem& item = taken[takenAt++];
+        if (takenAt < taken.size())
+            ahead(taken[takenAt]);
         if (item.path == 6) {   // a part's job: its items in this one's place, the job run here if not begun
             PartJob& j = *item.job;
             PartJobNeed(j, 2);
@@ -3317,6 +3374,8 @@ void GsThreadMain()
             jobAt = 0;
             continue;
         }
+        itemp = &item;
+        fromQueue = true;
         }
         if (jobNow) {
             if (jobAt >= jobNow->out.used) {
@@ -3324,6 +3383,8 @@ void GsThreadMain()
                 continue;
             }
             itemp = &jobNow->out.items[jobAt++];
+            if (jobAt < jobNow->out.used)
+                ahead(jobNow->out.items[jobAt]);
         }
         GsItem& item = *itemp;
         g_itemFinishTold = item.finishTold;
@@ -3446,7 +3507,7 @@ void GsThreadMain()
                 k += (std::size_t)taken * 4;
             }
         }
-        if (itemp == &owned && item.words.capacity() && emptied.size() < kGsSpareMost)
+        if (fromQueue && item.words.capacity() && emptied.size() < kGsSpareMost)
             emptied.push_back(std::move(item.words));
     }
 }
@@ -3462,12 +3523,20 @@ void RenderThreadMain()
         {
             std::unique_lock<std::mutex> lk(g_renderLock);
             g_renderBusy = false;
-            if (g_renderQueue.empty() && g_drainOwed) {   // nothing queued: the last list's jobs seen done now
+            if (g_renderQueue.empty() && g_drainOwed) {   // nothing queued: the last list's jobs seen done now, a step at a time
                 g_renderBusy = true;
                 lk.unlock();
-                PartJobsDrain();
-                g_drainOwed = false;
-                TIMELINE("render: the jobs are done");
+                if (PartJobsDrainStep()) {
+                    g_drainOwed = false;
+                    TIMELINE("render: the jobs are done");
+                }
+                continue;
+            }
+            if (g_renderQueue.empty() && !(g_partGrave.empty() && g_partGraveItems.empty())) {
+                g_renderBusy = true;
+                lk.unlock();
+                g_partGrave.clear();
+                g_partGraveItems.clear();
                 continue;
             }
             if (g_renderQueue.empty()) {
