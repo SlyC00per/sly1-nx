@@ -35,6 +35,7 @@ sys.path.insert(0, str(DECOMP / "tools"))
 from modern_check import standard_returns  # noqa: E402  (sly1-decomp's, unchanged)
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import patches  # noqa: E402
+import overrides  # noqa: E402
 
 def named_returns(text):
     """g++'s named return values (`T f(...) return out { ... }`) as standard C++: sly1-decomp's
@@ -397,7 +398,7 @@ ASM_FUNC_H = """// SPDX-License-Identifier: AGPL-3.0-or-later
 
 
 def text_stage(out):
-    stats = {"files": 0, "minmax": 0, "named_returns": 0, "broken_strings": 0, "patches": 0}
+    stats = {"files": 0, "minmax": 0, "named_returns": 0, "broken_strings": 0, "patches": 0, "overrides": 0}
     paths = []
     for d in ("include", "src/main"):
         paths += sorted((DECOMP / d).rglob("*"))
@@ -413,6 +414,10 @@ def text_stage(out):
             else:
                 text, n = patches.apply(rel, text)
                 stats["patches"] += n
+                # (the port's own versions of whole functions, tools/overrides.py: after the patches,
+                # which are written against the decompilation's text)
+                text, n = overrides.apply(rel, text)
+                stats["overrides"] += n
                 fixed = fix_broken_strings(text)
                 stats["broken_strings"] += fixed != text
                 text, found = named_returns(fixed)
@@ -561,9 +566,12 @@ def main():
     stats = text_stage(out)
     print("gen: text stage: %(files)d files, %(minmax)d min/max operators, "
           "%(named_returns)d named return values, %(broken_strings)d files with broken strings, "
-          "%(patches)d named patches" % stats)
+          "%(patches)d named patches, %(overrides)d functions the port's own" % stats)
     if stats["patches"] != len(patches.PATCHES):
         raise SystemExit("gen: %d named patches applied of %d" % (stats["patches"], len(patches.PATCHES)))
+    if stats["overrides"] != len(overrides.all_overrides()):
+        raise SystemExit("gen: %d of the port's own functions put in of %d (an override for a file the "
+                         "decompilation does not have?)" % (stats["overrides"], len(overrides.all_overrides())))
     if args.no_pointers:
         return 0
     units = sorted(str(p.relative_to(DECOMP)) for p in (DECOMP / "src/main").glob("*.cpp")) + PORTABLE_LIB_UNITS \

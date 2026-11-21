@@ -506,3 +506,27 @@ Its first list, read through on the generated code:
 
 Not covered: a function stored in data the tool cannot follow to its call (the 20 queued calls
 whose function is a variable; the property table's setters, which every level's load runs).
+
+## The port's own functions (maintainer's decision, 2026-11-21)
+
+The decompilation is never changed, and until now the port could alter the game's code only by a
+named patch: an exact replacement of a line or two (tools/patches.py). That is right for a
+one-line fix and wrong for doing a whole thing the port's way, which is what the renderer now
+needs: 60 frames a second were not reached by translating what the game sends the PS2's VU1 and
+GS (docs/RENDERER.md), and the maintainer decided to draw the game's model parts natively, as a
+studio's port does, with the game's own draw functions replaced.
+
+So the port may also supply its own version of a whole function, kept in this repository:
+`port/game/overrides/<file under sly1-decomp/>/<function>.cpp` (tools/overrides.py).
+tools/gen.py puts it in the generated copy in place of the decompilation's definition, after the
+named patches and before the pointer stage, so an override is written as the decompilation's
+code is and goes through the same rewriting. The definition is found by name, at the outermost
+level of the file, from its first line to its closing brace; the finder is checked against every
+source file (`python3 tools/overrides.py self-test`: each function it finds is found once, and
+taken out and put back leaves the file as it was). An override that does not find exactly one
+definition stops the generation, as a patch does.
+
+What stays as it was: the decompilation is untouched and stays a matching one; gameplay code is
+not overridden (section 12 holds); `python3 tools/overrides.py list` is the one list of where the
+port's functions are not the decompilation's, each with its reason.
+

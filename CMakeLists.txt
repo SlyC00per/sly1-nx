@@ -81,7 +81,9 @@ endif()
 
 file(GLOB DECOMP_UNITS CONFIGURE_DEPENDS ${SLY1_DECOMP}/src/main/*.cpp)
 file(GLOB_RECURSE DECOMP_INPUTS CONFIGURE_DEPENDS ${SLY1_DECOMP}/include/*.h ${SLY1_DECOMP}/src/main/*.cpp)
-file(GLOB GEN_TOOLS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tools/gen*.py ${CMAKE_SOURCE_DIR}/tools/patches.py
+# (the port's own versions of whole functions, tools/overrides.py: the generated code depends on them)
+file(GLOB_RECURSE PORT_OVERRIDES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/port/game/overrides/*.cpp)
+file(GLOB GEN_TOOLS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/tools/gen*.py ${CMAKE_SOURCE_DIR}/tools/patches.py ${CMAKE_SOURCE_DIR}/tools/overrides.py ${PORT_OVERRIDES}
      ${CMAKE_SOURCE_DIR}/port/include/port/ps2/*.h)
 set(GEN_UNITS ${GEN_DIR}/port_data_init.cpp ${GEN_DIR}/src/lib/sort.cpp)
 foreach(unit ${DECOMP_UNITS})
