@@ -244,8 +244,18 @@ void SampleWindow(bool open)
 
 void PlaceThread(ThreadRole role, bool sampled)
 {
-    if (sampled && (role == ThreadRole::Render || role == ThreadRole::Gs))
+    // SLY1_SAMPLE=4: the game's own threads in the render and GS threads' places (the first two
+    // placed: the report's "render" and "gs" are then those)
+    static const bool gameSampled = std::getenv("SLY1_SAMPLE") && std::getenv("SLY1_SAMPLE")[0] == '4';
+    if (sampled && !gameSampled && (role == ThreadRole::Render || role == ThreadRole::Gs))
         g_sampled[role == ThreadRole::Gs ? 1 : 0] = threadGetCurHandle();
+    if (gameSampled && role == ThreadRole::Game) {
+        static std::atomic<int> next{0};
+        const int slot = next.fetch_add(1);
+        if (slot < 2)
+            g_sampled[slot] = threadGetCurHandle();
+        std::fprintf(stderr, "sly1: the sampler's place %d is a game thread\n", slot);
+    }
     if (role == ThreadRole::Helper) {
         // The render thread's helper (the parts' hashes): the fourth core where the system lets
         // the program have it (it does not on the Switch as homebrew runs), else the game's core

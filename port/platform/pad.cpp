@@ -176,6 +176,10 @@ s32 ReadPadFrame(s32 port, s32 slot, u8* out)
             f.rx = 0xB0;
             f.ry = 0x80;
         }
+        // SLY1_PAD_START=N: START held for the Nth read and the five after (the pause menu, unattended)
+        static const long startAt = std::getenv("SLY1_PAD_START") ? std::atol(std::getenv("SLY1_PAD_START")) : -1;
+        if (startAt >= 0 && reads >= startAt && reads < startAt + 6)
+            f.buttons |= 0x0800;
         if (turnFrom >= 0 && reads >= turnFrom) {
             f.rx = 0xC0;
             f.ry = 0x80;

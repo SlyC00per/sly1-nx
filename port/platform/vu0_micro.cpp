@@ -11,6 +11,8 @@
 #include "port/vu0_micro.h"
 
 #include <cmath>
+#include <chrono>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -319,12 +321,117 @@ struct Runner {
 
 State& Vu0() { return g_state; }
 
+namespace {
+
+// The particle filter (0x010 to 0x058), as the game's microcode has it: ten instructions, run once
+// for each particle (port/include: Vu0::ParticleFilter). Interpreted it was a quarter of the game's
+// main thread on the Switch in A Stealthy Approach (the rain), so it is done here in the host's own
+// code, with the interpreter's arithmetic, field by field in its order:
+//   ACC.xyz = vf31 * vf24.x + vf30 * vf24.y + vf29 * vf24.z;  vf22.xyz = ACC + vf28 * vf00.w
+//   vf21.xyz = vf22 * vf27.x + vf23;  vf26.xyz = min(vf26, vf21);  vf25.xyz = max(vf25, vf21)
+//   vf22.w = vf24.w;  vf21.w = vf23.w
+// Only while the microcode there is that program, word for word. SLY1_VU0_NATIVE=0: interpreted;
+// SLY1_VU0_CHECK=1: both, compared (every register, ACC, the flags, where it stops).
+const std::uint32_t kParticleFilter[20] = {
+    0x8000033C, 0x01D8F9BC, 0x8000033C, 0x01D8F0BD, 0x8000033C, 0x01D8E8BE, 0x8000033C, 0x01C0E58B, 0x8000033C, 0x01DBB558,
+    0x8000033C, 0x01D7AD68, 0x8036C33C, 0x01D5D6AF, 0x8035BB3C, 0x01D5CE6B, 0x8000033C, 0x400002FF, 0x8000033C, 0x000002FF,
+};
+
+void ParticleFilterNative(State& s)
+{
+    s.vf[0][0] = s.vf[0][1] = s.vf[0][2] = 0.0f;
+    s.vf[0][3] = 1.0f;
+    s.vi[0] = 0;
+    const float ex = s.vf[24][0], ey = s.vf[24][1], ez = s.vf[24][2], scale = s.vf[27][0];
+    std::uint32_t mac = 0;
+    for (int k = 0; k < 3; k++) {
+        float acc = port_vu0::Mul(s.vf[31][k], ex);
+        acc = port_vu0::Add(acc, port_vu0::Mul(s.vf[30][k], ey));
+        acc = port_vu0::Add(acc, port_vu0::Mul(s.vf[29][k], ez));
+        s.acc[k] = acc;
+        const float moved = port_vu0::Add(acc, port_vu0::Mul(s.vf[28][k], 1.0f));
+        const float at = port_vu0::Add(port_vu0::Mul(moved, scale), s.vf[23][k]);
+        s.vf[22][k] = moved;
+        s.vf[21][k] = at;
+        mac |= FieldFlags(at, k);
+        const float lo = s.vf[26][k], hi = s.vf[25][k];
+        s.vf[26][k] = lo < at ? lo : at;
+        s.vf[25][k] = hi > at ? hi : at;
+    }
+    s.vf[22][3] = s.vf[24][3];
+    s.vf[21][3] = s.vf[23][3];
+    s.mac = mac;
+    s.pc = 12;
+}
+
+void Interpret(std::uint32_t addr);
+
+}  // namespace
+
 void Run(std::uint32_t addr)
+{
+    static const bool native = !(std::getenv("SLY1_VU0_NATIVE") && std::getenv("SLY1_VU0_NATIVE")[0] == '0');
+    static const bool check = std::getenv("SLY1_VU0_CHECK") != nullptr;
+    // SLY1_VU0_NATIVE=ab: native and interpreted in turn, ten seconds each, said as it changes
+    // (to compare the two in one played run)
+    static const bool turns = std::getenv("SLY1_VU0_NATIVE") && std::getenv("SLY1_VU0_NATIVE")[0] == 'a';
+    if (turns && addr == 0x10) {
+        static int was = -1;
+        const int now = (int)(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10 % 2);
+        if (now != was)
+            std::fprintf(stderr, "vu0ab: the particle filter %s\n", now ? "native" : "interpreted");
+        was = now;
+        if (!now) {
+            Interpret(addr);
+            return;
+        }
+    }
+    if (addr == 0x10 && native && std::memcmp(&g_state.micro[4], kParticleFilter, sizeof kParticleFilter) == 0) {
+        if (!check) {
+            ParticleFilterNative(g_state);
+            return;
+        }
+        static State before;
+        std::memcpy(&before, &g_state, offsetof(State, data));
+        Interpret(addr);
+        State& s = g_state;
+        static State mine;
+        std::memcpy(&mine, &before, offsetof(State, data));
+        ParticleFilterNative(mine);
+        static unsigned long runs, wrong;
+        runs++;
+        if (std::memcmp(mine.vf, s.vf, sizeof s.vf) != 0 || std::memcmp(mine.acc, s.acc, 12) != 0 || mine.mac != s.mac || mine.pc != s.pc) {
+            if (wrong++ < 8)
+                std::fprintf(stderr, "vu0check: the particle filter differs (run %lu): mac %X against %X, pc %u against %u\n", runs, mine.mac, s.mac, mine.pc, s.pc);
+        }
+        if (runs % 100000 == 0)
+            std::fprintf(stderr, "vu0check: %lu runs of the particle filter, %lu differed\n", runs, wrong);
+        return;
+    }
+    Interpret(addr);
+}
+
+namespace {
+
+void Interpret(std::uint32_t addr)
 {
     State& s = g_state;
     s.vf[0][0] = s.vf[0][1] = s.vf[0][2] = 0.0f;
     s.vf[0][3] = 1.0f;
     s.vi[0] = 0;
+    {   // SLY1_VU0_DUMP=1: each microprogram's instructions, the first time it is run
+        static const bool dump = std::getenv("SLY1_VU0_DUMP") != nullptr;
+        static std::uint32_t seen[8];
+        static int nseen;
+        bool had = false;
+        for (int k = 0; k < nseen; k++)
+            had = had || seen[k] == addr;
+        if (dump && !had && nseen < 8) {
+            seen[nseen++] = addr;
+            for (std::uint32_t at = (addr / 8) & 511, n = 0; n < 96; n++, at = (at + 1) & 511)
+                std::fprintf(stderr, "vu0dump: %03X %03X: %08X %08X\n", addr, at * 8, s.micro[at * 2 + 1], s.micro[at * 2]);
+        }
+    }
     Runner r;
     std::uint32_t pc = (addr / 8) & 511;
     long branch = -1;     // a taken branch's target, after the delay slot
@@ -359,6 +466,8 @@ void Run(std::uint32_t addr)
     std::fprintf(stderr, "port: a VU0 microprogram from 0x%03X ran without ending\n", addr);
     std::abort();
 }
+
+}  // namespace
 
 }  // namespace vu0
 }  // namespace port

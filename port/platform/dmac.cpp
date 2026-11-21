@@ -1686,7 +1686,7 @@ void HashTakeResults()
     results.clear();
 }   // by the hook's packet and half
 std::uint64_t g_partTimes[2];   // ns: parts drawn again, parts run in full
-std::uint64_t g_partsTexMoved, g_partsReplayed, g_partsRecorded, g_partsRefused, g_partsStale, g_partItemsReplayed, g_partsMoving, g_partsStaleBy[3], g_partHashNs, g_partWords, g_partsCleared, g_partKey, g_partsFickle, g_partsWaited;
+std::uint64_t g_partsTexMoved, g_partsReplayed, g_partsRecorded, g_partsRefused, g_partsStale, g_partItemsReplayed, g_partsMoving, g_partsStaleBy[3], g_partHashNs, g_partWords, g_partsCleared, g_partKey, g_partsFickle, g_partsWaited, g_waitWhy[12];
 constexpr std::size_t kBatchHead = 1 + (sizeof(gs::Batch) + 3) / 4;
 
 bool PartReplayOn()
@@ -1971,12 +1971,49 @@ bool KeepTwice()
     static const bool twice = !std::getenv("SLY1_PART_KEEP_TWICE") || std::getenv("SLY1_PART_KEEP_TWICE")[0] != '0';
     return twice;
 }
+bool g_headerNearAsked;   // (perfwait's count with SLY1_PART_HDR_EXACT: what the tolerance would have passed)
 bool PartHeaderSame(const std::uint32_t a[44], const std::uint32_t b[44], bool slow)
 {
     // (its mode, 9.y: -1 unlit and 0 lit by its cache alone read neither, as a part drawn from its
     // cache; the others are lit by VU1 from them)
-    if (slow && !((a[37] == 0xFFFFFFFFu || a[37] == 0) && a[37] == b[37]))
-        return std::memcmp(a + 16, b + 16, 28 * 4) == 0;
+    if (slow && !((a[37] == 0xFFFFFFFFu || a[37] == 0) && a[37] == b[37])) {
+        if (std::memcmp(a + 16, b + 16, 28 * 4) == 0)
+            return true;
+        // The game makes the inverse matrix and the centre anew each frame, and while the camera
+        // moves they come out other in their last digits for an object that stands still (seen
+        // walking through A Stealthy Approach: 20 to 45 parts a frame run again for that alone,
+        // most of what the render thread did there). Within 1/1024 in the rotation (the cosines a
+        // light is weighed by: an eighth of a step of a colour) and a quarter of a unit in the
+        // translation and the centre, the part is what it was kept as; the fog, the mode and
+        // count and the colours' scale exactly, the alpha's scale as below.
+        // SLY1_PART_HDR_EXACT=1: every word the same.
+        // Off unless SLY1_PART_HDR_EXACT=0: on the Switch, played, it passed under one part a frame (the
+        // parts whose headers are other there do change), so the headers are compared exactly.
+        static const bool exactAll = !(std::getenv("SLY1_PART_HDR_EXACT") && std::getenv("SLY1_PART_HDR_EXACT")[0] == '0') || std::getenv("SLY1_PART_HASH_NOW") != nullptr;
+        // (SLY1_PART_HDR_EXACT=ab: exact and near in turn, 600 frames each, to compare in one run)
+        static const bool turns = std::getenv("SLY1_PART_HDR_EXACT") && std::getenv("SLY1_PART_HDR_EXACT")[0] == 'a';
+        const bool exactNow = turns ? gs::FramesShown() / 600 % 2 == 0 : exactAll;
+        if ((exactNow && !g_headerNearAsked) || std::memcmp(a + 32, b + 32, 16) != 0 || std::memcmp(a + 37, b + 37, 12) != 0 || a[43] != b[43])
+            return false;
+        const auto near = [&](int k, float by) {
+            if (a[k] == b[k])
+                return true;
+            float x, y;
+            std::memcpy(&x, a + k, 4);
+            std::memcpy(&y, b + k, 4);
+            return x - y < by && y - x < by;
+        };
+        for (int k = 16; k < 28; k++)
+            if (!near(k, 1.0f / 1024))
+                return false;
+        for (int k = 28; k < 32; k++)
+            if (!near(k, 0.25f))
+                return false;
+        for (int k = 40; k < 43; k++)
+            if (!near(k, 0.25f))
+                return false;
+        return near(36, 1.0f / 512);
+    }
     if (std::memcmp(a + 32, b + 32, 16) != 0 || std::memcmp(a + 37, b + 37, 12) != 0 || a[43] != b[43])
         return false;
     if (a[36] == b[36])
@@ -2167,6 +2204,45 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             if (r.ok) {
                 g_partsStale++;
                 g_partsStaleBy[r.before == regs ? 2 : 1]++;
+            }
+            {   // (SLY1_PERF_LOG's perfwait: why it is not what the list before had)
+                const std::uint32_t* a = r.seenHeader;
+                const bool seen = r.seenList != 0 && r.seenList + 1 >= g_listSerial;
+                g_waitWhy[slow ? 1 : 0]++;
+                if (!seen) {
+                    g_waitWhy[2]++;
+                } else {
+                    if (!(r.seenRegs == regs))
+                        g_waitWhy[3]++;
+                    if (!PartHeaderSame(a, header, slow)) {
+                        g_waitWhy[4]++;
+                        g_headerNearAsked = true;
+                        if (PartHeaderSame(a, header, slow))
+                            g_waitWhy[11]++;
+                        g_headerNearAsked = false;
+                        {   // SLY1_PART_HDR_LOG=frame: what is other in the headers, from that frame on (the first 60)
+                            static const long from = std::getenv("SLY1_PART_HDR_LOG") ? std::atol(std::getenv("SLY1_PART_HDR_LOG")) : -1;
+                            static int said;
+                            if (from >= 0 && (long)gs::FramesShown() >= from && said < 60) {
+                                said++;
+                                float x[44], y[44];
+                                std::memcpy(x, a, sizeof x);
+                                std::memcpy(y, header, sizeof y);
+                                std::fprintf(stderr, "hdr: frame %llu part %08X slow %d mode %d:", (unsigned long long)gs::FramesShown(), marker, (int)slow, (int)header[37]);
+                                for (int k = 16; k < 44; k++)
+                                    if (a[k] != header[k])
+                                        std::fprintf(stderr, " [%d] %.6g -> %.6g", k, x[k], y[k]);
+                                std::fprintf(stderr, "\n");
+                            }
+                        }
+                        if (std::memcmp(a + 16, header + 16, 64) != 0) g_waitWhy[5]++;
+                        if (std::memcmp(a + 32, header + 32, 16) != 0) g_waitWhy[6]++;
+                        if (a[36] != header[36]) g_waitWhy[7]++;
+                        if (std::memcmp(a + 37, header + 37, 12) != 0) g_waitWhy[8]++;
+                        if (std::memcmp(a + 40, header + 40, 12) != 0) g_waitWhy[9]++;
+                        if (a[43] != header[43]) g_waitWhy[10]++;
+                    }
+                }
             }
             r.seenHash = 0;
             r.seenList = g_listSerial;
@@ -3092,10 +3168,31 @@ struct InterruptScan {
 InterruptScan g_interruptScan;
 std::atomic<std::uint64_t> g_liveLists, g_copiedLists;
 
+// (Quadwords that follow each other in memory are copied in one piece: a quadword at a time was
+// half of what the game's own render thread did on the Switch, before the port's could start.)
 struct CaptureSink {
     std::vector<std::uint32_t>& out;
-    void OnVif(const std::uint32_t* w, int n) { out.insert(out.end(), w, w + n); }
-    void OnGif(const std::uint32_t* q) { out.insert(out.end(), q, q + 4); }
+    const std::uint32_t* from = nullptr;
+    std::size_t count = 0;
+    void Flush()
+    {
+        if (count)
+            out.insert(out.end(), from, from + count);
+        count = 0;
+    }
+    void Add(const std::uint32_t* w, std::size_t n)
+    {
+        if (count && w == from + count) {
+            count += n;
+            return;
+        }
+        Flush();
+        from = w;
+        count = n;
+    }
+    void OnVif(const std::uint32_t* w, int n) { Add(w, (std::size_t)n); }
+    void OnGif(const std::uint32_t* q) { Add(q, 4); }
+    ~CaptureSink() { Flush(); }
     void OnTagDone(std::uint32_t) {}
     bool SkipData(std::uint32_t) { return false; }
     bool SkipCall(std::uint32_t) { return false; }
@@ -3220,8 +3317,10 @@ void RunDmaChain(std::uint32_t regs, std::uint32_t tadr)
             }
         }
         item.words = SpareBuffer();
-        CaptureSink sink{item.words};
-        WalkChain(regs, tadr, sink);
+        {
+            CaptureSink sink{item.words};
+            WalkChain(regs, tadr, sink);
+        }
         // A list of VIF1's with interrupts is not drawn from the copy. The interrupt's handler (the
         // decompilation's PackFrameColors) packs the colours VU1 has just lit a mesh with into the
         // mesh's cache, in the game's memory, and the list goes on to call the cache's packets:
@@ -3709,6 +3808,16 @@ void RenderThreadMain()
                                          (jobs[2] - jobsWas[2]) / f, (ns[2] - nsWas[2]) / f / 1e6, (g_jobDrainWaitNs - drainWas) / f / 1e6, (int)(JobWaitNs() / 1000),
                                          (g_partsWaited - waitedWas) / f, (g_gsSpareHad.load() - spareWas[0]) / f, (g_gsSpareNone.load() - spareWas[1]) / f, (g_gsSpareGrown.load() - spareWas[2]) / f, (unsigned long long)g_jobStaleCodes.load(), (unsigned long long)g_jobsNotCopied, (g_jobWordsCopied - copiedWas) / f);
                         copiedWas = g_jobWordsCopied;
+                        {
+                            static std::uint64_t was[12];
+                            if (since)
+                                std::fprintf(stderr, "perfwait: to %llu, a frame: parts not as the list before had them: from their cache %.1f, the long way %.1f; not in the list before %.1f, "
+                                             "registers other %.1f, header other %.1f (inverse matrix %.1f, fog %.1f, alpha's scale %.1f, mode and count %.1f, centre %.1f, colours' scale %.1f; near enough %.1f)\n",
+                                             (unsigned long long)shown, (g_waitWhy[0] - was[0]) / f, (g_waitWhy[1] - was[1]) / f, (g_waitWhy[2] - was[2]) / f, (g_waitWhy[3] - was[3]) / f,
+                                             (g_waitWhy[4] - was[4]) / f, (g_waitWhy[5] - was[5]) / f, (g_waitWhy[6] - was[6]) / f, (g_waitWhy[7] - was[7]) / f, (g_waitWhy[8] - was[8]) / f,
+                                             (g_waitWhy[9] - was[9]) / f, (g_waitWhy[10] - was[10]) / f, (g_waitWhy[11] - was[11]) / f);
+                            std::memcpy(was, g_waitWhy, sizeof was);
+                        }
                         spareWas[2] = g_gsSpareGrown.load();
                         spareWas[0] = g_gsSpareHad.load();
                         spareWas[1] = g_gsSpareNone.load();
