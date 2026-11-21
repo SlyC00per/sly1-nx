@@ -300,6 +300,19 @@ void* FindFunction(std::uint32_t addr)
 
 void* NativeFunction(std::uint32_t addr)
 {
+    // Retail's code lies from 0x00100000 for 0x00150000 bytes, a function at every fourth byte at
+    // most: one table by address, looked at once. (The search of the sorted list, at every call
+    // through a pointer, was 4% of the game's main thread on the Switch.)
+    static const std::vector<void*>& direct = *[] {
+        auto* table = new std::vector<void*>(0x00150000u / 4, nullptr);
+        for (const FunctionEntry& e : Functions().byAddr)
+            if (e.addr - 0x00100000u < 0x00150000u && (e.addr & 3) == 0)
+                (*table)[(e.addr - 0x00100000u) / 4] = e.fn;
+        return table;
+    }();
+    if (addr - 0x00100000u < 0x00150000u && (addr & 3) == 0)
+        if (void* fn = direct[(addr - 0x00100000u) / 4])
+            return fn;
     const FunctionIndex& index = Functions();
     auto it = std::lower_bound(index.byAddr.begin(), index.byAddr.end(), addr,
                                [](const FunctionEntry& e, std::uint32_t a) { return e.addr < a; });
