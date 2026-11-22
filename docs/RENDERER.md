@@ -1312,3 +1312,26 @@ camera turning, every 60th frame to 2,340 against the same run with `SLY1_PART_R
 25 frames in the level differ by 1 of a colour's 255 at most (the slid textures). `--verify-levels`
 with the counting renderer taking batches, 240 frames a level: all 46 levels, 254,000 parts drawn
 again with another scale and 48,000 with an offset moved. Not yet run on the Switch.
+
+### On the Switch, and what it showed next (2026-11-21)
+
+Played at ca9d740 (A Stealthy Approach and on, `SLY1_PERF_LOG=1`), against the play at a8a20da the
+same day, in the windows over 18.5 ms a frame: parts from their cache run again 39 a frame, then
+10; all parts run again 68, then 39; such windows 24% of those in 3D, then 11% (two plays, not
+one route). Left there: the parts VU1 lights afresh (mode 4), 20 jobs a frame; the GS thread at
+14 to 16 ms; and in the worst windows 9 parts a frame being kept and 10 watched, 5 to 8 ms of
+the render thread.
+
+Two things found on the host after it:
+
+- **Everything kept was let go at once** when it passed 48 MB, and a whole scene's parts were
+  then kept anew over the next frames. With a record for each half of the double buffer the
+  tour reached the 48 MB within a minute. Now the parts not drawn for longest are let go until
+  an eighth of the limit is free (`PartRecord::usedFrame`; `SLY1_PART_KEEP_MB`): 507 parts let go
+  over the tour, none of them drawn in the 120 frames before; at 24 MB a third of them had been.
+- **A job's registers** are matched as a kept part's are (the mask when the packet reads none,
+  and for a part drawn the long way not what its BASE and OFFSET set anew).
+
+`perfkeep:` says a frame why parts are kept anew and watched, what is kept and how often parts
+were let go for room; `perfkept:` (the GPU renderer) the kept batches' memory; and the program
+says at its start how much memory it may use.

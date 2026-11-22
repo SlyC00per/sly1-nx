@@ -1492,6 +1492,7 @@ struct PartRecord {
     bool ok = false;
     std::uint64_t hash = 0, hashWhole = 0;   // PartHash, and with every piece whole
     std::uint32_t verified = 0;          // the times it has been drawn again with the whole hash the same
+    std::uint64_t usedFrame = 0;         // the frame it was last kept or drawn again in (the ones unused longest are let go for room)
     bool moving = false;                 // its vertices change where the hash does not look: not drawn again
     // ...until movingUntil, when it is kept anew: one whose vertices changed once (its cache's
     // colours written again when a light changed) is then drawn again as before. Left alone for
@@ -1653,7 +1654,13 @@ struct PartTurns {
     }
 } g_partTurns;
 std::uint64_t g_partsSlowReplayed, g_partsSlowKept, g_partsSlowRefused;
-std::uint64_t g_partsAlphaMoved, g_partsStMoved;   // drawn again with another alpha's scale, another texture offset
+std::uint64_t g_partsAlphaMoved, g_partsStMoved;
+// (SLY1_PERF_LOG's perfkeep: why a part is kept anew: 0 never kept, 1 to 3 kept and found other by
+// its hash, registers, header, 4 its moving mark ended, 5 known but not kept (refused, let go);
+// and why one is run here and watched: 0 never run here cleanly, 1 no registers known for its
+// shape, 2 met with other registers than known)
+std::uint64_t g_keepWhy[6], g_watchWhy[3];
+std::uint64_t g_partsLetGo, g_partsLetGoRecent;   // kept parts let go for room, and those of them drawn in the last 120 frames   // drawn again with another alpha's scale, another texture offset
 
 std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow = false,
                        std::vector<const std::uint32_t*>* tex = nullptr, bool shape = false, std::vector<const std::uint32_t*>* st = nullptr,
@@ -2307,6 +2314,7 @@ bool PartCeiling()
 bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
 {
     const bool ceiling = PartCeiling();
+    int keepWhy = 0;
     const auto alphaFree = [](const PartRecord& r) { return PartParamsOn() && !r.alphaStrict; };
     if (!PartReplayOn() || !g_vif1.BetweenCodes())
         return false;
@@ -2491,6 +2499,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             g_partsMoving++;
             return false;   // run as ever, and not kept
         }
+        keepWhy = 4;
         r.moving = false;   // tried again: kept anew below
         r.ok = false;
     }
@@ -2535,7 +2544,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
         if (!same)
             regsCensus(r.before);
         if (!same)   // why, for the report: the hash, the registers, or the header
-            g_partsStaleBy[r.hash != hash ? 0 : !(sameRegs(r.before, !r.maskRead)) ? 1 : 2]++;
+            g_partsStaleBy[keepWhy = (r.hash != hash ? 0 : !(sameRegs(r.before, !r.maskRead)) ? 1 : 2)]++, keepWhy++;
         const bool wholeDue = !ceiling && (late ? r.wholeArrived : (r.verified < 8 || ((gs::FramesShown() + key) & 31) == 0));
         if (same && wholeDue) {
             const std::uint64_t whole = late ? r.seenWhole : PartHash(target, true, regs.cl, regs.wl, tte, slow);
@@ -2609,6 +2618,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             if (r.lockout != 0 && ++r.replays >= 60)
                 r.lockout = 0;
             g_partsReplayed++;
+            r.usedFrame = gs::FramesShown();
             g_partsLate += late ? 1 : 0;
             g_partItemsReplayed += r.kept->size();
             return true;
@@ -2625,13 +2635,35 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
         return false;
     // kept from this time on; everything kept is let go first when it has grown past 48 MB (another
     // level's parts stay kept until then)
-    if (g_partWords > (48u << 20) / 4) {
+    // (Until 2026-11-21 everything kept was let go at once, and a whole scene's parts were then
+    // kept anew over the next frames: with a record for each half of the double buffer the tour of
+    // A Stealthy Approach reached the 48 MB within a minute.) Now the parts not drawn for longest
+    // are let go, until an eighth is free. SLY1_PART_KEEP_MB: the limit.
+    static const std::uint64_t keepWords = (std::uint64_t)(std::getenv("SLY1_PART_KEEP_MB") ? std::max(8, std::atoi(std::getenv("SLY1_PART_KEEP_MB"))) : 48) << 18;
+    if (g_partWords > keepWords) {
+        static std::vector<std::pair<std::uint64_t, std::uint32_t>> byUse;
+        byUse.clear();
         for (auto& kv : g_parts)
-            PartForget(kv.second);
-        g_parts.clear();
-        g_partWords = 0;
+            if (kv.second.words != 0 && kv.second.kept && &kv.second != g_partRecording)
+                byUse.push_back({kv.second.usedFrame, kv.first});
+        std::sort(byUse.begin(), byUse.end());
+        for (std::size_t k = 0; k < byUse.size() && g_partWords > keepWords - keepWords / 8; k++) {
+            PartRecord& old = g_parts[byUse[k].second];
+            PartForget(old);
+            g_partWords -= std::min<std::uint64_t>(g_partWords, old.words);
+            old.words = 0;
+            old.ok = false;
+            g_partGrave.push_back(std::move(old.kept));
+            old.kept.reset();
+            g_partsLetGo++;
+            if (gs::FramesShown() - byUse[k].first < 120)
+                g_partsLetGoRecent++;
+        }
         g_partsCleared++;
+        it = g_parts.find(key);
     }
+    if (keepWhy == 0 && it != g_parts.end() && g_parts.count(key))
+        keepWhy = 5;
     PartRecord& r = g_parts[key];
     // A part found changed three times running (one that fades, its header's scales other each
     // frame) is run as ever for the next 30 frames: keeping it each frame costs more than it saves.
@@ -2683,6 +2715,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
         r.jobTwo = jobTwo;
     }
     r.serial = ++g_partSerial;
+    r.usedFrame = gs::FramesShown();
     r.verdictList = g_listSerial;
     r.slow = slow;
     r.watchUntil = watchUntil;
@@ -2728,6 +2761,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     r.interruptsWas = g_counts.vifInterrupts;
     r.finishesWas = g_counts.finishes;
     g_partRecording = &r;
+    g_keepWhy[keepWhy]++;
     return false;
 }
 
@@ -3119,12 +3153,33 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
     if (it == g_parts.end())
         return false;
     PartRecord& r = it->second;
-    const bool first = r.jobOk && r.jobBefore == g_callRegs, second = !first && r.jobOk && r.jobTwo && r.jobBefore2 == g_callRegs;
+    // The registers a part is met with, but for those it does not read (as PartDecide's sameRegs:
+    // the mask, when its packet unpacks through none before setting one; for a part drawn the
+    // long way, what its BASE and OFFSET set anew). Compared whole, a part met with another mask
+    // or the double buffer's flag the other way was run here and watched each time: 10 to 14 parts
+    // a frame and 5 ms of the render thread in the Switch's slowest stretches.
+    const auto sameRegs = [&](const Vif::Regs& was) {
+        Vif::Regs x = was;
+        if (!r.maskRead)
+            x.mask = g_callRegs.mask;
+        if (slow) {
+            x.base = g_callRegs.base;
+            x.ofst = g_callRegs.ofst;
+            x.tops = g_callRegs.tops;
+            x.dbf = g_callRegs.dbf;
+        }
+        return x == g_callRegs;
+    };
+    const bool first = r.jobOk && sameRegs(r.jobBefore), second = !first && r.jobOk && r.jobTwo && sameRegs(r.jobBefore2);
     if (!first && !second) {
         // run here and watched, if its shape is the one known (or none is yet)
-        const std::uint64_t shape = PartHash(target, false, g_callRegs.cl, g_callRegs.wl, g_callTte, slow, nullptr, true);
+        std::uint8_t maskUse = 1;
+        const std::uint64_t shape = PartHash(target, false, g_callRegs.cl, g_callRegs.wl, g_callTte, slow, nullptr, true, nullptr, &maskUse);
         g_fullWhy = shape != 0 ? 4 : 5;
+        g_watchWhy[r.jobOk ? 2 : r.shape == shape && shape != 0 ? 1 : 0]++;
         if (shape != 0) {
+            r.maskRead = (maskUse & 1) != 0;
+            r.maskSet = (maskUse & 2) != 0;
             if (r.shape != shape) {
                 r.shape = shape;
                 r.jobOk = r.jobTwo = false;
@@ -3137,7 +3192,9 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
         }
         return false;
     }
-    const Vif::Regs jobAfter = first ? r.jobAfter : r.jobAfter2;
+    Vif::Regs jobAfter = first ? r.jobAfter : r.jobAfter2;
+    if (!r.maskSet)   // (it leaves the mask as it finds it)
+        jobAfter.mask = g_callRegs.mask;
     {   // SLY1_PART_JOBS_ONLY=slow, cached, or a mode's number: jobs of those parts alone (diagnosis)
         static const char* only = std::getenv("SLY1_PART_JOBS_ONLY");
         if (only && (only[0] == 's' ? !slow : only[0] == 'c' ? slow : (int)g_callHeader[37] != std::atoi(only)))
@@ -4133,6 +4190,19 @@ void RenderThreadMain()
                                      "fickle %.0f, batches %.0f; ms: drawing again %.2f, parts in full %.2f\n", (unsigned long long)shown, (is[0] - was[0]) / f, (is[1] - was[1]) / f,
                                      (is[2] - was[2]) / f, (is[3] - was[3]) / f, (is[4] - was[4]) / f, (is[5] - was[5]) / f, (is[6] - was[6]) / f,
                                      (is[7] - was[7]) / f, (times[0] - timesWas[0]) / f / 1e6, (times[1] - timesWas[1]) / f / 1e6);
+                    {
+                        static std::uint64_t keepWas[6], watchWas[3];
+                        if (since)
+                            std::fprintf(stderr, "perfkeep: to %llu, a frame: kept anew: never kept %.1f, other by hash %.1f, registers %.1f, header %.1f, moving mark ended %.1f, "
+                                         "known and not kept %.1f; watched: never run here cleanly %.1f, no registers for its shape %.1f, other registers %.1f; kept %.1f MB, let go %llu times\n",
+                                         (unsigned long long)shown, (g_keepWhy[0] - keepWas[0]) / f, (g_keepWhy[1] - keepWas[1]) / f, (g_keepWhy[2] - keepWas[2]) / f,
+                                         (g_keepWhy[3] - keepWas[3]) / f, (g_keepWhy[4] - keepWas[4]) / f, (g_keepWhy[5] - keepWas[5]) / f, (g_watchWhy[0] - watchWas[0]) / f,
+                                         (g_watchWhy[1] - watchWas[1]) / f, (g_watchWhy[2] - watchWas[2]) / f, g_partWords * 4 / 1e6, (unsigned long long)g_partsCleared);
+                        std::fprintf(stderr, "perfkeep: to %llu: %llu parts let go for room so far, %llu of them drawn in the 120 frames before\n", (unsigned long long)shown,
+                                     (unsigned long long)g_partsLetGo, (unsigned long long)g_partsLetGoRecent);
+                        std::memcpy(keepWas, g_keepWhy, sizeof keepWas);
+                        std::memcpy(watchWas, g_watchWhy, sizeof watchWas);
+                    }
                     {   // the parts' jobs: how many each thread ran and for how long, and the render thread's wait at its list's end
                         static std::uint64_t jobsWas[3], nsWas[3], drainWas, waitedWas, spareWas[3], copiedWas;
                         std::uint64_t jobs[3], ns[3];

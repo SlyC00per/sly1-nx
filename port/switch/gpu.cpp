@@ -2927,6 +2927,8 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
                 static std::uint64_t usWas, countWas, scaleWas;
                 const std::uint64_t us = gpuSumUs_, count = gpuCount_;
                 static std::uint64_t lateWas;
+                std::fprintf(stderr, "perfkept: to %llu: kept batches' memory %.1f of %u MB, %llu batches with no room so far, emptied %llu times\n", (unsigned long long)frames_,
+                             keepUsed_ / 1e6, kKeepMemory >> 20, (unsigned long long)keptNoRoom_, (unsigned long long)keepResets_);
                 std::fprintf(stderr, "perfscale: to %llu: the GPU was %.1f ms at a frame; frames drawn at %.0f hundredths of the width and height on average; %llu frames late\n", (unsigned long long)frames_,
                              count > countWas ? (us - usWas) / 1000.0 / (double)(count - countWas) : 0.0, (scaleSum_ - scaleWas) / (double)(frames_ - framesWas),
                              (unsigned long long)(gpuLate_ - lateWas));

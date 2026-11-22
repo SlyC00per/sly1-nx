@@ -654,6 +654,14 @@ int main(int argc, char** argv)
         ArgsFromFile(argc, argv);
     port::CheckDevTable("main");
     std::fprintf(stderr, "sly1: image at %p\n", (void*)port::ImageBase());   // for a debugger's addresses
+#if defined(__SWITCH__)
+    {   // what the program may use of the console's memory (less when started as an applet), and what it has used
+        u64 total = 0, used = 0;
+        svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+        std::fprintf(stderr, "sly1: memory: %llu MB for the program, %llu MB used at its start\n", (unsigned long long)(total >> 20), (unsigned long long)(used >> 20));
+    }
+#endif
     std::string iso = "sdmc:/switch/sly1/sly1.iso";
     port::SetSaveFolder("sdmc:/switch/sly1/save");
 #else
