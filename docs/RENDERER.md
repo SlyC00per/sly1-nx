@@ -1392,3 +1392,30 @@ A start on the Switch faulted once more before any level (the game's GIF channel
 0x00261F1C, holding 0x4F265060 when InitDisplay sent its first packet, after InitDmaChannels
 had set it): the message for a chain on an unknown channel now prints the words around the
 five channel pointers.
+
+## A lit part's colours left to the renderer (2026-11-22)
+
+What still made jobs after the parts' numbers and the keeping were dealt with, by the host's
+`SLY1_PART_DIFF` census (Paris is level 2): parts lit by VU1 (mode 4) whose light moves (three
+words of the light's packet at 26, its place, other each frame: 17 parts a frame in Paris) or
+that turn (the header's inverse matrix and centre); parts with a texture laid on by a matrix
+that changes each frame (six quadwords at 22: 9 a frame); and parts whose programs make vertices
+for the frame's view (particles, sprites: 19 a frame, refused when kept). The first are the
+most, in both levels played, and they change every frame: only lighting them in the vertex
+shader makes them parts that are kept.
+
+How the programs light a batch in mode 4 (`SLY1_VU1_SEQ=1`): 0x051 (setup), a light's program
+for each light (0x17E directional, 0x1A6 point: both end in 0x0FE, four vertices at a time, the
+point light taken as a direction from the object's centre with the attenuation there), 0x242
+(the colours made final), then the transform and the kicks: the surface with each vertex's
+quadword 1, its two shares of light with quadword 2 and the colours' array.
+
+**The first stage** (this one) is the arithmetic and its inputs. `gs::LitColoursOf`
+(port/gs_backend.h) makes a vertex's three colours from its unit normal, its base colour and
+`gs::LitParams`: for each light a direction, base, scale and colour, the two sums' start, vf01
+and the colours' scale. The handlers note those as they run (`LitCapture`, by TOP, in the thread
+that runs the part: the lights in `LightFourWide`, the normals and base colours in `LitColours`;
+any other light, or a program left to the microcode, drops the notes), check them against the
+sums the programs left before the colours are made final, and give them to one batch only.
+`SLY1_LIT_CHECK=1` compares the formula's colours with the programs' at each kick: over the
+host's tours of Paris and A Stealthy Approach every value was the same (47 million in Paris).

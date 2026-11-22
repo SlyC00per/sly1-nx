@@ -14,6 +14,7 @@
 
 #include <cmath>
 #include <cstdlib>
+#include <atomic>
 #include <cstring>
 #include <cstdio>
 #include <map>
@@ -452,6 +453,8 @@ struct Deferred {
     // at stTop before the transform that defers the batch).
     float alphaScale = 1.0f;
     bool alphaFromHeader = false, alphaCopied = false;
+    bool lit = false;       // LitFor(top) is this batch's
+    int kick = 0;           // which of the batch's kicks comes next: 0 the surface, 1 and 2 its shares
     bool stApplied = false, stPending = false;
     std::uint16_t stTop = 0;
 };
@@ -528,6 +531,28 @@ bool DeferTransforms()
 // read what the transform leaves there (the outlines read the screen positions of a batch already
 // drawn, 0x6DA those of the batch in the other half). Not when VIF1 has unpacked over the batch
 // since: the memory is the next batch's.
+// What the lighting of the batch at each of the two TOPs was made from, for a renderer to light
+// the batch itself (gs::LitParams): set by the programs' handlers as they run, in the thread
+// that runs the part. valid: only lights four vertices at a time have lit it since its setup;
+// final: its colours were made final from them (n vertices' normals and base colours noted).
+struct LitCapture {
+    bool valid = false, final = false;
+    std::uint16_t top = 0;
+    int n = 0;
+    gs::LitParams p;
+    float normal[256][3];
+    std::uint32_t base[256][4];
+};
+thread_local LitCapture t_lit[2];
+std::atomic<std::uint64_t> g_litNotAsNoted{0};   // batches whose sums were not what their noted lights give
+LitCapture& LitFor(std::uint16_t top) { return t_lit[top > 256 ? 1 : 0]; }
+void LitInvalidate(std::uint16_t top)
+{
+    LitCapture& c = LitFor(top);
+    c.valid = c.final = false;
+    c.p.lights = 0;
+}
+
 inline float Itof0(float x);
 inline float Ftoi0(float x);
 void Materialise(Runner& r, bool always = false)
@@ -670,6 +695,56 @@ bool KickDeferred(Runner& r, std::uint16_t top, std::uint16_t tag)
     b.alphaScale = d.alphaScale;
     b.alphaDeferred = d.alphaFromHeader;
     b.stApplied = d.stApplied;
+    {   // SLY1_LIT_CHECK=1: gs::LitColoursOf on what was noted of the batch's lighting, against the
+        // colours the programs made (this kick's), a value at a time
+        static const bool litCheck = std::getenv("SLY1_LIT_CHECK") != nullptr;
+        if (litCheck && d.stride == 4) {
+            static std::uint64_t batches, litBatches, values, off1, off2, said, byKick[3][2];
+            batches++;
+            const LitCapture& c = LitFor(top);
+            if (d.lit && (std::uint32_t)c.n == count && d.kick < 3) {
+                litBatches++;
+                std::uint64_t far = 0;
+                for (std::uint32_t k = 0; k < count; k++) {
+                    std::int32_t want[3][3];
+                    gs::LitColoursOf(c.p, c.normal[k], c.base[k], want);
+                    const std::uint32_t* is = b.quads + (k * b.stride + b.colourAt) * 4;
+                    for (int i = 0; i < 3; i++) {
+                        const std::int32_t diff = (std::int32_t)is[i] - want[d.kick][i];
+                        values++;
+                        if (diff != 0)
+                            off1++;
+                        if (diff > 1 || diff < -1) {
+                            off2++;
+                            far++;
+                            if (said < 12) {
+                                if (said % 6 == 0) {
+                                    std::fprintf(stderr, "lit check: start %g %g one %g %g %g", (double)c.p.start[0], (double)c.p.start[1], (double)c.p.one[0], (double)c.p.one[1], (double)c.p.one[2]);
+                                    for (std::uint32_t q = 0; q < c.p.lights; q++) {
+                                        const gs::LitLight& l = c.p.light[q];
+                                        std::fprintf(stderr, " | dir %g %g %g base %g %g %g scale %g %g %g colour %g %g %g", (double)l.dir[0], (double)l.dir[1], (double)l.dir[2], (double)l.base[0],
+                                                     (double)l.base[1], (double)l.base[2], (double)l.scale[0], (double)l.scale[1], (double)l.scale[2], (double)l.colour[0], (double)l.colour[1], (double)l.colour[2]);
+                                    }
+                                    std::fprintf(stderr, "; this vertex's three colours by the program %u %u %u | quad1 %u %u %u quad2 %u %u %u\n", is[0], is[1], is[2],
+                                                 b.quads[(k * 4 + 1) * 4], b.quads[(k * 4 + 1) * 4 + 1], b.quads[(k * 4 + 1) * 4 + 2], b.quads[(k * 4 + 2) * 4], b.quads[(k * 4 + 2) * 4 + 1], b.quads[(k * 4 + 2) * 4 + 2]);
+                                }
+                                said++;
+                                std::fprintf(stderr, "lit check: kick %d vertex %u of %u value %d: the program %d, the formula %d (lights %u, scale %g, base %u %u %u, normal %g %g %g)\n",
+                                             d.kick, k, count, i, (int)is[i], (int)want[d.kick][i], c.p.lights, (double)c.p.colourScale, c.base[k][0], c.base[k][1], c.base[k][2],
+                                             (double)c.normal[k][0], (double)c.normal[k][1], (double)c.normal[k][2]);
+                            }
+                        }
+                    }
+                }
+                byKick[d.kick][far ? 1 : 0]++;
+            }
+            if ((batches & (batches - 1)) == 0 || batches % 200000 == 0)
+                std::fprintf(stderr, "lit check: %llu batches not lit as noted; %llu lit batches kicked, %llu with their lighting noted; %llu values, %llu other, %llu by more than 1; batches right/wrong by kick: %llu/%llu %llu/%llu %llu/%llu\n",
+                             (unsigned long long)g_litNotAsNoted.load(), (unsigned long long)batches, (unsigned long long)litBatches, (unsigned long long)values, (unsigned long long)off1, (unsigned long long)off2,
+                             (unsigned long long)byKick[0][0], (unsigned long long)byKick[0][1], (unsigned long long)byKick[1][0], (unsigned long long)byKick[1][1],
+                             (unsigned long long)byKick[2][0], (unsigned long long)byKick[2][1]);
+        }
+    }
     b.id = Def().overwritten ? 0 : Def().serial;
     static const bool check = std::getenv("SLY1_GPU_BATCH_CHECK") != nullptr;
     if (check) {
@@ -766,6 +841,15 @@ bool BatchTransform(Runner& r, const int stride, const Test test, const std::uin
             Def().serial++;
             Def().alphaScale = 1.0f;
             Def().alphaFromHeader = Def().alphaCopied = false;
+            {
+                // (what was noted is this batch's when its colours were made final since the batch
+                // before at this TOP was transformed: a mesh drawn again from its cache's colours runs
+                // no lights, and took the notes of the same mesh lit a moment before)
+                LitCapture& c = LitFor(top);
+                Def().lit = stride == 4 && c.valid && c.final && c.top == top && c.n == span / stride;
+                c.final = false;
+                Def().kick = 0;
+            }
             Def().stApplied = Def().stPending && Def().stTop == top;
             Def().stPending = false;
             Def().kicked = false;
@@ -1425,11 +1509,13 @@ bool Plain(Runner& r, std::uint16_t top, int& n)
 void SecondPass(Runner& r, std::uint16_t top, int n)
 {
     Colours4C1(r, top, n);
+    Def().kick = 1;
     KickBatch(r, top, Half(Load(r, top + 12).y));
     ClipIfMarked(r, top, 2);
     if (Half(Load(r, top + 9).w) == 1)
         return;
     Colours4DD(r, top, n);
+    Def().kick = 2;
     KickBatch(r, top, Half(Load(r, top + 12).z));
     ClipIfMarked(r, top, 1);
 }
@@ -1551,6 +1637,7 @@ bool PointLight(Runner& r)
     std::uint16_t top = (std::uint16_t)r.ctx.top;
     if (Half(Load(r, top + 9).y) == 4)
         return PointFourWide(r);
+    LitInvalidate(top);
     V hdr = Load(r, top + 11);
     std::uint16_t first = (std::uint16_t)(top + Half(hdr.x));
     int n = Count(first, (std::uint16_t)(top + Half(hdr.y)), 4);
@@ -1674,6 +1761,53 @@ bool LitColours(Runner& r)
     if (n == 0)
         return false;
     std::uint16_t colours = (std::uint16_t)(top + Half(Load(r, top + 12).w));
+    {   // (gs::LitParams) the normals, four to a group of vertices, and the base colours, as they are now
+        LitCapture& c = LitFor(top);
+        if (c.valid && c.top == top && n <= 256 && Half(Load(r, top + 13).w) != 0) {
+            for (int k = 0; k < n; k++) {
+                const std::uint16_t group = (std::uint16_t)(first + 16 * (k / 4));
+                for (int i = 0; i < 3; i++)
+                    c.normal[k][i] = r.Qword((std::uint16_t)(group + 4 * i))[k % 4];
+                std::memcpy(c.base[k], r.Qword((std::uint16_t)(first + 4 * k + 1)), 16);
+            }
+            c.n = n;
+            std::memcpy(c.p.one, st.vf[1], 12);
+            c.p.colourScale = Load(r, top + 10).w;
+            c.final = true;
+            // What was noted must give the sums the programs left (each vertex's two in quadword 2 and
+            // its lit colour): a light that came by a way not noted here (seen in Paris, a part with
+            // one more share of light than its lights noted gave) leaves the batch to the programs.
+            for (int k = 0; k < n && c.final; k++) {
+                float sum[5] = {c.p.start[0], c.p.start[1], 0.0f, 0.0f, 0.0f};
+                for (std::uint32_t q = 0; q < c.p.lights; q++) {
+                    const gs::LitLight& l = c.p.light[q];
+                    const float cs = c.normal[k][0] * l.dir[0] + c.normal[k][1] * l.dir[1] + c.normal[k][2] * l.dir[2];
+                    const float v = cs + cs * cs * cs;
+                    float a[3];
+                    for (int i = 0; i < 3; i++) {
+                        a[i] = l.base[i] + l.scale[i] * v;
+                        a[i] = a[i] > 0.0f ? a[i] : 0.0f;
+                    }
+                    sum[0] += a[0];
+                    sum[1] += a[1];
+                    for (int i = 0; i < 3; i++)
+                        sum[2 + i] += l.colour[i] * a[2];
+                }
+                const float* q2 = r.Qword((std::uint16_t)(first + 4 * k + 2));
+                const float* lc = r.Qword((std::uint16_t)(colours + k));
+                const float is[5] = {q2[0], q2[1], lc[0], lc[1], lc[2]};
+                for (int i = 0; i < 5; i++)
+                    if (!(std::fabs(is[i] - sum[i]) < 1.0f / 512))
+                        c.final = false;
+            }
+            if (!c.final) {
+                c.valid = false;
+                g_litNotAsNoted++;
+            }
+        } else {
+            c.valid = c.final = false;
+        }
+    }
     Regs R;
     std::memcpy(R.vf, st.vf, sizeof R.vf);
     const int X = 8, Y = 4, Z = 2, W = 1, XY = 12, XYZ = 14, XYZW = 15;
@@ -1841,6 +1975,7 @@ bool DirectionalLight(Runner& r)
     std::uint16_t top = (std::uint16_t)r.ctx.top;
     if (Half(Load(r, top + 9).y) == 4)
         return DirectionalFourWide(r);
+    LitInvalidate(top);
     V hdr = Load(r, top + 11);
     std::uint16_t first = (std::uint16_t)(top + Half(hdr.x));
     int n = Count(first, (std::uint16_t)(top + Half(hdr.y)), 4);
@@ -2044,6 +2179,26 @@ bool LightFourWide(Runner& r, Regs& R)
     const bool setUp = Half(Load(r, top + 13).w) != 0;
     std::uint16_t colours = (std::uint16_t)(top + Half(Load(r, top + 12).w));
     const V d = R.get(2);   // a result: no field with the largest exponent
+    {   // noted for a renderer that lights the batch itself (gs::LitParams)
+        LitCapture& c = LitFor(top);
+        if (!setUp) {   // the batch's first light
+            c.valid = true;
+            c.final = false;
+            c.top = top;
+            c.p.lights = 0;
+            c.p.start[0] = R.vf[17][0];
+            c.p.start[1] = R.vf[17][1];
+        }
+        if (c.valid && c.top == top && c.p.lights < 4) {
+            gs::LitLight& l = c.p.light[c.p.lights++];
+            std::memcpy(l.dir, &d, 12);
+            std::memcpy(l.scale, R.vf[4], 12);
+            std::memcpy(l.base, R.vf[5], 12);
+            std::memcpy(l.colour, R.vf[3], 12);
+        } else {
+            c.valid = false;
+        }
+    }
     // The light's scale (vf04), base (vf05) and colour (vf03), not written in the loop, fixed once;
     // the normals once each: on fixed operands and results Mul4 and Add4 are the host's arithmetic.
     const F4 scaleF = FixIn4(R.get(4).v), baseF = FixIn4(R.get(5).v), colourF = FixIn4(R.get(3).v);
@@ -2944,6 +3099,7 @@ bool BatchSetup(Runner& r)
     std::uint16_t first = (std::uint16_t)(top + Half(hdr.x)), end = (std::uint16_t)(top + Half(hdr.y));
     std::uint16_t colours = (std::uint16_t)(top + Half(Load(r, top + 12).w));
     int n = Count(first, end, 4);
+    LitInvalidate(top);   // (a batch's lighting begins)
     if ((kind == 1 || kind == 2 || kind == 3) && n == 0)
         return false;
     r.Qword(top + 13)[3] = FromBits(1);
@@ -3037,6 +3193,7 @@ bool SpotLight(Runner& r)
 {
     State& st = r.s;
     std::uint16_t top = (std::uint16_t)r.ctx.top;
+    LitInvalidate(top);
     float (*vf)[4] = st.vf;
     auto g = [&](int k) { V x = {}; std::memcpy(&x, vf[k], 16); return x; };
     auto xyz = [&](int k, const V& x) { std::memcpy(vf[k], &x, 12); };
@@ -3776,7 +3933,11 @@ void BeforeProgram(Handler fn, core::Runner& r)
     Materialise(r);
 }
 
-void LeftToMicrocode(core::Runner& r) { Materialise(r); }
+void LeftToMicrocode(core::Runner& r)
+{
+    LitInvalidate((std::uint16_t)r.ctx.top);   // (a program on the microcode may light the batch too)
+    Materialise(r);
+}
 
 void DataWritten(std::uint32_t qaddr, std::uint32_t count, std::uint32_t cycle, std::uint32_t write)
 {

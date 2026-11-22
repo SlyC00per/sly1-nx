@@ -38,6 +38,63 @@ struct DrawState {
 // viewport's scale and offset, the fog from w) and what the program and the clipper after it do
 // to each triangle (those outside the view cut or dropped, a backface dropped when cull is set
 // and the triangle's last vertex has kCullable in its control word).
+// A lit batch's colours as the game's programs make them, for a renderer to make itself
+// (docs/RENDERER.md, "A lit part's colours left to the renderer"). The programs light a batch by
+// up to four lights, each a direction in the batch's own space with a base, a scale and a colour
+// (0x0FE of chunk E1624411: a directional light, or a point light taken as one from the object's
+// centre), and then make three colours of each vertex (0x242 of chunk B90790F3), one for each
+// time the batch is drawn: the surface and its two lights' shares.
+struct LitLight {
+    float dir[3], base[3], scale[3], colour[3];
+};
+struct LitParams {
+    std::uint32_t lights = 0;
+    LitLight light[4];
+    float start[2];        // what each vertex's two sums start from
+    float one[3];          // vf01's x, y and z
+    float colourScale;     // the header's 10.w, which the kicks' colours are scaled by
+};
+// The three colours (R, G, B each) of a vertex with this unit normal and base colour (R, G, B as
+// the mesh has them, 0 to 255): [0] the surface's, [1] and [2] the shares'. The programs'
+// arithmetic in the host's floats: within one of what they give.
+inline void LitColoursOf(const LitParams& p, const float normal[3], const std::uint32_t base[3], std::int32_t out[3][3])
+{
+    float sx = p.start[0], sy = p.start[1], lit[3] = {0.0f, 0.0f, 0.0f};
+    for (std::uint32_t k = 0; k < p.lights; k++) {
+        const LitLight& l = p.light[k];
+        const float c = normal[0] * l.dir[0] + normal[1] * l.dir[1] + normal[2] * l.dir[2];
+        const float v = c + c * c * c;
+        float a[3];
+        for (int i = 0; i < 3; i++) {
+            a[i] = l.base[i] + l.scale[i] * v;
+            if (!(a[i] > 0.0f))
+                a[i] = 0.0f;
+        }
+        sx += a[0];
+        sy += a[1];
+        for (int i = 0; i < 3; i++)
+            lit[i] += l.colour[i] * a[2];
+    }
+    float m = lit[0] > lit[1] ? lit[0] : lit[1];
+    m = m > lit[2] ? m : lit[2];
+    float tx = p.one[0] - m - p.one[0] * sy, ty = p.one[1] - m;
+    tx = sx < tx ? sx : tx;
+    ty = sy < ty ? sy : ty;
+    tx = tx > 0.0f ? tx : 0.0f;
+    ty = ty > 0.0f ? ty : 0.0f;
+    const float third = 0.33333298563957214f;   // (0x3EAAAA9F, the program's constant)
+    const float b[3] = {(float)(std::int32_t)base[0], (float)(std::int32_t)base[1], (float)(std::int32_t)base[2]};
+    const float a = third * b[0] + third * b[1] + third * b[2];
+    const float s = p.colourScale;
+    for (int i = 0; i < 3; i++) {
+        const float capped = lit[i] < p.one[i] ? lit[i] : p.one[i];
+        const std::int32_t c0 = (std::int32_t)(a * tx), c1 = (std::int32_t)(b[i] * ty), c2 = (std::int32_t)(capped * a);
+        out[0][i] = (std::int32_t)((float)c0 * s);
+        out[1][i] = (std::int32_t)((float)c1 * s);
+        out[2][i] = (std::int32_t)((float)c2 * s);
+    }
+}
+
 struct Batch {
     const std::uint32_t* quads;   // count * stride quadwords
     std::uint32_t count, stride;
