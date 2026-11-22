@@ -374,6 +374,7 @@ struct Collect {
     bool trouble = false;   // a batch of the run was not handed over as unpacked (vu1::PartTrouble)
 };
 thread_local Collect* t_collect = nullptr;
+std::map<std::string, std::uint64_t> g_diffCounts;   // (SLY1_PART_DIFF and other censuses: PartDiffReport prints them)
 // (a job's thread) its VIF's count of texture-offset unpacks, and the count when the job began:
 // which of the packet's offsets a batch's is (gs::Batch::stSource), as PartRecordItem says it
 thread_local const std::uint32_t* t_jobStCount = nullptr;
@@ -531,6 +532,13 @@ void FinishLagWait()
 // given to the display (the swap after it, run by the GS thread): how long the port holds a frame.
 std::atomic<std::uint64_t> g_listAt{0}, g_heldNs{0}, g_heldMaxNs{0}, g_heldCount{0};
 
+// One of VU1's packets after another joins it in its item (SLY1_PATH1_JOIN=0: an item each). The
+// outlines' program kicks a packet for each edge it draws, 620 a frame in A Stealthy Approach
+// and over half of the GS thread's items: each cost it a buffer, its place in the queue, and
+// the taking and timing of an item, 2.7 ms a frame on the Switch for 1,100 packets.
+// (the item to join, where KickPath1 is to put the packet, or none)
+GsItem* Path1Last();
+
 void GsEnqueue(GsItem&& item)
 {
     if (Collect* c = t_collect) {
@@ -571,6 +579,7 @@ std::atomic<std::uint64_t> g_batchesQueued, g_batchesRefused, g_gsBusyNs;
 // packets, 2 VIF1's DIRECT data, 3 the GIF channel's (uploads), 4 a batch, 5 a part drawn again,
 // 6 a job's items), for SLY1_PERF_LOG's perfgs line.
 std::atomic<std::uint64_t> g_gsNsByPath[8], g_gsItemsByPath[8];
+std::atomic<std::uint64_t> g_path1Joined{0};   // VU1's packets that joined the one before in its item
 bool QueueBatch(std::uint32_t tagWord1, const gs::Batch& b)
 {
     GsItem item;
@@ -589,16 +598,117 @@ bool QueueBatch(std::uint32_t tagWord1, const gs::Batch& b)
     return true;
 }
 
+// The outlines' edges put together. The outlines' program (0x26D) kicks a packet for each edge: a
+// tag with one register write and the edge's two vertices (a line), then the same again with
+// another write (the line once more for its depth alone, which the GPU renderer leaves out: the
+// first writes its depth everywhere). Some 620 edges a frame in A Stealthy Approach, each two
+// tags, two register writes and four vertices for the GS to take one by one. As the packets join
+// in one item (Path1Last), a run of edges whose tags and writes are the same becomes: the first
+// edge's first half as it is, one tag with all the other edges' vertices (lines, two vertices a
+// loop), and the last edge's second half: the same lines drawn by the first write's state, and
+// the registers and the vertex queue left as the last edge left them.
+// SLY1_OUTLINE_JOIN=0: not. (The software drawing draws every edge's second line where the GPU
+// renderer leaves it out; under lockstep its pictures are the same with the edges put together.)
+struct OutlineRun {
+    std::size_t end = 0;     // the item's words when the run was last added to (0: no run)
+    std::size_t run = 0;     // where the tag of the lines is (0: only one edge yet)
+    std::size_t tail = 0;    // where the last edge's second half is
+    std::uint32_t head[8];   // an edge's first tag and write
+    std::uint32_t second[8]; // its second
+};
+thread_local OutlineRun t_outline;
+std::atomic<std::uint64_t> g_outlinesJoined{0};
+
+void OutlineJoin(GsItem& item, std::size_t at)
+{
+    static const bool on = !(std::getenv("SLY1_OUTLINE_JOIN") && std::getenv("SLY1_OUTLINE_JOIN")[0] == '0');
+    OutlineRun& o = t_outline;
+    std::vector<std::uint32_t>& w = item.words;
+    const auto half = [&](std::size_t q, bool eop) {   // a tag of one loop of an A+D write and two vertices, the primitive a line set by the tag
+        return (w[q] & 0x7FFF) == 1 && ((w[q] >> 15) & 1) == (eop ? 1u : 0u) && ((w[q + 1] >> 26) & 3) == 0 && (w[q + 1] >> 28) == 3 && (w[q + 2] & 0xFFF) == 0x44E &&
+               ((w[q + 1] >> 14) & 1) == 1 && ((w[q + 1] >> 15) & 7) == 1;
+    };
+    const bool edge = on && w.size() == at + 32 && half(at, false) && half(at + 16, true);
+    if (!edge) {
+        o.end = 0;
+        return;
+    }
+    const bool follows = o.end == at && o.end != 0 && std::memcmp(o.head, &w[at], 32) == 0 && std::memcmp(o.second, &w[at + 16], 32) == 0 &&
+                         std::memcmp(o.second, &w[o.tail], 32) == 0;
+    if (!follows) {
+        std::memcpy(o.head, &w[at], 32);
+        std::memcpy(o.second, &w[at + 16], 32);
+        o.run = 0;
+        o.tail = at + 16;
+        o.end = w.size();
+        return;
+    }
+    // the new edge's two vertices (its first half's), and its second half whole
+    std::uint32_t verts[8], tail[16];
+    std::memcpy(verts, &w[at + 8], 32);
+    std::memcpy(tail, &w[at + 16], 64);
+    std::size_t put = o.tail;
+    if (o.run == 0) {   // the second edge of a run: the tag of the lines in the first edge's second half's place
+        o.run = put;
+        w[put] = 0;
+        w[put + 1] = 2u << 28;
+        w[put + 2] = 0x44;
+        w[put + 3] = 0;
+        put += 4;
+    }
+    w.resize(put + 8 + 16);
+    std::memcpy(&w[put], verts, 32);
+    std::memcpy(&w[put + 8], tail, 64);
+    w[o.run]++;   // (a loop more: under 0x7FFF, an item being 4,096 words at most)
+    o.tail = put + 8;
+    o.end = w.size();
+    g_outlinesJoined++;
+}
+
+GsItem* Path1Last()
+{
+    static const bool off = std::getenv("SLY1_PATH1_JOIN") && std::getenv("SLY1_PATH1_JOIN")[0] == '0';
+    if (off)
+        return nullptr;
+    GsItem* last = nullptr;
+    if (Collect* c = t_collect)
+        last = c->used != 0 ? &c->items[c->used - 1] : nullptr;
+    else if (!g_partRecording && !g_gsPending.empty())
+        last = &g_gsPending.back();
+    if (!last || last->path != 1 || last->kept || last->finishTold || last->words.size() > 4096)
+        return nullptr;
+    return last;
+}
+
 // XGKICK: the GIF packet at quadword qaddr of VU1's data memory, tag by tag until a tag with
 // EOP has had its data (the data memory wraps at 1,024 quadwords).
 void KickPath1(std::uint32_t qaddr, void*)
 {
     const std::uint8_t* d = vu1::Data();
     g_counts.path1Packets++;
+    {   // SLY1_PATH1_CENSUS=1: VU1's packets by their first tag and the program that kicked them (partdiff:)
+        static const bool census = std::getenv("SLY1_PATH1_CENSUS") != nullptr;
+        if (census && !t_collect) {
+            const std::uint32_t* tag = reinterpret_cast<const std::uint32_t*>(d + (qaddr & 0x3FF) * 16);
+            std::uint32_t hash, entry;
+            vu1::CurrentProgram(&hash, &entry);
+            char name[112];
+            std::snprintf(name, sizeof name, "path1: program %08X 0x%03X: nloop %u eop %u flg %u nreg %u regs %X%s", hash, entry, tag[0] & 0x7FFF, (tag[0] >> 15) & 1, (tag[1] >> 26) & 3,
+                          (tag[1] >> 28) & 0xF, tag[2], g_partRecording ? " (a part being kept)" : "");
+            g_diffCounts[name]++;
+        }
+    }
     if (GsAsync()) {   // the packet copied, tag by tag to the one with EOP
-        GsItem item;
-        item.path = 1;
-        item.words = GsSpare();
+        GsItem fresh;
+        GsItem* const last = Path1Last();
+        if (!last) {
+            fresh.path = 1;
+            fresh.words = GsSpare();
+        } else {
+            g_path1Joined++;
+        }
+        GsItem& item = last ? *last : fresh;
+        const std::size_t packetAt = item.words.size();
         for (int tags = 0; tags < 1024; tags++) {
             const std::uint32_t* tag = reinterpret_cast<const std::uint32_t*>(d + (qaddr & 0x3FF) * 16);
             std::uint32_t nloop = tag[0] & 0x7FFF, flg = (tag[1] >> 26) & 3, nreg = (tag[1] >> 28) & 0xF;
@@ -618,7 +728,9 @@ void KickPath1(std::uint32_t qaddr, void*)
             if ((tag[0] >> 15) & 1)
                 break;
         }
-        GsEnqueue(std::move(item));
+        OutlineJoin(item, packetAt);
+        if (!last)
+            GsEnqueue(std::move(fresh));
         return;
     }
     gs::Hold hold;
@@ -2313,7 +2425,6 @@ struct DiffSeen {
     std::uint32_t header[44];
 };
 std::unordered_map<std::uint32_t, DiffSeen> g_diffSeen;
-std::map<std::string, std::uint64_t> g_diffCounts;
 void PartDiff(std::uint32_t key, std::uint32_t target, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow, const std::uint32_t* header)
 {
     DiffSeen now;
@@ -3824,6 +3935,8 @@ void PartCountsLine(const char* what)
     PartDiffReport();
     std::fprintf(stderr, "partparams: %s: parts drawn again with another alpha's scale %llu, with a texture offset moved %llu, lit by this frame's lights %llu\n", what,
                  (unsigned long long)g_partsAlphaMoved, (unsigned long long)g_partsStMoved, (unsigned long long)g_partsLitNow);
+    std::fprintf(stderr, "path1: %llu of VU1's packets joined the one before in its item; %llu outline edges put with the edge before\n", (unsigned long long)g_path1Joined.load(),
+                 (unsigned long long)g_outlinesJoined.load());
     std::fprintf(stderr, "partjobs: making them: the shape %.2f s, the job %.2f, the copy %.2f, the queue %.2f; the render thread waited %.2f s for them at its lists' ends\n",
                  g_jobMakeNs[0] / 1e9, g_jobMakeNs[1] / 1e9, g_jobMakeNs[2] / 1e9, g_jobMakeNs[3] / 1e9, g_jobDrainWaitNs / 1e9);
     std::fprintf(stderr, "partjobs: %s: %llu made (%llu not, the shape other), %llu wrong, %llu run again by a thread that needed them; run by the helper %llu (%.2f s), the render thread %llu (%.2f s), "

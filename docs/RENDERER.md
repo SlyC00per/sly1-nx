@@ -1456,3 +1456,33 @@ registers than foretold (none before; not looked into yet).
 The colours are made on the GS thread, a vertex at a time, not in the shader: the renderer's
 vertex layout and its three colour streams stay as they are. The shader is the next step if
 the GS thread's time for it shows.
+
+## The GS thread by kind of item, and the outlines' edges (2026-11-22)
+
+With the parts' jobs down to some 25 a frame the Switch's GS thread is what limits a frame: 12.4
+ms a frame over a play of Into the Machine and Prowling the Grounds, 17.3 in the windows over
+18.5 ms. `perfgs:` (and `lategs:` after a late frame's line) says where, by the path of the
+items it takes. In the windows at 60 frames a second, a frame: parts drawn again 5.84 ms (168
+parts: 35 microseconds each), VU1's packets 2.74 ms (1,109), batches 1.62 ms (295), the GIF
+channel's 0.83 ms (311 KB of image data a frame), calls 0.66 ms; 1,420 palette loads a frame,
+85 of them read from the GS's memory.
+
+`SLY1_PATH1_CENSUS=1` (the host) says what VU1's packets are: over half are the outlines' (0x26D
+kicks one for each edge it draws, 620 a frame in A Stealthy Approach, each a tag with a
+register write and a line and the same again for the line's depth alone).
+
+- **VU1's packets join in one item** (`Path1Last`; `SLY1_PATH1_JOIN=0`: an item each): 1,092
+  items a frame became 316 on the host's tour.
+- **A run of outline edges is one tag of lines** (`OutlineJoin`; `SLY1_OUTLINE_JOIN=0`: not): as
+  the packets join, edges with the same tags and writes become the first edge's first half, one
+  tag with all the other edges' vertices, and the last edge's second half. The same lines are
+  drawn by the first write's state, and the registers and the vertex queue are left as the last
+  edge left them; the lines for the depth alone, which the GPU renderer leaves out, are not sent
+  but for the last.
+
+On the host's tour the GS thread's time for VU1's packets went from 0.58 to 0.41 ms a frame
+(the host is some ten times the Switch). Checked: level 4 under lockstep with the software
+batches, 28 frames within 1 of 255 of `SLY1_PART_REPLAY=0` (the software drawing draws each
+edge's second line where it has one: the pictures are the same without them); `--verify-levels`
+with `SLY1_PART_JOBS_CHECK=1`: all 46 levels, 388,710 jobs, 0 wrong, 7.4 million edges put with
+the edge before.
