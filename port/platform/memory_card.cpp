@@ -42,9 +42,16 @@ std::FILE* g_files[kHandles];
 // The request is done: its number and result wait for SyncCardRequest.
 s32 Done(s32 op, s32 result)
 {
+    // The first 200 requests are always said (SLY1_CARD_TRACE: all): a start now and then finds no
+    // save where there is one (twice on the Switch on 2026-11-22), and what the card answered
+    // then is not known. A request done while the one before still waits to be asked after
+    // (SyncCardRequest) takes its place: said too, as that would give the game another's result.
     static const bool trace = std::getenv("SLY1_CARD_TRACE") != nullptr;
-    if (trace)
-        std::fprintf(stderr, "card: request 0x%X -> %d\n", op, result);
+    static int said;
+    if (trace || said < 200) {
+        said++;
+        std::fprintf(stderr, "card: request 0x%X -> %d%s\n", op, result, g_inFlight != 0 ? " (the request before was not asked after: its result is lost)" : "");
+    }
     g_inFlight = op;
     g_result = result;
     return 0;
@@ -222,6 +229,11 @@ s32 OpenCardFile(s32 port, s32, const char* name, s32 flags)
     std::FILE* f = std::fopen(p.c_str(), "r+b");
     if (!f && (flags & 0x200))
         f = std::fopen(p.c_str(), "w+b");
+    {
+        static int said;
+        if (said++ < 40)
+            std::fprintf(stderr, "card: open %s (flags 0x%X): %s\n", name ? name : "(null)", (unsigned)flags, f ? "opened" : "not there");
+    }
     if (!f)
         return Done(2, kNotFound);
     g_files[fd] = f;
