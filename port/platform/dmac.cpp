@@ -567,6 +567,10 @@ void GsEnqueue(GsItem&& item)
 // A batch from VU1's handlers for the GS thread (gs::SetBatchSink): the tag's word, the batch's
 // record, and its vertices copied (VU1's data memory is written over by the next batch).
 std::atomic<std::uint64_t> g_batchesQueued, g_batchesRefused, g_gsBusyNs;
+// The GS thread's time and items by kind (an item's path: 0 a call (the swap among them), 1 VU1's
+// packets, 2 VIF1's DIRECT data, 3 the GIF channel's (uploads), 4 a batch, 5 a part drawn again,
+// 6 a job's items), for SLY1_PERF_LOG's perfgs line.
+std::atomic<std::uint64_t> g_gsNsByPath[8], g_gsItemsByPath[8];
 bool QueueBatch(std::uint32_t tagWord1, const gs::Batch& b)
 {
     GsItem item;
@@ -4295,8 +4299,15 @@ void GsThreadMain()
         const std::uint64_t gsStarted = NowNs();
         struct Busy {
             std::uint64_t from;
-            ~Busy() { g_gsBusyNs += NowNs() - from; }
-        } busy{gsStarted};
+            int path;
+            ~Busy()
+            {
+                const std::uint64_t ns = NowNs() - from;
+                g_gsBusyNs += ns;
+                g_gsNsByPath[path & 7] += ns;   // (SLY1_PERF_LOG's perfgs)
+                g_gsItemsByPath[path & 7]++;
+            }
+        } busy{gsStarted, item.path};
         // The GS held once for the item, not once for each packet and batch in it (a call may wait
         // for the display, and holds it for itself as it needs).
         struct HeldIf {
@@ -4318,7 +4329,10 @@ void GsThreadMain()
                     // each thread did between the two (at most 8 a second are printed; all are counted)
                     static const bool perfLog = std::getenv("SLY1_PERF_LOG") != nullptr;
                     if (perfLog) {
-                        static std::uint64_t at, was[12], said, saidSecond;
+                        static std::uint64_t at, was[12], said, saidSecond, pathWas[8];
+                        std::uint64_t pathIs[8];
+                        for (int k = 0; k < 8; k++)
+                            pathIs[k] = g_gsNsByPath[k].load();
                         const std::uint64_t now = NowNs();
                         const std::uint64_t is[12] = {g_renderNs[0] + g_renderNs[1] + g_renderNs[2], g_gsBusyNs.load(), KernelIdleNs(), g_jobNsBy[0].load(), g_jobsBy[0].load() + g_jobsBy[1].load() + g_jobsBy[2].load(),
                                                       g_fullBy[0], g_fullBy[3] + g_fullBy[4], g_fullNsBy[0] + g_fullNsBy[1] + g_fullNsBy[2] + g_fullNsBy[3] + g_fullNsBy[4] + g_fullNsBy[5] + g_fullNsBy[6],
@@ -4336,7 +4350,12 @@ void GsThreadMain()
                                              (unsigned long long)(is[4] - was[4]), (unsigned long long)(is[5] - was[5]), (unsigned long long)(is[6] - was[6]), (is[7] - was[7]) / 1e6,
                                              (unsigned long long)(is[8] - was[8]), (unsigned long long)(is[9] - was[9]), (unsigned long long)(is[10] - was[10]), (is[11] - was[11]) / 1e6,
                                              (now - item.listAt) / 1e6);
+                            if (said <= 8)
+                                std::fprintf(stderr, "lategs: frame %llu: the GS thread's ms: calls %.1f, VU1's packets %.1f, DIRECT %.1f, the GIF channel %.1f, batches %.1f, parts drawn again %.1f, jobs' items %.1f\n",
+                                             (unsigned long long)gs::FramesShown(), (pathIs[0] - pathWas[0]) / 1e6, (pathIs[1] - pathWas[1]) / 1e6, (pathIs[2] - pathWas[2]) / 1e6,
+                                             (pathIs[3] - pathWas[3]) / 1e6, (pathIs[4] - pathWas[4]) / 1e6, (pathIs[5] - pathWas[5]) / 1e6, (pathIs[6] - pathWas[6]) / 1e6);
                         }
+                        std::memcpy(pathWas, pathIs, sizeof pathWas);
                         at = now;
                         std::memcpy(was, is, sizeof was);
                     }
@@ -4638,6 +4657,27 @@ void RenderThreadMain()
                                      "fickle %.0f, batches %.0f; ms: drawing again %.2f, parts in full %.2f\n", (unsigned long long)shown, (is[0] - was[0]) / f, (is[1] - was[1]) / f,
                                      (is[2] - was[2]) / f, (is[3] - was[3]) / f, (is[4] - was[4]) / f, (is[5] - was[5]) / f, (is[6] - was[6]) / f,
                                      (is[7] - was[7]) / f, (times[0] - timesWas[0]) / f / 1e6, (times[1] - timesWas[1]) / f / 1e6);
+                    {
+                        static std::uint64_t nsWas[8], itemsWas[8], qwWas, palWas[2];
+                        std::uint64_t ns[8], items[8], pal[2];
+                        for (int k = 0; k < 8; k++) {
+                            ns[k] = g_gsNsByPath[k].load();
+                            items[k] = g_gsItemsByPath[k].load();
+                        }
+                        const std::uint64_t qw = gs::UploadedQuadwords(pal);
+                        static const char* const kPath[7] = {"calls", "VU1's packets", "DIRECT", "the GIF channel", "batches", "parts drawn again", "jobs' items"};
+                        if (since) {
+                            std::fprintf(stderr, "perfgs: to %llu, the GS thread a frame:", (unsigned long long)shown);
+                            for (int k = 0; k < 7; k++)
+                                std::fprintf(stderr, " %s %.2f ms (%.0f)%s", kPath[k], (ns[k] - nsWas[k]) / f / 1e6, (items[k] - itemsWas[k]) / f, k < 6 ? "," : "");
+                            std::fprintf(stderr, "; uploads %.1f KB, palettes read %.1f, from the cache %.1f\n", (qw - qwWas) * 16 / f / 1024.0, (pal[0] - palWas[0]) / f, (pal[1] - palWas[1]) / f);
+                        }
+                        std::memcpy(nsWas, ns, sizeof nsWas);
+                        std::memcpy(itemsWas, items, sizeof itemsWas);
+                        qwWas = qw;
+                        palWas[0] = pal[0];
+                        palWas[1] = pal[1];
+                    }
                     {
                         static std::uint64_t keepWas[6], watchWas[3];
                         if (since)

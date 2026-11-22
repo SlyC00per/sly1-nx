@@ -183,6 +183,7 @@ std::uint32_t Expand24(std::uint32_t c)
 
 bool Surveying();
 extern std::uint32_t g_uploads;
+std::atomic<std::uint64_t> g_uploadedQuadwords{0}, g_palettes[2];   // (SLY1_PERF_LOG's perfgs: image data taken; palettes read, and copied from the cache)
 extern std::uint32_t g_pageUpload[kLocalBytes / 8192];
 template <typename F>
 void PagesOf(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, std::uint32_t x0, std::uint32_t y0, std::uint32_t w,
@@ -238,6 +239,7 @@ void LoadClut(std::uint64_t tex)
     {   // SLY1_GS_SURVEY: the palette loads from the cache and read
         static std::uint64_t hits, misses;
         (hit ? hits : misses)++;
+        g_palettes[hit ? 1 : 0]++;
         if (Surveying() && ((hits + misses) & 0xFFFF) == 0)
             std::fprintf(stderr, "gs survey: palette loads, %llu from the cache, %llu read\n", (unsigned long long)hits,
                          (unsigned long long)misses);
@@ -1246,6 +1248,7 @@ void ImageRun(const std::uint32_t* q, std::uint32_t count)
 {
     // the caller holds the GS (gs::Hold)
     Transfer& t = g_trx;
+    g_uploadedQuadwords += count;
     static const bool check = std::getenv("SLY1_GS_CHECK") != nullptr;
     if (check && t.active && !g_checkingImage) {   // SLY1_GS_CHECK: the pixels both ways, on a copy of local memory
         static std::vector<std::uint8_t> before(kLocalBytes), slow(kLocalBytes);
@@ -2240,6 +2243,12 @@ std::uint64_t TextureSource(const DrawState& state)
 }
 
 std::uint32_t UploadSerial() { return g_uploads; }
+std::uint64_t UploadedQuadwords(std::uint64_t palettes[2])
+{
+    palettes[0] = g_palettes[0];
+    palettes[1] = g_palettes[1];
+    return g_uploadedQuadwords;
+}
 
 std::uint32_t BufferGeneration(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t width, std::uint32_t height)
 {

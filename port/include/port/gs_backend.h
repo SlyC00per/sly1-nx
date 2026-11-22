@@ -243,6 +243,9 @@ std::uint32_t TextureGeneration(const DrawState& state);
 // of a 32-bit buffer at frame base fbp, fbw * 64 wide: a backend that keeps such a buffer as an
 // image of its own (the game drew into it) learns so that the game has since put textures there.
 std::uint32_t UploadSerial();
+// (SLY1_PERF_LOG) The quadwords of image data the GS has taken so far; palettes read from its
+// memory [0] and copied from the cache of them [1].
+std::uint64_t UploadedQuadwords(std::uint64_t palettes[2]);
 std::uint32_t BufferGeneration(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t width, std::uint32_t height);
 
 // For a backend, inside Begin. A hash of what the state's texture is read from: the pages of
