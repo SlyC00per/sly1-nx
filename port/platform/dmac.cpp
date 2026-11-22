@@ -371,8 +371,13 @@ struct GsItem {
 struct Collect {
     std::vector<GsItem> items;
     std::size_t used = 0;
+    bool trouble = false;   // a batch of the run was not handed over as unpacked (vu1::PartTrouble)
 };
 thread_local Collect* t_collect = nullptr;
+// (a job's thread) its VIF's count of texture-offset unpacks, and the count when the job began:
+// which of the packet's offsets a batch's is (gs::Batch::stSource), as PartRecordItem says it
+thread_local const std::uint32_t* t_jobStCount = nullptr;
+thread_local std::uint32_t t_jobStBase = 0;
 std::atomic<std::uint64_t> g_jobStaleCodes{0};   // interrupts and microcode loads a job's stale run came to, and left alone
 std::mutex g_gsLock;
 std::condition_variable g_gsWake, g_gsIdle;
@@ -457,6 +462,7 @@ extern bool g_observeBad;
 void PartRecordItem(const GsItem& item);
 bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow);
 void PartDone();
+struct PartRecord;
 
 // FINISH writes among what the render thread has queued for the GS thread in its current item
 // (the game ends each of a frame's packets with one: a tag of one A+D register and the write).
@@ -528,6 +534,15 @@ std::atomic<std::uint64_t> g_listAt{0}, g_heldNs{0}, g_heldMaxNs{0}, g_heldCount
 void GsEnqueue(GsItem&& item)
 {
     if (Collect* c = t_collect) {
+        if (item.path == 4 && t_jobStCount && item.words.size() > 1 + (sizeof(gs::Batch) + 3) / 4) {
+            gs::Batch b;
+            std::memcpy(&b, &item.words[1], sizeof b);
+            if (b.stApplied) {
+                const std::uint32_t seen = *t_jobStCount - t_jobStBase;
+                b.stSource = seen >= 1 && seen <= 64 ? (std::uint8_t)(seen - 1) : 0xFF;
+                std::memcpy(&item.words[1], &b, sizeof b);
+            }
+        }
         if (c->used < c->items.size())
             c->items[c->used] = std::move(item);
         else
@@ -701,6 +716,7 @@ public:
     bool BetweenCodes() const { return left_ == 0; }
     // the unpacks so far of a mesh's texture offset (kStUnpack)
     std::uint32_t StUnpacks() const { return stUnpacks_; }
+    const std::uint32_t* StUnpacksAt() const { return &stUnpacks_; }
 
     void Words(const std::uint32_t* w, int n)
     {
@@ -1525,6 +1541,7 @@ struct PartRecord {
     bool bad = false;
     // the hash a frame late (PartHashLate): what the helper last found, and whether it is asked
     std::uint32_t serial = 0;            // which keeping of the part this is (a result for another is dropped)
+    bool pending = false;                // a job is running it for this keeping (PartJobsKeep)
     std::uint64_t seen = 0, seenWhole = 0;
     bool wholeArrived = false, asked = false;
     // A part found changed is hashed before each decision, as it was, until this frame: one that
@@ -1665,6 +1682,8 @@ std::uint64_t g_keepWhy[6], g_watchWhy[3];
 std::uint64_t g_partsLetGo, g_partsLetGoRecent;
 std::uint64_t g_fullNsBy[7], g_fullBy[7];
 std::uint64_t g_partsKeepPutOff;   // parts not kept in the list they could have been (no more than a few a list)
+std::uint64_t g_keptByJob, g_keptByJobRefused;   // parts kept from a job's run of them, and those a job's run did not give as a part's
+void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs& after, const char* jobWhy);
 std::uint64_t g_jobsByShape;       // parts made a job at first sight by another part's registers for the same shape   // kept parts let go for room, and those of them drawn in the last 120 frames   // drawn again with another alpha's scale, another texture offset
 
 std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow = false,
@@ -2692,13 +2711,16 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             g_partsWaited++;
             return false;
         }
-        // No more parts are kept in one list than 2 ms of the render thread's time allow
-        // (SLY1_PART_KEEP_US): keeping a part costs several times running it, and where the view
+        // SLY1_PART_KEEP_US=N: no more parts are kept by the render thread in one list than N
+        // microseconds of its time allow. Off: at 2 ms the Switch put off 50,000 keepings in one
+        // play, the parts waiting were jobs (92 in a late frame against 47) and twice as many frames
+        // came late; parts are kept from their jobs instead (PartJobsKeep).
+        // Keeping a part costs several times running it, and where the view
         // turns onto a new place ten parts were kept in one frame, 3 to 6 ms, which made that frame
         // late (the Switch's late: lines, 2026-11-22). The rest wait their turn as jobs. (By their
         // number, three a list, the keeping fell behind: 11,666 put off over the host's tour and a
         // sixth fewer parts drawn again.)
-        static const std::uint64_t most = (std::uint64_t)(std::getenv("SLY1_PART_KEEP_US") ? std::max(100, std::atoi(std::getenv("SLY1_PART_KEEP_US"))) : 2000) * 1000;
+        static const std::uint64_t most = std::getenv("SLY1_PART_KEEP_US") ? (std::uint64_t)std::max(100, std::atoi(std::getenv("SLY1_PART_KEEP_US"))) * 1000 : ~0ull;
         static std::uint64_t list, keepNsAtStart;
         if (list != g_listSerial) {
             list = g_listSerial;
@@ -2713,6 +2735,8 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             return false;
         }
     }
+    if (r.pending)   // (a job of this list is running it for its keeping)
+        return false;
     g_partWords -= std::min<std::uint64_t>(g_partWords, r.words);   // what it held before is let go
     PartForget(r);
     {
@@ -2849,7 +2873,14 @@ struct PartJob {
     std::atomic<int> runners{0};
     Collect ref;   // SLY1_PART_JOBS_CHECK: what the job gives when run at once on the render thread
     bool hasRef = false;
+    // The part is to be kept from what the job gives (PartJobsKeep): its key and the record's
+    // serial when the job was made (0: not), and the matrix its batches must have.
+    std::uint32_t keepKey = 0;
+    std::uint64_t keepSerial = 0;
+    float keepMatrix[16];
+    bool right = false;   // the run that gave the job its items left VIF1's registers as foretold
 };
+std::vector<std::shared_ptr<PartJob>> g_keepJobs;   // (the render thread's) this list's jobs whose parts are to be kept from them
 std::vector<PartJob*> g_jobFree;
 std::mutex g_jobFreeLock;   // (the render thread and the GS thread: never the helper)
 std::vector<std::uint32_t> g_jobWrongKeys;         // parts whose job left other registers than foretold
@@ -2944,6 +2975,9 @@ bool PartJobWork(PartJob& j, Collect& out)
     out.used = 0;
     vu1::LaneEnter(work);
     t_collect = &out;
+    t_jobStCount = vif->StUnpacksAt();
+    t_jobStBase = vif->StUnpacks();
+    const std::uint64_t troubleWas = vu1::PartTrouble();
     vif->SetRegs(j.before);
     bool walked;
     if (j.copied) {
@@ -2953,6 +2987,8 @@ bool PartJobWork(PartJob& j, Collect& out)
         walked = WalkPart(j.target, j.tte, *vif);
     }
     const bool right = walked && vif->BetweenCodes() && vif->GetRegs() == j.after;
+    out.trouble = vu1::PartTrouble() != troubleWas;
+    t_jobStCount = nullptr;
     if (!vif->BetweenCodes()) {   // left inside a code: not used again
         delete vif;
         vif = nullptr;
@@ -2991,6 +3027,7 @@ bool PartJobRun(PartJob& j, int who, bool again = false)
     if (j.gen.load(std::memory_order_seq_cst) != gen || j.given.exchange(true, std::memory_order_acq_rel))
         return true;   // another thread ended it first (or the job is another part's now): this run's items are dropped
     std::swap(j.out, *mine);
+    j.right = right;
     if (!right) {
         g_jobsWrong++;
         std::lock_guard<std::mutex> lk(g_hashLock);
@@ -3087,9 +3124,50 @@ bool PartJobsDrainStep()
 }
 
 // (the render thread, a list begun) The parts whose jobs went wrong are not made jobs again.
+// (the render thread, every job of the list done) The parts to be kept from their jobs: what each
+// job gave, copied (the job's buffers are another part's next), with a key for each batch, and
+// then judged as the render thread's own recording is.
+void PartJobsKeep()
+{
+    for (std::shared_ptr<PartJob>& jp : g_keepJobs) {
+        PartJob& j = *jp;
+        auto it = g_parts.find(j.keepKey);
+        if (it == g_parts.end() || it->second.serial != j.keepSerial || !it->second.pending)
+            continue;
+        PartRecord& r = it->second;
+        r.pending = false;
+        const bool done = j.state.load(std::memory_order_acquire) == 2 && j.right && !j.out.trouble && j.out.used != 0;
+        bool ok = done;
+        r.keyFirst = g_partKey + 1;
+        r.items.clear();
+        for (std::size_t k = 0; ok && k < j.out.used; k++) {
+            const GsItem& item = j.out.items[k];
+            if ((item.path != 1 && item.path != 2 && item.path != 4) || item.kept) {
+                ok = false;
+                break;
+            }
+            std::vector<std::uint32_t> words = item.words;
+            if (item.path == 4) {
+                gs::Batch b;
+                std::memcpy(&b, &words[1], sizeof b);
+                b.keep = ++g_partKey;
+                std::memcpy(&words[1], &b, sizeof b);
+            }
+            r.words += words.size();
+            g_partWords += words.size();
+            r.items.push_back({item.path, std::make_shared<const std::vector<std::uint32_t>>(std::move(words))});
+        }
+        Vif::Regs after = j.after;
+        PartKeepFinish(&r, ok, j.keepMatrix, after, !done ? "its job did not give a part's items" : "an item not a part's");
+        (r.ok ? g_keptByJob : g_keptByJobRefused)++;
+    }
+    g_keepJobs.clear();
+}
+
 void PartJobsBegin()
 {
     // (every job of the list before is done: PartJobsDrain)
+    PartJobsKeep();
     const std::uint32_t had = g_listJobCount.load(std::memory_order_acquire);
     g_listJobNext.store(0, std::memory_order_release);
     g_listJobCount.store(0, std::memory_order_release);
@@ -3195,17 +3273,30 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
     // kept, 1 no key (fickle, moving, jobs off), 2 lit by volumes, 3 not known, 4 watched for its
     // registers, 5 its shape cannot be hashed, 6 its shape changed)
     g_fullWhy = g_partRecording ? 0 : 1;
-    if (g_partRecording || g_callKey == 0 || !PartJobsOn())
+    // A part that is to be kept (PartDecide has begun its record) is made a job all the same when
+    // it can be one, and kept from what the job gives (PartJobsKeep): the render thread ran it
+    // itself for that before, which cost it several times a part's run, 3 to 6 ms in a frame where
+    // the view turned onto a new place. SLY1_PART_KEEP_JOB=0: kept by the render thread's run.
+    static const bool keepByJob = !std::getenv("SLY1_PART_KEEP_JOB") || std::getenv("SLY1_PART_KEEP_JOB")[0] != '0';
+    PartRecord* const keeping = g_partRecording;
+    if ((keeping && (!keepByJob || keeping->slow != slow)) || g_callKey == 0 || !PartJobsOn())
         return false;
     // (a part lit by its cache and by volumes of light, mode 1, reads the volumes' packets where
     // the game writes them anew each frame: run in its turn, before the game has)
     g_fullWhy = 2;
     if (g_callHeader[37] == 1)
         return false;
+    // (a part met for the first time has no record yet: it gets one here, so that it can be a job
+    // at once by its shape, below. SLY1_PART_SHAPE_REGS=0: run here this once, as before.)
     auto it = g_parts.find(g_callKey);
     g_fullWhy = 3;
-    if (it == g_parts.end())
-        return false;
+    if (it == g_parts.end()) {
+        static const bool shared = !std::getenv("SLY1_PART_SHAPE_REGS") || std::getenv("SLY1_PART_SHAPE_REGS")[0] != '0';
+        if (!shared)
+            return false;
+        it = g_parts.emplace(g_callKey, PartRecord()).first;
+        it->second.slow = slow;
+    }
     PartRecord& r = it->second;
     // The registers a part is met with, but for those it does not read (as PartDecide's sameRegs:
     // the mask, when its packet unpacks through none before setting one; for a part drawn the
@@ -3249,6 +3340,10 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
             if (!first)
                 r.maskRead = maskReadWas;
         }
+    }
+    if (keeping && (&r != keeping || (!first && !second))) {
+        g_fullWhy = 0;
+        return false;   // kept by this run
     }
     if (!first && !second) {
         // run here and watched, if its shape is the one known (or none is yet)
@@ -3309,6 +3404,19 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
     if (!job) {
         job.reset(new PartJob, back);
         job->gen.fetch_add(1, std::memory_order_seq_cst);
+    }
+    job->keepKey = 0;
+    if (keeping) {
+        // (from here on nothing sends the part back to the render thread's own run)
+        g_partRecording = nullptr;
+        keeping->pending = true;
+        job->keepKey = g_callKey;
+        job->keepSerial = keeping->serial;
+        if (slow)
+            vu1::PartMatrixFrom(reinterpret_cast<const float*>(g_callHeader), job->keepMatrix);
+        else
+            vu1::PartMatrix(g_callRegs.tops, job->keepMatrix);
+        g_keepJobs.push_back(job);
     }
     job->target = target;
     job->key = g_callKey;
@@ -3401,6 +3509,14 @@ void PartDone()
     } else {
         vu1::PartMatrix(r->before.tops, matrix);
     }
+    PartKeepFinish(r, ok, matrix, g_vif1.GetRegs(), nullptr);
+}
+
+// What was collected of a part (r->items) kept if nothing but packets of registers and batches of
+// the header's matrix came of it: by the render thread's own run of the part (PartDone), or by a
+// job's (PartJobsKeep).
+void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs& after, const char* jobWhy)
+{
     std::uint32_t minId = ~0u, maxId = 0;
     bool alphaStrict = false, stStrict = r->stAt.size() > 8;
     std::uint64_t stUsed = 0;
@@ -3416,7 +3532,7 @@ void PartDone()
                 else
                     stStrict = true;
             }
-            ok = std::memcmp(b.matrix, matrix, sizeof matrix) == 0;
+            ok = std::memcmp(b.matrix, matrix, sizeof b.matrix) == 0;
             if (!ok && std::getenv("SLY1_PART_DIFF")) {
                 std::uint32_t hash, entry;
                 vu1::CurrentProgram(&hash, &entry);
@@ -3465,14 +3581,14 @@ void PartDone()
         }
     }
     if (!ok && std::getenv("SLY1_PART_DIFF")) {
-        const char* why = r->bad ? "an item not a part's" : !g_vif1.BetweenCodes() ? "ends inside a VIFcode" :
+        const char* why = jobWhy ? jobWhy : r->bad ? "an item not a part's" : !g_vif1.BetweenCodes() ? "ends inside a VIFcode" :
                           vu1::PartTrouble() != r->troubleWas ? "trouble (a program not taken)" : g_counts.vifInterrupts != r->interruptsWas ? "an interrupt" :
                           g_counts.finishes != r->finishesWas ? "a FINISH" : r->items.empty() ? "nothing queued" : "a batch's matrix or a packet's registers";
         char name[96];
         std::snprintf(name, sizeof name, "refused %s mode %d: %s", r->slow ? "long" : "cached", (int)r->header[37], why);
         g_diffCounts[name]++;
     }
-    r->after = g_vif1.GetRegs();
+    r->after = after;
     r->alphaStrict = alphaStrict;
     r->stStrict = stStrict || stUsed != (r->stAt.size() >= 64 ? ~0ull : (1ull << r->stAt.size()) - 1);
     r->firstId = minId == ~0u ? 0 : minId;
@@ -3680,6 +3796,14 @@ void WalkChain(std::uint32_t regs, std::uint32_t tadr, Sink& sink)
     std::uint32_t sadr = toSpr ? r[0x80 / 4] : 0;
     if (!vif && !gif && !toSpr) {
         std::fprintf(stderr, "dmac: a chain on channel 0x%08X, which the port does not run\n", regs);
+        {   // (seen at a start now and then, the game's channel pointer holding another word: what lies
+            // around the five pointers InitDmaChannels sets, 0x00261F10 to 0x00261F24, to tell what wrote there)
+            const std::uint32_t* w = static_cast<const std::uint32_t*>(Native(0x00261EE0));
+            std::fprintf(stderr, "dmac: the words at 0x00261EE0:");
+            for (int k = 0; k < 32; k++)
+                std::fprintf(stderr, " %08X", w[k]);
+            std::fprintf(stderr, "\n");
+        }
         r[0] &= ~0x100u;
         return;
     }
@@ -4305,8 +4429,9 @@ void RenderThreadMain()
                                          (g_keepWhy[3] - keepWas[3]) / f, (g_keepWhy[4] - keepWas[4]) / f, (g_keepWhy[5] - keepWas[5]) / f, (g_watchWhy[0] - watchWas[0]) / f,
                                          (g_watchWhy[1] - watchWas[1]) / f, (g_watchWhy[2] - watchWas[2]) / f, g_partWords * 4 / 1e6, (unsigned long long)g_partsCleared);
                         std::fprintf(stderr, "perfkeep: to %llu: %llu parts let go for room so far, %llu of them drawn in the 120 frames before; %llu keepings put off to a later list, "
-                                     "%llu parts made jobs at first sight by their shape\n", (unsigned long long)shown,
-                                     (unsigned long long)g_partsLetGo, (unsigned long long)g_partsLetGoRecent, (unsigned long long)g_partsKeepPutOff, (unsigned long long)g_jobsByShape);
+                                     "%llu parts made jobs at first sight by their shape; %llu parts kept from their jobs, %llu not (the job's run was not a part's)\n", (unsigned long long)shown,
+                                     (unsigned long long)g_partsLetGo, (unsigned long long)g_partsLetGoRecent, (unsigned long long)g_partsKeepPutOff, (unsigned long long)g_jobsByShape,
+                                     (unsigned long long)g_keptByJob, (unsigned long long)g_keptByJobRefused);
                         std::memcpy(keepWas, g_keepWhy, sizeof keepWas);
                         std::memcpy(watchWas, g_watchWhy, sizeof watchWas);
                     }

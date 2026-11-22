@@ -1362,3 +1362,33 @@ copy left from the job's last use (it hung in the first level); it now runs afte
 With it, `--verify-levels` at 240 frames a level: 549,356 jobs over the 46 levels, 0 wrong.
 Level 4 under lockstep with the software batches: 28 frames within 1 of 255 of
 `SLY1_PART_REPLAY=0`.
+
+### A part kept from its job (2026-11-22)
+
+Played at abf3c72 the limit on keeping did harm: at 2 ms a list the Switch put off 50,759
+keepings in one play, the parts waiting were jobs (92 in a late frame against 47), and 2.1% of
+the frames in 3D came late against 1.1% (the camera was turned fast on purpose in that play, so
+the two are not one route). The other change held: 2.7 parts new or watched in a late frame
+against 10.6. The limit is off now (`SLY1_PART_KEEP_US` sets one), and keeping no longer needs
+the render thread:
+
+- A job collects exactly what a recording collects (the packets and batches the part queues for
+  the GS). A part that is to be kept and can be a job is made one, with the matrix its batches
+  must have, and when the list's jobs are all done (`PartJobsKeep`, at the next list's start)
+  what the job gave is copied to the record, each batch given its key, and judged by the code
+  that judges the render thread's own recording (`PartKeepFinish`). `SLY1_PART_KEEP_JOB=0`: kept
+  by the render thread's run as before.
+- A job's thread says which of the packet's texture offsets a batch has (`t_jobStCount`), and
+  whether a batch of the run was not handed over as unpacked (`Collect::trouble`).
+- A part met for the first time gets its record at once, so that it can be a job by its shape.
+
+On the host's tour: 2,308 parts kept, all from their jobs (199 refused, as before); no part run
+on the render thread to be kept (1.25 a frame before) or because it was not known (0.74); the
+parts drawn again unchanged. Checked: level 4 under lockstep, 33 frames within 1 of 255 of
+`SLY1_PART_REPLAY=0`; `--verify-levels` with `SLY1_PART_JOBS_CHECK=1`, 240 frames a level: all
+46 levels, 562,679 jobs, 0 wrong, 29,836 parts kept from their jobs.
+
+A start on the Switch faulted once more before any level (the game's GIF channel pointer,
+0x00261F1C, holding 0x4F265060 when InitDisplay sent its first packet, after InitDmaChannels
+had set it): the message for a chain on an unknown channel now prints the words around the
+five channel pointers.
