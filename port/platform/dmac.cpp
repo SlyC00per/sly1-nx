@@ -3259,6 +3259,12 @@ bool PartCall(std::uint32_t marker, std::uint32_t target, bool slow)
 {
     const std::uint64_t jobsWas = g_jobsMade;
     const bool skipped = PartCallInner(marker, target, slow);
+    {   // (SLY1_VU1_SEQ: where each part begins among the programs, with its lighting's mode and count)
+        static const bool seq = std::getenv("SLY1_VU1_SEQ") != nullptr;
+        if (seq)
+            std::fprintf(stderr, "seqpart frame %llu %s mode %d lights %u key %08X%s\n", (unsigned long long)gs::FramesShown(), slow ? "long" : "cached",
+                         (int)g_callHeader[37], g_callHeader[39], g_callKey, skipped ? " (not run here)" : "");
+    }
     const std::int32_t mode = (std::int32_t)g_callHeader[37];
     const int m = mode < -1 || mode > 6 ? 7 : mode + 1;
     g_modeCensus[slow ? 1 : 0][m][!skipped ? 2 : g_jobsMade != jobsWas ? 1 : 0]++;

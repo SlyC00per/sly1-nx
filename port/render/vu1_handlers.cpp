@@ -749,7 +749,11 @@ bool BatchTransform(Runner& r, const int stride, const Test test, const std::uin
         }
         kept = count++ < keep;
     }
-    if (test == Test::Guard274 && !kept && DeferTransforms()) {
+    // SLY1_GPU_FAR=1: the far-plane test's batches left to the renderer too (ab: in turn with not,
+    // 600 frames each), to see on the Switch what the renderer's own cutting makes of them.
+    static const char* const farEnv = std::getenv("SLY1_GPU_FAR");
+    const bool farToo = farEnv && (farEnv[0] == 'a' ? gs::FramesShown() / 600 % 2 == 1 : farEnv[0] != '0');
+    if ((test == Test::Guard274 || farToo) && !kept && DeferTransforms()) {
         V hdr = Load(r, top + 11);
         std::uint16_t span = (std::uint16_t)(Half(hdr.y) - Half(hdr.x));
         if (span != 0 && span % stride == 0 && span / stride <= 256 && Half(Load(r, top + 13).z) == 0 &&
