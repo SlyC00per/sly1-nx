@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <vector>
 
@@ -132,7 +133,94 @@ struct Batch {
     std::uint32_t litWords = 0;
     std::uint8_t litKick = 0;
     const LitParams* litNow = nullptr;
+    // A batch whose vertices a sway moved before its transform (0x750, 0x752, 0x754 of chunk
+    // 51A89CD8: each vertex's position plus its four weights times four displacements, rows 22 to
+    // 25 turned into the part's space): sway is swayWords words after its lighting's (kSwayHead
+    // and after: the four displacements it was moved by, then each vertex's weights). swaySource:
+    // which of its packet's unpacks of those rows it was. swayMoved, set for a part drawn again:
+    // quads are its vertices moved by this frame's displacements (SwayQuads), not those kept.
+    const std::uint32_t* sway = nullptr;
+    std::uint32_t swayWords = 0;
+    std::uint8_t swaySource = 0xFF;
+    bool swayMoved = false;
+    // A skinned batch (0x401 and 0x411 of chunk 2DDC9AA2: each vertex's position through four
+    // matrices blended by its weights, its normal through their 3x3 parts, made unit length):
+    // skin is skinWords words after its sway's (kSkinHead and after: where its four matrices were
+    // in VU1's memory, from its TOP, and whether its normals were skinned; then each vertex's
+    // position and normal as they were before, and its weights). boneSource: for each of the four
+    // matrices, which of its packet's bone unpacks it was (0xFF: none known). skinMoved, set for a
+    // part drawn again: quads are its vertices skinned by this frame's bones (SkinQuads).
+    const std::uint32_t* skin = nullptr;
+    std::uint32_t skinWords = 0;
+    std::uint8_t boneSource[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+    bool skinMoved = false;
 };
+constexpr std::size_t kSkinHead = 2 + 64;   // (and the four matrices it was skinned by, 2 to 65)
+inline std::size_t SkinWords(std::uint32_t count) { return kSkinHead + (std::size_t)count * 10; }
+// Whether any vertex of a skinned batch weighs its matrix j (a mesh of fewer than four bones
+// leaves the other places as they were, weighed 0 by every vertex).
+inline bool SkinUses(const std::uint32_t* skin, std::uint32_t count, int j)
+{
+    const float* w = reinterpret_cast<const float*>(skin + kSkinHead + (std::size_t)count * 6);
+    for (std::uint32_t k = 0; k < count; k++)
+        if (w[k * 4 + j] != 0.0f)
+            return true;
+    return false;
+}
+// A skinned batch's vertices by this frame's four matrices (64 floats, as VU1 has them: four
+// quadwords each, the translation last): out is the batch's quadwords with each position skinned
+// anew; normals (count * 3) each normal skinned anew and made unit length, when the batch's
+// normals were skinned (skin[1]) and normals is given. The host's arithmetic: within a rounding.
+inline void SkinQuads(const Batch& b, const float* mats, std::uint32_t* out, float* normals)
+{
+    const float* pos = reinterpret_cast<const float*>(b.skin + kSkinHead);
+    const float* nrm = pos + (std::size_t)b.count * 3;
+    const float* w = nrm + (std::size_t)b.count * 3;
+    const std::size_t words = (std::size_t)b.count * b.stride * 4;
+    std::memcpy(out, b.quads, words * 4);
+    for (std::uint32_t k = 0; k < b.count; k++) {
+        const float* p = pos + k * 3, * n = nrm + k * 3, * wk = w + k * 4;
+        float sp[3] = {0, 0, 0}, sn[3] = {0, 0, 0};
+        for (int j = 0; j < 4; j++) {
+            const float* m = mats + j * 16;
+            for (int c = 0; c < 3; c++) {
+                sp[c] += wk[j] * (m[c] * p[0] + m[4 + c] * p[1] + m[8 + c] * p[2] + m[12 + c]);
+                sn[c] += wk[j] * (m[c] * n[0] + m[4 + c] * n[1] + m[8 + c] * n[2]);
+            }
+        }
+        float* q = reinterpret_cast<float*>(out + (k * b.stride + b.positionAt) * 4);
+        q[0] = sp[0];
+        q[1] = sp[1];
+        q[2] = sp[2];
+        if (normals && b.skin[1]) {
+            const float len2 = sn[0] * sn[0] + sn[1] * sn[1] + sn[2] * sn[2];
+            const float over = len2 == 0.0f ? 3.4028235e38f : 1.0f / std::sqrt(len2);
+            for (int c = 0; c < 3; c++)
+                normals[k * 3 + c] = sn[c] * over;
+        }
+    }
+}
+constexpr std::size_t kSwayHead = 12;   // four displacements, x y z each
+inline std::size_t SwayWords(std::uint32_t count) { return kSwayHead + (std::size_t)count * 4; }
+// A swayed batch's vertices moved by now's displacements (12 floats) in place of those it was
+// moved by: out is the batch's count * stride quadwords with each position moved by the change.
+inline void SwayQuads(const Batch& b, const float* now, std::uint32_t* out)
+{
+    const float* was = reinterpret_cast<const float*>(b.sway);
+    const float* weights = was + kSwayHead;
+    float d[4][3];
+    for (int i = 0; i < 4; i++)
+        for (int c = 0; c < 3; c++)
+            d[i][c] = now[i * 3 + c] - was[i * 3 + c];
+    const std::size_t words = (std::size_t)b.count * b.stride * 4;
+    std::memcpy(out, b.quads, words * 4);
+    for (std::uint32_t k = 0; k < b.count; k++) {
+        float* p = reinterpret_cast<float*>(out + (k * b.stride + b.positionAt) * 4);
+        const float* w = weights + k * 4;
+        for (int c = 0; c < 3; c++)
+            p[c] += w[0] * d[0][c] + w[1] * d[1][c] + w[2] * d[2][c] + w[3] * d[3][c];
+    }
+}
 // A lit batch's colours for this frame (Batch::litNow), count times R, G, B and the alpha, as a
 // kick's vertices have them.
 inline void LitColoursNow(const Batch& b, std::uint32_t* out)

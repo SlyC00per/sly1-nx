@@ -374,11 +374,35 @@ struct Collect {
     bool trouble = false;   // a batch of the run was not handed over as unpacked (vu1::PartTrouble)
 };
 thread_local Collect* t_collect = nullptr;
-std::map<std::string, std::uint64_t> g_diffCounts;   // (SLY1_PART_DIFF and other censuses: PartDiffReport prints them)
+// SLY1_SKIN_VERIFY=1 (with SLY1_PART_JOBS=0): a skinned part that would be drawn again is run as
+// ever, and each batch it gives is compared with the one its keeping would have drawn.
+struct SkinVerify {
+    bool on = false;
+    std::vector<std::vector<std::uint32_t>> predicted;   // positions, count*3 floats as words, by batch
+    std::vector<std::vector<std::uint32_t>> colours;     // a lit one's kick's colours, count*4 (empty: none)
+    std::vector<std::vector<float>> normals;             // its normals skinned anew, count*3
+    std::size_t next = 0;
+};
+SkinVerify g_skinVerify; // (SLY1_PART_DIFF and the other censuses: PartDiffReport prints them.) Counted by the render
+// thread and the threads that run jobs, printed and cleared by the host's main thread at a
+// level's end: a lock (without it a run of the 46 levels faulted in the map at level 11).
+std::map<std::string, std::uint64_t> g_diffCounts;
+std::mutex g_diffLock;
+void DiffCount(const std::string& name)
+{
+    std::lock_guard<std::mutex> lk(g_diffLock);
+    g_diffCounts[name]++;
+}
 // (a job's thread) its VIF's count of texture-offset unpacks, and the count when the job began:
 // which of the packet's offsets a batch's is (gs::Batch::stSource), as PartRecordItem says it
 thread_local const std::uint32_t* t_jobStCount = nullptr;
 thread_local std::uint32_t t_jobStBase = 0;
+thread_local const std::uint32_t* t_jobSwayCount = nullptr;
+thread_local std::uint32_t t_jobSwayBase = 0;
+class Vif;
+thread_local const Vif* t_jobVif = nullptr;   // (its bones: gs::Batch::boneSource)
+thread_local std::uint32_t t_jobBoneBase = 0;
+void BoneSources(gs::Batch& b, const std::vector<std::uint32_t>& words, const Vif& vif, std::uint32_t base);
 std::atomic<std::uint64_t> g_jobStaleCodes{0};   // interrupts and microcode loads a job's stale run came to, and left alone
 std::mutex g_gsLock;
 std::condition_variable g_gsWake, g_gsIdle;
@@ -548,8 +572,14 @@ void GsEnqueue(GsItem&& item)
             if (b.stApplied) {
                 const std::uint32_t seen = *t_jobStCount - t_jobStBase;
                 b.stSource = seen >= 1 && seen <= 64 ? (std::uint8_t)(seen - 1) : 0xFF;
-                std::memcpy(&item.words[1], &b, sizeof b);
             }
+            if (b.swayWords != 0 && t_jobSwayCount) {
+                const std::uint32_t seen = *t_jobSwayCount - t_jobSwayBase;
+                b.swaySource = seen >= 1 && seen <= 64 ? (std::uint8_t)(seen - 1) : 0xFF;
+            }
+            if (b.skinWords != 0 && t_jobVif)
+                BoneSources(b, item.words, *t_jobVif, t_jobBoneBase);
+            std::memcpy(&item.words[1], &b, sizeof b);
         }
         if (c->used < c->items.size())
             c->items[c->used] = std::move(item);
@@ -557,6 +587,77 @@ void GsEnqueue(GsItem&& item)
             c->items.push_back(std::move(item));
         c->used++;
         return;
+    }
+    if (g_skinVerify.on && item.path == 4) {
+        gs::Batch b;
+        std::memcpy(&b, &item.words[1], sizeof b);
+        const std::uint32_t* q = &item.words[1 + (sizeof(gs::Batch) + 3) / 4];
+        static std::uint64_t batches, wrong, said;
+        batches++;
+        double worst = 0;
+        if (g_skinVerify.next < g_skinVerify.predicted.size()) {
+            const std::vector<std::uint32_t>& p = g_skinVerify.predicted[g_skinVerify.next];
+            if (p.size() == (std::size_t)b.count * 3)
+                for (std::uint32_t k = 0; k < b.count; k++)
+                    for (int c = 0; c < 3; c++) {
+                        float x, y;
+                        std::memcpy(&x, &p[k * 3 + c], 4);
+                        std::memcpy(&y, &q[(k * b.stride + b.positionAt) * 4 + c], 4);
+                        worst = std::max<double>(worst, std::fabs(x - y));
+                    }
+            else
+                worst = 1e9;
+        } else {
+            worst = 1e9;
+        }
+        {   // the normals the program lit by (the item's lighting, as the handlers noted it) against those skinned anew
+            const std::size_t at = g_skinVerify.next;
+            static int said;
+            if (b.litWords && at < g_skinVerify.normals.size() && g_skinVerify.normals[at].size() == (std::size_t)b.count * 3 && said < 6) {
+                const float* got = reinterpret_cast<const float*>(q + (std::size_t)b.count * b.stride * 4 + gs::kLitHead);
+                double far = 0;
+                int farK = 0;
+                for (std::uint32_t k = 0; k < b.count; k++)
+                    for (int c = 0; c < 3; c++)
+                        if (std::fabs(got[k * 3 + c] - g_skinVerify.normals[at][k * 3 + c]) > far) {
+                            far = std::fabs(got[k * 3 + c] - g_skinVerify.normals[at][k * 3 + c]);
+                            farK = (int)k;
+                        }
+                if (far > 0.01) {
+                    said++;
+                    const float* a = &g_skinVerify.normals[at][farK * 3];
+                    std::fprintf(stderr, "skin verify: batch %zu's normals: furthest %g, vertex %d: the program's %g %g %g, anew %g %g %g\n", at + 1, far, farK,
+                                 got[farK * 3], got[farK * 3 + 1], got[farK * 3 + 2], a[0], a[1], a[2]);
+                }
+            }
+        }
+        {   // the colours
+            static std::uint64_t lit, litWrong, litSaid;
+            const std::size_t at = g_skinVerify.next;
+            if (at < g_skinVerify.colours.size() && g_skinVerify.colours[at].size() == (std::size_t)b.count * 4) {
+                lit++;
+                int far = 0;
+                for (std::uint32_t k = 0; k < b.count; k++)
+                    for (int c = 0; c < 3; c++)
+                        far = std::max(far, std::abs((int)q[(k * b.stride + b.colourAt) * 4 + c] - (int)g_skinVerify.colours[at][k * 4 + c]));
+                if (far > 1) {
+                    litWrong++;
+                    if (litSaid++ < 8)
+                        std::fprintf(stderr, "skin verify: batch %zu's colours: furthest %d from what the keeping would draw (kick %u)\n", at + 1, far, b.litKick);
+                }
+                if ((lit & (lit - 1)) == 0)
+                    std::fprintf(stderr, "skin verify: %llu lit batches, %llu with colours further than 1\n", (unsigned long long)lit, (unsigned long long)litWrong);
+            }
+        }
+        g_skinVerify.next++;
+        if (worst > 0.05) {
+            wrong++;
+            if (said++ < 10)
+                std::fprintf(stderr, "skin verify: batch %zu of %zu (%u vertices, skinned %d): furthest %g from what the keeping would draw\n", g_skinVerify.next,
+                             g_skinVerify.predicted.size(), b.count, (int)(b.skinWords != 0), worst);
+        }
+        if ((batches & (batches - 1)) == 0)
+            std::fprintf(stderr, "skin verify: %llu batches, %llu other than the keeping would draw\n", (unsigned long long)batches, (unsigned long long)wrong);
     }
     if (g_partRecording)
         PartRecordItem(item);
@@ -588,11 +689,15 @@ bool QueueBatch(std::uint32_t tagWord1, const gs::Batch& b)
     const std::size_t head = 1 + (sizeof(gs::Batch) + 3) / 4, quads = (std::size_t)b.count * b.stride * 4;
     std::uint32_t record[1 + (sizeof(gs::Batch) + 3) / 4] = {tagWord1};
     std::memcpy(&record[1], &b, sizeof b);
-    item.words.reserve(head + quads + (b.lit ? b.litWords : 0));
+    item.words.reserve(head + quads + (b.lit ? b.litWords : 0) + (b.sway ? b.swayWords : 0) + (b.skin ? b.skinWords : 0));
     item.words.insert(item.words.end(), record, record + head);
     item.words.insert(item.words.end(), b.quads, b.quads + quads);
     if (b.lit)   // (its lighting after its vertices: gs::Batch::lit)
         item.words.insert(item.words.end(), b.lit, b.lit + b.litWords);
+    if (b.sway)   // (and its sway after that: gs::Batch::sway)
+        item.words.insert(item.words.end(), b.sway, b.sway + b.swayWords);
+    if (b.skin)   // (and its skinning: gs::Batch::skin)
+        item.words.insert(item.words.end(), b.skin, b.skin + b.skinWords);
     GsEnqueue(std::move(item));
     g_batchesQueued++;
     return true;
@@ -695,7 +800,7 @@ void KickPath1(std::uint32_t qaddr, void*)
             char name[112];
             std::snprintf(name, sizeof name, "path1: program %08X 0x%03X: nloop %u eop %u flg %u nreg %u regs %X%s", hash, entry, tag[0] & 0x7FFF, (tag[0] >> 15) & 1, (tag[1] >> 26) & 3,
                           (tag[1] >> 28) & 0xF, tag[2], g_partRecording ? " (a part being kept)" : "");
-            g_diffCounts[name]++;
+            DiffCount(name);
         }
     }
     if (GsAsync()) {   // the packet copied, tag by tag to the one with EOP
@@ -780,6 +885,38 @@ void KickPath1(std::uint32_t qaddr, void*)
 // packet changes: they are left out of the part's hash and given to the renderer as numbers
 // (docs/RENDERER.md, "A part's numbers left to the renderer"). SLY1_PART_PARAMS=0: not.
 constexpr std::uint32_t kStUnpackMask = 0x7FFF83FFu, kStUnpack = 0x64018016u;
+// The unpack of a mesh's sway: six quadwords to 22 (rows 22 to 25 the four displacements the sway
+// program, 0x754 of chunk 51A89CD8, moves each vertex by with its weights; 26 and 27 what else it
+// reads). The game writes them anew each frame in the mesh's data; they are left out of the part's
+// hash and the renderer moves the kept vertices by how much they changed (gs::SwayQuads).
+constexpr std::uint32_t kSwayUnpack = 0x6C068016u;
+// The unpack of a bone's matrix for a skinned mesh (DrawModelPart: four quadwords, V4-32, to the
+// mesh's bone slot from TOPS): the game writes the bones anew each frame in the part's own chain.
+// They are left out of the part's hash, found again by their place in the chain, and the renderer
+// skins the kept vertices by them (gs::SkinQuads).
+constexpr std::uint32_t kBoneMask = 0x7FFFC000u, kBoneUnpack = 0x6C04C000u;
+bool SkinOn()
+{
+    static const bool off = std::getenv("SLY1_SKIN") && std::getenv("SLY1_SKIN")[0] == '0';
+    return !off;
+}
+// A place in a part's packet that the hash leaves out: in memory that stays (a cached packet, a
+// REF of a mesh's data), or, for a part drawn the long way, in its own chain, which is written
+// anew each frame at another place: then as words from the chain's start.
+struct MaskAt {
+    const std::uint32_t* p = nullptr;
+    std::ptrdiff_t fromChain = -1;   // words from the chain's start, or -1: p
+    // the VIFcode before the words (an unpack's, whose data they are): a place in this frame's
+    // chain is taken only when the same code is before it (the verdict that a part is as it was
+    // may be the helper's, of the list before, and a chain laid out otherwise has other words there)
+    std::uint32_t code = 0;
+    const std::uint32_t* At(const std::uint32_t* chain) const { return fromChain < 0 ? p : chain + fromChain; }
+};
+bool SwayOn()
+{
+    static const bool off = std::getenv("SLY1_SWAY") && std::getenv("SLY1_SWAY")[0] == '0';
+    return !off;
+}
 // The unpacks of a light's packet (RefreshConeVolumeShape): its colour to 22 (four words), its
 // scale and base to 23 and 24 (eight), then a directional light's direction to 25, or a point light's attenuation to 25
 // and place to 26. A part lit by VU1 (mode 4) whose light moves has only these words other from
@@ -788,7 +925,10 @@ constexpr std::uint32_t kStUnpackMask = 0x7FFF83FFu, kStUnpack = 0x64018016u;
 inline bool LightUnpack(std::uint32_t code)
 {
     const std::uint32_t c = code & kStUnpackMask;
-    return c == 0x6C018016u || c == 0x6C028017u || c == 0x68018019u || c == 0x64018019u || c == 0x6801801Au;
+    // (and a spot light's: its cone's two ramps to 25 and 26, its direction to 27, its view and
+    // projection to 28 to 31)
+    return c == 0x6C018016u || c == 0x6C028017u || c == 0x68018019u || c == 0x64018019u || c == 0x6801801Au || c == 0x6C028019u ||
+           c == 0x6801801Bu || c == 0x6C04801Cu;
 }
 struct LitAt {
     std::uint32_t addr, words;
@@ -856,6 +996,11 @@ public:
     // the unpacks so far of a mesh's texture offset (kStUnpack)
     std::uint32_t StUnpacks() const { return stUnpacks_; }
     const std::uint32_t* StUnpacksAt() const { return &stUnpacks_; }
+    std::uint32_t SwayUnpacks() const { return swayUnpacks_; }
+    // the bone unpacks so far, and the last one to each place (0: none)
+    std::uint32_t BoneUnpacks() const { return boneUnpacks_; }
+    std::uint32_t LastBoneAt(std::uint32_t addr) const { return lastBone_[addr & 0x3FF]; }
+    const std::uint32_t* SwayUnpacksAt() const { return &swayUnpacks_; }
 
     void Words(const std::uint32_t* w, int n)
     {
@@ -981,6 +1126,10 @@ private:
             std::uint32_t vectors = n;
             if ((w & kStUnpackMask) == kStUnpack)
                 stUnpacks_++;
+            if ((w & kStUnpackMask) == kSwayUnpack)
+                swayUnpacks_++;
+            if ((w & kBoneMask) == kBoneUnpack)
+                lastBone_[w & 0x3FF] = ++boneUnpacks_;
             if (wl_ > cl_)   // filling: only cl of every wl written vectors come from the stream
                 vectors = cl_ * (n / wl_) + (n % wl_ < cl_ ? n % wl_ : cl_);
             std::uint32_t bits = (vn == 3 && vl == 3) ? 16 : (32u >> vl) * (vn + 1);
@@ -1495,7 +1644,8 @@ private:
     // VIF1's registers (VIF0 keeps the unpacking ones too)
     std::uint32_t row_[4] = {}, col_[4] = {}, mask_ = 0, mode_ = 0;
     std::uint32_t base_ = 0, ofst_ = 0, tops_ = 0, itops_ = 0;
-    std::uint32_t stUnpacks_ = 0;
+    std::uint32_t stUnpacks_ = 0, swayUnpacks_ = 0, boneUnpacks_ = 0;
+    std::uint32_t lastBone_[1024] = {};
     bool dbf_ = false;
     std::uint32_t cmd_ = 0, imm_ = 0, num_ = 0;
     std::vector<std::uint32_t> data_;
@@ -1715,6 +1865,7 @@ struct PartRecord {
     // followed: the words and the header must be what they were.
     struct LitSource {
         const float* colour = nullptr, * scale = nullptr, * base = nullptr, * dir = nullptr, * atten = nullptr, * place = nullptr;
+        const float* ramp = nullptr, * view = nullptr;   // a spot light's (its direction in dir)
     };
     bool litStrict = false;
     std::vector<LitAt> litAt;
@@ -1726,6 +1877,22 @@ struct PartRecord {
     std::vector<const std::uint32_t*> stAt;
     std::vector<St> stWas;
     std::uint32_t stBase = 0, stTarget = 0;
+    // The same for a mesh's sway (kSwayUnpack): where its rows lie, what they were, and VIF1's
+    // count of such unpacks when the part was kept (gs::Batch::swaySource counts from it).
+    // swayStrict: a sway no kept batch answers for, or a kept batch moved by none: the rows must be
+    // what they were.
+    std::vector<const std::uint32_t*> swayAt;
+    std::vector<std::uint32_t> swayWas;
+    std::uint32_t swayBase = 0;
+    bool swayStrict = false;
+    // A skinned part's bones (kBoneUnpack): where each lies (MaskAt), what it was, VIF1's count of
+    // bone unpacks when the part was kept (gs::Batch::boneSource counts from it). boneStrict: a
+    // bone no kept batch answers for, a skinned batch without its skinning noted, or one not
+    // left out: the bones must be what they were.
+    std::vector<MaskAt> boneAt;
+    std::vector<std::uint32_t> boneWas;
+    std::uint32_t boneBase = 0;
+    bool boneStrict = false;
     // For a job (PartJob): its packet's shape when it was last run here, and the registers it was
     // run from and left (two pairs: the game turns VIF1's buffers about from part to part, and a
     // part comes with either), with nothing a job must not have (an interrupt, a FINISH, a call).
@@ -1826,7 +1993,11 @@ struct PartTurns {
 } g_partTurns;
 std::uint64_t g_partsSlowReplayed, g_partsSlowKept, g_partsSlowRefused;
 std::uint64_t g_partsAlphaMoved, g_partsStMoved;
-std::uint64_t g_partsLitNow;   // parts lit by VU1 drawn again with this frame's lighting
+std::uint64_t g_partsLitNow;
+std::uint64_t g_partsSwayed;
+std::uint64_t g_partsSkinned;
+std::uint64_t g_bonesMislaid;
+  // parts whose bones were not at their places in this frame's chain   // parts drawn again with their vertices skinned by this frame's bones   // parts drawn again with their vertices moved by this frame's sway   // parts lit by VU1 drawn again with this frame's lighting
 // (SLY1_PERF_LOG's perfkeep: why a part is kept anew: 0 never kept, 1 to 3 kept and found other by
 // its hash, registers, header, 4 its moving mark ended, 5 known but not kept (refused, let go);
 // and why one is run here and watched: 0 never run here cleanly, 1 no registers known for its
@@ -1841,7 +2012,8 @@ std::uint64_t g_jobsByShape;       // parts made a job at first sight by another
 
 std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow = false,
                        std::vector<const std::uint32_t*>* tex = nullptr, bool shape = false, std::vector<const std::uint32_t*>* st = nullptr,
-                       std::uint8_t* maskUse = nullptr, bool lit = false, std::vector<LitAt>* litAt = nullptr);
+                       std::uint8_t* maskUse = nullptr, bool lit = false, std::vector<LitAt>* litAt = nullptr,
+                       std::vector<const std::uint32_t*>* swayAt = nullptr, std::vector<MaskAt>* boneAt = nullptr);
 
 }  // namespace
 
@@ -2005,10 +2177,35 @@ bool PartReplayOn()
 }
 
 void PartHeader(std::uint32_t tops, std::uint32_t out[44]);
+// Which of the packet's bone unpacks (counted from base) each of a skinned batch's four matrices
+// was: the last one to its place (the batch's skin[0], four quadwords a matrix) before the batch.
+void BoneSources(gs::Batch& b, const std::vector<std::uint32_t>& words, const Vif& vif, std::uint32_t base)
+{
+    // (the batch's skin, as QueueBatch laid it out after its vertices, lighting and sway)
+    const std::size_t at = 1 + (sizeof(gs::Batch) + 3) / 4 + (std::size_t)b.count * b.stride * 4 + b.litWords + b.swayWords;
+    const bool has = b.skinWords != 0 && at < words.size();
+    const std::uint32_t mats = has ? words[at] : 0;
+    for (int j = 0; j < 4; j++) {
+        const std::uint32_t last = has ? vif.LastBoneAt(mats + 4 * (std::uint32_t)j) : 0;
+        b.boneSource[j] = last > base && last - base <= 254 ? (std::uint8_t)(last - base - 1) : 0xFF;
+        {
+            static const bool log = std::getenv("SLY1_SKIN_LOG") != nullptr;
+            static std::atomic<int> said{0};
+            if (log && has && b.boneSource[j] == 0xFF && said++ < 16)
+                std::fprintf(stderr, "skinsrc: matrix %d at %u: last bone there %u, base %u, bones so far %u\n", j, mats + 4 * j, last, base, vif.BoneUnpacks());
+        }
+    }
+}
+
 void PartRecordItem(const GsItem& item)
 {
     PartRecord& r = *g_partRecording;
     if (item.path == 0 || item.path == 3 || item.path == 5 || item.kept) {   // a call, the GIF channel's: not a part's
+        if (std::getenv("SLY1_PART_DIFF")) {
+            char name[64];
+            std::snprintf(name, sizeof name, "refusal: an item of path %d%s while %s mode %d was kept", item.path, item.kept ? " (kept)" : "", r.slow ? "long" : "cached", (int)r.header[37]);
+            DiffCount(name);
+        }
         r.bad = true;
         return;
     }
@@ -2021,6 +2218,12 @@ void PartRecordItem(const GsItem& item)
             const std::uint32_t seen = g_vif1.StUnpacks() - r.stBase;
             b.stSource = seen >= 1 && seen <= 64 ? (std::uint8_t)(seen - 1) : 0xFF;
         }
+        if (b.swayWords != 0) {   // which of the packet's sways moved it: likewise
+            const std::uint32_t seen = g_vif1.SwayUnpacks() - r.swayBase;
+            b.swaySource = seen >= 1 && seen <= 64 ? (std::uint8_t)(seen - 1) : 0xFF;
+        }
+        if (b.skinWords != 0)   // which of the packet's bones its four matrices were
+            BoneSources(b, words, g_vif1, r.boneBase);
         std::memcpy(&words[1], &b, sizeof b);
         r.items.push_back({item.path, std::make_shared<const std::vector<std::uint32_t>>(std::move(words))});
     } else {
@@ -2059,6 +2262,16 @@ struct PartHasher {
     // noted when asked for (st), in the order VIF1 meets them.
     bool stFree = false, stSkip = false;
     std::vector<const std::uint32_t*>* st = nullptr;
+    // A mesh's sway (kSwayUnpack): its 24 words left out, where they lie in memory that stays (a
+    // cached packet, or a REF of a mesh's data: not a part's chain, in the frame's memory).
+    bool swayFree = false, swaySkip = false, stable = true;
+    std::vector<const std::uint32_t*>* sway = nullptr;
+    // A skinned mesh's bones (kBoneUnpack): their 16 words left out, where they lie noted (chain:
+    // the part's chain's start, for those in it).
+    bool bonesFree = false, boneSkip = false;
+    std::vector<MaskAt>* bones = nullptr;
+    const std::uint32_t* chain = nullptr;
+    std::uint32_t boneCode = 0;
     // Whether the packet unpacks through the mask as it comes (a masked unpack before any STMASK
     // of its own), and whether it sets the mask: a part that does not read the mask it is met
     // with is the same part whatever that is.
@@ -2085,6 +2298,14 @@ struct PartHasher {
                 sampled = false;
                 at = 0;
                 stSkip = stFree && (code & kStUnpackMask) == kStUnpack && wl <= cl;
+                if (stFree && (code & kStUnpackMask) == kStUnpack && !(stSkip && stable) && st)
+                    st->push_back(nullptr);   // (one not left out: its place kept, the part compared by its words)
+                stSkip = stSkip && stable;
+                swaySkip = swayFree && stable && (code & kStUnpackMask) == kSwayUnpack && wl <= cl;
+                boneSkip = bonesFree && (code & kBoneMask) == kBoneUnpack && wl <= cl && (stable || chain);
+                boneCode = code;
+                if (swayFree && !swaySkip && (code & kStUnpackMask) == kSwayUnpack && sway)
+                    sway->push_back(nullptr);   // (one not left out: its place kept, the part compared by its words)
                 litSkip = litFree && LightUnpack(code) && wl <= cl;
                 litAddr = code & 0x3FF;
                 if (cmd == 0x20)
@@ -2135,6 +2356,38 @@ struct PartHasher {
                     continue;
                 }
             }
+            if (boneSkip) {
+                boneSkip = false;
+                if (take == 16 && left == 16) {   // (in one piece)
+                    if (bones) {
+                        MaskAt m;
+                        m.p = w + k;
+                        m.code = boneCode;
+                        if (!stable)
+                            m.fromChain = w + k - chain;
+                        bones->push_back(m);
+                    }
+                    k += 16;
+                    at += 16;
+                    left = 0;
+                    continue;
+                }
+                if (bones)
+                    bones->push_back(MaskAt());   // (not left out: in the hash)
+            }
+            if (swaySkip) {
+                swaySkip = false;
+                if (take == 24 && left == 24 && stable) {   // (in one piece)
+                    if (sway)
+                        sway->push_back(w + k);
+                    k += 24;
+                    at += 24;
+                    left = 0;
+                    continue;
+                }
+                if (sway)
+                    sway->push_back(nullptr);
+            }
             if (stSkip) {
                 stSkip = false;
                 if (take == 2 && left == 2) {   // (in one piece, as the game writes it)
@@ -2145,6 +2398,8 @@ struct PartHasher {
                     left = 0;
                     continue;
                 }
+                if (st)
+                    st->push_back(nullptr);
             }
             if (segs && !ignored && !segs->empty())
                 for (std::size_t i = 0; i < take; i++)
@@ -2212,9 +2467,15 @@ bool PartTte() { return (static_cast<volatile std::uint32_t*>(Native(kVif1))[0] 
 // packets of one shape leave VIF1's registers the same.
 std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow,
                        std::vector<const std::uint32_t*>* tex, bool shape, std::vector<const std::uint32_t*>* st, std::uint8_t* maskUse,
-                       bool lit, std::vector<LitAt>* litAt)
+                       bool lit, std::vector<LitAt>* litAt, std::vector<const std::uint32_t*>* swayAt, std::vector<MaskAt>* boneAt)
 {
     PartHasher hasher;
+    hasher.bonesFree = !shape && lit && PartParamsOn() && SkinOn();   // (a part lit by VU1: the skinned ones)
+    hasher.bones = boneAt;
+    if (slow && !(target & 0x80000000u))
+        hasher.chain = At(target, false);
+    hasher.swayFree = !shape && PartParamsOn() && SwayOn();
+    hasher.sway = swayAt;
     hasher.litFree = lit && !shape;
     hasher.lit = litAt;
     struct MaskOut {   // (bit 0: read as met; bit 1: set)
@@ -2226,7 +2487,10 @@ std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::
                 *out = (std::uint8_t)((h.maskRead ? 1 : 0) | (h.maskSet ? 2 : 0));
         }
     } maskOut{hasher, maskUse};
-    hasher.stFree = !slow && !shape && PartParamsOn();
+    // (a part drawn the long way too: its texture offsets left out where they lie in memory that
+    // stays, a REF of a mesh's data; 53,000 changes over the 46 levels' tour were these)
+    static const bool stLong = !(std::getenv("SLY1_ST_LONG") && std::getenv("SLY1_ST_LONG")[0] == '0');
+    hasher.stFree = !shape && PartParamsOn() && (stLong || !slow);
     hasher.st = st;
     hasher.skipHeader = slow && !shape;
     hasher.shape = shape;
@@ -2275,6 +2539,9 @@ std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::
         if (tte)
             hasher.Feed(tag + 2, 2);
         std::uint32_t after = (tadr & 0x7FFFFFFFu) + 16;
+        // (a part drawn the long way: its chain's own data is in the frame's memory, written anew
+        // each frame at other places; what a REF names stays)
+        hasher.stable = !slow || id == 3 || id == 4;
         switch (id) {
         case 1:
             data(after, tagSpr, qwc);
@@ -2425,6 +2692,7 @@ struct DiffSeen {
     std::uint32_t header[44];
 };
 std::unordered_map<std::uint32_t, DiffSeen> g_diffSeen;
+std::atomic<bool> g_diffSeenClear{false};
 void PartDiff(std::uint32_t key, std::uint32_t target, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow, const std::uint32_t* header)
 {
     DiffSeen now;
@@ -2432,22 +2700,24 @@ void PartDiff(std::uint32_t key, std::uint32_t target, std::uint32_t cl, std::ui
     PartHash(target, true, cl, wl, tte, slow);
     g_diffSegs = nullptr;
     std::memcpy(now.header, header, sizeof now.header);
+    if (g_diffSeenClear.exchange(false))
+        g_diffSeen.clear();
     auto it = g_diffSeen.find(key);
     char kindName[24];
     std::snprintf(kindName, sizeof kindName, slow ? "long %d" : "cached %d", (int)header[37]);   // (with its lighting's mode)
     const char* kind = kindName;
-    g_diffCounts[std::string(kind) + " calls"]++;
+    DiffCount(std::string(kind) + " calls");
     {
         char name[64];
         std::snprintf(name, sizeof name, "%s calls of mode %d", kind, (int)header[37]);
-        g_diffCounts[name]++;
+        DiffCount(name);
     }
     if (it != g_diffSeen.end()) {
         const DiffSeen& was = it->second;
         char name[96];
         bool any = false;
         if (was.segs.size() != now.segs.size()) {
-            g_diffCounts[std::string(kind) + " other shape"]++;
+            DiffCount(std::string(kind) + " other shape");
             any = true;
         } else {
             std::set<std::string> kinds;
@@ -2468,7 +2738,7 @@ void PartDiff(std::uint32_t key, std::uint32_t target, std::uint32_t cl, std::ui
                 }
             }
             for (const std::string& n : kinds)
-                g_diffCounts[n]++;
+                DiffCount(n);
             any = !kinds.empty();
         }
         for (int q = 4; q < 11; q++)
@@ -2477,21 +2747,22 @@ void PartDiff(std::uint32_t key, std::uint32_t target, std::uint32_t cl, std::ui
                 for (int w = 0; w < 4; w++)
                     mask |= (was.header[q * 4 + w] != now.header[q * 4 + w]) << w;
                 std::snprintf(name, sizeof name, "%s header %d words %X%s", kind, q, q >= 8 ? mask : 0, any ? " (packet too)" : " (packet same)");
-                g_diffCounts[name]++;
+                DiffCount(name);
             }
         if (any)
-            g_diffCounts[std::string(kind) + " packet changed"]++;
+            DiffCount(std::string(kind) + " packet changed");
     } else {
-        g_diffCounts[std::string(kind) + " first seen"]++;
+        DiffCount(std::string(kind) + " first seen");
     }
     g_diffSeen[key] = std::move(now);
 }
 void PartDiffReport()
 {
+    std::lock_guard<std::mutex> lk(g_diffLock);
     for (const auto& kv : g_diffCounts)
         std::fprintf(stderr, "partdiff: %-44s %llu\n", kv.first.c_str(), (unsigned long long)kv.second);
     g_diffCounts.clear();
-    g_diffSeen.clear();
+    g_diffSeenClear = true;   // (the render thread's: cleared there, at its next part)
 }
 
 // The hook's NOP and then the call of target: true when the part has been drawn from what was
@@ -2514,7 +2785,35 @@ bool PartLitNow(const PartRecord& r, const std::uint32_t* header, gs::LitParams*
         const PartRecord::LitSource& s = r.lights[k];
         gs::LitLight& l = p.light[k];
         float dir[3], fade = 1.0f;
-        if (s.place) {
+        const float* scale = s.scale, * base = s.base;
+        static const float kOutside[3] = {23.0f, 23.0f, 23.0f};
+        if (s.view) {
+            // a spot light (0x154): the object's centre through its view and projection; outside
+            // the view the program goes on as a directional light from 25 (the first ramp) with a
+            // scale of 23 (0x179, as the microcode has it); inside, the cone's factor at the centre
+            // scales the light, its direction the spot's (27)
+            const float* m = s.view;
+            float c[4];
+            for (int i = 0; i < 4; i++)
+                c[i] = m[i] * centre[0] + m[4 + i] * centre[1] + m[8 + i] * centre[2] + m[12 + i];
+            const bool outside = !(c[3] > 0.0f) || std::fabs(c[0]) > c[3] || std::fabs(c[1]) > c[3] || std::fabs(c[2]) > c[3];
+            if (outside) {
+                std::memcpy(dir, s.ramp, 12);
+                scale = kOutside;
+            } else {
+                const float q = 1.0f / c[3];
+                const float x = std::fabs(c[0] * q), y = std::fabs(c[1] * q);
+                const float p[4] = {x, y, x * x + y * y, c[3]};
+                float f[4];
+                for (int i = 0; i < 4; i++) {
+                    f[i] = s.ramp[4 + i] * p[i] + s.ramp[i];
+                    f[i] = f[i] < 1.0f ? f[i] : 1.0f;
+                    f[i] = f[i] > 0.0f ? f[i] : 0.0f;
+                }
+                fade = f[0] * f[3] * f[2] * f[1];
+                std::memcpy(dir, s.dir, 12);
+            }
+        } else if (s.place) {
             float v[3] = {s.place[0] - centre[0], s.place[1] - centre[1], s.place[2] - centre[2]};
             const float len2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
             const float over = len2 == 0.0f ? 3.4028235e38f : 1.0f / std::sqrt(len2);
@@ -2532,8 +2831,8 @@ bool PartLitNow(const PartRecord& r, const std::uint32_t* header, gs::LitParams*
         const float over = len2 == 0.0f ? 3.4028235e38f : 1.0f / std::sqrt(len2);
         for (int i = 0; i < 3; i++) {
             l.dir[i] = turned[i] * over;
-            l.scale[i] = s.scale[i] * fade;
-            l.base[i] = s.base[i] * fade;
+            l.scale[i] = scale[i] * fade;
+            l.base[i] = base[i] * fade;
             l.colour[i] = s.colour[i];
         }
     }
@@ -2612,7 +2911,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
                           a.mask != regs.mask ? " mask" : "", a.mode != regs.mode ? " mode" : "", a.base != regs.base ? " base" : "", a.ofst != regs.ofst ? " ofst" : "",
                           a.tops != regs.tops ? " tops" : "", a.itops != regs.itops ? " itops" : "", a.dbf != regs.dbf ? " dbf" : "",
                           std::memcmp(a.row, regs.row, sizeof a.row) ? " row" : "", std::memcmp(a.col, regs.col, sizeof a.col) ? " col" : "");
-            g_diffCounts[name]++;
+            DiffCount(name);
         }
     };
     // The game turns VIF1's two buffers about from mesh to mesh, so a part comes in either half
@@ -2776,9 +3075,17 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
         PartRecord::St stNow[8];
         std::uint32_t stCount = 0;
         if (same && !r.stAt.empty()) {
-            same = r.stTarget == target;
+            // (a cached packet's offsets are read where they were found; a part drawn the long way
+            // has a chain of its own each frame, its offsets in REFs of its meshes' data, which the
+            // hash's tags say are the same)
+            same = r.slow || r.stTarget == target;
             for (std::size_t k = 0; same && k < r.stAt.size(); k++) {
                 PartRecord::St v;
+                if (!r.stAt[k]) {   // (one in the hash: as it was)
+                    if (!r.stStrict)
+                        stNow[k] = r.stWas[k];
+                    continue;
+                }
                 std::memcpy(&v, r.stAt[k], 8);
                 if (r.stStrict)
                     same = std::memcmp(&v, &r.stWas[k], 8) == 0;
@@ -2787,6 +3094,71 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             }
             if (same && !r.stStrict)
                 stCount = (std::uint32_t)r.stAt.size();
+        }
+        // a mesh's sway: its rows as the packet has them now, turned into the part's space by the
+        // header's 4 to 7 as 0x22B turns them, or the words as they were (swayStrict)
+        float swayNow[16][12];
+        std::uint32_t swayCount = 0;
+        if (same && !r.swayAt.empty()) {
+            if (r.swayStrict) {
+                for (std::size_t k = 0; same && k < r.swayAt.size(); k++)
+                    same = !r.swayAt[k] || std::memcmp(r.swayAt[k], &r.swayWas[k * 24], 96) == 0;   // (a null one is in the hash)
+            } else {
+                const float* h = reinterpret_cast<const float*>(header);
+                for (std::size_t k = 0; k < r.swayAt.size() && k < 16; k++) {
+                    const float* rows = reinterpret_cast<const float*>(r.swayAt[k]);
+                    for (int i = 0; i < 4; i++)
+                        for (int c = 0; c < 3; c++)
+                            swayNow[k][i * 3 + c] = rows[i * 4] * h[16 + c] + rows[i * 4 + 1] * h[20 + c] + rows[i * 4 + 2] * h[24 + c] + rows[i * 4 + 3] * h[28 + c];
+                }
+                swayCount = (std::uint32_t)std::min<std::size_t>(r.swayAt.size(), 15);
+            }
+        }
+        // a skinned part's bones: where they are in this frame's chain, as they are now, or as they
+        // were (boneStrict)
+        static std::vector<const std::uint32_t*> boneNow;   // (the render thread's)
+        std::uint32_t boneCount = 0;
+        if (same && !r.boneAt.empty()) {
+            const std::uint32_t* chain = slow && !(target & 0x80000000u) ? At(target, false) : nullptr;
+            const bool reach = r.boneAt.size() <= 255;
+            boneNow.resize(r.boneAt.size());
+            for (std::size_t k = 0; same && k < r.boneAt.size(); k++) {
+                const MaskAt& m = r.boneAt[k];
+                const std::uint32_t* now = m.fromChain >= 0 ? (chain ? chain + m.fromChain : nullptr) : m.p;
+                if (!m.p) {   // (one in the hash)
+                    now = nullptr;
+                } else if (!now || now[-1] != m.code) {   // (the chain laid out otherwise: run as ever)
+                    same = false;
+                    g_bonesMislaid++;
+                    break;
+                }
+                if (r.boneStrict)
+                    same = !now || std::memcmp(now, &r.boneWas[k * 16], 64) == 0;
+                else if (reach)
+                    boneNow[k] = now ? now : &r.boneWas[k * 16];
+            }
+            if (same && !r.boneStrict && reach)
+                boneCount = (std::uint32_t)r.boneAt.size();
+            {   // SLY1_SKIN_CHECK=5: the bones found by their place in the chain against a walk of it now
+                static const bool check = std::getenv("SLY1_SKIN_CHECK") && std::getenv("SLY1_SKIN_CHECK")[0] == '5';
+                if (check && boneCount) {
+                    std::vector<MaskAt> walked;
+                    PartHash(target, false, regs.cl, regs.wl, tte, slow, nullptr, false, nullptr, nullptr, litMode, nullptr, nullptr, &walked);
+                    static std::uint64_t parts, wrong, said;
+                    parts++;
+                    bool bad = walked.size() != r.boneAt.size();
+                    for (std::size_t k = 0; !bad && k < walked.size(); k++)
+                        bad = walked[k].p != boneNow[k];
+                    if (bad) {
+                        wrong++;
+                        if (said++ < 6)
+                            std::fprintf(stderr, "skin check 5: %zu bones walked, %zu kept; first other at %zd\n", walked.size(), r.boneAt.size(),
+                                         walked.size() == r.boneAt.size() ? std::distance(walked.begin(), std::mismatch(walked.begin(), walked.end(), boneNow.begin(), [](const MaskAt& m, const std::uint32_t* p) { return m.p == p; }).first) : (std::ptrdiff_t)-1);
+                    }
+                    if ((parts & (parts - 1)) == 0)
+                        std::fprintf(stderr, "skin check 5: %llu parts, %llu with bones elsewhere than their places say\n", (unsigned long long)parts, (unsigned long long)wrong);
+                }
+            }
         }
         // a part lit by VU1: its lights' words as the packet has them now (the same packets' words:
         // the hash covers the tags), or the lighting's parameters made of them for this frame
@@ -2818,6 +3190,8 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             texMoved = false;
             stCount = 0;
             hasLit = false;
+            swayCount = 0;
+            boneCount = 0;
         }
         if (!same)
             regsCensus(r.before);
@@ -2848,7 +3222,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             item.path = 5;
             item.part = r.kept;
             item.words = GsSpare();
-            item.words.resize(28 + 2 * stCount + (hasLit ? gs::kLitParamWords : 0));
+            item.words.resize(28 + 2 * stCount + (hasLit ? gs::kLitParamWords : 0) + 12 * swayCount + 16 * boneCount);
             float matrix[16];
             if (r.slow) {
                 vu1::PartMatrixFrom(reinterpret_cast<const float*>(header), matrix);
@@ -2866,10 +3240,78 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             // this frame's numbers for the renderer: the alpha's scale, and how far each texture
             // offset is from what the kept vertices have in them
             item.words[26] = header[36];
-            item.words[27] = stCount | (hasLit ? 0x10000u : 0u);
+            item.words[27] = stCount | (hasLit ? 0x10000u : 0u) | swayCount << 20 | boneCount << 24;
             if (hasLit) {
                 std::memcpy(&item.words[28 + 2 * stCount], &litNow, sizeof litNow);
                 g_partsLitNow++;
+            }
+            if (swayCount) {
+                std::memcpy(&item.words[28 + 2 * stCount + (hasLit ? gs::kLitParamWords : 0)], swayNow, 48 * swayCount);
+                g_partsSwayed++;
+            }
+            if (boneCount) {
+                std::uint32_t* to = &item.words[28 + 2 * stCount + (hasLit ? gs::kLitParamWords : 0) + 12 * swayCount];
+                for (std::uint32_t k = 0; k < boneCount; k++)
+                    std::memcpy(to + 16 * k, boneNow[k], 64);
+                g_partsSkinned++;
+                static const bool verify = std::getenv("SLY1_SKIN_VERIFY") != nullptr;
+                if (verify) {   // what each kept batch would be drawn with, then the part run as ever
+                    g_skinVerify.on = true;
+                    g_skinVerify.next = 0;
+                    g_skinVerify.predicted.clear();
+                    g_skinVerify.colours.clear();
+                    g_skinVerify.normals.clear();
+                    for (const PartKept& kk : *r.kept) {
+                        if (kk.path != 4)
+                            continue;
+                        gs::Batch b;
+                        std::memcpy(&b, &kk.data[1], sizeof b);
+                        b.quads = kk.data + kBatchHead;
+                        std::vector<std::uint32_t> pos((std::size_t)b.count * 3, 0);
+                        if (b.skinWords) {
+                            b.skin = b.quads + (std::size_t)b.count * b.stride * 4 + b.litWords + b.swayWords;
+                            float mats[64] = {};
+                            for (int j = 0; j < 4; j++)
+                                if (b.boneSource[j] < boneCount)
+                                    std::memcpy(mats + 16 * j, &to[16 * b.boneSource[j]], 64);
+                            std::vector<std::uint32_t> q((std::size_t)b.count * b.stride * 4);
+                            std::vector<std::uint32_t> lit;
+                            float* normals = nullptr;
+                            if (b.litWords && b.skin[1]) {
+                                const std::uint32_t* l = b.quads + (std::size_t)b.count * b.stride * 4;
+                                lit.assign(l, l + b.litWords);
+                                normals = reinterpret_cast<float*>(lit.data() + gs::kLitHead);
+                            }
+                            gs::SkinQuads(b, mats, q.data(), normals);
+                            for (std::uint32_t k = 0; k < b.count; k++)
+                                std::memcpy(&pos[k * 3], &q[(k * b.stride + b.positionAt) * 4], 12);
+                            std::vector<std::uint32_t> col;
+                            if (hasLit && !lit.empty()) {   // the kick's colours as the GS thread would make them
+                                gs::LitParams now = litNow, was;
+                                std::memcpy(&was, lit.data(), sizeof was);
+                                float add;
+                                std::memcpy(&add, lit.data() + gs::kLitParamWords, 4);
+                                now.start[1] += add;
+                                std::memcpy(now.one, was.one, sizeof now.one);
+                                if (now.lights == was.lights) {
+                                    b.lit = lit.data();
+                                    b.litNow = &now;
+                                    col.resize((std::size_t)b.count * 4);
+                                    gs::LitColoursNow(b, col.data());
+                                }
+                            }
+                            g_skinVerify.colours.push_back(std::move(col));
+                            g_skinVerify.normals.emplace_back(normals ? normals : nullptr, normals ? normals + (std::size_t)b.count * 3 : nullptr);
+                        } else {
+                            for (std::uint32_t k = 0; k < b.count; k++)
+                                std::memcpy(&pos[k * 3], &b.quads[(k * b.stride + b.positionAt) * 4], 12);
+                        }
+                        if (g_skinVerify.colours.size() < g_skinVerify.predicted.size() + 1)
+                            g_skinVerify.colours.emplace_back();
+                        g_skinVerify.predicted.push_back(std::move(pos));
+                    }
+                    return false;
+                }
             }
             for (std::uint32_t k = 0; k < stCount; k++) {
                 const float d[2] = {stNow[k].s - r.stWas[k].s, stNow[k].t - r.stWas[k].t};
@@ -3045,7 +3487,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     }
     {
         std::uint8_t maskUse = 1;
-        r.hashWhole = PartHash(target, true, regs.cl, regs.wl, tte, slow, &r.texAt, false, &r.stAt, &maskUse, litMode, &r.litAt);
+        r.hashWhole = PartHash(target, true, regs.cl, regs.wl, tte, slow, &r.texAt, false, &r.stAt, &maskUse, litMode, &r.litAt, &r.swayAt, &r.boneAt);
         r.maskRead = (maskUse & 1) != 0 || r.hashWhole == 0;
         r.maskSet = (maskUse & 2) != 0;
     }
@@ -3055,12 +3497,28 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
         r.texWas.push_back(v);
     }
     for (const std::uint32_t* q : r.stAt) {
+        if (!q) {
+            r.stWas.push_back({0.0f, 0.0f});
+            continue;
+        }
         PartRecord::St v;
         std::memcpy(&v, q, 8);
         r.stWas.push_back(v);
     }
     r.stTarget = target;
     r.stBase = g_vif1.StUnpacks();
+    for (const std::uint32_t* q : r.swayAt)
+        if (q)
+            r.swayWas.insert(r.swayWas.end(), q, q + 24);
+        else
+            r.swayWas.insert(r.swayWas.end(), 24, 0u);
+    r.swayBase = g_vif1.SwayUnpacks();
+    for (const MaskAt& m : r.boneAt)
+        if (m.p)
+            r.boneWas.insert(r.boneWas.end(), m.p, m.p + 16);
+        else
+            r.boneWas.insert(r.boneWas.end(), 16, 0u);
+    r.boneBase = g_vif1.BoneUnpacks();
     {   // the part's lights, of the words left out: each begins with its colour (to 22)
         std::vector<PartRecord::LitSource> all;
         bool bad = false;
@@ -3082,6 +3540,12 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
                 all.back().atten = f;
             } else if (at.addr == 0x1A) {
                 all.back().place = f;
+            } else if (at.addr == 0x19 && at.words == 8) {
+                all.back().ramp = f;
+            } else if (at.addr == 0x1B && at.words == 3) {
+                all.back().dir = f;
+            } else if (at.addr == 0x1C && at.words == 16) {
+                all.back().view = f;
             } else {
                 bad = true;
             }
@@ -3095,7 +3559,10 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             }
         for (std::size_t k = 0; k < all.size(); k++) {
             const PartRecord::LitSource& l = all[k];
-            bad = bad || !l.scale || (l.dir != nullptr) == (l.atten != nullptr) || (l.atten != nullptr) != (l.place != nullptr) || l.colour != all[k % each].colour;
+            const bool spot = l.ramp || l.view;
+            const bool kind = spot ? (l.ramp && l.view && l.dir && !l.atten && !l.place)
+                                   : ((l.dir != nullptr) != (l.atten != nullptr) && (l.atten != nullptr) == (l.place != nullptr));
+            bad = bad || !l.scale || !kind || l.colour != all[k % each].colour;
         }
         r.litStrict = litMode && (bad || each == 0 || each > 4);
         if (!r.litStrict && litMode)
@@ -3275,6 +3742,10 @@ bool PartJobWork(PartJob& j, Collect& out)
     t_collect = &out;
     t_jobStCount = vif->StUnpacksAt();
     t_jobStBase = vif->StUnpacks();
+    t_jobSwayCount = vif->SwayUnpacksAt();
+    t_jobSwayBase = vif->SwayUnpacks();
+    t_jobVif = vif;
+    t_jobBoneBase = vif->BoneUnpacks();
     const std::uint64_t troubleWas = vu1::PartTrouble();
     vif->SetRegs(j.before);
     bool walked;
@@ -3287,6 +3758,8 @@ bool PartJobWork(PartJob& j, Collect& out)
     const bool right = walked && vif->BetweenCodes() && vif->GetRegs() == j.after;
     out.trouble = vu1::PartTrouble() != troubleWas;
     t_jobStCount = nullptr;
+    t_jobSwayCount = nullptr;
+    t_jobVif = nullptr;
     if (!vif->BetweenCodes()) {   // left inside a code: not used again
         delete vif;
         vif = nullptr;
@@ -3441,6 +3914,11 @@ void PartJobsKeep()
         for (std::size_t k = 0; ok && k < j.out.used; k++) {
             const GsItem& item = j.out.items[k];
             if ((item.path != 1 && item.path != 2 && item.path != 4) || item.kept) {
+                if (std::getenv("SLY1_PART_DIFF")) {
+                    char name[80];
+                    std::snprintf(name, sizeof name, "refusal: a job's item of path %d%s (%s mode %d)", item.path, item.kept ? " (kept)" : "", r.slow ? "long" : "cached", (int)r.header[37]);
+                    DiffCount(name);
+                }
                 ok = false;
                 break;
             }
@@ -3794,6 +4272,7 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
 // and batches of the header's matrix came of it.
 void PartDone()
 {
+    g_skinVerify.on = false;
     if (PartRecord* seen = g_partObserving) {
         g_partObserving = nullptr;
         PartJobSeen(*seen, g_observeBefore, !g_observeBad && g_vif1.BetweenCodes() && g_counts.vifInterrupts == g_observeInterrupts &&
@@ -3823,8 +4302,14 @@ void PartDone()
 void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs& after, const char* jobWhy)
 {
     std::uint32_t minId = ~0u, maxId = 0;
-    bool alphaStrict = false, stStrict = r->stAt.size() > 8, litStrict = r->litStrict;
-    std::uint64_t stUsed = 0;
+    bool alphaStrict = false, stStrict = r->stAt.size() > 8, litStrict = r->litStrict, swayStrict = r->swayAt.size() > 15;
+    for (const std::uint32_t* q : r->swayAt)
+        swayStrict = swayStrict || q == nullptr;
+    bool boneStrict = r->boneAt.size() > 254;
+    std::vector<char> boneUsed(r->boneAt.size(), 0);
+    for (const MaskAt& m : r->boneAt)
+        boneStrict = boneStrict || m.p == nullptr;
+    std::uint64_t stUsed = 0, swayUsed = 0;
     for (std::size_t k = 0; ok && k < r->items.size(); k++) {
         const std::vector<std::uint32_t>& w = *r->items[k].words;
         if (r->items[k].path == 4) {
@@ -3844,13 +4329,54 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
                 else
                     stStrict = true;
             }
+            if (b.swayWords != 0) {
+                if (b.swaySource < r->swayAt.size())
+                    swayUsed |= 1ull << b.swaySource;
+                else
+                    swayStrict = true;
+            }
+            if (b.skinWords != 0) {   // a skinned batch: each of its matrices a bone of the packet's
+                const std::size_t skinAt = kBatchHead + (std::size_t)b.count * b.stride * 4 + b.litWords + b.swayWords;
+                const std::uint32_t* skin = skinAt + b.skinWords <= w.size() ? &w[skinAt] : nullptr;
+                for (int j = 0; j < 4; j++) {
+                    {   // SLY1_SKIN_CHECK=3: the bone taken for matrix j against the matrix the loop used
+                        static const bool check = std::getenv("SLY1_SKIN_CHECK") && std::getenv("SLY1_SKIN_CHECK")[0] == '3';
+                        if (check && skin && gs::SkinUses(skin, b.count, j)) {
+                            static std::uint64_t n3, wrong3, unknown3;
+                            n3++;
+                            if (b.boneSource[j] >= r->boneAt.size()) {
+                                unknown3++;
+                            } else if (std::memcmp(&r->boneWas[b.boneSource[j] * 16], skin + 2 + 16 * j, 64) != 0) {
+                                wrong3++;
+                                if (wrong3 < 6) {
+                                    // which bone, if any, has it
+                                    int found = -1;
+                                    for (std::size_t q = 0; q < r->boneAt.size() && found < 0; q++)
+                                        if (std::memcmp(&r->boneWas[q * 16], skin + 2 + 16 * j, 64) == 0)
+                                            found = (int)q;
+                                    std::fprintf(stderr, "skin check 3: matrix %d at %u: taken bone %u, the one that has it %d (of %zu)\n", j, skin[0] + 4 * j, b.boneSource[j], found, r->boneAt.size());
+                                }
+                            }
+                            if ((n3 & (n3 - 1)) == 0)
+                                std::fprintf(stderr, "skin check 3: %llu matrices, %llu taken from another bone, %llu with none\n", (unsigned long long)n3, (unsigned long long)wrong3, (unsigned long long)unknown3);
+                        }
+                    }
+                    if (b.boneSource[j] < r->boneAt.size())
+                        boneUsed[b.boneSource[j]] = 1;
+                    else if (!skin || gs::SkinUses(skin, b.count, j))
+                        boneStrict = true;   // (one no vertex weighs needs no bone)
+                }
+            } else if (b.stride == 4 && !r->boneAt.empty()) {
+                // (a lit batch of a part with bones, its skinning not noted: by the bones as they were)
+                boneStrict = true;
+            }
             ok = std::memcmp(b.matrix, matrix, sizeof b.matrix) == 0;
             if (!ok && std::getenv("SLY1_PART_DIFF")) {
                 std::uint32_t hash, entry;
                 vu1::CurrentProgram(&hash, &entry);
                 char name[96];
                 std::snprintf(name, sizeof name, "refusal: batch %zu of %zu, matrix other (last program %08X 0x%03X)", k, r->items.size(), hash, entry);
-                g_diffCounts[name]++;
+                DiffCount(name);
             }
             if (b.id != 0) {
                 minId = std::min(minId, b.id);
@@ -3876,7 +4402,7 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
                     vu1::CurrentProgram(&hash, &entry);
                     char name[112];
                     std::snprintf(name, sizeof name, "refusal: packet tag flg %u nreg %u regs %X prim %X pre %u (last program %08X 0x%03X)", flg, nreg, w[q + 2], (w[q + 1] >> 15) & 0x7FF, (w[q+1]>>14)&1, hash, entry);
-                    g_diffCounts[name]++;
+                    DiffCount(name);
                 }
                 for (std::uint32_t i = 0; ok && i < nloop; i++) {
                     std::uint32_t reg = w[q + 4 + i * 4 + 2] & 0xFF;
@@ -3884,7 +4410,7 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
                     if (!ok && std::getenv("SLY1_PART_DIFF")) {
                         char name[96];
                         std::snprintf(name, sizeof name, "refusal: packet writes register %02X", reg);
-                        g_diffCounts[name]++;
+                        DiffCount(name);
                     }
                     if (reg == 0x06 && !r->texAt.empty()) {
                         std::uint64_t v;
@@ -3927,7 +4453,7 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
                           g_counts.finishes != r->finishesWas ? "a FINISH" : r->items.empty() ? "nothing queued" : "a batch's matrix or a packet's registers";
         char name[96];
         std::snprintf(name, sizeof name, "refused %s mode %d: %s", r->slow ? "long" : "cached", (int)r->header[37], why);
-        g_diffCounts[name]++;
+        DiffCount(name);
     }
     r->after = after;
     r->litStrict = litStrict;
@@ -3935,6 +4461,32 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
         r->lights.clear();
     r->alphaStrict = alphaStrict;
     r->stStrict = stStrict || stUsed != (r->stAt.size() >= 64 ? ~0ull : (1ull << r->stAt.size()) - 1);
+    r->swayStrict = swayStrict || swayUsed != (r->swayAt.size() >= 64 ? ~0ull : (1ull << r->swayAt.size()) - 1);
+    r->boneStrict = boneStrict || std::find(boneUsed.begin(), boneUsed.end(), 0) != boneUsed.end();
+    {   // SLY1_SKIN_LOG: why a part with bones is compared by them (partdiff:)
+        static const bool log = std::getenv("SLY1_SKIN_LOG") != nullptr;
+        if (log && !r->boneAt.empty()) {
+            int nulls = 0, skinned = 0, lit = 0, badSource = 0;
+            for (const MaskAt& m : r->boneAt)
+                nulls += m.p == nullptr;
+            for (const PartKept& kk : r->items) {
+                if (kk.path != 4)
+                    continue;
+                gs::Batch b;
+                std::memcpy(&b, &(*kk.words)[1], sizeof b);
+                lit += b.stride == 4;
+                if (b.skinWords) {
+                    skinned++;
+                    for (int j = 0; j < 4; j++)
+                        badSource += b.boneSource[j] >= r->boneAt.size();
+                }
+            }
+            char name[128];
+            std::snprintf(name, sizeof name, "skin: %s: bones %zu (%d in the hash), batches lit %d skinned %d, sources unknown %d, bones unused %d", r->boneStrict ? "strict" : "free",
+                          r->boneAt.size(), nulls, lit, skinned, badSource, (int)std::count(boneUsed.begin(), boneUsed.end(), 0));
+            DiffCount(name);
+        }
+    }
     r->firstId = minId == ~0u ? 0 : minId;
     r->ids = minId == ~0u ? 0 : maxId - minId + 1;
     r->keys = g_partKey + 1 - r->keyFirst;
@@ -3964,6 +4516,9 @@ void PartCountsLine(const char* what)
     PartDiffReport();
     std::fprintf(stderr, "partparams: %s: parts drawn again with another alpha's scale %llu, with a texture offset moved %llu, lit by this frame's lights %llu\n", what,
                  (unsigned long long)g_partsAlphaMoved, (unsigned long long)g_partsStMoved, (unsigned long long)g_partsLitNow);
+    std::fprintf(stderr, "partsway: %s: parts drawn again with their vertices moved by this frame's sway %llu, skinned by this frame's bones %llu\n", what,
+                 (unsigned long long)g_partsSwayed, (unsigned long long)g_partsSkinned);
+    std::fprintf(stderr, "partsway: %s: parts whose bones were not at their places in this frame's chain %llu\n", what, (unsigned long long)g_bonesMislaid);
     std::fprintf(stderr, "path1: %llu of VU1's packets joined the one before in its item; %llu outline edges put with the edge before\n", (unsigned long long)g_path1Joined.load(),
                  (unsigned long long)g_outlinesJoined.load());
     std::fprintf(stderr, "partjobs: making them: the shape %.2f s, the job %.2f, the copy %.2f, the queue %.2f; the render thread waited %.2f s for them at its lists' ends\n",
@@ -4519,8 +5074,12 @@ void GsThreadMain()
             std::memcpy(&alphaNow, &item.words[26], 4);
             const std::uint32_t stCount = item.words[27] & 0xFFFF;
             const bool hasLit = (item.words[27] & 0x10000u) != 0;
+            const std::uint32_t swayCount = (item.words[27] >> 20) & 0xF;
+            const std::uint32_t boneCount = (item.words[27] >> 24) & 0xFF;
             const std::size_t litAt = 28 + 2 * (std::size_t)stCount;
-            std::size_t fix = litAt + (hasLit ? gs::kLitParamWords : 0);
+            const std::size_t swayAt = litAt + (hasLit ? gs::kLitParamWords : 0);
+            const std::size_t boneAt = swayAt + 12 * (std::size_t)swayCount;
+            std::size_t fix = boneAt + 16 * (std::size_t)boneCount;
             for (std::size_t i = 0; i < part.size(); i++) {
                 const PartKept& kept = part[i];
                 if (i + 2 < part.size()) {
@@ -4562,6 +5121,60 @@ void GsThreadMain()
                     b.quads = w + head;
                     b.lit = b.litWords ? b.quads + (std::size_t)b.count * b.stride * 4 : nullptr;
                     b.litNow = nullptr;
+                    b.sway = b.swayWords ? b.quads + (std::size_t)b.count * b.stride * 4 + b.litWords : nullptr;
+                    b.swayMoved = false;
+                    b.skin = b.skinWords ? b.quads + (std::size_t)b.count * b.stride * 4 + b.litWords + b.swayWords : nullptr;
+                    b.skinMoved = false;
+                    static thread_local std::vector<std::uint32_t> skinned, litSkinned;
+                    if (b.skin && boneCount != 0) {
+                        // its vertices skinned by this frame's bones, and its normals for its lighting (a
+                        // matrix with no bone known is one no vertex weighs: the keeping said so)
+                        float mats[64] = {};
+                        for (int j = 0; j < 4; j++)
+                            if (b.boneSource[j] < boneCount)
+                                std::memcpy(mats + 16 * j, &item.words[boneAt + 16 * (std::size_t)b.boneSource[j]], 64);
+                        skinned.resize((std::size_t)b.count * b.stride * 4);
+                        float* normals = nullptr;
+                        if (b.lit && b.skin[1]) {
+                            litSkinned.assign(b.lit, b.lit + b.litWords);
+                            normals = reinterpret_cast<float*>(litSkinned.data() + gs::kLitHead);
+                        }
+                        gs::SkinQuads(b, mats, skinned.data(), normals);
+                        {   // SLY1_SKIN_CHECK=4: this frame's bones against those it was kept with, and the kept
+                            // vertices skinned anew by the latter against themselves
+                            static const bool check = std::getenv("SLY1_SKIN_CHECK") && std::getenv("SLY1_SKIN_CHECK")[0] == '4';
+                            if (check) {
+                                static std::vector<std::uint32_t> again;
+                                again.resize(skinned.size());
+                                gs::SkinQuads(b, reinterpret_cast<const float*>(b.skin + 2), again.data(), nullptr);
+                                double self = 0, moved = 0;
+                                for (std::uint32_t k = 0; k < b.count; k++)
+                                    for (int c = 0; c < 3; c++) {
+                                        const std::size_t at = (k * b.stride + b.positionAt) * 4 + c;
+                                        const float* kept = reinterpret_cast<const float*>(w + head);
+                                        self = std::max<double>(self, std::fabs(reinterpret_cast<const float*>(again.data())[at] - kept[at]));
+                                        moved = std::max<double>(moved, std::fabs(reinterpret_cast<const float*>(skinned.data())[at] - kept[at]));
+                                    }
+                                double bones = 0;
+                                for (int q = 0; q < 64; q++)
+                                    bones = std::max<double>(bones, std::fabs(mats[q] - reinterpret_cast<const float*>(b.skin + 2)[q]));
+                                static int said;
+                                if (said++ < 30)
+                                    std::fprintf(stderr, "skin check 4: batch of %u: kept vertices skinned anew by their bones %g apart; by this frame's %g; the bones %g apart\n", b.count, self, moved, bones);
+                            }
+                        }
+                        b.quads = skinned.data();
+                        b.skinMoved = true;
+                        if (normals)
+                            b.lit = litSkinned.data();
+                    }
+                    if (b.sway && b.swaySource < swayCount) {   // its vertices moved by this frame's sway
+                        static thread_local std::vector<std::uint32_t> moved;
+                        moved.resize((std::size_t)b.count * b.stride * 4);
+                        gs::SwayQuads(b, reinterpret_cast<const float*>(&item.words[swayAt + 12 * (std::size_t)b.swaySource]), moved.data());
+                        b.quads = moved.data();
+                        b.swayMoved = true;
+                    }
                     gs::LitParams litNow;
                     if (hasLit && b.lit) {   // this frame's lighting, with the batch's own start and vf01
                         std::memcpy(&litNow, &item.words[litAt], sizeof litNow);
@@ -4600,6 +5213,10 @@ void GsThreadMain()
             b.quads = item.kept ? item.kept->data() + head : &item.words[head];
             b.lit = b.litWords ? b.quads + (std::size_t)b.count * b.stride * 4 : nullptr;
             b.litNow = nullptr;
+            b.sway = b.swayWords ? b.quads + (std::size_t)b.count * b.stride * 4 + b.litWords : nullptr;
+            b.swayMoved = false;
+            b.skin = b.skinWords ? b.quads + (std::size_t)b.count * b.stride * 4 + b.litWords + b.swayWords : nullptr;
+            b.skinMoved = false;
             if (!gs::DrawBatch(item.words[0], b))
                 g_batchesRefused++;   // not a strip the renderer takes: nothing drawn of it
         } else {

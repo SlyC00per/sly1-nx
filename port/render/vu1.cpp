@@ -380,8 +380,44 @@ std::uint64_t Run(std::uint32_t start, const Context& ctx)
         Runner r(ctx);
         BeforeProgram(h ? h->fn : nullptr, r);
     }
-    if (!h)
+    if (!h) {
+        // SLY1_PROJ_DUMP=N: the first N runs of 0x750, 0x752 and 0x754 (chunk 51A89CD8, the
+        // projected texture), with what they read and what they change of VU1's memory
+        static const int projDump = std::getenv("SLY1_PROJ_DUMP") ? std::atoi(std::getenv("SLY1_PROJ_DUMP")) : 0;
+        static int projSaid;
+        const std::uint32_t e = start & 0x7FF;
+        if ((e == 0x750 || e == 0x752 || e == 0x754) && g_currentHash == 0x51A89CD8u && projSaid >= projDump) {
+            const std::uint64_t res = Interpret(start, ctx);
+            SwayNoted(ctx.top, e);
+            return res;
+        }
+        if (projSaid < projDump && (e == 0x750 || e == 0x752 || e == 0x754)) {
+            projSaid++;
+            static std::uint8_t was[16384];
+            std::uint8_t* d = Data();
+            std::memcpy(was, d, sizeof was);
+            const std::uint64_t res = Interpret(start, ctx);
+            const std::uint32_t top = ctx.top & 0x3FF;
+            auto q = [&](const std::uint8_t* m, std::uint32_t a) { return reinterpret_cast<const float*>(m + ((a & 0x3FF) * 16)); };
+            std::fprintf(stderr, "proj: entry 0x%03X top %u; header 4-7, 11, 13, 22-27 before:\n", e, top);
+            for (std::uint32_t k : {4u, 5u, 6u, 7u, 11u, 13u, 22u, 23u, 24u, 25u, 26u, 27u}) {
+                const float* f = q(was, top + k);
+                const std::uint32_t* w = reinterpret_cast<const std::uint32_t*>(f);
+                std::fprintf(stderr, "proj:   %2u: %g %g %g %g (%08X %08X %08X %08X)\n", k, f[0], f[1], f[2], f[3], w[0], w[1], w[2], w[3]);
+            }
+            int shown = 0;
+            for (std::uint32_t a = 0; a < 1024 && shown < 24; a++)
+                if (std::memcmp(was + a * 16, d + a * 16, 16) != 0) {
+                    shown++;
+                    const float* b = q(was, a), * n = q(d, a);
+                    std::fprintf(stderr, "proj:   changed %4u (top+%d): %g %g %g %g -> %g %g %g %g\n", a, (int)a - (int)top, b[0], b[1], b[2], b[3], n[0], n[1], n[2], n[3]);
+                }
+            if (g_currentHash == 0x51A89CD8u)
+                SwayNoted(ctx.top, e);
+            return res;
+        }
         return Interpret(start, ctx);
+    }
     if (!check) {
         Runner r(ctx);
         static const bool profile = std::getenv("SLY1_VU1_PROFILE") != nullptr;

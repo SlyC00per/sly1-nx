@@ -112,6 +112,7 @@ struct Source {
     bool placed = false;
     bool kept = false;        // placed in keepMem_, not in the frame's memory
     bool colourFrame = false; // a kept batch's colours are this frame's, in the frame's memory (a lit part drawn again)
+    bool vertexFrame = false; // a kept batch's positions and STQ are this frame's, in the frame's memory (a part swayed)
     std::int8_t* doubled = nullptr;   // a kept batch's: where Doubled's answer for it is kept (Kept::doubled)
     bool allCullable = false; // a batch's: every triangle is one dropped when it faces away (the GPU can cull)
     std::uint8_t alphaMin = 0, alphaMax = 255;   // of the vertices' alpha, where it is known
@@ -1681,6 +1682,23 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
             src.colourAt = k.colourAt;
             src.indexAt = k.indexAt;
             src.doubled = &it->doubled;
+            if (b.swayMoved || b.skinMoved) {   // its vertices moved (sway, skinning) this frame: positions and STQ in the frame's memory
+                const std::uint32_t bytes = b.count * 32;
+                if (frameUsed_ + bytes + 64 > kFrameMemory)
+                    Send(true);
+                frameUsed_ = Align(frameUsed_, 16);
+                std::uint8_t* out = static_cast<std::uint8_t*>(dkMemBlockGetCpuAddr(frameMem_)) + frameUsed_;
+                const std::uint32_t step = b.stride * 4;
+                for (std::uint32_t v = 0; v < b.count; v++, out += 32) {
+                    const std::uint32_t* q = b.quads + v * step;
+                    std::memcpy(out, q + b.positionAt * 4, 16);
+                    std::memcpy(out + 16, q + b.stqAt * 4, 16);
+                }
+                src.vertexAt = frameUsed_;
+                src.vertexFrame = true;
+                frameUsed_ += bytes;
+                copiedBytes_ += bytes;
+            }
             if (litColours) {   // its colours in the frame's memory, as a batch not kept has them
                 const std::uint32_t bytes = b.count * 16;
                 if (frameUsed_ + bytes + 64 > kFrameMemory)
@@ -2412,9 +2430,10 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     }
     if (src.placed) {   // the batch's two streams where DrawBatch put them
         DkGpuAddr base = dkMemBlockGetGpuAddr(src.kept ? keepMem_ : frameMem_);
+        const DkGpuAddr vertexBase = src.vertexFrame ? dkMemBlockGetGpuAddr(frameMem_) : base;
         const std::uint32_t count = src.batch->count;   // the streams' sizes exactly (an emulator tracks what is bound)
         const DkGpuAddr own = (src.colourFrame ? dkMemBlockGetGpuAddr(frameMem_) : base) + src.colourAt;
-        DkBufExtents streams[4] = {{base + src.vertexAt, count * 32}, {own, count * 16}, {src.layers >= 1 ? src.layerColours[0] : own, count * 16},
+        DkBufExtents streams[4] = {{vertexBase + src.vertexAt, count * 32}, {own, count * 16}, {src.layers >= 1 ? src.layerColours[0] : own, count * 16},
                                    {src.layers >= 2 ? src.layerColours[1] : own, count * 16}};
         dkCmdBufBindVtxBuffers(cmd_, 0, streams, 4);
         firstIndex = src.indexAt / 4;

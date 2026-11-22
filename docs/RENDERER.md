@@ -1513,3 +1513,66 @@ lockstep, 28 frames within 1 of 255 of `SLY1_PART_REPLAY=0`; `--verify-levels` w
 jobs, 1 wrong (0 to 2 in the runs since a part's first sight makes it a job by its shape: a job
 that leaves other registers than foretold is caught and its part run in its turn after; the
 cause is not found).
+
+## The survey of all levels, spot lights, and skinned parts drawn again (2026-11-22)
+
+**The survey.** `SLY1_TOUR=arrivals` with `--verify-levels` toured every level's arrival points
+with the camera turning (39 of the 46 have them; Treasure in the Depths has no player object).
+A second pass with `SLY1_PART_DIFF` faulted at the eleventh level: the census's table was counted
+by the render thread and printed and cleared by the host's main thread at each level's end. It
+is now taken under a lock (`DiffCount`), and the table of packets seen is cleared by the render
+thread itself. What changed in parts' packets over the 46 levels, the largest: the bones of
+skinned parts (some 90,000 changes for each bone's place), six quadwords to 22 in parts drawn
+the long way (262,000: the inputs of 0x076, below, and of the sway), eight quadwords to 48 in
+unlit cached parts (126,000, not looked into), texture offsets in parts drawn the long way
+(53,000).
+
+**Six quadwords to 22.** Two programs read them. 0x750, 0x752 and 0x754 of chunk 51A89CD8 (run
+on the interpreter: no handler) are a sway: rows 22 to 25 turned into the part's space by the
+header's 4 to 7 (0x22B), and each vertex's position moved by its four weights (the array at
+11.w) times those rows. The kept vertices are now moved by how much the rows changed
+(`gs::Batch::sway`, `gs::SwayQuads`, `kSwayUnpack`; `SLY1_SWAY=0`: not), but the sway runs a few
+hundred times in a whole tour: most of those quadwords are 0x076's (sprites drawn at a mesh's
+transformed vertices through another matrix), whose parts are refused when kept (their packets
+carry vertices made for the frame's view). Not done.
+
+**Texture offsets in parts drawn the long way** are left out of the hash too where they lie in
+a REF of a mesh's data (`PartHasher::stable`); those in the part's own chain stay in the hash.
+
+**Spot lights.** A part lit four vertices at a time by a spot light (0x1DE with 9.y 4: 0x154,
+then 0x0FE) is now drawn again with this frame's lighting: the light's view and projection (28
+to 31) take the object's centre; outside the view the program goes on as a directional light
+from 25 with a scale of 23, inside the cone's factor there (the two ramps at 25 and 26) scales
+the light (`PartLitNow`). `SLY1_LIT_CHECK=1` over Treasure in the Depths: 21.9 million values, 2
+other by one.
+
+**Skinned parts** (0x401 and 0x411 of chunk 2DDC9AA2: each vertex's position through four
+matrices blended by its weights; its normal through their 3x3 parts, made unit length):
+
+- What the skinning begins from is noted (`SkinCapture`): the positions at 0x401, the normals at
+  0x411 (they are unpacked after the positions are skinned: read at 0x401 they were another
+  batch's), the weights, the four matrices. A morph or a program on the microcode after it drops
+  it. The batch carries it (`gs::Batch::skin`).
+- The bones (`kBoneUnpack`: four quadwords to a mesh's bone place) are left out of the hash. They
+  are in the part's own chain, written each frame at another place: noted as words from the
+  chain's start (`MaskAt`), and taken only where the same unpack's code is before them (the
+  verdict may be the helper's, of the list before, and a chain laid out otherwise has other
+  words there: 443 parts over the 46 levels).
+- Which bone each of a batch's four matrices was is the last bone unpack to its place
+  (`Vif::LastBoneAt`, `BoneSources`); a place no vertex weighs needs none.
+- Drawn again, each batch's positions and normals are skinned by this frame's bones on the GS
+  thread (`gs::SkinQuads`), and its colours made from the new normals and this frame's lights.
+  The Switch's renderer puts the positions in the frame's memory (`Source::vertexFrame`).
+
+Checks: `SLY1_SKIN_CHECK=2` (the formula against 0x401's own output: 2,048 batches the same),
+`=3` (the bone taken against the matrix the loop used: 4,096 the same), `=5` (the bones by their
+places against a walk of the chain), and `SLY1_SKIN_VERIFY=1` with `SLY1_PART_JOBS=0` (a part that
+would be drawn again run as ever, each batch compared with what drawing it again would give):
+16,384 batches with the same positions, 16,384 lit with 68 colours further than one (the frame
+after a part's lights change). Level 4 under lockstep with the software batches: 39 frames
+within 1 of 255 of `SLY1_PART_REPLAY=0` (with the normals read too early, Sly's colours were up
+to 150 off from frame 1,140 on); Paris: 28 frames within 3. On the host's tour of A Stealthy
+Approach the parts lit by VU1 run as jobs 3.7 a frame against 6.6, 5,474 skinned parts drawn
+again; `--verify-levels` with `SLY1_PART_JOBS_CHECK=1`: all 46 levels, 32,132 skinned parts drawn
+again, 333,185 jobs against 389,003, 4 leaving other registers than foretold (caught, as before).
+`SLY1_SKIN=0` turns the skinning off.

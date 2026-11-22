@@ -47,6 +47,9 @@ std::uint64_t PartTrouble();
 // given this frame (words of a gs::LitParams, or null), for the handlers to compare with what the
 // programs light the part's batches with as it runs.
 void LitExpect(const void* params);
+// (port/render/vu1.cpp) The sway's program (0x750, 0x752, 0x754 of chunk 51A89CD8) has run on the
+// interpreter at TOP top: what it moved the batch by is noted for the batch (gs::Batch::sway).
+void SwayNoted(std::uint32_t top, std::uint32_t entry);
 void PartSkipped();
 std::uint32_t TakeBatchIds(std::uint32_t count);
 

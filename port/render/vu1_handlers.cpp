@@ -454,6 +454,8 @@ struct Deferred {
     float alphaScale = 1.0f;
     bool alphaFromHeader = false, alphaCopied = false;
     bool lit = false;       // LitFor(top) is this batch's
+    bool sway = false;      // SwayFor(top) is this batch's: its vertices were moved by the sway
+    bool skin = false;      // SkinFor(top) is this batch's: its vertices were skinned
     int kick = 0;           // which of the batch's kicks comes next: 0 the surface, 1 and 2 its shares
     bool stApplied = false, stPending = false;
     std::uint16_t stTop = 0;
@@ -466,7 +468,7 @@ bool PartParams()
 }
 struct LaneCounts {
     std::map<std::uint64_t, std::uint64_t> lateBy;   // late transforms by program (hash << 12 | entry)
-    std::uint64_t lateNs = 0, lateVertices = 0, skippedOverwritten = 0, notTaken = 0, taken = 0;
+    std::uint64_t lateNs = 0, lateVertices = 0, skippedOverwritten = 0, notTaken = 0, taken = 0, swayed = 0;
 };
 Deferred g_mainDeferred;
 LaneCounts g_mainCounts;
@@ -545,6 +547,35 @@ struct LitCapture {
 };
 thread_local LitCapture t_lit[2];
 thread_local const void* t_litExpect = nullptr;   // (vu1::LitExpect)
+
+// What the sway (0x750, 0x752, 0x754 of chunk 51A89CD8) moved a batch's vertices by, by TOP, in the
+// thread that runs the part: the four displacements in the part's space (rows 22 to 25 as the
+// program leaves them, turned by the header's 4 to 7) and each vertex's four weights (the array at
+// 11.w); which quadword of a vertex it moved (vi05: 0, 2 or 3). For the batch whose transform
+// comes next at that TOP (gs::Batch::sway).
+struct SwayCapture {
+    bool valid = false;
+    std::uint16_t top = 0;
+    int at = 0, n = 0, stride = 0;
+    float d[12];
+    float weights[256][4];
+};
+thread_local SwayCapture t_sway[2];
+SwayCapture& SwayFor(std::uint16_t top) { return t_sway[top > 256 ? 1 : 0]; }
+
+// What the skinning (0x401, and 0x411 for the normals) began from, by TOP: each vertex's position
+// and normal before, its weights, and where the four matrices were (11.z), for the batch whose
+// transform comes next at that TOP (gs::Batch::skin). A morph or a program on the microcode after
+// it drops it: the positions are not the skinning's alone then.
+struct SkinCapture {
+    bool valid = false, normals = false;
+    std::uint16_t top = 0, mats = 0;
+    int n = 0;
+    float pos[256][3], nrm[256][3], weights[256][4];
+    float mats4[64];   // the four matrices the loop skinned by
+};
+thread_local SkinCapture t_skin[2];
+SkinCapture& SkinFor(std::uint16_t top) { return t_skin[top > 256 ? 1 : 0]; }
 std::atomic<std::uint64_t> g_litNotAsNoted{0};   // batches whose sums were not what their noted lights give
 LitCapture& LitFor(std::uint16_t top) { return t_lit[top > 256 ? 1 : 0]; }
 void LitInvalidate(std::uint16_t top)
@@ -754,6 +785,61 @@ bool KickDeferred(Runner& r, std::uint16_t top, std::uint16_t tag)
             b.litKick = (std::uint8_t)d.kick;
         }
     }
+    {   // what the skinning began from goes with the vertices (gs::Batch::skin). SLY1_SKIN=0: not.
+        static const bool skinOff = std::getenv("SLY1_SKIN") && std::getenv("SLY1_SKIN")[0] == '0';
+        const SkinCapture& c = SkinFor(top);
+        if (!skinOff && d.skin && (std::uint32_t)c.n == count) {
+            static thread_local std::vector<std::uint32_t> blob;
+            blob.assign(gs::SkinWords(count), 0);
+            blob[0] = c.mats;
+            blob[1] = c.normals ? 1 : 0;
+            std::memcpy(&blob[2], c.mats4, 256);
+            std::memcpy(&blob[gs::kSkinHead], c.pos, (std::size_t)count * 12);
+            std::memcpy(&blob[gs::kSkinHead + (std::size_t)count * 3], c.nrm, (std::size_t)count * 12);
+            std::memcpy(&blob[gs::kSkinHead + (std::size_t)count * 6], c.weights, (std::size_t)count * 16);
+            b.skin = blob.data();
+            b.skinWords = (std::uint32_t)blob.size();
+            // SLY1_SKIN_CHECK=1: the positions skinned anew from what was noted, by the matrices at
+            // the batch's 11.z now, against those the program made
+            static const bool check = std::getenv("SLY1_SKIN_CHECK") != nullptr;
+            if (check) {
+                float mats[64];
+                for (int k = 0; k < 16; k++)
+                    std::memcpy(mats + 4 * k, r.Qword((std::uint16_t)(top + c.mats + k)), 16);
+                static thread_local std::vector<std::uint32_t> again;
+                again.resize((std::size_t)count * b.stride * 4);
+                gs::SkinQuads(b, mats, again.data(), nullptr);
+                static std::uint64_t batches, wrong, said;
+                double worst = 0;
+                for (std::uint32_t k = 0; k < count; k++)
+                    for (int i = 0; i < 3; i++) {
+                        const float x = reinterpret_cast<const float*>(again.data())[(k * b.stride + b.positionAt) * 4 + i];
+                        const float y = reinterpret_cast<const float*>(b.quads)[(k * b.stride + b.positionAt) * 4 + i];
+                        worst = std::max<double>(worst, std::fabs(x - y));
+                    }
+                batches++;
+                if (worst > 0.05) {
+                    wrong++;
+                    if (said++ < 6)
+                        std::fprintf(stderr, "skin check: batch of %u at top %u, matrices at %u: furthest %g apart\n", count, top, c.mats, worst);
+                }
+                if ((batches & (batches - 1)) == 0 || batches % 20000 == 0)
+                    std::fprintf(stderr, "skin check: %llu skinned batches, %llu skinned anew further than 0.05\n", (unsigned long long)batches, (unsigned long long)wrong);
+            }
+        }
+    }
+    {   // what the sway moved the vertices by goes with them (gs::Batch::sway). SLY1_SWAY=0: not.
+        static const bool swayOff = std::getenv("SLY1_SWAY") && std::getenv("SLY1_SWAY")[0] == '0';
+        const SwayCapture& w = SwayFor(top);
+        if (!swayOff && d.sway && (std::uint32_t)w.n == count) {
+            static thread_local std::vector<std::uint32_t> blob;
+            blob.assign(gs::SwayWords(count), 0);
+            std::memcpy(blob.data(), w.d, sizeof w.d);
+            std::memcpy(&blob[gs::kSwayHead], w.weights, (std::size_t)count * 16);
+            b.sway = blob.data();
+            b.swayWords = (std::uint32_t)blob.size();
+        }
+    }
     {   // SLY1_LIT_CHECK=1: gs::LitColoursOf on what was noted of the batch's lighting, against the
         // colours the programs made (this kick's), a value at a time
         static const bool litCheck = std::getenv("SLY1_LIT_CHECK") != nullptr;
@@ -908,6 +994,18 @@ bool BatchTransform(Runner& r, const int stride, const Test test, const std::uin
                 Def().lit = stride == 4 && c.valid && c.final && c.top == top && c.n == span / stride;
                 c.final = false;
                 Def().kick = 0;
+                SkinCapture& sk = SkinFor(top);
+                Def().skin = stride == 4 && sk.valid && sk.top == top && sk.n == span / stride;
+                sk.valid = false;
+                SwayCapture& w = SwayFor(top);
+                Def().sway = w.valid && w.top == top && w.stride == stride && w.at == stride - 1 && w.n == span / stride;
+                {
+                    static const bool log = std::getenv("SLY1_SWAY_LOG") != nullptr;
+                    static int said;
+                    if (log && w.valid && !Def().sway && said++ < 20)
+                        std::fprintf(stderr, "sway: not the batch's: noted top %u stride %d at %d n %d; the batch top %u stride %d n %d\n", w.top, w.stride, w.at, w.n, top, stride, span / stride);
+                }
+                w.valid = false;
             }
             Def().stApplied = Def().stPending && Def().stTop == top;
             Def().stPending = false;
@@ -2174,6 +2272,26 @@ bool Skin(Runner& r)
     V hdr = Load(r, top + 11);
     std::uint16_t step = Half(Load(r, top + 13).x);
     std::uint16_t back = (std::uint16_t)(step - 1);
+    {   // noted before the positions are skinned (gs::Batch::skin)
+        SkinCapture& c = SkinFor(top);
+        c.valid = false;
+        const int n = Count((std::uint16_t)(top + Half(hdr.x) + back), (std::uint16_t)(top + Half(hdr.y) + back), step);
+        if (step == 4 && n > 0 && n <= 256) {
+            const std::uint16_t first = (std::uint16_t)(top + Half(hdr.x));
+            const std::uint16_t weights = (std::uint16_t)(top + Half(hdr.w));
+            for (int k = 0; k < n; k++) {
+                std::memcpy(c.pos[k], r.Qword((std::uint16_t)(first + 4 * k + back)), 12);
+                std::memcpy(c.weights[k], r.Qword((std::uint16_t)(weights + k)), 16);
+            }
+            c.top = top;
+            c.mats = (std::uint16_t)Half(hdr.z);
+            for (int k = 0; k < 16; k++)
+                std::memcpy(c.mats4 + 4 * k, r.Qword((std::uint16_t)(top + c.mats + k)), 16);
+            c.n = n;
+            c.normals = false;
+            c.valid = true;
+        }
+    }
     float vf[32][4];
     std::memcpy(vf, st.vf, sizeof vf);
     if (!SkinLoop(r, vf, (std::uint16_t)(top + Half(hdr.x) + back), (std::uint16_t)(top + Half(hdr.y) + back), step,
@@ -2181,6 +2299,41 @@ bool Skin(Runner& r)
         return false;
     std::memcpy(st.vf, vf, sizeof vf);
     st.pc = 0x411;
+    {   // SLY1_SKIN_CHECK=2: the formula against the loop's own output, at once
+        static const bool check = std::getenv("SLY1_SKIN_CHECK") && std::getenv("SLY1_SKIN_CHECK")[0] == '2';
+        const SkinCapture& c = SkinFor(top);
+        if (check && c.valid && c.top == top) {
+            static std::uint64_t n2, wrong2, said2;
+            double worst = 0;
+            int worstK = -1;
+            for (int k = 0; k < c.n; k++) {
+                const float* p = c.pos[k], * wk = c.weights[k];
+                float sp[3] = {0, 0, 0};
+                for (int j = 0; j < 4; j++) {
+                    const float* m = r.Qword((std::uint16_t)(top + c.mats + 4 * j));
+                    for (int cc = 0; cc < 3; cc++)
+                        sp[cc] += wk[j] * (m[cc] * p[0] + m[4 + cc] * p[1] + m[8 + cc] * p[2] + m[12 + cc]);
+                }
+                const float* out = r.Qword((std::uint16_t)(top + Half(hdr.x) + 4 * k + back));
+                for (int cc = 0; cc < 3; cc++)
+                    if (std::fabs(out[cc] - sp[cc]) > worst) {
+                        worst = std::fabs(out[cc] - sp[cc]);
+                        worstK = k;
+                    }
+            }
+            n2++;
+            if (worst > 0.05) {
+                wrong2++;
+                if (said2++ < 4) {
+                    const float* out = r.Qword((std::uint16_t)(top + Half(hdr.x) + 4 * worstK + back));
+                    std::fprintf(stderr, "skin check 2: n %d step %u mats %u: vertex %d: before %g %g %g weights %g %g %g %g -> %g %g %g\n", c.n, step, c.mats, worstK,
+                                 c.pos[worstK][0], c.pos[worstK][1], c.pos[worstK][2], c.weights[worstK][0], c.weights[worstK][1], c.weights[worstK][2], c.weights[worstK][3], out[0], out[1], out[2]);
+                }
+            }
+            if ((n2 & (n2 - 1)) == 0)
+                std::fprintf(stderr, "skin check 2: %llu, %llu further than 0.05\n", (unsigned long long)n2, (unsigned long long)wrong2);
+        }
+    }
     return true;
 }
 
@@ -2981,6 +3134,16 @@ bool SkinNormals(Runner& r)
     State& st = r.s;
     std::uint16_t top = (std::uint16_t)r.ctx.top;
     V hdr = Load(r, top + 11);
+    {   // (the normals, read at 0x401 as they were, are skinned too: gs::Batch::skin)
+        // (the normals are unpacked after the positions are skinned: read here, as they come)
+        SkinCapture& c = SkinFor(top);
+        if (c.valid && c.top == top && (std::uint16_t)Half(hdr.z) == c.mats) {
+            const std::uint16_t first = (std::uint16_t)(top + Half(hdr.x));
+            for (int k = 0; k < c.n; k++)
+                std::memcpy(c.nrm[k], r.Qword((std::uint16_t)(first + 4 * k)), 12);
+            c.normals = true;
+        }
+    }
     std::uint16_t vi05 = (std::uint16_t)(top + Half(hdr.x)), vi06 = (std::uint16_t)(top + Half(hdr.y) + 8);
     std::uint16_t span = (std::uint16_t)(vi06 - vi05);
     if (span == 0 || (span & 3) || span > 0x400)
@@ -3252,7 +3415,10 @@ bool SpotLight(Runner& r)
 {
     State& st = r.s;
     std::uint16_t top = (std::uint16_t)r.ctx.top;
-    LitInvalidate(top);
+    // (four at a time, 9.y 4, the spot ends in LightFourWide, which notes it as a light; the other
+    // way it lights each vertex by its own place in the cone, which the formula does not follow)
+    if (Half(Load(r, top + 9).y) != 4)
+        LitInvalidate(top);
     float (*vf)[4] = st.vf;
     auto g = [&](int k) { V x = {}; std::memcpy(&x, vf[k], 16); return x; };
     auto xyz = [&](int k, const V& x) { std::memcpy(vf[k], &x, 12); };
@@ -3853,10 +4019,15 @@ bool Morph(Runner& r, std::uint16_t offset, std::uint32_t endPc)
 
 bool MorphFromStride(Runner& r)
 {
+    SkinFor((std::uint16_t)r.ctx.top).valid = false;   // (the positions are not the skinning's alone)
     std::uint16_t top = (std::uint16_t)r.ctx.top;
     return Morph(r, (std::uint16_t)(Half(Load(r, top + 13).x) - 1), 0x477);
 }
-bool MorphFromStart(Runner& r) { return Morph(r, 0, 0x477); }
+bool MorphFromStart(Runner& r)
+{
+    SkinFor((std::uint16_t)r.ctx.top).valid = false;   // (the positions are not the skinning's alone)
+    return Morph(r, 0, 0x477);
+}
 
 // --- 0x47E of chunk 2DDC9AA2: a batch's normals made unit length and laid out four at a time,
 // as 0x411 without the matrices: the loop pipelined two deep, MFP reading the ERLENG of two
@@ -3995,6 +4166,7 @@ void BeforeProgram(Handler fn, core::Runner& r)
 void LeftToMicrocode(core::Runner& r)
 {
     LitInvalidate((std::uint16_t)r.ctx.top);   // (a program on the microcode may light the batch too)
+    SkinFor((std::uint16_t)r.ctx.top).valid = false;   // (or move its vertices)
     Materialise(r);
 }
 
@@ -4088,6 +4260,39 @@ std::uint64_t PartTrouble()
 }
 
 void LitExpect(const void* params) { t_litExpect = params; }
+
+void SwayNoted(std::uint32_t top32, std::uint32_t entry)
+{
+    Context ctx;
+    ctx.top = top32;
+    Runner r(ctx);
+    const std::uint16_t top = (std::uint16_t)(top32 & 0x3FF);
+    SwayCapture& w = SwayFor(top);
+    w.valid = false;
+    const V hdr = Load(r, top + 11);
+    const int stride = Half(Load(r, top + 13).x);
+    const std::uint16_t first = (std::uint16_t)(top + Half(hdr.x)), end = (std::uint16_t)(top + Half(hdr.y));
+    const int n = stride > 0 ? (std::uint16_t)(end - first) / stride : 0;
+    if (stride <= 0 || stride > 4 || n <= 0 || n > 256 || (std::uint16_t)(end - first) % stride)
+        return;
+    w.top = top;
+    w.at = entry == 0x750 ? 0 : entry == 0x752 ? 2 : 3;
+    w.n = n;
+    w.stride = stride;
+    for (int i = 0; i < 4; i++)
+        std::memcpy(&w.d[i * 3], r.Qword((std::uint16_t)(top + 22 + i)), 12);
+    const std::uint16_t weights = (std::uint16_t)(top + Half(hdr.w));
+    for (int k = 0; k < n; k++)
+        std::memcpy(w.weights[k], r.Qword((std::uint16_t)(weights + k)), 16);
+    w.valid = true;
+    Cnt().swayed++;
+    {   // SLY1_SWAY_LOG: how the sways go (a line for each 1,024th)
+        static const bool log = std::getenv("SLY1_SWAY_LOG") != nullptr;
+        static std::atomic<std::uint64_t> seen{0};
+        if (log && (++seen & 1023) == 1)
+            std::fprintf(stderr, "sway: %llu noted; this one entry 0x%03X top %u stride %d at %d vertices %d\n", (unsigned long long)seen.load(), entry, top, stride, w.at, n);
+    }
+}
 
 // The part's packet was not run: no batch waits for its kicks.
 void PartSkipped()
