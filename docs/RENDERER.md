@@ -1486,3 +1486,30 @@ batches, 28 frames within 1 of 255 of `SLY1_PART_REPLAY=0` (the software drawing
 edge's second line where it has one: the pictures are the same without them); `--verify-levels`
 with `SLY1_PART_JOBS_CHECK=1`: all 46 levels, 388,710 jobs, 0 wrong, 7.4 million edges put with
 the edge before.
+
+### On the Switch, and the parts drawn again (2026-11-22)
+
+Played at a1497e8 (Paris), the GS thread's time for VU1's packets was 1.26 ms a frame for 365
+items in the windows at 60 frames a second, against 2.74 ms for 1,109 in the play before; the
+outlines looked as before. What is left is the parts drawn again: 7.85 ms a frame there for 271
+parts (29 microseconds each), 12.35 ms for 424 in the windows over 18.5 ms.
+
+Three things for them, none of which changes what is drawn:
+
+- **A kept packet is its register writes** (`PartKeepFinish`: path 7, a register and its value's
+  halves, a tag's PRIM first; `SLY1_PART_WRITES=0`: the packet as it was). The GS thread makes
+  the writes without the GIF's reading of tags and quadwords. A TEX0 moved is put at its place
+  among the writes.
+- **A texture found before, with nothing uploaded since, is taken without its pages being
+  walked** (`Renderer::TextureFor`: the walk was for the latest upload to them, which cannot be
+  another).
+- **Whether a kept batch has a triangle twice** is kept with the batch (`Kept::doubled`), not
+  looked up by its key in a table of its own.
+
+On the host's tour the GS thread's time for the parts drawn again went from 0.95 to 0.75 ms a
+frame with the first (the other two are the Switch renderer's). Checked: level 4 under
+lockstep, 28 frames within 1 of 255 of `SLY1_PART_REPLAY=0`; `--verify-levels` with
+`SLY1_PART_JOBS_CHECK=1`: all 46 levels, 64,174 parts drawn again with a texture moved, 389,003
+jobs, 1 wrong (0 to 2 in the runs since a part's first sight makes it a job by its shape: a job
+that leaves other registers than foretold is caught and its part run in its turn after; the
+cause is not found).

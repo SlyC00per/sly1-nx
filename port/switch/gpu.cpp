@@ -112,6 +112,7 @@ struct Source {
     bool placed = false;
     bool kept = false;        // placed in keepMem_, not in the frame's memory
     bool colourFrame = false; // a kept batch's colours are this frame's, in the frame's memory (a lit part drawn again)
+    std::int8_t* doubled = nullptr;   // a kept batch's: where Doubled's answer for it is kept (Kept::doubled)
     bool allCullable = false; // a batch's: every triangle is one dropped when it faces away (the GPU can cull)
     std::uint8_t alphaMin = 0, alphaMax = 255;   // of the vertices' alpha, where it is known
     std::uint32_t vertexAt = 0, colourAt = 0, indexAt = 0;
@@ -350,6 +351,7 @@ private:
         std::uint32_t at = 0, bytes = 0, indexAt = 0, vertexAt = 0, colourAt = 0, indices = 0, count = 0;
         bool allCullable = false;
         std::uint8_t alphaMin = 0, alphaMax = 255;
+        std::int8_t doubled = -1;   // Doubled's answer for its vertices, once asked (-1: not yet)
     };
     struct FreeBlock {
         std::uint32_t at, bytes;
@@ -425,6 +427,7 @@ private:
     struct Recent {
         std::uint64_t key = 0;
         const Texture* texture = nullptr;
+        std::uint32_t uploads = 0;   // gs::UploadSerial() when it was found (0: a movie's picture, looked up each time)
     };
     Recent recent_[64];
     void KeptAhead(std::uint64_t keep) override { kept_.ahead(keep); }
@@ -439,6 +442,7 @@ private:
     int cullBound_ = 0;   // the rasteriser's culling bound: 0 none, 1 the faces a batch drops
     std::uint64_t culledDraws_ = 0, onePassDraws_ = 0, twoPassDraws_ = 0;
     std::vector<std::uint32_t> staging_;   // a batch's indices, positions or colours made before they are copied
+    std::uint64_t recentHits_ = 0;   // textures found again with nothing uploaded since
     std::vector<std::uint32_t> litStaging_;   // a lit part's colours for this frame (DrawBatch)
     std::uint64_t litNowBatches_ = 0;
     std::uint64_t batches_ = 0, batchVertices_ = 0;
@@ -971,6 +975,16 @@ const Texture* Renderer::TextureFor(const gs::DrawState& state)
 {
     // what names the texels: TBP0, TBW, PSM, TW, TH and the palette's CBP, CPSM, CSM, CSA
     std::uint64_t key = state.tex0 & 0x1FFFFFE3FFFFFFFFull;
+    // (found before, and nothing uploaded since: its pages' latest upload, which TextureGeneration
+    // walks them for, cannot be another. 7% of the GS thread's samples were this lookup.)
+    const std::uint32_t uploadsNow = gs::UploadSerial();
+    {
+        const Recent& was = recent_[(key * 0x9E3779B97F4A7C15ull) >> 58];
+        if (was.texture && was.key == key && was.uploads == uploadsNow && uploadsNow != 0) {
+            recentHits_++;
+            return was.texture;
+        }
+    }
     std::uint32_t generation = gs::TextureGeneration(state);
     {   // a movie's picture: copied into the texture's corner as it is, with no reading of the GS's memory
         const std::uint32_t* picture;
@@ -1004,11 +1018,13 @@ const Texture* Renderer::TextureFor(const gs::DrawState& state)
     }
     // the last textures found, by their keys, before the map (its lookup is memory not seen lately)
     Recent& recent = recent_[(key * 0x9E3779B97F4A7C15ull) >> 58];
-    if (recent.texture && recent.key == key && recent.texture->generation == generation)
+    if (recent.texture && recent.key == key && recent.texture->generation == generation) {
+        recent.uploads = uploadsNow;
         return recent.texture;
+    }
     auto it = textures_.find(key);
     if (it != textures_.end() && it->second.generation == generation) {
-        recent = {key, &it->second};
+        recent = {key, &it->second, uploadsNow};
         return &it->second;
     }
     std::uint64_t hash = gs::TextureSource(state);
@@ -1414,7 +1430,15 @@ void Renderer::Layer(const gs::DrawState& s, const Source& src, const gs::Batch&
         surface_.on = true;
         surface_.s = s;
         surface_.src = src;
-        surface_.doubled = Doubled(b);
+        // (a kept batch's answer is with what is kept of it: no lookup by its key)
+        if (src.doubled && *src.doubled >= 0) {
+            surface_.doubled = *src.doubled != 0;
+            doubledBatches_ += surface_.doubled ? 1 : 0;
+        } else {
+            surface_.doubled = Doubled(b);
+            if (src.doubled)
+                *src.doubled = surface_.doubled ? 1 : 0;
+        }
         surface_.batch = b;
         surface_.texture = texture_;
         return;
@@ -1653,6 +1677,7 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
             src.vertexAt = k.vertexAt;
             src.colourAt = k.colourAt;
             src.indexAt = k.indexAt;
+            src.doubled = &it->doubled;
             if (litColours) {   // its colours in the frame's memory, as a batch not kept has them
                 const std::uint32_t bytes = b.count * 16;
                 if (frameUsed_ + bytes + 64 > kFrameMemory)

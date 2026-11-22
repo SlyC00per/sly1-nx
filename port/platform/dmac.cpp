@@ -3857,9 +3857,19 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
                 maxId = std::max(maxId, b.id);
             }
         } else {
-            // a path's packet: tags of A+D writes alone, and none to a vertex's registers
+            // a path's packet: tags of A+D writes alone, and none to a vertex's registers.
+            // Kept as the writes themselves (path 7: a register, its value's two halves; a tag's
+            // PRIM first where it sets one), for the GS thread to make without the GIF's reading
+            // of tags and quadwords (a fifth of its time was the registers' way in).
+            std::vector<std::uint32_t> flat;
+            flat.reserve(w.size());
             for (std::size_t q = 0; ok && q + 4 <= w.size();) {
                 std::uint32_t nloop = w[q] & 0x7FFF, flg = (w[q + 1] >> 26) & 3, nreg = (w[q + 1] >> 28) & 0xF;
+                if ((w[q + 1] >> 14) & 1) {   // PRE
+                    flat.push_back(0x00);
+                    flat.push_back((w[q + 1] >> 15) & 0x7FF);
+                    flat.push_back(0);
+                }
                 ok = flg == 0 && nreg == 1 && (w[q + 2] & 0xF) == 0xE && q + 4 + (std::size_t)nloop * 4 <= w.size();
                 if (!ok && std::getenv("SLY1_PART_DIFF")) {
                     std::uint32_t hash, entry;
@@ -3883,12 +3893,31 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
                         while (which < r->texWas.size() && r->texWas[which] != v)
                             which++;
                         if (which < r->texWas.size())
-                            r->texFix.push_back({(std::uint32_t)k, (std::uint32_t)(q + 4 + i * 4), (std::uint32_t)which});
+                            r->texFix.push_back({(std::uint32_t)k, (std::uint32_t)(flat.size() + 1), (std::uint32_t)which});
                         else
                             r->texStrict = true;
                     }
+                    if (ok) {
+                        flat.push_back(reg);
+                        flat.push_back(w[q + 4 + i * 4]);
+                        flat.push_back(w[q + 4 + i * 4 + 1]);
+                    }
                 }
                 q += 4 + (std::size_t)nloop * 4;
+            }
+            static const bool asWrites = !(std::getenv("SLY1_PART_WRITES") && std::getenv("SLY1_PART_WRITES")[0] == '0');
+            if (ok && asWrites) {
+                const std::size_t was = w.size();
+                r->words = r->words + flat.size() - std::min<std::uint64_t>(r->words, was);
+                g_partWords = g_partWords + flat.size() - std::min<std::uint64_t>(g_partWords, was);
+                r->items[k] = {7, std::make_shared<const std::vector<std::uint32_t>>(std::move(flat))};
+            } else if (asWrites) {
+                // (texFix's places were the writes': a packet refused is not kept, so they are not used)
+            } else {
+                // SLY1_PART_WRITES=0: the packet as it was, and the TEX0s' places in it
+                for (PartRecord::TexFix& f : r->texFix)
+                    if (f.item == k)
+                        r->texStrict = true;
             }
         }
     }
@@ -4547,6 +4576,10 @@ void GsThreadMain()
                     }
                     if (!gs::DrawBatch(w[0], b))
                         g_batchesRefused++;
+                } else if (kept.path == 7) {   // a packet kept as its register writes (PartKeepFinish)
+                    gs::Hold hold;
+                    for (std::size_t k = 0; k + 3 <= size; k += 3)
+                        gs::Write(w[k], w[k + 1] | (std::uint64_t)w[k + 2] << 32);
                 } else {
                     Gif& gif = kept.path == 1 ? g_path1 : g_path2;
                     gs::Hold hold;
