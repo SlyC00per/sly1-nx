@@ -979,8 +979,11 @@ const Texture* Renderer::TextureFor(const gs::DrawState& state)
     // walks them for, cannot be another. 7% of the GS thread's samples were this lookup.)
     const std::uint32_t uploadsNow = gs::UploadSerial();
     {
+        // (SLY1_GPU_TEX_FAST=0: not; =ab: in turn with not, 600 frames each, to measure it in one run)
+        static const char* const e = std::getenv("SLY1_GPU_TEX_FAST");
+        const bool fast = !e || (e[0] == 'a' ? frames_ / 600 % 2 == 0 : e[0] != '0');
         const Recent& was = recent_[(key * 0x9E3779B97F4A7C15ull) >> 58];
-        if (was.texture && was.key == key && was.uploads == uploadsNow && uploadsNow != 0) {
+        if (fast && was.texture && was.key == key && was.uploads == uploadsNow && uploadsNow != 0) {
             recentHits_++;
             return was.texture;
         }

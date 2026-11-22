@@ -56,6 +56,10 @@ namespace port { inline void CheckDevTable(const char*) {} }
 struct Player;
 struct Vec4;
 void func_00178008(Player*, Vec4*);   // the game's SetPlayerPosition (SLY1_WARP)
+struct World;
+std::int32_t func_0015A4F0(World* world, std::uint32_t flags, std::int32_t id, void* scope, std::int32_t max, void* found);   // GatherObjectsById (SLY1_TOUR=arrivals)
+struct BaseObject;
+void func_001F3BD8(BaseObject* self, Vec4* out);   // GetObjectWorldPosition
 struct GameProgress;
 struct IdentityKey;
 void func_001F0428(IdentityKey*, std::int32_t, std::int32_t);   // the game's StartObjectFade (SLY1_FADE_TO)
@@ -401,6 +405,44 @@ void VerifyLevels()
             int frames = 480, stop = 0;
             std::sscanf(tour, "%d", &frames);
             const char* at = std::strchr(tour, ':');
+            // SLY1_TOUR=arrivals[:frames]: the stops are the level's arrival points (class 0x74: where
+            // the player comes into the level and where it is put back after a fall, FindArrivalPoint),
+            // which lie along the way through it: the same tour for any level, without a played route
+            // (the user's idea, 2026-11-22). With --verify-levels: every level's.
+            static std::string arrivals;
+            if (std::strncmp(tour, "arrivals", 8) == 0) {
+                frames = 240;
+                if (tour[8] == ':')
+                    frames = std::max(1, std::atoi(tour + 9));
+                static std::uint32_t found[64 + 4];   // (the game's pointers: its own 32-bit addresses)
+                static float places[64][4] __attribute__((aligned(16)));
+                static std::int32_t count;
+                static std::atomic<bool> gathered;
+                count = 0;
+                gathered = false;
+                if (word(0x00275710) != 0 && word(0x00262E10) != 0) {
+                    port::CallOnGameThread([] {   // (run by the game's thread in its turn: waited for)
+                        count = ::func_0015A4F0((::World*)port::Native(*(std::uint32_t*)port::Native(0x00275710)), 0x205, 0x74, nullptr, 64, found);
+                        for (std::int32_t k = 0; k < count && k < 64; k++)
+                            if (found[k] != 0)
+                                ::func_001F3BD8((::BaseObject*)port::Native(found[k]), (::Vec4*)places[k]);
+                        gathered = true;
+                    });
+                    waitFor([&] { return gathered.load(); }, 30);
+                }
+                arrivals = ":";
+                for (std::int32_t k = 0; k < count && k < 64; k++) {
+                    float p[3];
+                    if (found[k] == 0)
+                        continue;
+                    std::memcpy(p, places[k], sizeof p);
+                    char one[96];
+                    std::snprintf(one, sizeof one, "%s%.1f,%.1f,%.1f", k ? ";" : "", (double)p[0], (double)p[1], (double)p[2]);
+                    arrivals += one;
+                }
+                std::fprintf(stderr, "tour: %d arrival points in the level (world 0x%08X, player 0x%08X)\n", (int)count, (unsigned)word(0x00275710), (unsigned)word(0x00262E10));
+                at = count > 0 ? arrivals.c_str() : nullptr;
+            }
             while (at && at[1]) {
                 at++;
                 if (std::sscanf(at, "%f,%f,%f", &pos[0], &pos[1], &pos[2]) != 3)
