@@ -1419,3 +1419,40 @@ any other light, or a program left to the microcode, drops the notes), check the
 sums the programs left before the colours are made final, and give them to one batch only.
 `SLY1_LIT_CHECK=1` compares the formula's colours with the programs' at each kick: over the
 host's tours of Paris and A Stealthy Approach every value was the same (47 million in Paris).
+
+**The second stage: a lit part drawn again with this frame's lighting.**
+
+- A lit batch carries what was noted of its lighting after its vertices (`gs::Batch::lit`: the
+  parameters, what its mesh adds to the second sum's start, each vertex's normal and base
+  colour). `SLY1_LIT_GPU=0`: not.
+- A part in mode 4 has its lights' words left out of its hash (`LightUnpack`: the unpacks of a
+  light's packet, RefreshConeVolumeShape's: the colour to 22, the scale and base to 23 and 24, a
+  direction to 25 or an attenuation to 25 and a place to 26), and where they lie is noted
+  (`PartRecord::litAt`, grouped into the part's lights: every mesh refers to the same packets).
+  Its header is compared by the fog and the mode and count alone (`PartHeaderSame`'s `litFree`).
+- Drawn again, the part is given the lighting's parameters made for this frame (`PartLitNow`: a
+  point light's direction from the centre and its fade there, each direction turned by the
+  header's inverse matrix, as 0x142 and 0x0FE make them), and each kept batch its own with its
+  start and vf01 (`gs::Batch::litNow`). The renderer makes the kick's colours from them
+  (`gs::LitColoursNow`): the Switch's in `Renderer::DrawBatch`, on the GS thread, into the
+  frame's memory in place of the kept colours; the software batches and the counting renderer
+  likewise.
+- A part with a lit batch that has no lighting noted, or with lights not of the two kinds, is
+  compared by the words and the whole header as before (`litStrict`). `SLY1_LIT_REPLAY=0`: all.
+
+`SLY1_LIT_NOW_CHECK=1` (with `SLY1_PART_JOBS=0`) runs such a part all the same and compares what
+the programs light it with against what it would have been given: on the host's tour of Paris
+79,892 batches the same and 108 not, those lit by another light than the part was kept with
+(a part's hash is the helper's, of the list before: for one frame after its lights change it is
+lit by the old ones, as it is drawn as it was for one frame after anything else of it changes).
+
+On the host's tour of Paris: the parts in mode 4 drawn again 23.9 a frame against 7.1, their
+jobs 8.6 against 25.4 (what is left are skinned); all jobs 46.6 against 63.0. Checked: Paris
+under lockstep with the software batches, 28 frames within 3 of 255 of `SLY1_PART_REPLAY=0`;
+`--verify-levels` with `SLY1_PART_JOBS_CHECK=1`, 240 frames a level: all 46 levels, 282,013
+parts lit by their frame's lights, 387,167 jobs against 562,679, 2 of them leaving other
+registers than foretold (none before; not looked into yet).
+
+The colours are made on the GS thread, a vertex at a time, not in the shader: the renderer's
+vertex layout and its three colour streams stay as they are. The shader is the next step if
+the GS thread's time for it shows.

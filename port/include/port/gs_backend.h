@@ -54,6 +54,12 @@ struct LitParams {
     float one[3];          // vf01's x, y and z
     float colourScale;     // the header's 10.w, which the kicks' colours are scaled by
 };
+// What a lit batch carries of its lighting (Batch::lit), as words: the parameters it was lit with,
+// what its mesh adds to the second sum's start (13.y / 32768), the count of its vertices, then
+// each vertex's unit normal (three words) and each one's base colour and alpha (four).
+constexpr std::size_t kLitParamWords = (sizeof(LitParams) + 3) / 4;
+constexpr std::size_t kLitHead = kLitParamWords + 2;
+inline std::size_t LitWords(std::uint32_t count) { return kLitHead + (std::size_t)count * 7; }
 // The three colours (R, G, B each) of a vertex with this unit normal and base colour (R, G, B as
 // the mesh has them, 0 to 255): [0] the surface's, [1] and [2] the shares'. The programs'
 // arithmetic in the host's floats: within one of what they give.
@@ -117,7 +123,31 @@ struct Batch {
     bool alphaDeferred = false;   // alphaScale is the header's, not yet in the colours
     bool stApplied = false;       // the program that adds 22.x and y ran on the batch (they are in its S and T)
     std::uint8_t stSource = 0xFF; // while a part is kept: which of its packet's unpacks to 22 the batch's is
+    // A lit batch's lighting (kLitHead and after), when the programs' lights were all of the kind
+    // LitColoursOf follows: litWords words after the batch's vertices where a batch is kept as
+    // words. litKick: which of the three colours this kick draws. litNow, set for a part drawn
+    // again: the lighting's parameters this frame, for the renderer to make the kick's colours
+    // from (the vertices' own are those of the frame the part was kept in).
+    const std::uint32_t* lit = nullptr;
+    std::uint32_t litWords = 0;
+    std::uint8_t litKick = 0;
+    const LitParams* litNow = nullptr;
 };
+// A lit batch's colours for this frame (Batch::litNow), count times R, G, B and the alpha, as a
+// kick's vertices have them.
+inline void LitColoursNow(const Batch& b, std::uint32_t* out)
+{
+    const float* normal = reinterpret_cast<const float*>(b.lit + kLitHead);
+    const std::uint32_t* base = b.lit + kLitHead + (std::size_t)b.count * 3;
+    for (std::uint32_t k = 0; k < b.count; k++) {
+        std::int32_t c[3][3];
+        LitColoursOf(*b.litNow, normal + k * 3, base + k * 4, c);
+        out[k * 4] = (std::uint32_t)c[b.litKick][0];
+        out[k * 4 + 1] = (std::uint32_t)c[b.litKick][1];
+        out[k * 4 + 2] = (std::uint32_t)c[b.litKick][2];
+        out[k * 4 + 3] = base[k * 4 + 3];
+    }
+}
 constexpr std::uint32_t kStripStart = 0x8000, kCullable = 0x4000;   // bits of a vertex's control word
 
 // What a renderer's vertex shader computes of a batch's vertex k (port/switch/shaders/

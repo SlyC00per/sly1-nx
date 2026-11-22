@@ -575,9 +575,11 @@ bool QueueBatch(std::uint32_t tagWord1, const gs::Batch& b)
     const std::size_t head = 1 + (sizeof(gs::Batch) + 3) / 4, quads = (std::size_t)b.count * b.stride * 4;
     std::uint32_t record[1 + (sizeof(gs::Batch) + 3) / 4] = {tagWord1};
     std::memcpy(&record[1], &b, sizeof b);
-    item.words.reserve(head + quads);
+    item.words.reserve(head + quads + (b.lit ? b.litWords : 0));
     item.words.insert(item.words.end(), record, record + head);
     item.words.insert(item.words.end(), b.quads, b.quads + quads);
+    if (b.lit)   // (its lighting after its vertices: gs::Batch::lit)
+        item.words.insert(item.words.end(), b.lit, b.lit + b.litWords);
     GsEnqueue(std::move(item));
     g_batchesQueued++;
     return true;
@@ -662,6 +664,27 @@ void KickPath1(std::uint32_t qaddr, void*)
 // packet changes: they are left out of the part's hash and given to the renderer as numbers
 // (docs/RENDERER.md, "A part's numbers left to the renderer"). SLY1_PART_PARAMS=0: not.
 constexpr std::uint32_t kStUnpackMask = 0x7FFF83FFu, kStUnpack = 0x64018016u;
+// The unpacks of a light's packet (RefreshConeVolumeShape): its colour to 22 (four words), its
+// scale and base to 23 and 24 (eight), then a directional light's direction to 25, or a point light's attenuation to 25
+// and place to 26. A part lit by VU1 (mode 4) whose light moves has only these words other from
+// frame to frame; for such a part they are left out of its hash, and its colours are made from
+// what they hold each frame (docs/RENDERER.md, "A lit part's colours left to the renderer").
+inline bool LightUnpack(std::uint32_t code)
+{
+    const std::uint32_t c = code & kStUnpackMask;
+    return c == 0x6C018016u || c == 0x6C028017u || c == 0x68018019u || c == 0x64018019u || c == 0x6801801Au;
+}
+struct LitAt {
+    std::uint32_t addr, words;
+    const std::uint32_t* p;
+};
+// SLY1_LIT_REPLAY=0: a part lit by VU1 is kept and drawn again only while its lights and its
+// header are what they were, as before.
+bool LitReplayOn()
+{
+    static const bool off = std::getenv("SLY1_LIT_REPLAY") && std::getenv("SLY1_LIT_REPLAY")[0] == '0';
+    return !off;
+}
 bool PartParamsOn()
 {
     static const bool off = std::getenv("SLY1_PART_PARAMS") && std::getenv("SLY1_PART_PARAMS")[0] == '0';
@@ -1569,6 +1592,18 @@ struct PartRecord {
     // values must be what they were.
     bool alphaStrict = false, stStrict = false;
     bool maskRead = true, maskSet = false;   // (PartHasher's, of the packet it was kept from)
+    // A part lit by VU1 (mode 4). litAt: its lights' words left out of the hash, in the packet's
+    // order (every mesh refers to the same lights' packets); litWas: what they held when the part
+    // was kept; lights: the part's lights, made of them (LitSource), the same for each mesh.
+    // litStrict: a lit batch kept of it has no lighting noted, or the lights are not ones that are
+    // followed: the words and the header must be what they were.
+    struct LitSource {
+        const float* colour = nullptr, * scale = nullptr, * base = nullptr, * dir = nullptr, * atten = nullptr, * place = nullptr;
+    };
+    bool litStrict = false;
+    std::vector<LitAt> litAt;
+    std::vector<std::uint32_t> litWas;
+    std::vector<LitSource> lights;
     struct St {
         float s, t;
     };
@@ -1603,6 +1638,7 @@ struct HashJob {
     std::uint32_t key, serial, target, cl, wl;
     bool tte, whole, slow;
     std::uint32_t list;   // the list it came in (g_listSerial)
+    bool lit = false;     // (PartHash's: a part lit by VU1, its lights' words left out)
 };
 struct HashResult {
     std::uint32_t key, serial;
@@ -1674,6 +1710,7 @@ struct PartTurns {
 } g_partTurns;
 std::uint64_t g_partsSlowReplayed, g_partsSlowKept, g_partsSlowRefused;
 std::uint64_t g_partsAlphaMoved, g_partsStMoved;
+std::uint64_t g_partsLitNow;   // parts lit by VU1 drawn again with this frame's lighting
 // (SLY1_PERF_LOG's perfkeep: why a part is kept anew: 0 never kept, 1 to 3 kept and found other by
 // its hash, registers, header, 4 its moving mark ended, 5 known but not kept (refused, let go);
 // and why one is run here and watched: 0 never run here cleanly, 1 no registers known for its
@@ -1688,7 +1725,7 @@ std::uint64_t g_jobsByShape;       // parts made a job at first sight by another
 
 std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow = false,
                        std::vector<const std::uint32_t*>* tex = nullptr, bool shape = false, std::vector<const std::uint32_t*>* st = nullptr,
-                       std::uint8_t* maskUse = nullptr);
+                       std::uint8_t* maskUse = nullptr, bool lit = false, std::vector<LitAt>* litAt = nullptr);
 
 }  // namespace
 
@@ -1767,9 +1804,9 @@ void HashHelperMain()
             const HashJob& j = jobs[n];
             HashResult r = {j.key, j.serial, 0, 0, j.whole, true};
             if (!(j.slow && g_listsBegun.load(std::memory_order_acquire) != j.list)) {
-                r.hash = PartHash(j.target, false, j.cl, j.wl, j.tte, j.slow);
+                r.hash = PartHash(j.target, false, j.cl, j.wl, j.tte, j.slow, nullptr, false, nullptr, nullptr, j.lit);
                 if (j.whole)
-                    r.hashWhole = PartHash(j.target, true, j.cl, j.wl, j.tte, j.slow);
+                    r.hashWhole = PartHash(j.target, true, j.cl, j.wl, j.tte, j.slow, nullptr, false, nullptr, nullptr, j.lit);
             }
             if (j.slow && g_listsBegun.load(std::memory_order_acquire) != j.list) {
                 r.valid = false;
@@ -1910,6 +1947,10 @@ struct PartHasher {
     // of its own), and whether it sets the mask: a part that does not read the mask it is met
     // with is the same part whatever that is.
     bool maskRead = false, maskSet = false;
+    // A part lit by VU1: its lights' words (LightUnpack) left out, and noted when asked for.
+    bool litFree = false, litSkip = false;
+    std::vector<LitAt>* lit = nullptr;
+    std::uint32_t litAddr = 0;
     void Mix(std::uint32_t w)
     {
         h = (h ^ w) * 0x9E3779B97F4A7C15ull;
@@ -1928,6 +1969,8 @@ struct PartHasher {
                 sampled = false;
                 at = 0;
                 stSkip = stFree && (code & kStUnpackMask) == kStUnpack && wl <= cl;
+                litSkip = litFree && LightUnpack(code) && wl <= cl;
+                litAddr = code & 0x3FF;
                 if (cmd == 0x20)
                     maskSet = true;
                 else if ((cmd & 0x70) == 0x70 && !maskSet)
@@ -1965,6 +2008,17 @@ struct PartHasher {
                 continue;
             }
             const std::size_t take = std::min<std::size_t>(left, n - k);
+            if (litSkip) {
+                litSkip = false;
+                if (take == left) {   // (in one piece)
+                    if (lit)
+                        lit->push_back({litAddr, left, w + k});
+                    k += take;
+                    at += (std::uint32_t)take;
+                    left = 0;
+                    continue;
+                }
+            }
             if (stSkip) {
                 stSkip = false;
                 if (take == 2 && left == 2) {   // (in one piece, as the game writes it)
@@ -2041,9 +2095,12 @@ bool PartTte() { return (static_cast<volatile std::uint32_t*>(Native(kVif1))[0] 
 // registers), 0 when it has what a part's job must not (microcode loaded, an interrupt): two
 // packets of one shape leave VIF1's registers the same.
 std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow,
-                       std::vector<const std::uint32_t*>* tex, bool shape, std::vector<const std::uint32_t*>* st, std::uint8_t* maskUse)
+                       std::vector<const std::uint32_t*>* tex, bool shape, std::vector<const std::uint32_t*>* st, std::uint8_t* maskUse,
+                       bool lit, std::vector<LitAt>* litAt)
 {
     PartHasher hasher;
+    hasher.litFree = lit && !shape;
+    hasher.lit = litAt;
     struct MaskOut {   // (bit 0: read as met; bit 1: set)
         PartHasher& h;
         std::uint8_t* out;
@@ -2166,8 +2223,13 @@ bool KeepTwice()
     return twice;
 }
 bool g_headerNearAsked;   // (perfwait's count with SLY1_PART_HDR_EXACT: what the tolerance would have passed)
-bool PartHeaderSame(const std::uint32_t a[44], const std::uint32_t b[44], bool slow, bool alphaFree)
+bool PartHeaderSame(const std::uint32_t a[44], const std::uint32_t b[44], bool slow, bool alphaFree, bool litFree = false)
 {
+    // (litFree: a part lit by VU1 whose colours the renderer makes from this frame's header and
+    // lights: the inverse matrix, the centre and the colours' scale may be any; the fog and the
+    // mode and count must be what they were)
+    if (litFree)
+        return std::memcmp(a + 32, b + 32, 16) == 0 && std::memcmp(a + 37, b + 37, 12) == 0 && (alphaFree || a[36] == b[36]);
     // (alphaFree: the alpha's scale, 9.x, is the renderer's to apply: any will do)
     // (its mode, 9.y: -1 unlit and 0 lit by its cache alone read neither, as a part drawn from its
     // cache; the others are lit by VU1 from them)
@@ -2319,6 +2381,54 @@ void PartDiffReport()
 
 // The hook's NOP and then the call of target: true when the part has been drawn from what was
 // kept, and the call is not to be followed.
+// The lighting of a part lit by VU1, for this frame: each of its lights as the programs make it
+// before their loop (0x142 for a point light: the direction from the object's centre, the scale
+// and base faded by the distance there; then 0x0FE: the direction turned into the part's own
+// space by the header's inverse matrix and made unit length). start is 3 of VU1's data memory
+// as it is; a batch adds its own to the second (gs::Batch::lit), and has vf01.
+bool PartLitNow(const PartRecord& r, const std::uint32_t* header, gs::LitParams* out)
+{
+    if (r.lights.empty() || r.lights.size() > 4)
+        return false;
+    const float* h = reinterpret_cast<const float*>(header);
+    const float* rows = h + 16;      // quadwords 4, 5, 6
+    const float* centre = h + 40;    // quadword 10
+    gs::LitParams p;
+    p.lights = (std::uint32_t)r.lights.size();
+    for (std::size_t k = 0; k < r.lights.size(); k++) {
+        const PartRecord::LitSource& s = r.lights[k];
+        gs::LitLight& l = p.light[k];
+        float dir[3], fade = 1.0f;
+        if (s.place) {
+            float v[3] = {s.place[0] - centre[0], s.place[1] - centre[1], s.place[2] - centre[2]};
+            const float len2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+            const float over = len2 == 0.0f ? 3.4028235e38f : 1.0f / std::sqrt(len2);
+            fade = s.atten[0] + over * s.atten[1];
+            fade = fade > 0.0f ? (fade < 1.0f ? fade : 1.0f) : 0.0f;
+            for (int i = 0; i < 3; i++)
+                dir[i] = v[i] * over;
+        } else {
+            std::memcpy(dir, s.dir, 12);
+        }
+        float turned[3];
+        for (int i = 0; i < 3; i++)
+            turned[i] = rows[i] * dir[0] + rows[4 + i] * dir[1] + rows[8 + i] * dir[2];
+        const float len2 = turned[0] * turned[0] + turned[1] * turned[1] + turned[2] * turned[2];
+        const float over = len2 == 0.0f ? 3.4028235e38f : 1.0f / std::sqrt(len2);
+        for (int i = 0; i < 3; i++) {
+            l.dir[i] = turned[i] * over;
+            l.scale[i] = s.scale[i] * fade;
+            l.base[i] = s.base[i] * fade;
+            l.colour[i] = s.colour[i];
+        }
+    }
+    std::memcpy(p.start, vu1::Data() + 3 * 16, 8);
+    p.one[0] = p.one[1] = p.one[2] = 1.0f;   // (the batch's own: PartReplay's draw)
+    p.colourScale = h[43];
+    *out = p;
+    return true;
+}
+
 // What PartDecide found of the call, for PartCall to make a job of it.
 std::uint32_t g_callKey, g_callHeader[44], g_callHeaderAt;
 Vif::Regs g_callRegs;
@@ -2421,6 +2531,9 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     g_callHeaderAt = headerAt;
     g_callRegs = regs;
     g_callTte = tte;
+    // (a part lit by VU1: its lights' words are left out of its hash, PartHasher::litFree)
+    const bool litMode = slow && header[37] == 4 && PartParamsOn() && LitReplayOn();
+    const auto litFree = [&](const PartRecord& r) { return litMode && !r.litStrict; };
     static const bool diffOn = std::getenv("SLY1_PART_DIFF") != nullptr && std::getenv("SLY1_PART_HASH_NOW") != nullptr;
     if (diffOn)
         PartDiff(key, target, regs.cl, regs.wl, tte, slow, header);
@@ -2442,7 +2555,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             if (!r.asked) {
                 r.asked = true;
                 const bool whole = r.ok && (r.verified < 8 || ((gs::FramesShown() + key) & 31) == 0);
-                g_hashPending.push_back({key, r.serial, target, regs.cl, regs.wl, tte, whole, slow, g_listSerial});
+                g_hashPending.push_back({key, r.serial, target, regs.cl, regs.wl, tte, whole, slow, g_listSerial, litMode});
                 if (g_hashPending.size() >= 16)
                     HashPassOn();
             }
@@ -2450,7 +2563,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     }
     auto hashNow = [&] {
         const std::uint64_t h0 = NowNs();
-        const std::uint64_t h = PartHash(target, false, regs.cl, regs.wl, tte, slow);
+        const std::uint64_t h = PartHash(target, false, regs.cl, regs.wl, tte, slow, nullptr, false, nullptr, nullptr, litMode);
         g_partHashNs += NowNs() - h0;
         return h;
     };
@@ -2460,8 +2573,8 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     // thread's work walking on the Switch (the helper's hashes come a list late for them).
     if (!late && it != g_parts.end() && !it->second.moving && KeepTwice()) {
         PartRecord& r = it->second;
-        const bool asKept = r.ok && (ceiling || (sameRegs(r.before, !r.maskRead) && PartHeaderSame(r.header, header, slow, alphaFree(r))));
-        const bool asSeen = r.seenList != 0 && r.seenList + 1 >= g_listSerial && (ceiling || (sameRegs(r.seenRegs, r.ok && !r.maskRead) && PartHeaderSame(r.seenHeader, header, slow, alphaFree(r))));
+        const bool asKept = r.ok && (ceiling || (sameRegs(r.before, !r.maskRead) && PartHeaderSame(r.header, header, slow, alphaFree(r), litFree(r))));
+        const bool asSeen = r.seenList != 0 && r.seenList + 1 >= g_listSerial && (ceiling || (sameRegs(r.seenRegs, r.ok && !r.maskRead) && PartHeaderSame(r.seenHeader, header, slow, alphaFree(r), litFree(r))));
         if (!asKept && !asSeen) {
             if (r.ok) {
                 g_partsStale++;
@@ -2477,10 +2590,10 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
                 } else {
                     if (!(sameRegs(r.seenRegs, r.ok && !r.maskRead)))
                         g_waitWhy[3]++;
-                    if (!PartHeaderSame(a, header, slow, alphaFree(r))) {
+                    if (!PartHeaderSame(a, header, slow, alphaFree(r), litFree(r))) {
                         g_waitWhy[4]++;
                         g_headerNearAsked = true;
-                        if (PartHeaderSame(a, header, slow, alphaFree(r)))
+                        if (PartHeaderSame(a, header, slow, alphaFree(r), litFree(r)))
                             g_waitWhy[11]++;
                         g_headerNearAsked = false;
                         {   // SLY1_PART_HDR_LOG=frame: what is other in the headers, from that frame on (the first 60)
@@ -2529,7 +2642,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     }
     if (it != g_parts.end() && it->second.ok) {
         PartRecord& r = it->second;
-        bool same = hash != 0 && r.hash == hash && sameRegs(r.before, !r.maskRead) && PartHeaderSame(r.header, header, slow, alphaFree(r));
+        bool same = hash != 0 && r.hash == hash && sameRegs(r.before, !r.maskRead) && PartHeaderSame(r.header, header, slow, alphaFree(r), litFree(r));
         std::uint64_t texNow[4];
         bool texMoved = false;
         for (std::size_t k = 0; same && k < r.texAt.size(); k++) {
@@ -2560,10 +2673,36 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             if (same && !r.stStrict)
                 stCount = (std::uint32_t)r.stAt.size();
         }
+        // a part lit by VU1: its lights' words as the packet has them now (the same packets' words:
+        // the hash covers the tags), or the lighting's parameters made of them for this frame
+        gs::LitParams litNow;
+        bool hasLit = false;
+        if (same && !r.litAt.empty()) {
+            if (r.litStrict || !litMode) {
+                std::size_t at = 0;
+                for (const LitAt& l : r.litAt) {
+                    same = same && std::memcmp(l.p, &r.litWas[at], l.words * 4) == 0;
+                    at += l.words;
+                }
+            } else {
+                hasLit = PartLitNow(r, header, &litNow);
+                same = hasLit;
+                // SLY1_LIT_NOW_CHECK=1 (with SLY1_PART_JOBS=0): the part is run here all the same, and
+                // the handlers compare what the programs light it with against this (vu1::LitExpect)
+                static const bool check = std::getenv("SLY1_LIT_NOW_CHECK") != nullptr;
+                if (check && hasLit) {
+                    static gs::LitParams expect;
+                    expect = litNow;
+                    vu1::LitExpect(&expect);
+                    return false;
+                }
+            }
+        }
         if (ceiling) {
             same = r.kept != nullptr;   // (a record without its kept items faulted here at the end of the one run)
             texMoved = false;
             stCount = 0;
+            hasLit = false;
         }
         if (!same)
             regsCensus(r.before);
@@ -2571,7 +2710,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             g_partsStaleBy[keepWhy = (r.hash != hash ? 0 : !(sameRegs(r.before, !r.maskRead)) ? 1 : 2)]++, keepWhy++;
         const bool wholeDue = !ceiling && (late ? r.wholeArrived : (r.verified < 8 || ((gs::FramesShown() + key) & 31) == 0));
         if (same && wholeDue) {
-            const std::uint64_t whole = late ? r.seenWhole : PartHash(target, true, regs.cl, regs.wl, tte, slow);
+            const std::uint64_t whole = late ? r.seenWhole : PartHash(target, true, regs.cl, regs.wl, tte, slow, nullptr, false, nullptr, nullptr, litMode);
             r.wholeArrived = false;
             if (whole == r.hashWhole) {
                 r.verified++;
@@ -2594,7 +2733,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             item.path = 5;
             item.part = r.kept;
             item.words = GsSpare();
-            item.words.resize(28 + 2 * stCount);
+            item.words.resize(28 + 2 * stCount + (hasLit ? gs::kLitParamWords : 0));
             float matrix[16];
             if (r.slow) {
                 vu1::PartMatrixFrom(reinterpret_cast<const float*>(header), matrix);
@@ -2612,7 +2751,11 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             // this frame's numbers for the renderer: the alpha's scale, and how far each texture
             // offset is from what the kept vertices have in them
             item.words[26] = header[36];
-            item.words[27] = stCount;
+            item.words[27] = stCount | (hasLit ? 0x10000u : 0u);
+            if (hasLit) {
+                std::memcpy(&item.words[28 + 2 * stCount], &litNow, sizeof litNow);
+                g_partsLitNow++;
+            }
             for (std::uint32_t k = 0; k < stCount; k++) {
                 const float d[2] = {stNow[k].s - r.stWas[k].s, stNow[k].t - r.stWas[k].t};
                 std::memcpy(&item.words[28 + 2 * k], d, 8);
@@ -2702,7 +2845,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     // thread on the Switch, walking through A Stealthy Approach. SLY1_PART_KEEP_TWICE=0: at once.
     {
         const bool twice = KeepTwice();
-        const bool asSeen = r.seenList != 0 && r.seenList + 1 >= g_listSerial && (ceiling || (r.seenHash == hash && sameRegs(r.seenRegs, r.ok && !r.maskRead) && PartHeaderSame(r.seenHeader, header, slow, alphaFree(r))));
+        const bool asSeen = r.seenList != 0 && r.seenList + 1 >= g_listSerial && (ceiling || (r.seenHash == hash && sameRegs(r.seenRegs, r.ok && !r.maskRead) && PartHeaderSame(r.seenHeader, header, slow, alphaFree(r), litFree(r))));
         if (twice && !asSeen) {
             r.seenHash = hash;
             r.seenList = g_listSerial;
@@ -2787,7 +2930,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     }
     {
         std::uint8_t maskUse = 1;
-        r.hashWhole = PartHash(target, true, regs.cl, regs.wl, tte, slow, &r.texAt, false, &r.stAt, &maskUse);
+        r.hashWhole = PartHash(target, true, regs.cl, regs.wl, tte, slow, &r.texAt, false, &r.stAt, &maskUse, litMode, &r.litAt);
         r.maskRead = (maskUse & 1) != 0 || r.hashWhole == 0;
         r.maskSet = (maskUse & 2) != 0;
     }
@@ -2803,6 +2946,46 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     }
     r.stTarget = target;
     r.stBase = g_vif1.StUnpacks();
+    {   // the part's lights, of the words left out: each begins with its colour (to 22)
+        std::vector<PartRecord::LitSource> all;
+        bool bad = false;
+        for (const LitAt& at : r.litAt) {
+            for (std::uint32_t k = 0; k < at.words; k++)
+                r.litWas.push_back(at.p[k]);
+            const float* f = reinterpret_cast<const float*>(at.p);
+            if (at.addr == 0x16) {
+                all.emplace_back();
+                all.back().colour = f;
+            } else if (all.empty()) {
+                bad = true;
+            } else if (at.addr == 0x17 && at.words == 8) {
+                all.back().scale = f;
+                all.back().base = f + 4;
+            } else if (at.addr == 0x19 && at.words == 3) {
+                all.back().dir = f;
+            } else if (at.addr == 0x19 && at.words == 2) {
+                all.back().atten = f;
+            } else if (at.addr == 0x1A) {
+                all.back().place = f;
+            } else {
+                bad = true;
+            }
+        }
+        // (every mesh refers to the same lights' packets: the part's lights are the first mesh's)
+        std::size_t each = all.size();
+        for (std::size_t k = 1; k < all.size(); k++)
+            if (all[k].colour == all[0].colour) {
+                each = k;
+                break;
+            }
+        for (std::size_t k = 0; k < all.size(); k++) {
+            const PartRecord::LitSource& l = all[k];
+            bad = bad || !l.scale || (l.dir != nullptr) == (l.atten != nullptr) || (l.atten != nullptr) != (l.place != nullptr) || l.colour != all[k % each].colour;
+        }
+        r.litStrict = litMode && (bad || each == 0 || each > 4);
+        if (!r.litStrict && litMode)
+            r.lights.assign(all.begin(), all.begin() + (std::ptrdiff_t)each);
+    }
     r.texStrict = r.texAt.size() > 4;
     std::memcpy(r.header, header, sizeof header);
     r.before = regs;
@@ -3501,6 +3684,7 @@ void PartDone()
         PartJobSeen(*seen, g_observeBefore, !g_observeBad && g_vif1.BetweenCodes() && g_counts.vifInterrupts == g_observeInterrupts &&
                                                 g_counts.finishes == g_observeFinishes);
     }
+    vu1::LitExpect(nullptr);
     PartRecord* r = g_partRecording;
     g_partRecording = nullptr;
     if (!r)
@@ -3524,7 +3708,7 @@ void PartDone()
 void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs& after, const char* jobWhy)
 {
     std::uint32_t minId = ~0u, maxId = 0;
-    bool alphaStrict = false, stStrict = r->stAt.size() > 8;
+    bool alphaStrict = false, stStrict = r->stAt.size() > 8, litStrict = r->litStrict;
     std::uint64_t stUsed = 0;
     for (std::size_t k = 0; ok && k < r->items.size(); k++) {
         const std::vector<std::uint32_t>& w = *r->items[k].words;
@@ -3532,6 +3716,13 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
             gs::Batch b;
             std::memcpy(&b, &w[1], sizeof b);
             alphaStrict = alphaStrict || !b.alphaDeferred;
+            if (b.stride == 4 && !r->lights.empty()) {   // a lit batch: its lighting noted, by the part's lights
+                std::uint32_t lights = 0;
+                if (b.litWords != 0 && w.size() >= kBatchHead + (std::size_t)b.count * b.stride * 4 + b.litWords)
+                    lights = w[kBatchHead + (std::size_t)b.count * b.stride * 4];
+                if (lights != r->lights.size())
+                    litStrict = true;
+            }
             if (b.stApplied) {
                 if (b.stSource < r->stAt.size())
                     stUsed |= 1ull << b.stSource;
@@ -3595,6 +3786,9 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
         g_diffCounts[name]++;
     }
     r->after = after;
+    r->litStrict = litStrict;
+    if (litStrict)
+        r->lights.clear();
     r->alphaStrict = alphaStrict;
     r->stStrict = stStrict || stUsed != (r->stAt.size() >= 64 ? ~0ull : (1ull << r->stAt.size()) - 1);
     r->firstId = minId == ~0u ? 0 : minId;
@@ -3624,8 +3818,8 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
 void PartCountsLine(const char* what)
 {
     PartDiffReport();
-    std::fprintf(stderr, "partparams: %s: parts drawn again with another alpha's scale %llu, with a texture offset moved %llu\n", what,
-                 (unsigned long long)g_partsAlphaMoved, (unsigned long long)g_partsStMoved);
+    std::fprintf(stderr, "partparams: %s: parts drawn again with another alpha's scale %llu, with a texture offset moved %llu, lit by this frame's lights %llu\n", what,
+                 (unsigned long long)g_partsAlphaMoved, (unsigned long long)g_partsStMoved, (unsigned long long)g_partsLitNow);
     std::fprintf(stderr, "partjobs: making them: the shape %.2f s, the job %.2f, the copy %.2f, the queue %.2f; the render thread waited %.2f s for them at its lists' ends\n",
                  g_jobMakeNs[0] / 1e9, g_jobMakeNs[1] / 1e9, g_jobMakeNs[2] / 1e9, g_jobMakeNs[3] / 1e9, g_jobDrainWaitNs / 1e9);
     std::fprintf(stderr, "partjobs: %s: %llu made (%llu not, the shape other), %llu wrong, %llu run again by a thread that needed them; run by the helper %llu (%.2f s), the render thread %llu (%.2f s), "
@@ -4162,8 +4356,10 @@ void GsThreadMain()
             const std::vector<PartKept>& part = *item.part;
             float alphaNow;
             std::memcpy(&alphaNow, &item.words[26], 4);
-            const std::uint32_t stCount = item.words[27];
-            std::size_t fix = 28 + 2 * (std::size_t)stCount;
+            const std::uint32_t stCount = item.words[27] & 0xFFFF;
+            const bool hasLit = (item.words[27] & 0x10000u) != 0;
+            const std::size_t litAt = 28 + 2 * (std::size_t)stCount;
+            std::size_t fix = litAt + (hasLit ? gs::kLitParamWords : 0);
             for (std::size_t i = 0; i < part.size(); i++) {
                 const PartKept& kept = part[i];
                 if (i + 2 < part.size()) {
@@ -4203,6 +4399,20 @@ void GsThreadMain()
                     if (b.stApplied && b.stSource < stCount)
                         std::memcpy(b.stOffset, &item.words[28 + 2 * b.stSource], 8);
                     b.quads = w + head;
+                    b.lit = b.litWords ? b.quads + (std::size_t)b.count * b.stride * 4 : nullptr;
+                    b.litNow = nullptr;
+                    gs::LitParams litNow;
+                    if (hasLit && b.lit) {   // this frame's lighting, with the batch's own start and vf01
+                        std::memcpy(&litNow, &item.words[litAt], sizeof litNow);
+                        gs::LitParams was;
+                        std::memcpy(&was, b.lit, sizeof was);
+                        float add;
+                        std::memcpy(&add, b.lit + gs::kLitParamWords, 4);
+                        litNow.start[1] += add;
+                        std::memcpy(litNow.one, was.one, sizeof litNow.one);
+                        if (litNow.lights == was.lights)
+                            b.litNow = &litNow;
+                    }
                     if (!gs::DrawBatch(w[0], b))
                         g_batchesRefused++;
                 } else {
@@ -4223,6 +4433,8 @@ void GsThreadMain()
             const std::size_t head = 1 + (sizeof(gs::Batch) + 3) / 4;
             std::memcpy(&b, &item.words[1], sizeof b);
             b.quads = item.kept ? item.kept->data() + head : &item.words[head];
+            b.lit = b.litWords ? b.quads + (std::size_t)b.count * b.stride * 4 : nullptr;
+            b.litNow = nullptr;
             if (!gs::DrawBatch(item.words[0], b))
                 g_batchesRefused++;   // not a strip the renderer takes: nothing drawn of it
         } else {

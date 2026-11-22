@@ -43,6 +43,10 @@ void PartMatrix(std::uint32_t top, float out[16]);
 // inside its own packet).
 void PartMatrixFrom(const float* header, float out[16]);
 std::uint64_t PartTrouble();
+// SLY1_LIT_NOW_CHECK (port/platform/dmac.cpp): the lighting a part drawn again would have been
+// given this frame (words of a gs::LitParams, or null), for the handlers to compare with what the
+// programs light the part's batches with as it runs.
+void LitExpect(const void* params);
 void PartSkipped();
 std::uint32_t TakeBatchIds(std::uint32_t count);
 

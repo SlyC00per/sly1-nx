@@ -1993,6 +1993,11 @@ void SoftBatch(const Batch& b)
     Draw d = DrawOf(g_regs.prim);
     std::vector<Vertex> v(b.count);
     std::vector<bool> inside(b.count);
+    std::vector<std::uint32_t> litNow;   // a lit part drawn again: its colours by this frame's lights
+    if (b.lit && b.litNow) {
+        litNow.resize((std::size_t)b.count * 4);
+        LitColoursNow(b, litNow.data());
+    }
     for (std::uint32_t k = 0; k < b.count; k++) {
         BatchVertex bv = VertexOf(b, k);
         float w = bv.clip[3];
@@ -2005,7 +2010,7 @@ void SoftBatch(const Batch& b)
         o.y = (std::int32_t)bv.y;
         o.z = (std::uint32_t)bv.z;
         o.f = (std::uint8_t)bv.fog;
-        const std::uint32_t* c = q + b.colourAt * 4;
+        const std::uint32_t* c = litNow.empty() ? q + b.colourAt * 4 : &litNow[(std::size_t)k * 4];
         o.r = (std::uint8_t)c[0]; o.g = (std::uint8_t)c[1]; o.b = (std::uint8_t)c[2]; o.a = (std::uint8_t)c[3];
         if (b.alphaScale != 1.0f)   // (as 0x4A9 scales it: the integer times the scale, truncated)
             o.a = (std::uint8_t)(std::int32_t)((float)(std::int32_t)c[3] * b.alphaScale);

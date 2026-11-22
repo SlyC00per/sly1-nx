@@ -544,6 +544,7 @@ struct LitCapture {
     std::uint32_t base[256][4];
 };
 thread_local LitCapture t_lit[2];
+thread_local const void* t_litExpect = nullptr;   // (vu1::LitExpect)
 std::atomic<std::uint64_t> g_litNotAsNoted{0};   // batches whose sums were not what their noted lights give
 LitCapture& LitFor(std::uint16_t top) { return t_lit[top > 256 ? 1 : 0]; }
 void LitInvalidate(std::uint16_t top)
@@ -695,6 +696,64 @@ bool KickDeferred(Runner& r, std::uint16_t top, std::uint16_t tag)
     b.alphaScale = d.alphaScale;
     b.alphaDeferred = d.alphaFromHeader;
     b.stApplied = d.stApplied;
+    if (t_litExpect && d.lit && d.kick == 0) {   // SLY1_LIT_NOW_CHECK
+        const LitCapture& c = LitFor(top);
+        gs::LitParams want;
+        std::memcpy(&want, t_litExpect, sizeof want);
+        want.start[1] += c.p.start[1] - Load(r, 3).y;
+        static std::uint64_t batches, wrong, said;
+        double worst = 0;
+        bool ok = want.lights == c.p.lights;
+        for (std::uint32_t k = 0; ok && k < want.lights; k++)
+            for (int i = 0; i < 3; i++) {
+                worst = std::max<double>(worst, std::fabs(want.light[k].dir[i] - c.p.light[k].dir[i]));
+                worst = std::max<double>(worst, std::fabs(want.light[k].base[i] - c.p.light[k].base[i]));
+                worst = std::max<double>(worst, std::fabs(want.light[k].scale[i] - c.p.light[k].scale[i]));
+                worst = std::max<double>(worst, std::fabs(want.light[k].colour[i] - c.p.light[k].colour[i]));
+            }
+        worst = std::max<double>(worst, std::fabs(want.start[0] - c.p.start[0]));
+        worst = std::max<double>(worst, std::fabs(want.start[1] - c.p.start[1]));
+        worst = std::max<double>(worst, std::fabs(want.colourScale - c.p.colourScale));
+        ok = ok && worst < 1e-4;
+        batches++;
+        if (!ok) {
+            wrong++;
+            if (said < 8 && want.lights == c.p.lights)
+                for (std::uint32_t k = 0; k < want.lights; k++) {
+                    const gs::LitLight& a = want.light[k];
+                    const gs::LitLight& b2 = c.p.light[k];
+                    std::fprintf(stderr, "lit now check: light %u: dir %g %g %g | %g %g %g; base %g %g %g | %g %g %g; scale %g %g %g | %g %g %g; colour %g %g %g | %g %g %g\n", k,
+                                 (double)a.dir[0], (double)a.dir[1], (double)a.dir[2], (double)b2.dir[0], (double)b2.dir[1], (double)b2.dir[2], (double)a.base[0], (double)a.base[1], (double)a.base[2],
+                                 (double)b2.base[0], (double)b2.base[1], (double)b2.base[2], (double)a.scale[0], (double)a.scale[1], (double)a.scale[2], (double)b2.scale[0], (double)b2.scale[1],
+                                 (double)b2.scale[2], (double)a.colour[0], (double)a.colour[1], (double)a.colour[2], (double)b2.colour[0], (double)b2.colour[1], (double)b2.colour[2]);
+                }
+            if (said++ < 8)
+                std::fprintf(stderr, "lit now check: lights %u against %u, the furthest value %g apart (dir %g %g %g against %g %g %g; start %g %g against %g %g; scale %g against %g)\n",
+                             want.lights, c.p.lights, worst, (double)want.light[0].dir[0], (double)want.light[0].dir[1], (double)want.light[0].dir[2], (double)c.p.light[0].dir[0],
+                             (double)c.p.light[0].dir[1], (double)c.p.light[0].dir[2], (double)want.start[0], (double)want.start[1], (double)c.p.start[0], (double)c.p.start[1],
+                             (double)want.colourScale, (double)c.p.colourScale);
+        }
+        if ((batches & (batches - 1)) == 0 || batches % 20000 == 0)
+            std::fprintf(stderr, "lit now check: %llu batches lit by the programs as a part drawn again would have been, %llu not\n", (unsigned long long)(batches - wrong),
+                         (unsigned long long)wrong);
+    }
+    {   // what was noted of the batch's lighting goes with it (gs::Batch::lit). SLY1_LIT_GPU=0: not.
+        static const bool litOff = std::getenv("SLY1_LIT_GPU") && std::getenv("SLY1_LIT_GPU")[0] == '0';
+        const LitCapture& c = LitFor(top);
+        if (!litOff && d.lit && (std::uint32_t)c.n == count && d.kick < 3 && d.stride == 4) {
+            static thread_local std::vector<std::uint32_t> blob;
+            blob.assign(gs::LitWords(count), 0);
+            std::memcpy(blob.data(), &c.p, sizeof c.p);
+            const float add = c.p.start[1] - Load(r, 3).y;
+            std::memcpy(&blob[gs::kLitParamWords], &add, 4);
+            blob[gs::kLitParamWords + 1] = count;
+            std::memcpy(&blob[gs::kLitHead], c.normal, (std::size_t)count * 12);
+            std::memcpy(&blob[gs::kLitHead + (std::size_t)count * 3], c.base, (std::size_t)count * 16);
+            b.lit = blob.data();
+            b.litWords = (std::uint32_t)blob.size();
+            b.litKick = (std::uint8_t)d.kick;
+        }
+    }
     {   // SLY1_LIT_CHECK=1: gs::LitColoursOf on what was noted of the batch's lighting, against the
         // colours the programs made (this kick's), a value at a time
         static const bool litCheck = std::getenv("SLY1_LIT_CHECK") != nullptr;
@@ -4027,6 +4086,8 @@ std::uint64_t PartTrouble()
         late += kv.second;
     return late + Cnt().notTaken + Cnt().skippedOverwritten;
 }
+
+void LitExpect(const void* params) { t_litExpect = params; }
 
 // The part's packet was not run: no batch waits for its kicks.
 void PartSkipped()

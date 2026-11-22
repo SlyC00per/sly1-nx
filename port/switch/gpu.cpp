@@ -111,6 +111,7 @@ struct Source {
     // vertex), its colours (16), its indices, as offsets in the frame's memory
     bool placed = false;
     bool kept = false;        // placed in keepMem_, not in the frame's memory
+    bool colourFrame = false; // a kept batch's colours are this frame's, in the frame's memory (a lit part drawn again)
     bool allCullable = false; // a batch's: every triangle is one dropped when it faces away (the GPU can cull)
     std::uint8_t alphaMin = 0, alphaMax = 255;   // of the vertices' alpha, where it is known
     std::uint32_t vertexAt = 0, colourAt = 0, indexAt = 0;
@@ -438,6 +439,8 @@ private:
     int cullBound_ = 0;   // the rasteriser's culling bound: 0 none, 1 the faces a batch drops
     std::uint64_t culledDraws_ = 0, onePassDraws_ = 0, twoPassDraws_ = 0;
     std::vector<std::uint32_t> staging_;   // a batch's indices, positions or colours made before they are copied
+    std::vector<std::uint32_t> litStaging_;   // a lit part's colours for this frame (DrawBatch)
+    std::uint64_t litNowBatches_ = 0;
     std::uint64_t batches_ = 0, batchVertices_ = 0;
     float cullFront_ = 1.0f;
     int batchInFrame_ = 0;
@@ -1381,7 +1384,7 @@ void Renderer::Layer(const gs::DrawState& s, const Source& src, const gs::Batch&
             (!s.fge || (s.fogcol & 0xFFFFFF) == 0) && (!s.tme || texture_ != nullptr) &&
             std::memcmp(b.matrix, surface_.batch.matrix, sizeof b.matrix) == 0) {
             surface_.src.shareTextures[surface_.src.layers] = texture_;
-            surface_.src.layerColours[surface_.src.layers++] = dkMemBlockGetGpuAddr(src.kept ? keepMem_ : frameMem_) + src.colourAt;
+            surface_.src.layerColours[surface_.src.layers++] = dkMemBlockGetGpuAddr(src.kept && !src.colourFrame ? keepMem_ : frameMem_) + src.colourAt;
             layersMerged_++;
             return;
         }
@@ -1456,6 +1459,15 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
 {
     if (pending_)   // (not a surface held for its lights' shares: Layer)
         FlushPending();
+    // A lit part drawn again (gs::Batch::litNow): this kick's colours by this frame's lights, made
+    // here (the vertices kept are those of the frame the part was kept in).
+    const std::uint32_t* litColours = nullptr;
+    if (b.lit && b.litNow && b.keep != 0) {
+        litStaging_.resize((std::size_t)b.count * 4);
+        gs::LitColoursNow(b, litStaging_.data());
+        litColours = litStaging_.data();
+        litNowBatches_++;
+    }
     {
         const bool adds = s.abe && (s.alpha & 0xFF) == 0x48;
         if (vary_ == 6 || ((vary_ == 2 || vary_ == 7) && adds) || (vary_ == 4 && !adds))
@@ -1481,17 +1493,18 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
         const std::uint32_t test = (std::uint32_t)s.test;
         if (!off && vary_ != 1 && s.abe && (s.alpha & 0xFF) == 0x48 && (test & 1) && ((test >> 1) & 7) == 0 && ((test >> 12) & 3) == 3 &&
             (!s.fge || (s.fogcol & 0xFFFFFF) == 0) && (!s.tme || ((s.tex0 >> 35) & 3) == 0) && b.count) {
-            const std::uint32_t* c = b.quads + b.colourAt * 4;
-            const std::uint32_t step = b.stride * 4;
-            // (a kept batch's colours are what they were: looked at once, not met cold each frame)
+            const std::uint32_t* c = litColours ? litColours : b.quads + b.colourAt * 4;
+            const std::uint32_t step = litColours ? 4 : b.stride * 4;
+            // (a kept batch's colours are what they were: looked at once, not met cold each frame;
+            // a lit part's drawn again are this frame's: looked at each time)
             std::uint32_t any = 0;
-            auto known = b.keep != 0 ? blackKept_.find(b.keep) : blackKept_.end();
+            auto known = b.keep != 0 && !litColours ? blackKept_.find(b.keep) : blackKept_.end();
             if (known != blackKept_.end()) {
                 any = known->second ? 0 : 1;
             } else {
                 for (std::uint32_t k = 0; k < b.count && !any; k++, c += step)
                     any = (c[0] | c[1] | c[2]) & 0xFF;
-                if (b.keep != 0) {
+                if (b.keep != 0 && !litColours) {
                     if (blackKept_.size() > 200000)   // (a key is never used again: the old ones let go)
                         blackKept_.clear();
                     blackKept_.emplace(b.keep, any == 0);
@@ -1640,6 +1653,17 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
             src.vertexAt = k.vertexAt;
             src.colourAt = k.colourAt;
             src.indexAt = k.indexAt;
+            if (litColours) {   // its colours in the frame's memory, as a batch not kept has them
+                const std::uint32_t bytes = b.count * 16;
+                if (frameUsed_ + bytes + 64 > kFrameMemory)
+                    Send(true);
+                frameUsed_ = Align(frameUsed_, 16);
+                std::memcpy(static_cast<std::uint8_t*>(dkMemBlockGetCpuAddr(frameMem_)) + frameUsed_, litColours, bytes);
+                src.colourAt = frameUsed_;
+                src.colourFrame = true;
+                frameUsed_ += bytes;
+                copiedBytes_ += bytes;
+            }
             Layer(s, src, b);
             return true;
         }
@@ -2361,7 +2385,7 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     if (src.placed) {   // the batch's two streams where DrawBatch put them
         DkGpuAddr base = dkMemBlockGetGpuAddr(src.kept ? keepMem_ : frameMem_);
         const std::uint32_t count = src.batch->count;   // the streams' sizes exactly (an emulator tracks what is bound)
-        const DkGpuAddr own = base + src.colourAt;
+        const DkGpuAddr own = (src.colourFrame ? dkMemBlockGetGpuAddr(frameMem_) : base) + src.colourAt;
         DkBufExtents streams[4] = {{base + src.vertexAt, count * 32}, {own, count * 16}, {src.layers >= 1 ? src.layerColours[0] : own, count * 16},
                                    {src.layers >= 2 ? src.layerColours[1] : own, count * 16}};
         dkCmdBufBindVtxBuffers(cmd_, 0, streams, 4);
