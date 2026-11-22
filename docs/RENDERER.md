@@ -1335,3 +1335,30 @@ Two things found on the host after it:
 `perfkeep:` says a frame why parts are kept anew and watched, what is kept and how often parts
 were let go for room; `perfkept:` (the GPU renderer) the kept batches' memory; and the program
 says at its start how much memory it may use.
+
+### The frames that come late (2026-11-22)
+
+Played at d502426 the Switch's windows over 18.5 ms were 8% of those in 3D, with 23% between
+17.2 and 18.5: single frames of two blanks among frames of one, which a second's averages do
+not explain (`SLY1_SAMPLE=1` there: the render thread idle 57% of the time and the GS thread
+27%, and no function of the GS thread's over 10%). `SLY1_PERF_LOG` now prints a line for each
+frame shown more than 20 ms after the one before (`late:`, 8 a second at most): what each thread
+did between the two, the parts kept, new or watched, the uploads, the batches.
+
+157 such frames in 3D over one play: on average 10 parts kept and 11 new or watched in the frame
+(about 1 of each in an ordinary frame), 6 ms of parts run in full on the render thread, 22
+uploads, 710 batches against 500. They are the frames in which the view turns onto a new place.
+Two things done for it:
+
+- **A part met for the first time is a job at once** when another part's packet of the same
+  shape has shown the registers it leaves (`g_shapeRegs`; `SLY1_PART_SHAPE_REGS=0`: not). It was
+  run on the render thread and watched before. On the host's tour: 2,005 parts made jobs so, and
+  the parts watched 0.37 a frame against 1.35.
+- **No more keeping in one list than 2 ms allow** (`SLY1_PART_KEEP_US`); the rest wait as jobs.
+  (Three parts a list fell behind: a sixth fewer parts drawn again over the tour.)
+
+Also: `SLY1_PART_JOBS_CHECK=1` ran its own pass before the job's packet was copied and read the
+copy left from the job's last use (it hung in the first level); it now runs after the copy.
+With it, `--verify-levels` at 240 frames a level: 549,356 jobs over the 46 levels, 0 wrong.
+Level 4 under lockstep with the software batches: 28 frames within 1 of 255 of
+`SLY1_PART_REPLAY=0`.

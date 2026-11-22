@@ -345,6 +345,8 @@ struct PartKept {
     std::uint32_t size = 0;
 };
 
+// The render thread's time in each kind of item (VIF1 data, GIF data, calls), for the report.
+std::atomic<std::uint64_t> g_renderNs[3], g_renderItems[3];
 struct GsItem {
     std::uint8_t path = 0;   // 1-3, 4 a batch, 5 a part drawn again, or 0: a call
     std::vector<std::uint32_t> words;
@@ -1660,7 +1662,10 @@ std::uint64_t g_partsAlphaMoved, g_partsStMoved;
 // and why one is run here and watched: 0 never run here cleanly, 1 no registers known for its
 // shape, 2 met with other registers than known)
 std::uint64_t g_keepWhy[6], g_watchWhy[3];
-std::uint64_t g_partsLetGo, g_partsLetGoRecent;   // kept parts let go for room, and those of them drawn in the last 120 frames   // drawn again with another alpha's scale, another texture offset
+std::uint64_t g_partsLetGo, g_partsLetGoRecent;
+std::uint64_t g_fullNsBy[7], g_fullBy[7];
+std::uint64_t g_partsKeepPutOff;   // parts not kept in the list they could have been (no more than a few a list)
+std::uint64_t g_jobsByShape;       // parts made a job at first sight by another part's registers for the same shape   // kept parts let go for room, and those of them drawn in the last 120 frames   // drawn again with another alpha's scale, another texture offset
 
 std::uint64_t PartHash(std::uint32_t target, bool whole, std::uint32_t cl, std::uint32_t wl, bool tte, bool slow = false,
                        std::vector<const std::uint32_t*>* tex = nullptr, bool shape = false, std::vector<const std::uint32_t*>* st = nullptr,
@@ -2687,6 +2692,26 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             g_partsWaited++;
             return false;
         }
+        // No more parts are kept in one list than 2 ms of the render thread's time allow
+        // (SLY1_PART_KEEP_US): keeping a part costs several times running it, and where the view
+        // turns onto a new place ten parts were kept in one frame, 3 to 6 ms, which made that frame
+        // late (the Switch's late: lines, 2026-11-22). The rest wait their turn as jobs. (By their
+        // number, three a list, the keeping fell behind: 11,666 put off over the host's tour and a
+        // sixth fewer parts drawn again.)
+        static const std::uint64_t most = (std::uint64_t)(std::getenv("SLY1_PART_KEEP_US") ? std::max(100, std::atoi(std::getenv("SLY1_PART_KEEP_US"))) : 2000) * 1000;
+        static std::uint64_t list, keepNsAtStart;
+        if (list != g_listSerial) {
+            list = g_listSerial;
+            keepNsAtStart = g_fullNsBy[0];
+        }
+        if (!ceiling && g_fullNsBy[0] - keepNsAtStart >= most) {
+            r.seenHash = hash;
+            r.seenList = g_listSerial;
+            r.seenRegs = regs;
+            std::memcpy(r.seenHeader, header, sizeof r.seenHeader);
+            g_partsKeepPutOff++;
+            return false;
+        }
     }
     g_partWords -= std::min<std::uint64_t>(g_partWords, r.words);   // what it held before is let go
     PartForget(r);
@@ -3097,14 +3122,44 @@ bool g_observeBad;
 
 // The part has just been run here from before: the pair noted if the run was clean, or the part
 // not to be made a job.
+// The registers a packet of a shape was met with and left, whichever part's it was: two packets
+// of one shape (the same VIFcodes, tags and register-setting data) leave VIF1's registers the same,
+// so a part met for the first time is made a job at once by what another part of its shape
+// showed, where it was run here and watched before (ten parts in a frame where the view turns
+// onto a new place). Two pairs a shape, as a part's record has.
+struct ShapeRegs {
+    Vif::Regs before[2], after[2];
+    int pairs = 0;
+    bool maskRead = true, maskSet = false;
+};
+std::unordered_map<std::uint64_t, ShapeRegs> g_shapeRegs;
+
 void PartJobSeen(PartRecord& r, const Vif::Regs& before, bool clean)
 {
     if (!clean) {
         r.jobOk = r.jobTwo = false;
+        if (r.shape != 0)
+            g_shapeRegs.erase(r.shape);
         r.shape = 0;
         return;
     }
     const Vif::Regs after = g_vif1.GetRegs();
+    if (r.shape != 0) {
+        if (g_shapeRegs.size() > 8192)
+            g_shapeRegs.clear();
+        ShapeRegs& sr = g_shapeRegs[r.shape];
+        int k = 0;
+        while (k < sr.pairs && !(sr.before[k] == before))
+            k++;
+        if (k == sr.pairs && sr.pairs < 2)
+            sr.pairs++;
+        if (k < 2) {
+            sr.before[k] = before;
+            sr.after[k] = after;
+        }
+        sr.maskRead = r.maskRead;
+        sr.maskSet = r.maskSet;
+    }
     if (!r.jobOk || r.jobBefore == before) {
         r.jobBefore = before;
         r.jobAfter = after;
@@ -3117,7 +3172,6 @@ void PartJobSeen(PartRecord& r, const Vif::Regs& before, bool clean)
 }
 
 int g_fullWhy;
-std::uint64_t g_fullNsBy[7], g_fullBy[7];
 // (SLY1_PERF_LOG's perfmodes: the parts by how they are drawn (from their cache, the long way), their
 // header's lighting mode (9.y: -1, 0, 1 ...) and what became of each: drawn again as kept, made a
 // job, run here in full. A census for the renderer that is to draw them itself.)
@@ -3170,7 +3224,32 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
         }
         return x == g_callRegs;
     };
-    const bool first = r.jobOk && sameRegs(r.jobBefore), second = !first && r.jobOk && r.jobTwo && sameRegs(r.jobBefore2);
+    bool first = r.jobOk && sameRegs(r.jobBefore), second = !first && r.jobOk && r.jobTwo && sameRegs(r.jobBefore2);
+    if (!first && !second) {
+        // (another part's registers for this shape: SLY1_PART_SHAPE_REGS=0: not)
+        static const bool shared = !std::getenv("SLY1_PART_SHAPE_REGS") || std::getenv("SLY1_PART_SHAPE_REGS")[0] != '0';
+        std::uint8_t use = 1;
+        const std::uint64_t shape = shared ? PartHash(target, false, g_callRegs.cl, g_callRegs.wl, g_callTte, slow, nullptr, true, nullptr, &use) : 0;
+        auto known = shape != 0 ? g_shapeRegs.find(shape) : g_shapeRegs.end();
+        if (known != g_shapeRegs.end()) {
+            const ShapeRegs& sr = known->second;
+            const bool maskReadWas = r.maskRead;
+            r.maskRead = sr.maskRead;
+            for (int k = 0; k < sr.pairs && !first; k++)
+                if (sameRegs(sr.before[k])) {
+                    r.shape = shape;
+                    r.jobBefore = sr.before[k];
+                    r.jobAfter = sr.after[k];
+                    r.jobOk = true;
+                    r.jobTwo = false;
+                    r.maskSet = sr.maskSet;
+                    first = true;
+                    g_jobsByShape++;
+                }
+            if (!first)
+                r.maskRead = maskReadWas;
+        }
+    }
     if (!first && !second) {
         // run here and watched, if its shape is the one known (or none is yet)
         std::uint8_t maskUse = 1;
@@ -3243,12 +3322,6 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
     // (its batches' ids from a run of its own, far from the render thread's)
     const std::uint64_t tCopy = NowNs();
     vu1::LaneCopyMain(job->lane, 0x80000000u | (std::uint32_t)((g_jobSerial++ & 0x7FFFF) << 12) | 1);
-    {   // SLY1_PART_JOBS_CHECK=1: the job's work done here too, at once, to compare what a thread gives with
-        static const bool check = std::getenv("SLY1_PART_JOBS_CHECK") != nullptr;
-        job->hasRef = check;
-        if (check)
-            PartJobWork(*job, job->ref);
-    }
     {   // the packet copied for the job (SLY1_JOB_COPY=0: read where it lies, and the list's end waits for the jobs)
         static const bool copy = !std::getenv("SLY1_JOB_COPY") || std::getenv("SLY1_JOB_COPY")[0] != '0';
         job->copied = false;
@@ -3263,6 +3336,13 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
             g_listJobsLive = true;
             g_jobsNotCopied++;
         }
+    }
+    // (after the copy: the job's work reads the copy, and one left from the job's last use hung the check)
+    {   // SLY1_PART_JOBS_CHECK=1: the job's work done here too, at once, to compare what a thread gives with
+        static const bool check = std::getenv("SLY1_PART_JOBS_CHECK") != nullptr;
+        job->hasRef = check;
+        if (check)
+            PartJobWork(*job, job->ref);
     }
     job->gen.fetch_add(1, std::memory_order_seq_cst);   // made: threads may run it
     const std::uint64_t tQueue = NowNs();
@@ -3910,6 +3990,33 @@ void GsThreadMain()
                     std::this_thread::sleep_for(std::chrono::milliseconds(slow));
             }
             if (item.listAt && gs::FramesShown() != shownBefore) {   // the swap: the frame is the display's now
+                {   // SLY1_PERF_LOG's late: a frame that came more than 20 ms after the one before, and what
+                    // each thread did between the two (at most 8 a second are printed; all are counted)
+                    static const bool perfLog = std::getenv("SLY1_PERF_LOG") != nullptr;
+                    if (perfLog) {
+                        static std::uint64_t at, was[12], said, saidSecond;
+                        const std::uint64_t now = NowNs();
+                        const std::uint64_t is[12] = {g_renderNs[0] + g_renderNs[1] + g_renderNs[2], g_gsBusyNs.load(), KernelIdleNs(), g_jobNsBy[0].load(), g_jobsBy[0].load() + g_jobsBy[1].load() + g_jobsBy[2].load(),
+                                                      g_fullBy[0], g_fullBy[3] + g_fullBy[4], g_fullNsBy[0] + g_fullNsBy[1] + g_fullNsBy[2] + g_fullNsBy[3] + g_fullNsBy[4] + g_fullNsBy[5] + g_fullNsBy[6],
+                                                      gs::UploadSerial(), g_partsReplayed, g_batchesQueued.load(), g_lagWaitNs.load()};
+                        const double dt = at ? (now - at) / 1e6 : 0.0;
+                        if (dt > 20.0 && dt < 200.0) {
+                            if (now / 1000000000ull != saidSecond) {
+                                saidSecond = now / 1000000000ull;
+                                said = 0;
+                            }
+                            if (said++ < 8)
+                                std::fprintf(stderr, "late: frame %llu after %.1f ms: render thread %.1f ms, GS thread %.1f, the game's threads %.1f, the helper's jobs %.1f; %llu jobs, %llu parts kept, "
+                                             "%llu new or watched, parts in full %.1f ms, %llu uploads, %llu parts drawn again, %llu batches, the render thread waited %.1f ms for the GS thread; held %.1f ms\n",
+                                             (unsigned long long)gs::FramesShown(), dt, (is[0] - was[0]) / 1e6, (is[1] - was[1]) / 1e6, dt - (is[2] - was[2]) / 1e6, (is[3] - was[3]) / 1e6,
+                                             (unsigned long long)(is[4] - was[4]), (unsigned long long)(is[5] - was[5]), (unsigned long long)(is[6] - was[6]), (is[7] - was[7]) / 1e6,
+                                             (unsigned long long)(is[8] - was[8]), (unsigned long long)(is[9] - was[9]), (unsigned long long)(is[10] - was[10]), (is[11] - was[11]) / 1e6,
+                                             (now - item.listAt) / 1e6);
+                        }
+                        at = now;
+                        std::memcpy(was, is, sizeof was);
+                    }
+                }
                 const std::uint64_t held = NowNs() - item.listAt;
                 g_heldNs += held;
                 g_heldCount++;
@@ -4008,7 +4115,6 @@ void GsThreadMain()
 }
 
 // The render thread's time in each kind of item (VIF1 data, GIF data, calls), for the report.
-std::atomic<std::uint64_t> g_renderNs[3], g_renderItems[3];
 
 void RenderThreadMain()
 {
@@ -4198,8 +4304,9 @@ void RenderThreadMain()
                                          (unsigned long long)shown, (g_keepWhy[0] - keepWas[0]) / f, (g_keepWhy[1] - keepWas[1]) / f, (g_keepWhy[2] - keepWas[2]) / f,
                                          (g_keepWhy[3] - keepWas[3]) / f, (g_keepWhy[4] - keepWas[4]) / f, (g_keepWhy[5] - keepWas[5]) / f, (g_watchWhy[0] - watchWas[0]) / f,
                                          (g_watchWhy[1] - watchWas[1]) / f, (g_watchWhy[2] - watchWas[2]) / f, g_partWords * 4 / 1e6, (unsigned long long)g_partsCleared);
-                        std::fprintf(stderr, "perfkeep: to %llu: %llu parts let go for room so far, %llu of them drawn in the 120 frames before\n", (unsigned long long)shown,
-                                     (unsigned long long)g_partsLetGo, (unsigned long long)g_partsLetGoRecent);
+                        std::fprintf(stderr, "perfkeep: to %llu: %llu parts let go for room so far, %llu of them drawn in the 120 frames before; %llu keepings put off to a later list, "
+                                     "%llu parts made jobs at first sight by their shape\n", (unsigned long long)shown,
+                                     (unsigned long long)g_partsLetGo, (unsigned long long)g_partsLetGoRecent, (unsigned long long)g_partsKeepPutOff, (unsigned long long)g_jobsByShape);
                         std::memcpy(keepWas, g_keepWhy, sizeof keepWas);
                         std::memcpy(watchWas, g_watchWhy, sizeof watchWas);
                     }
