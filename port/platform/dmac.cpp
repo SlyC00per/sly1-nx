@@ -914,6 +914,9 @@ std::atomic<std::uint64_t> g_batchesQueued, g_batchesRefused, g_gsBusyNs;
 // packets, 2 VIF1's DIRECT data, 3 the GIF channel's (uploads), 4 a batch, 5 a part drawn again,
 // 6 a job's items), for SLY1_PERF_LOG's perfgs line.
 std::atomic<std::uint64_t> g_gsNsByPath[8], g_gsItemsByPath[8];
+// (perfgs) a part drawn again's time, by what in it: its batches (drawn, with their per-frame work),
+// its packets kept as register writes, its packets through the GIF
+std::atomic<std::uint64_t> g_replayNs[3];
 std::atomic<std::uint64_t> g_path1Joined{0};   // VU1's packets that joined the one before in its item
 bool QueueBatch(std::uint32_t tagWord1, const gs::Batch& b)
 {
@@ -4754,12 +4757,36 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
     r->ids = minId == ~0u ? 0 : maxId - minId + 1;
     r->keys = g_partKey + 1 - r->keyFirst;
     r->ok = ok;
-    if (ok)
-        for (PartKept& k : r->items) {
-            k.data = k.words->data();
-            k.size = (std::uint32_t)k.words->size();
+    if (ok) {
+        // The part's items in one piece of memory, one after another, as the GS thread goes
+        // through them (each in a block of its own, the GS thread waited on memory at each:
+        // SLY1_PART_PACK=0: as they were)
+        static const bool pack = !(std::getenv("SLY1_PART_PACK") && std::getenv("SLY1_PART_PACK")[0] == '0');
+        if (pack) {
+            std::size_t total = 0;
+            for (const PartKept& k : r->items)
+                total += (k.words->size() + 15) & ~std::size_t(15);   // (each at 64 bytes)
+            auto block = std::make_shared<std::vector<std::uint32_t>>(total + 16);
+            std::uint32_t* base = block->data();
+            base += (16 - ((reinterpret_cast<std::uintptr_t>(base) / 4) & 15)) & 15;
+            std::size_t at = 0;
+            for (PartKept& k : r->items) {
+                std::memcpy(base + at, k.words->data(), k.words->size() * 4);
+                k.data = base + at;
+                k.size = (std::uint32_t)k.words->size();
+                at += (k.words->size() + 15) & ~std::size_t(15);
+            }
+            const std::shared_ptr<const std::vector<std::uint32_t>> held = block;
+            for (PartKept& k : r->items)
+                k.words = held;   // (each item's own words let go: the block holds them)
+        } else {
+            for (PartKept& k : r->items) {
+                k.data = k.words->data();
+                k.size = (std::uint32_t)k.words->size();
+            }
         }
-        r->kept = std::make_shared<const std::vector<PartKept>>(std::move(r->items));
+    }
+    r->kept = std::make_shared<const std::vector<PartKept>>(std::move(r->items));
     r->items.clear();
     if (!ok) {
         g_partWords -= std::min<std::uint64_t>(g_partWords, r->words);
@@ -5357,6 +5384,7 @@ void GsThreadMain()
                 else
                     g_prepsMade[2]++;
             }
+            std::uint64_t t0 = NowNs();
             for (std::size_t i = 0; i < part.size(); i++) {
                 const PartKept& kept = part[i];
                 if (i + 2 < part.size()) {
@@ -5411,10 +5439,16 @@ void GsThreadMain()
                     }
                     if (!gs::DrawBatch(w[0], b))
                         g_batchesRefused++;
+                    const std::uint64_t t1 = NowNs();
+                    g_replayNs[0] += t1 - t0;
+                    t0 = t1;
                 } else if (kept.path == 7) {   // a packet kept as its register writes (PartKeepFinish)
                     gs::Hold hold;
                     for (std::size_t k = 0; k + 3 <= size; k += 3)
                         gs::Write(w[k], w[k + 1] | (std::uint64_t)w[k + 2] << 32);
+                    const std::uint64_t t1 = NowNs();
+                    g_replayNs[1] += t1 - t0;
+                    t0 = t1;
                 } else {
                     Gif& gif = kept.path == 1 ? g_path1 : g_path2;
                     gs::Hold hold;
@@ -5426,6 +5460,9 @@ void GsThreadMain()
                         }
                         k += (std::size_t)taken * 4;
                     }
+                    const std::uint64_t t1 = NowNs();
+                    g_replayNs[2] += t1 - t0;
+                    t0 = t1;
                 }
             }
         } else if (item.path == 4) {   // a batch (QueueBatch)
@@ -5643,7 +5680,7 @@ void RenderThreadMain()
                                      (is[2] - was[2]) / f, (is[3] - was[3]) / f, (is[4] - was[4]) / f, (is[5] - was[5]) / f, (is[6] - was[6]) / f,
                                      (is[7] - was[7]) / f, (times[0] - timesWas[0]) / f / 1e6, (times[1] - timesWas[1]) / f / 1e6);
                     {
-                        static std::uint64_t nsWas[8], itemsWas[8], qwWas, palWas[2];
+                        static std::uint64_t nsWas[8], itemsWas[8], qwWas, palWas[2], replayWas[3];
                         std::uint64_t ns[8], items[8], pal[2];
                         for (int k = 0; k < 8; k++) {
                             ns[k] = g_gsNsByPath[k].load();
@@ -5655,13 +5692,17 @@ void RenderThreadMain()
                             std::fprintf(stderr, "perfgs: to %llu, the GS thread a frame:", (unsigned long long)shown);
                             for (int k = 0; k < 7; k++)
                                 std::fprintf(stderr, " %s %.2f ms (%.0f)%s", kPath[k], (ns[k] - nsWas[k]) / f / 1e6, (items[k] - itemsWas[k]) / f, k < 6 ? "," : "");
-                            std::fprintf(stderr, "; uploads %.1f KB, palettes read %.1f, from the cache %.1f\n", (qw - qwWas) * 16 / f / 1024.0, (pal[0] - palWas[0]) / f, (pal[1] - palWas[1]) / f);
+                            std::fprintf(stderr, "; uploads %.1f KB, palettes read %.1f, from the cache %.1f; parts drawn again: batches %.2f ms, register writes %.2f, packets %.2f\n",
+                                         (qw - qwWas) * 16 / f / 1024.0, (pal[0] - palWas[0]) / f, (pal[1] - palWas[1]) / f, (g_replayNs[0] - replayWas[0]) / f / 1e6,
+                                         (g_replayNs[1] - replayWas[1]) / f / 1e6, (g_replayNs[2] - replayWas[2]) / f / 1e6);
                         }
                         std::memcpy(nsWas, ns, sizeof nsWas);
                         std::memcpy(itemsWas, items, sizeof itemsWas);
                         qwWas = qw;
                         palWas[0] = pal[0];
                         palWas[1] = pal[1];
+                        for (int k = 0; k < 3; k++)
+                            replayWas[k] = g_replayNs[k].load();
                     }
                     {
                         static std::uint64_t keepWas[6], watchWas[3];

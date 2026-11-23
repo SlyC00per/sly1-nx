@@ -1603,3 +1603,16 @@ it saved, but the lit parts' colours move off the GS thread too.
 On the host's tour of A Stealthy Approach with `SLY1_SKIN=1`: 30,176 tasks made by the helper,
 14,529 by the GS thread, 49 done its own way, 0.14 s of waiting over some 2,300 frames. Level 4
 under lockstep: 29 frames within 1 of 255 of `SLY1_PART_REPLAY=0`. Not measured on the Switch.
+
+### The GS thread's time for a part drawn again (2026-11-22)
+
+At 6d6b145 on the Switch a part drawn again cost the GS thread 26 microseconds (32 with the
+skinning); the host cannot say where (its renderer only counts what it is given). Two things:
+
+- `perfgs:` now splits it: the batches (drawn, with their per-frame work), the packets kept as
+  register writes, the packets through the GIF.
+- A kept part's items are in one piece of memory, one after another at 64 bytes, as the GS thread
+  goes through them (`PartKeepFinish`; `SLY1_PART_PACK=0`: each in a block of its own, as before):
+  the Switch's cores wait on memory, and the items were scattered over the heap.
+
+Level 4 under lockstep: 29 frames within 1 of 255 of `SLY1_PART_REPLAY=0`.
