@@ -5223,6 +5223,7 @@ void RenderFlush()
 
 void GsThreadMain()
 {
+    ProfileThisThread();   // (SLY1_PROFILE)
     gs::SetBatchSink(QueueBatch);
     g_gsStarted.store(true, std::memory_order_release);
     // Everything queued is taken at once, and the emptied buffers given back then: the lock once a
@@ -5458,6 +5459,43 @@ void GsThreadMain()
                 if (kept.path == 4) {
                     gs::Batch b;
                     std::memcpy(&b, &w[1], sizeof b);
+                    {   // SLY1_FUSE_SURVEY: batches that follow one of another id with nothing between and the same layout
+                        static const bool survey = std::getenv("SLY1_FUSE_SURVEY") != nullptr;
+                        if (survey) {
+                            static std::uint64_t all, fusable, vertices;
+                            static std::uint32_t prevTag, prevId;
+                            static std::size_t prevI = ~std::size_t(0);
+                            static const void* prevPart;
+                            static gs::Batch prev;
+                            all++;
+                            static std::uint64_t adjacent, sameTag, otherId, gap1;
+                            if (prevPart == &part && prevI + 1 == i) {
+                                adjacent++;
+                                sameTag += prevTag == w[0];
+                                otherId += prevTag == w[0] && prevId != b.id;
+                            }
+                            gap1 += prevPart == &part && prevI + 2 == i;
+                            if ((all & 0x3FFFF) == 0)
+                                std::fprintf(stderr, "fuse: adjacent %llu, same tag %llu, of another id %llu; one item between %llu\n", (unsigned long long)adjacent,
+                                             (unsigned long long)sameTag, (unsigned long long)otherId, (unsigned long long)gap1);
+                            if (prevPart == &part && prevI + 1 == i && prevTag == w[0] && prevId != b.id && b.id != 0 && prev.stride == b.stride &&
+                                prev.positionAt == b.positionAt && prev.stqAt == b.stqAt && prev.colourAt == b.colourAt && prev.cull == b.cull &&
+                                prev.fogScale == b.fogScale && prev.wMax == b.wMax && prev.alphaDeferred == b.alphaDeferred && prev.stSource == b.stSource &&
+                                (prev.litWords != 0) == (b.litWords != 0) && prev.litKick == b.litKick && prev.swaySource == b.swaySource &&
+                                (prev.skinWords != 0) == (b.skinWords != 0) && prev.projected == b.projected && prev.projSource == b.projSource) {
+                                fusable++;
+                                vertices += b.count;
+                            }
+                            prev = b;
+                            prevTag = w[0];
+                            prevId = b.id;
+                            prevI = i;
+                            prevPart = &part;
+                            if ((all & 0x3FFFF) == 0)
+                                std::fprintf(stderr, "fuse: %llu kept batches drawn, %llu could join the one before (%.1f vertices each)\n", (unsigned long long)all,
+                                             (unsigned long long)fusable, fusable ? (double)vertices / fusable : 0.0);
+                        }
+                    }
                     std::memcpy(b.matrix, matrix, sizeof b.matrix);
                     std::memcpy(b.scale, viewport, 16);
                     std::memcpy(b.offset, viewport + 4, 16);

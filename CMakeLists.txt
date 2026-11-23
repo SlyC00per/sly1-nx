@@ -157,7 +157,7 @@ target_compile_options(port_libm PRIVATE -w -ffp-contract=off -fwrapv -fno-stric
 
 add_library(port_platform STATIC
     port/platform/lib_runtime.cpp port/platform/lib_kernel.cpp port/platform/lib_devices.cpp
-    port/platform/iop.cpp port/platform/iso.cpp port/platform/float_mode.cpp
+    port/platform/iop.cpp port/platform/iso.cpp port/platform/float_mode.cpp port/platform/profiler.cpp
     port/platform/kernel.cpp port/platform/lib_services.cpp port/platform/dmac.cpp
     port/platform/memory_card.cpp port/platform/pad.cpp port/audio/audio.cpp
     port/video/mpeg2.cpp port/video/movie.cpp)
