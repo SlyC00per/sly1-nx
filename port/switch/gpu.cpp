@@ -1492,7 +1492,10 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
     // A lit part drawn again (gs::Batch::litNow): this kick's colours by this frame's lights, made
     // here (the vertices kept are those of the frame the part was kept in).
     const std::uint32_t* litColours = nullptr;
-    if (b.lit && b.litNow && b.keep != 0) {
+    if (b.coloursNow && b.keep != 0) {   // made already, by the helper
+        litColours = b.coloursNow;
+        litNowBatches_++;
+    } else if (b.lit && b.litNow && b.keep != 0) {
         // (all three kicks' colours made at the first: the others come next with the same id)
         if (b.id == 0 || b.id != litId_ || frames_ != litFrame_ || litStaging_.size() != (std::size_t)b.count * 12) {
             litStaging_.resize((std::size_t)b.count * 12);

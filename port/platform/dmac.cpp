@@ -360,10 +360,244 @@ struct GsItem {
     std::uint64_t a = 0, b = 0;
     // path 6, a part run beside the render thread (PartJob): its items come in this one's place
     std::shared_ptr<struct PartJob> job;
+    // path 5: what the part's batches are drawn with this frame, made ahead by the helper (PrepTask)
+    std::shared_ptr<struct PrepTask> prep;
     // paths 2 and 3: its last tag is the game's FINISH, and the game has been told (FinishEarly)
     bool finishTold = false;    // a call: when the list of VIF1's before it reached the render thread (g_listAt)
     std::uint64_t listAt = 0;
 };
+
+// What a kept batch is drawn with this frame (a part drawn again): its vertices skinned by this
+// frame's bones and moved by its sway, its lighting's parameters for this frame (b.litNow, in sc).
+// iw: the item's words (PartDecide's), whose layout ReplayLayout reads. Run by the GS thread, or
+// by the helper ahead of it for the whole part (PrepTask).
+struct ReplayLayout {
+    std::uint32_t stCount = 0, swayCount = 0, boneCount = 0;
+    bool hasLit = false;
+    std::size_t litAt = 0, swayAt = 0, boneAt = 0, fix = 0;
+    explicit ReplayLayout(const std::uint32_t* iw)
+    {
+        stCount = iw[27] & 0xFFFF;
+        hasLit = (iw[27] & 0x10000u) != 0;
+        swayCount = (iw[27] >> 20) & 0xF;
+        boneCount = (iw[27] >> 24) & 0xFF;
+        litAt = 28 + 2 * (std::size_t)stCount;
+        swayAt = litAt + (hasLit ? gs::kLitParamWords : 0);
+        boneAt = swayAt + 12 * (std::size_t)swayCount;
+        fix = boneAt + 16 * (std::size_t)boneCount;
+    }
+};
+struct BatchScratch {
+    std::vector<std::uint32_t> skinned, litSkinned, moved;
+    const void* skinnedPart = nullptr;
+    std::uint32_t skinnedId = 0;
+    bool skinnedLit = false;
+    gs::LitParams litNow;
+};
+void BatchNow(const std::uint32_t* iw, const ReplayLayout& L, const void* partKey, const std::uint32_t* w, gs::Batch& b, BatchScratch& sc);
+
+// A part drawn again whose batches are skinned, swayed or lit anew each frame: that work made by
+// the helper when the part is decided, so that the GS thread, which limits the frame, only takes
+// what it made (measured on the Switch: skinning there cost it 6 microseconds a part, and the
+// helper had the time). The GS thread makes it itself if the helper has not begun, and does the
+// work its own way if the helper is set aside in the middle of it. Of a pool, made once.
+struct PrepTask {
+    std::atomic<int> state{0};      // 0 waiting, 1 being made, 2 made
+    std::atomic<int> runners{0};
+    std::shared_ptr<const std::vector<PartKept>> part;
+    std::vector<std::uint32_t> words;                          // the item's words (its parameters)
+    std::vector<std::vector<std::uint32_t>> quads, colours;    // by the part's item: moved vertices, a kick's colours
+    std::vector<std::uint8_t> moved;                           // bit 0 skinned, bit 1 swayed
+    std::vector<std::uint32_t> all3;
+    BatchScratch sc;
+    std::uint64_t begunAt = 0;
+};
+std::vector<PrepTask*> g_prepFree;
+std::mutex g_prepFreeLock;
+constexpr std::uint32_t kListPreps = 2048;
+std::shared_ptr<PrepTask> g_preps[kListPreps];
+std::atomic<std::uint32_t> g_prepCount{0}, g_prepNext{0};
+std::mutex g_prepLock;   // (the queue's slots: the render thread fills and empties them, the helper takes)
+std::atomic<std::uint64_t> g_prepsMade[3], g_prepWaitNs{0};   // by the helper, the GS thread, done the GS thread's own way
+bool PrepOn()
+{
+    static const bool off = std::getenv("SLY1_PART_PREP") && std::getenv("SLY1_PART_PREP")[0] == '0';
+    return !off;
+}
+std::shared_ptr<PrepTask> PrepNew()
+{
+    PrepTask* t = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_prepFreeLock);
+        for (std::size_t k = g_prepFree.size(); k-- > 0 && !t;)
+            if (g_prepFree[k]->runners.load(std::memory_order_acquire) == 0) {
+                t = g_prepFree[k];
+                g_prepFree.erase(g_prepFree.begin() + (std::ptrdiff_t)k);
+            }
+    }
+    if (!t)
+        t = new PrepTask;
+    t->state.store(0, std::memory_order_relaxed);
+    t->begunAt = 0;
+    return std::shared_ptr<PrepTask>(t, [](PrepTask* x) {
+        x->part.reset();
+        std::lock_guard<std::mutex> lk(g_prepFreeLock);
+        g_prepFree.push_back(x);
+    });
+}
+// The work, on this thread (who: 0 the helper, 1 the GS thread): true when this thread made it.
+bool PrepRun(PrepTask& t, int who)
+{
+    struct Runner {
+        PrepTask& t;
+        explicit Runner(PrepTask& x) : t(x) { t.runners.fetch_add(1, std::memory_order_acq_rel); }
+        ~Runner() { t.runners.fetch_sub(1, std::memory_order_acq_rel); }
+    } runner(t);
+    int waiting = 0;
+    if (!t.state.compare_exchange_strong(waiting, 1, std::memory_order_acq_rel))
+        return false;
+    t.begunAt = NowNs();
+    const std::vector<PartKept>& part = *t.part;
+    const ReplayLayout L(t.words.data());
+    const std::size_t head = 1 + (sizeof(gs::Batch) + 3) / 4;
+    t.quads.resize(part.size());
+    t.colours.resize(part.size());
+    t.moved.assign(part.size(), 0);
+    std::uint32_t lastId = 0, lastCount = 0;
+    for (std::size_t i = 0; i < part.size(); i++) {
+        t.quads[i].clear();
+        t.colours[i].clear();
+        const PartKept& kept = part[i];
+        if (kept.path != 4)
+            continue;
+        gs::Batch b;
+        std::memcpy(&b, &kept.data[1], sizeof b);
+        b.quads = kept.data + head;
+        BatchNow(t.words.data(), L, &part, kept.data, b, t.sc);
+        if (b.skinMoved || b.swayMoved) {
+            t.quads[i].assign(b.quads, b.quads + (std::size_t)b.count * b.stride * 4);
+            t.moved[i] = (b.skinMoved ? 1 : 0) | (b.swayMoved ? 2 : 0);
+        }
+        if (b.lit && b.litNow) {   // the three kicks' colours made at the first, the others taken from them
+            if (!(b.id != 0 && b.id == lastId && b.count == lastCount)) {
+                t.all3.resize((std::size_t)b.count * 12);
+                gs::LitColoursAll(b, t.all3.data());
+                lastId = b.id;
+                lastCount = b.count;
+            }
+            const std::size_t at = (std::size_t)(b.litKick < 3 ? b.litKick : 0) * b.count * 4;
+            t.colours[i].assign(t.all3.begin() + (std::ptrdiff_t)at, t.all3.begin() + (std::ptrdiff_t)(at + (std::size_t)b.count * 4));
+        }
+    }
+    t.state.store(2, std::memory_order_release);
+    g_prepsMade[who]++;
+    return true;
+}
+std::shared_ptr<PrepTask> PrepTake()
+{
+    std::lock_guard<std::mutex> lk(g_prepLock);
+    const std::uint32_t next = g_prepNext.load(std::memory_order_acquire);
+    if (next >= g_prepCount.load(std::memory_order_acquire))
+        return nullptr;
+    g_prepNext.store(next + 1, std::memory_order_release);
+    return g_preps[next];
+}
+
+void BatchNow(const std::uint32_t* iw, const ReplayLayout& L, const void* partKey, const std::uint32_t* w, gs::Batch& b, BatchScratch& sc)
+{
+    const std::size_t head = 1 + (sizeof(gs::Batch) + 3) / 4;
+    const bool hasLit = L.hasLit;
+    const std::uint32_t swayCount = L.swayCount, boneCount = L.boneCount;
+    const std::size_t litAt = L.litAt, swayAt = L.swayAt, boneAt = L.boneAt;
+    (void)head;
+        b.lit = b.litWords ? b.quads + (std::size_t)b.count * b.stride * 4 : nullptr;
+        b.litNow = nullptr;
+        b.sway = b.swayWords ? b.quads + (std::size_t)b.count * b.stride * 4 + b.litWords : nullptr;
+        b.swayMoved = false;
+        b.skin = b.skinWords ? b.quads + (std::size_t)b.count * b.stride * 4 + b.litWords + b.swayWords : nullptr;
+        b.skinMoved = false;
+        std::vector<std::uint32_t>& skinned = sc.skinned, & litSkinned = sc.litSkinned;
+        // (a batch's kicks come one after another, each with its own copy of the vertices:
+        // skinned once, for the first; the next take what it gave)
+        const void*& skinnedPart = sc.skinnedPart;
+        std::uint32_t& skinnedId = sc.skinnedId;
+        bool& skinnedLit = sc.skinnedLit;
+        // (only a lit one's: the kicks' own colours are in their vertices otherwise, and those
+        // of the first would be drawn for all)
+        const bool again = b.skin && boneCount != 0 && b.id != 0 && skinnedPart == partKey && skinnedId == b.id && skinnedLit && b.lit &&
+                           skinned.size() == (std::size_t)b.count * b.stride * 4;
+        if (again) {
+            b.quads = skinned.data();
+            b.skinMoved = true;
+            if (litSkinned.size() == b.litWords)
+                b.lit = litSkinned.data();
+        } else if (b.skin && boneCount != 0) {
+            skinnedPart = partKey;
+            skinnedId = b.id;
+            skinnedLit = false;
+            // its vertices skinned by this frame's bones, and its normals for its lighting (a
+            // matrix with no bone known is one no vertex weighs: the keeping said so)
+            float mats[64] = {};
+            for (int j = 0; j < 4; j++)
+                if (b.boneSource[j] < boneCount)
+                    std::memcpy(mats + 16 * j, &iw[boneAt + 16 * (std::size_t)b.boneSource[j]], 64);
+            skinned.resize((std::size_t)b.count * b.stride * 4);
+            float* normals = nullptr;
+            if (b.lit && b.skin[1]) {
+                litSkinned.assign(b.lit, b.lit + b.litWords);
+                normals = reinterpret_cast<float*>(litSkinned.data() + gs::kLitHead);
+            }
+            gs::SkinQuads(b, mats, skinned.data(), normals);
+            skinnedLit = normals != nullptr;
+            {   // SLY1_SKIN_CHECK=4: this frame's bones against those it was kept with, and the kept
+                // vertices skinned anew by the latter against themselves
+                static const bool check = std::getenv("SLY1_SKIN_CHECK") && std::getenv("SLY1_SKIN_CHECK")[0] == '4';
+                if (check) {
+                    static std::vector<std::uint32_t> again;
+                    again.resize(skinned.size());
+                    gs::SkinQuads(b, reinterpret_cast<const float*>(b.skin + 2), again.data(), nullptr);
+                    double self = 0, moved = 0;
+                    for (std::uint32_t k = 0; k < b.count; k++)
+                        for (int c = 0; c < 3; c++) {
+                            const std::size_t at = (k * b.stride + b.positionAt) * 4 + c;
+                            const float* kept = reinterpret_cast<const float*>(w + head);
+                            self = std::max<double>(self, std::fabs(reinterpret_cast<const float*>(again.data())[at] - kept[at]));
+                            moved = std::max<double>(moved, std::fabs(reinterpret_cast<const float*>(skinned.data())[at] - kept[at]));
+                        }
+                    double bones = 0;
+                    for (int q = 0; q < 64; q++)
+                        bones = std::max<double>(bones, std::fabs(mats[q] - reinterpret_cast<const float*>(b.skin + 2)[q]));
+                    static int said;
+                    if (said++ < 30)
+                        std::fprintf(stderr, "skin check 4: batch of %u: kept vertices skinned anew by their bones %g apart; by this frame's %g; the bones %g apart\n", b.count, self, moved, bones);
+                }
+            }
+            b.quads = skinned.data();
+            b.skinMoved = true;
+            if (normals)
+                b.lit = litSkinned.data();
+        }
+        if (b.sway && b.swaySource < swayCount) {   // its vertices moved by this frame's sway
+            std::vector<std::uint32_t>& moved = sc.moved;
+            moved.resize((std::size_t)b.count * b.stride * 4);
+            gs::SwayQuads(b, reinterpret_cast<const float*>(&iw[swayAt + 12 * (std::size_t)b.swaySource]), moved.data());
+            b.quads = moved.data();
+            b.swayMoved = true;
+        }
+        gs::LitParams& litNow = sc.litNow;
+        if (hasLit && b.lit) {   // this frame's lighting, with the batch's own start and vf01
+            std::memcpy(&litNow, &iw[litAt], sizeof litNow);
+            gs::LitParams was;
+            std::memcpy(&was, b.lit, sizeof was);
+            float add;
+            std::memcpy(&add, b.lit + gs::kLitParamWords, 4);
+            litNow.start[1] += add;
+            std::memcpy(litNow.one, was.one, sizeof litNow.one);
+            if (litNow.lights == was.lights)
+                b.litNow = &litNow;
+        }
+}
+
 // On a thread running a part's job: where what it queues for the GS goes. The items stay where
 // they are from job to job, and each one's buffer is used again for the item that comes in its
 // place: a job's thread neither allocates nor takes a lock (the helper may be set aside by the
@@ -2078,6 +2312,8 @@ void HashHelperMain()
             HelperGiveWay();
             if (PartJob* j = PartJobTake())
                 PartJobRun(*j, 0, false);
+            else if (std::shared_ptr<PrepTask> p = PrepTake())
+                PrepRun(*p, 0);
             else if (g_listWalked.load(std::memory_order_acquire) && jobs.empty() && !g_hashQueued.load(std::memory_order_acquire))
 #if defined(__SWITCH__)
                 // (asleep a moment, not a yield: above the game's threads a yield gives them nothing,
@@ -3335,6 +3571,18 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
                 }
                 g_partsTexMoved++;
             }
+            if ((hasLit || swayCount || boneCount) && PrepOn()) {   // the per-frame work made ahead by the helper
+                std::shared_ptr<PrepTask> prep = PrepNew();
+                prep->part = r.kept;
+                prep->words.assign(item.words.begin(), item.words.end());
+                std::lock_guard<std::mutex> lk(g_prepLock);
+                const std::uint32_t at = g_prepCount.load(std::memory_order_acquire);
+                if (at < kListPreps) {
+                    g_preps[at] = prep;
+                    g_prepCount.store(at + 1, std::memory_order_release);
+                }
+                item.prep = std::move(prep);
+            }
             g_gsPending.push_back(std::move(item));
             if (g_gsPending.size() >= 24)
                 GsPassOn();
@@ -3951,6 +4199,14 @@ void PartJobsBegin()
 {
     // (every job of the list before is done: PartJobsDrain)
     PartJobsKeep();
+    {   // the preps the helper has not taken are the GS thread's (each item holds its own)
+        std::lock_guard<std::mutex> lk(g_prepLock);
+        const std::uint32_t had = g_prepCount.load(std::memory_order_acquire);
+        for (std::uint32_t k = 0; k < had; k++)
+            g_preps[k].reset();
+        g_prepCount.store(0, std::memory_order_release);
+        g_prepNext.store(0, std::memory_order_release);
+    }
     const std::uint32_t had = g_listJobCount.load(std::memory_order_acquire);
     g_listJobNext.store(0, std::memory_order_release);
     g_listJobCount.store(0, std::memory_order_release);
@@ -4526,6 +4782,8 @@ void PartCountsLine(const char* what)
     std::fprintf(stderr, "partsway: %s: parts drawn again with their vertices moved by this frame's sway %llu, skinned by this frame's bones %llu\n", what,
                  (unsigned long long)g_partsSwayed, (unsigned long long)g_partsSkinned);
     std::fprintf(stderr, "partsway: %s: parts whose bones were not at their places in this frame's chain %llu\n", what, (unsigned long long)g_bonesMislaid);
+    std::fprintf(stderr, "partprep: %s: parts' per-frame work made by the helper %llu, by the GS thread %llu, done the GS thread's own way %llu; the GS thread waited %.3f s\n", what,
+                 (unsigned long long)g_prepsMade[0].load(), (unsigned long long)g_prepsMade[1].load(), (unsigned long long)g_prepsMade[2].load(), g_prepWaitNs.load() / 1e9);
     std::fprintf(stderr, "path1: %llu of VU1's packets joined the one before in its item; %llu outline edges put with the edge before\n", (unsigned long long)g_path1Joined.load(),
                  (unsigned long long)g_outlinesJoined.load());
     std::fprintf(stderr, "partjobs: making them: the shape %.2f s, the job %.2f, the copy %.2f, the queue %.2f; the render thread waited %.2f s for them at its lists' ends\n",
@@ -4894,6 +5152,7 @@ void RenderFlush()
     g_gsIdle.wait_for(lk, std::chrono::seconds(5), [] { return g_gsQueue.empty() && !g_gsBusy; });
 }
 
+
 void GsThreadMain()
 {
     gs::SetBatchSink(QueueBatch);
@@ -5079,14 +5338,25 @@ void GsThreadMain()
             const std::vector<PartKept>& part = *item.part;
             float alphaNow;
             std::memcpy(&alphaNow, &item.words[26], 4);
-            const std::uint32_t stCount = item.words[27] & 0xFFFF;
-            const bool hasLit = (item.words[27] & 0x10000u) != 0;
-            const std::uint32_t swayCount = (item.words[27] >> 20) & 0xF;
-            const std::uint32_t boneCount = (item.words[27] >> 24) & 0xFF;
-            const std::size_t litAt = 28 + 2 * (std::size_t)stCount;
-            const std::size_t swayAt = litAt + (hasLit ? gs::kLitParamWords : 0);
-            const std::size_t boneAt = swayAt + 12 * (std::size_t)swayCount;
-            std::size_t fix = boneAt + 16 * (std::size_t)boneCount;
+            const ReplayLayout layout(item.words.data());
+            const std::uint32_t stCount = layout.stCount;
+            std::size_t fix = layout.fix;
+            // what the helper made of the part's batches this frame: made here if it has not begun,
+            // waited for a little if it has, done this thread's own way if it is still at it
+            PrepTask* prep = nullptr;
+            if (item.prep) {
+                PrepTask& t = *item.prep;
+                if (!PrepRun(t, 1)) {
+                    const std::uint64_t w0 = NowNs();
+                    while (t.state.load(std::memory_order_acquire) == 1 && NowNs() - w0 < 200000)
+                        std::this_thread::yield();
+                    g_prepWaitNs += NowNs() - w0;
+                }
+                if (t.state.load(std::memory_order_acquire) == 2 && t.quads.size() == part.size())
+                    prep = &t;
+                else
+                    g_prepsMade[2]++;
+            }
             for (std::size_t i = 0; i < part.size(); i++) {
                 const PartKept& kept = part[i];
                 if (i + 2 < part.size()) {
@@ -5126,91 +5396,18 @@ void GsThreadMain()
                     if (b.stApplied && b.stSource < stCount)
                         std::memcpy(b.stOffset, &item.words[28 + 2 * b.stSource], 8);
                     b.quads = w + head;
-                    b.lit = b.litWords ? b.quads + (std::size_t)b.count * b.stride * 4 : nullptr;
-                    b.litNow = nullptr;
-                    b.sway = b.swayWords ? b.quads + (std::size_t)b.count * b.stride * 4 + b.litWords : nullptr;
-                    b.swayMoved = false;
-                    b.skin = b.skinWords ? b.quads + (std::size_t)b.count * b.stride * 4 + b.litWords + b.swayWords : nullptr;
-                    b.skinMoved = false;
-                    static thread_local std::vector<std::uint32_t> skinned, litSkinned;
-                    // (a batch's kicks come one after another, each with its own copy of the vertices:
-                    // skinned once, for the first; the next take what it gave)
-                    static thread_local const std::vector<PartKept>* skinnedPart = nullptr;
-                    static thread_local std::uint32_t skinnedId = 0;
-                    static thread_local bool skinnedLit = false;
-                    // (only a lit one's: the kicks' own colours are in their vertices otherwise, and those
-                    // of the first would be drawn for all)
-                    const bool again = b.skin && boneCount != 0 && b.id != 0 && skinnedPart == &part && skinnedId == b.id && skinnedLit && b.lit &&
-                                       skinned.size() == (std::size_t)b.count * b.stride * 4;
-                    if (again) {
-                        b.quads = skinned.data();
-                        b.skinMoved = true;
-                        if (litSkinned.size() == b.litWords)
-                            b.lit = litSkinned.data();
-                    } else if (b.skin && boneCount != 0) {
-                        skinnedPart = &part;
-                        skinnedId = b.id;
-                        skinnedLit = false;
-                        // its vertices skinned by this frame's bones, and its normals for its lighting (a
-                        // matrix with no bone known is one no vertex weighs: the keeping said so)
-                        float mats[64] = {};
-                        for (int j = 0; j < 4; j++)
-                            if (b.boneSource[j] < boneCount)
-                                std::memcpy(mats + 16 * j, &item.words[boneAt + 16 * (std::size_t)b.boneSource[j]], 64);
-                        skinned.resize((std::size_t)b.count * b.stride * 4);
-                        float* normals = nullptr;
-                        if (b.lit && b.skin[1]) {
-                            litSkinned.assign(b.lit, b.lit + b.litWords);
-                            normals = reinterpret_cast<float*>(litSkinned.data() + gs::kLitHead);
+                    if (prep) {
+                        if (!prep->quads[i].empty()) {
+                            b.quads = prep->quads[i].data();
+                            b.skinMoved = (prep->moved[i] & 1) != 0;
+                            b.swayMoved = (prep->moved[i] & 2) != 0;
                         }
-                        gs::SkinQuads(b, mats, skinned.data(), normals);
-                        skinnedLit = normals != nullptr;
-                        {   // SLY1_SKIN_CHECK=4: this frame's bones against those it was kept with, and the kept
-                            // vertices skinned anew by the latter against themselves
-                            static const bool check = std::getenv("SLY1_SKIN_CHECK") && std::getenv("SLY1_SKIN_CHECK")[0] == '4';
-                            if (check) {
-                                static std::vector<std::uint32_t> again;
-                                again.resize(skinned.size());
-                                gs::SkinQuads(b, reinterpret_cast<const float*>(b.skin + 2), again.data(), nullptr);
-                                double self = 0, moved = 0;
-                                for (std::uint32_t k = 0; k < b.count; k++)
-                                    for (int c = 0; c < 3; c++) {
-                                        const std::size_t at = (k * b.stride + b.positionAt) * 4 + c;
-                                        const float* kept = reinterpret_cast<const float*>(w + head);
-                                        self = std::max<double>(self, std::fabs(reinterpret_cast<const float*>(again.data())[at] - kept[at]));
-                                        moved = std::max<double>(moved, std::fabs(reinterpret_cast<const float*>(skinned.data())[at] - kept[at]));
-                                    }
-                                double bones = 0;
-                                for (int q = 0; q < 64; q++)
-                                    bones = std::max<double>(bones, std::fabs(mats[q] - reinterpret_cast<const float*>(b.skin + 2)[q]));
-                                static int said;
-                                if (said++ < 30)
-                                    std::fprintf(stderr, "skin check 4: batch of %u: kept vertices skinned anew by their bones %g apart; by this frame's %g; the bones %g apart\n", b.count, self, moved, bones);
-                            }
-                        }
-                        b.quads = skinned.data();
-                        b.skinMoved = true;
-                        if (normals)
-                            b.lit = litSkinned.data();
-                    }
-                    if (b.sway && b.swaySource < swayCount) {   // its vertices moved by this frame's sway
-                        static thread_local std::vector<std::uint32_t> moved;
-                        moved.resize((std::size_t)b.count * b.stride * 4);
-                        gs::SwayQuads(b, reinterpret_cast<const float*>(&item.words[swayAt + 12 * (std::size_t)b.swaySource]), moved.data());
-                        b.quads = moved.data();
-                        b.swayMoved = true;
-                    }
-                    gs::LitParams litNow;
-                    if (hasLit && b.lit) {   // this frame's lighting, with the batch's own start and vf01
-                        std::memcpy(&litNow, &item.words[litAt], sizeof litNow);
-                        gs::LitParams was;
-                        std::memcpy(&was, b.lit, sizeof was);
-                        float add;
-                        std::memcpy(&add, b.lit + gs::kLitParamWords, 4);
-                        litNow.start[1] += add;
-                        std::memcpy(litNow.one, was.one, sizeof litNow.one);
-                        if (litNow.lights == was.lights)
-                            b.litNow = &litNow;
+                        b.lit = b.litWords ? w + head + (std::size_t)b.count * b.stride * 4 : nullptr;
+                        b.litNow = nullptr;
+                        b.coloursNow = prep->colours[i].empty() ? nullptr : prep->colours[i].data();
+                    } else {
+                        static thread_local BatchScratch scratch;
+                        BatchNow(item.words.data(), layout, &part, w, b, scratch);
                     }
                     if (!gs::DrawBatch(w[0], b))
                         g_batchesRefused++;

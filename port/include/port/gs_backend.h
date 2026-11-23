@@ -154,6 +154,9 @@ struct Batch {
     std::uint32_t skinWords = 0;
     std::uint8_t boneSource[4] = {0xFF, 0xFF, 0xFF, 0xFF};
     bool skinMoved = false;
+    // A lit part drawn again whose colours for this kick were made already (count * 4 words, as
+    // LitColoursNow makes them: the helper's, port/platform/dmac.cpp's PrepTask): drawn as they are.
+    const std::uint32_t* coloursNow = nullptr;
 };
 constexpr std::size_t kSkinHead = 2 + 64;   // (and the four matrices it was skinned by, 2 to 65)
 inline std::size_t SkinWords(std::uint32_t count) { return kSkinHead + (std::size_t)count * 10; }

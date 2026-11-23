@@ -1587,3 +1587,19 @@ So the skinning is off unless `SLY1_SKIN=1`, until it is done off the GS thread 
 the time it frees: the positions and colours could be made there when the part is decided).
 Over the whole play: 77% of windows in 3D at 60, 5% slow, 1.2% of frames late; the GS thread
 11.7 ms a frame, its parts drawn again 5.7 ms for 197 parts.
+
+### The per-frame work of parts drawn again, made by the helper (2026-11-22)
+
+What a kept batch is drawn with each frame (its vertices skinned and swayed, its colours lit anew)
+is one function now (`BatchNow`, with `ReplayLayout` reading the item's words). For a part with any
+of it, PartDecide makes a task (`PrepTask`, of a pool) that the helper takes between jobs: it runs
+`BatchNow` for each of the part's batches and keeps the moved vertices and each kick's colours
+(three kicks' made at once, `gs::LitColoursAll`). The GS thread takes what it made
+(`gs::Batch::coloursNow`); it makes the task itself if the helper has not begun it, and if the
+helper is at it waits up to 0.2 ms, then does the work its own way. `SLY1_PART_PREP=0`: the GS
+thread does it all, as before. This is for the skinning above, which cost the GS thread more than
+it saved, but the lit parts' colours move off the GS thread too.
+
+On the host's tour of A Stealthy Approach with `SLY1_SKIN=1`: 30,176 tasks made by the helper,
+14,529 by the GS thread, 49 done its own way, 0.14 s of waiting over some 2,300 frames. Level 4
+under lockstep: 29 frames within 1 of 255 of `SLY1_PART_REPLAY=0`. Not measured on the Switch.

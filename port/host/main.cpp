@@ -920,10 +920,12 @@ int main(int argc, char** argv)
                     } else {
                         Mix(q + b.stqAt * 4, 8);
                     }
-                    if (!(b.lit && b.litNow))
+                    if (!(b.lit && b.litNow) && !b.coloursNow)
                         Mix(q + b.colourAt * 4, 16);
                 }
-                if (b.lit && b.litNow) {   // (a lit part drawn again: its colours by this frame's lights)
+                if (b.coloursNow) {
+                    Mix(b.coloursNow, (std::size_t)b.count * 16);
+                } else if (b.lit && b.litNow) {   // (a lit part drawn again: its colours by this frame's lights)
                     static std::vector<std::uint32_t> now;
                     now.resize((std::size_t)b.count * 4);
                     port::gs::LitColoursNow(b, now.data());

@@ -1997,7 +1997,9 @@ void SoftBatch(const Batch& b)
     std::vector<Vertex> v(b.count);
     std::vector<bool> inside(b.count);
     std::vector<std::uint32_t> litNow;   // a lit part drawn again: its colours by this frame's lights
-    if (b.lit && b.litNow) {
+    if (b.coloursNow) {
+        litNow.assign(b.coloursNow, b.coloursNow + (std::size_t)b.count * 4);
+    } else if (b.lit && b.litNow) {
         litNow.resize((std::size_t)b.count * 4);
         LitColoursNow(b, litNow.data());
     }
