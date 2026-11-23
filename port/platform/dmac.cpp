@@ -5395,6 +5395,17 @@ void GsThreadMain()
                                              (unsigned long long)gs::FramesShown(), (pathIs[0] - pathWas[0]) / 1e6, (pathIs[1] - pathWas[1]) / 1e6, (pathIs[2] - pathWas[2]) / 1e6,
                                              (pathIs[3] - pathWas[3]) / 1e6, (pathIs[4] - pathWas[4]) / 1e6, (pathIs[5] - pathWas[5]) / 1e6, (pathIs[6] - pathWas[6]) / 1e6);
                         }
+                        {   // lateparts: in the same frames, the parts' jobs by thread and the render thread's
+                            // waits for them, and the parts not drawn as the list before had them
+                            static std::uint64_t jw[7];
+                            const std::uint64_t ji[7] = {g_jobsBy[0].load(), g_jobNsBy[0].load(), g_jobsBy[1].load(), g_jobNsBy[1].load(),
+                                                         g_jobsBy[2].load(), g_jobNsBy[2].load(), g_jobDrainWaitNs};
+                            if (dt > 20.0 && dt < 200.0 && said <= 8)
+                                std::fprintf(stderr, "lateparts: frame %llu: jobs by the helper %llu (%.1f ms), the render thread %llu (%.1f ms), the GS thread %llu (%.1f ms); "
+                                             "the render thread waited %.1f ms for jobs\n", (unsigned long long)gs::FramesShown(), (unsigned long long)(ji[0] - jw[0]), (ji[1] - jw[1]) / 1e6,
+                                             (unsigned long long)(ji[2] - jw[2]), (ji[3] - jw[3]) / 1e6, (unsigned long long)(ji[4] - jw[4]), (ji[5] - jw[5]) / 1e6, (ji[6] - jw[6]) / 1e6);
+                            std::memcpy(jw, ji, sizeof jw);
+                        }
                         std::memcpy(pathWas, pathIs, sizeof pathWas);
                         at = now;
                         std::memcpy(was, is, sizeof was);

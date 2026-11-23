@@ -4042,6 +4042,17 @@ bool Streaks(Runner& r)
     st.p = p;
     st.q = q;
     st.clip = clip;
+    {   // (diagnosis: SLY1_STREAK_DUMP: the packet kicked, its first particles)
+        static int dumped;
+        static const bool dump = std::getenv("SLY1_STREAK_DUMP") != nullptr;
+        if (dump && dumped++ < 6) {
+            const std::uint16_t first = (std::uint16_t)(Half(h0.x) + top);
+            for (std::uint16_t a = (std::uint16_t)(top + 48); a < first + 20 && a < top + 48 + 40; a++) {
+                const std::uint32_t* w = reinterpret_cast<const std::uint32_t*>(r.Qword(a));
+                std::fprintf(stderr, "streak: %u: %08X %08X %08X %08X\n", (unsigned)(a - top), w[0], w[1], w[2], w[3]);
+            }
+        }
+    }
     Kick(r, (std::uint16_t)(top + 48));
     st.pc = 0x110;
     return true;
