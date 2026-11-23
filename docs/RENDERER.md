@@ -1576,3 +1576,14 @@ Approach the parts lit by VU1 run as jobs 3.7 a frame against 6.6, 5,474 skinned
 again; `--verify-levels` with `SLY1_PART_JOBS_CHECK=1`: all 46 levels, 32,132 skinned parts drawn
 again, 333,185 jobs against 389,003, 4 leaving other registers than foretold (caught, as before).
 `SLY1_SKIN=0` turns the skinning off.
+
+### On the Switch: what the skinning costs (2026-11-22)
+
+At 6d6b145 with `SLY1_SKIN=ab` (skinning anew on and off in turn, 600 frames each), one play of
+A Stealthy Approach, in the windows in 3D away from the switches: on, the helper's jobs 3.8 ms a
+frame and the GS thread 32 microseconds for each part drawn again; off, 9.1 ms and 26. The frame
+is the GS thread's: windows at 60 frames a second 71% on, 83% off, the mean frame 17.1 ms both.
+So the skinning is off unless `SLY1_SKIN=1`, until it is done off the GS thread (the helper has
+the time it frees: the positions and colours could be made there when the part is decided).
+Over the whole play: 77% of windows in 3D at 60, 5% slow, 1.2% of frames late; the GS thread
+11.7 ms a frame, its parts drawn again 5.7 ms for 197 parts.

@@ -897,8 +897,15 @@ constexpr std::uint32_t kSwayUnpack = 0x6C068016u;
 constexpr std::uint32_t kBoneMask = 0x7FFFC000u, kBoneUnpack = 0x6C04C000u;
 bool SkinOn()
 {
-    static const bool off = std::getenv("SLY1_SKIN") && std::getenv("SLY1_SKIN")[0] == '0';
-    return !off;
+    // Off unless SLY1_SKIN=1 (2026-11-22): measured on the Switch in one play of A Stealthy Approach
+    // with SLY1_SKIN=ab (on and off in turn, 600 frames each), the skinning anew took the helper
+    // from 9.1 to 3.8 ms a frame but cost the GS thread, which limits the frame, 26 to 32
+    // microseconds for each part drawn again: windows at 60 frames a second 71% on, 83% off. It is
+    // for when the skinning is done off the GS thread.
+    static const char* const e = std::getenv("SLY1_SKIN");
+    if (e && e[0] == 'a')
+        return gs::FramesShown() / 600 % 2 == 0;
+    return e && e[0] == '1';
 }
 // A place in a part's packet that the hash leaves out: in memory that stays (a cached packet, a
 // REF of a mesh's data), or, for a part drawn the long way, in its own chain, which is written
