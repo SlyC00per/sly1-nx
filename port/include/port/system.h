@@ -3,6 +3,7 @@
 #ifndef PORT_SYSTEM_H
 #define PORT_SYSTEM_H
 
+#include <atomic>
 #include <cstdint>
 
 namespace port {
@@ -28,6 +29,8 @@ std::uint64_t NowNs();
 std::int32_t CurrentThreadId();
 // The EE's float rules on the calling thread: rounding toward zero, denormals flushed.
 void SetGameFloatMode();
+// The pad's buttons the game last read, as its word holds them, set when pressed (port/platform/pad.cpp)
+extern std::atomic<std::uint16_t> g_padHeld;
 // The kernel model (port/platform/kernel.cpp): the calling host thread becomes the game's main
 // thread, running; and an interrupt cause's handler is called (the clock: 2, vertical blank).
 void KernelStartMainThread();

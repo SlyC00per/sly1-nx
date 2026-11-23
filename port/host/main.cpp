@@ -786,6 +786,50 @@ int main(int argc, char** argv)
         pthread_t verify;
         pthread_create(&verify, nullptr, [](void*) -> void* { VerifyLevels(); return nullptr; }, nullptr);
         pthread_detach(verify);
+    } else if (std::getenv("SLY1_GOTO")) {
+        // SLY1_GOTO=n: in ordinary play, L, R and minus held together (L1, R1 and SELECT) load level n
+        // where the player stands in a level, as the verifier asks for it (the game's own request,
+        // with no arrival keys): for playing a level the save has not opened yet. Again each time
+        // they are pressed. SLY1_GOTO_AFTER=frames: once, that many frames after a player is first
+        // in a level, with no one pressing (for trying it on the host)
+        pthread_t go;
+        pthread_create(&go, nullptr, [](void*) -> void* {
+            auto word = [](std::uint32_t a) -> volatile std::int32_t& { return *(volatile std::int32_t*)port::Native(a); };
+            constexpr std::uint32_t kLevels = 0x00247AF0, kRequest = 0x00275AF0, kFrames = 0x002626C0, kPlayer = 0x00262E10;
+            constexpr std::uint16_t kCombo = 0x0004 | 0x0008 | 0x0100;
+            const int n = std::atoi(std::getenv("SLY1_GOTO"));
+            const int after = std::getenv("SLY1_GOTO_AFTER") ? std::atoi(std::getenv("SLY1_GOTO_AFTER")) : -1;
+            if (n < 1 || n > 46)
+                return nullptr;
+            std::int32_t since = -1;
+            bool armed = true, timedDone = false;
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                const bool held = (port::g_padHeld.load() & kCombo) == kCombo;
+                if (!held)
+                    armed = true;
+                if (!g_started || word(kPlayer) == 0 || word(kRequest) != 0) {
+                    continue;
+                }
+                if (since < 0)
+                    since = word(kFrames);
+                const bool timed = after >= 0 && !timedDone && word(kFrames) - since >= after;
+                if (!(held && armed) && !timed)
+                    continue;
+                if (timed)
+                    timedDone = true;
+                armed = false;
+                std::fprintf(stderr, "goto: loading level %d\n", n);
+                word(kRequest + 0x04) = (std::int32_t)(kLevels + (std::uint32_t)(n - 1) * 0x2C);
+                word(kRequest + 0x08) = -1;
+                word(kRequest + 0x0C) = -1;
+                word(kRequest + 0x10) = 0;
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                word(kRequest) = 1;
+            }
+            return nullptr;
+        }, nullptr);
+        pthread_detach(go);
     }
 
     pthread_t game, clock, render, gsThread;

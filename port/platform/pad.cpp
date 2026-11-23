@@ -16,6 +16,7 @@
 #include <mutex>
 
 #include "common.h"
+#include "port/system.h"
 
 #if defined(__SWITCH__)
 #include <switch.h>
@@ -115,6 +116,9 @@ bool Connected(s32 port, s32 slot) { return port == 0 && slot == 0; }
 
 }  // namespace
 
+// The buttons the last read gave the game, as its word holds them (the host's SLY1_GOTO watches it)
+std::atomic<std::uint16_t> port::g_padHeld{0};
+
 extern "C" {
 
 s32 InitPadLibrary(s32) { return 1; }
@@ -185,6 +189,7 @@ s32 ReadPadFrame(s32 port, s32 slot, u8* out)
             f.ry = 0x80;
         }
     }
+    port::g_padHeld = f.buttons;
     std::memset(out, 0, 32);
     out[1] = 0x79;
     std::uint16_t released = (std::uint16_t)~f.buttons;
