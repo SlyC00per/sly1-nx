@@ -189,6 +189,60 @@ template <typename F>
 void PagesOf(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, std::uint32_t x0, std::uint32_t y0, std::uint32_t w,
              std::uint32_t h, F f);
 
+void LoadClutNow(std::uint64_t tex, std::uint64_t texclut);
+
+// A palette's load waits until something reads the palette buffer (a texture decoded or hashed)
+// or the GS's memory changes (Touch): the renderer finds most textures without either, and kept
+// parts load a palette with each of their TEX0 writes (half the time of their register writes on
+// the GS thread). A load that writes the entries of one waiting before it replaces that one.
+// Not with the reference drawing, nor SLY1_GS_CHECK. SLY1_CLUT_LAZY=0: each load made as it
+// comes; =ab: in turn with that, 600 frames each.
+struct ClutLoad {
+    std::uint64_t tex, texclut;
+    std::uint32_t first, count;
+};
+ClutLoad g_clutWaiting[32];
+int g_clutWaitingCount;
+// SLY1_CLUT_LAZY_CHECK=1: each load also read at once into a palette of its own, compared with the
+// buffer at each textured run (the waiting loads made first)
+std::uint32_t g_clutRef[256];
+bool ClutChecking()
+{
+    static const bool on = std::getenv("SLY1_CLUT_LAZY_CHECK") != nullptr;
+    return on;
+}
+void ReadClut(std::uint64_t tex, std::uint64_t texclut, std::uint32_t* out)
+{
+    const std::uint32_t cbp = (std::uint32_t)Bits(tex, 37, 14), psm = (std::uint32_t)Bits(tex, 20, 6), cpsm = (std::uint32_t)Bits(tex, 51, 4);
+    const std::uint32_t csm = (std::uint32_t)Bits(tex, 55, 1), csa = (std::uint32_t)Bits(tex, 56, 5);
+    const bool c16 = cpsm == PSMCT16 || cpsm == PSMCT16S;
+    auto fetch = [&](std::uint32_t x, std::uint32_t y) -> std::uint32_t {
+        return c16 ? ReadPixel(cpsm, cbp, 1, x, y) | 0x80000000u : ReadPixel(PSMCT32, cbp, 1, x, y);
+    };
+    if (csm) {
+        const std::uint32_t cbw = (std::uint32_t)Bits(texclut, 0, 6), cou = (std::uint32_t)Bits(texclut, 6, 6) * 16, cov = (std::uint32_t)Bits(texclut, 12, 10);
+        const std::uint32_t n = (psm == PSMT8 || psm == PSMT8H) ? 256 : 16;
+        for (std::uint32_t i = 0; i < n; i++)
+            out[i] = ReadPixel(cpsm, cbp, cbw, cou + i, cov) | (c16 ? 0x80000000u : 0);
+        return;
+    }
+    if (psm == PSMT8 || psm == PSMT8H) {
+        for (std::uint32_t i = 0; i < 256; i++)
+            out[i] = fetch((i & 7) | ((i & 0x10) >> 1), ((i & 8) >> 3) | ((i & 0xE0) >> 4));
+    } else {
+        const std::uint32_t base = (csa & (c16 ? 31 : 15)) * 16;
+        for (std::uint32_t i = 0; i < 16; i++)
+            out[(base + i) & 255] = fetch(i & 7, i >> 3);
+    }
+}
+void ClutSettle()
+{
+    const int n = g_clutWaitingCount;
+    g_clutWaitingCount = 0;
+    for (int k = 0; k < n; k++)
+        LoadClutNow(g_clutWaiting[k].tex, g_clutWaiting[k].texclut);
+}
+
 void LoadClut(std::uint64_t tex)
 {
     std::uint32_t cld = (std::uint32_t)Bits(tex, 61, 3), cbp = (std::uint32_t)Bits(tex, 37, 14);
@@ -203,6 +257,41 @@ void LoadClut(std::uint64_t tex)
     }
     if (!load)
         return;
+    if (ClutChecking())
+        ReadClut(tex, g_regs.texclut, g_clutRef);
+    static const bool check = std::getenv("SLY1_GS_CHECK") != nullptr;
+    static const char* const lazyEnv = std::getenv("SLY1_CLUT_LAZY");
+    const bool lazy = !g_rasterise && !check && !(lazyEnv && (lazyEnv[0] == '0' || (lazyEnv[0] == 'a' && FramesShown() / 600 % 2 == 1)));
+    if (!lazy) {
+        ClutSettle();
+        LoadClutNow(tex, g_regs.texclut);
+        return;
+    }
+    const std::uint32_t psm = (std::uint32_t)Bits(tex, 20, 6), cpsm = (std::uint32_t)Bits(tex, 51, 4);
+    const std::uint32_t csm = (std::uint32_t)Bits(tex, 55, 1), csa = (std::uint32_t)Bits(tex, 56, 5);
+    const bool eight = psm == PSMT8 || psm == PSMT8H;
+    std::uint32_t first = 0, count = 256;   // (as LoadClutNow's)
+    if (csm)
+        count = eight ? 256 : 16;
+    else if (!eight) {
+        first = (csa & ((cpsm == PSMCT16 || cpsm == PSMCT16S) ? 31 : 15)) * 16;
+        count = 16;
+    }
+    int kept = 0;
+    for (int k = 0; k < g_clutWaitingCount; k++) {
+        const ClutLoad& w = g_clutWaiting[k];
+        if (!(w.first >= first && w.first + w.count <= first + count))
+            g_clutWaiting[kept++] = w;
+    }
+    g_clutWaitingCount = kept;
+    if (g_clutWaitingCount == 32)
+        ClutSettle();
+    g_clutWaiting[g_clutWaitingCount++] = {tex, g_regs.texclut, first, count};
+}
+
+void LoadClutNow(std::uint64_t tex, std::uint64_t texclut)
+{
+    std::uint32_t cbp = (std::uint32_t)Bits(tex, 37, 14);
     std::uint32_t psm = (std::uint32_t)Bits(tex, 20, 6), cpsm = (std::uint32_t)Bits(tex, 51, 4);
     std::uint32_t csm = (std::uint32_t)Bits(tex, 55, 1), csa = (std::uint32_t)Bits(tex, 56, 5);
     // A palette loaded before, with nothing uploaded over its pages since, is copied from a small
@@ -210,12 +299,12 @@ void LoadClut(std::uint64_t tex)
     // writes local memory without marking pages). SLY1_GS_CHECK reads it all the same and compares.
     bool eight = psm == PSMT8 || psm == PSMT8H;
     std::uint64_t key = (std::uint64_t)cbp | (std::uint64_t)cpsm << 14 | (std::uint64_t)csm << 18 | (std::uint64_t)csa << 19 |
-                        (std::uint64_t)eight << 24 | (csm ? (g_regs.texclut & 0x3FFFFF) << 25 : 0);
+                        (std::uint64_t)eight << 24 | (csm ? (texclut & 0x3FFFFF) << 25 : 0);
     // the latest upload to the palette's pages, looked for only when a candidate was cached before
     // some upload (with none since, nothing can have changed)
     auto latestUpload = [&]() {
         std::uint32_t latest = 0;
-        PagesOf(cbp, csm ? (std::uint32_t)Bits(g_regs.texclut, 0, 6) : 1, cpsm, 0, 0, csm ? 1024 : 16, csm ? 1024 : 16,
+        PagesOf(cbp, csm ? (std::uint32_t)Bits(texclut, 0, 6) : 1, cpsm, 0, 0, csm ? 1024 : 16, csm ? 1024 : 16,
                 [&](std::uint32_t page) { latest = std::max(latest, g_pageUpload[page]); });
         return latest;
     };
@@ -336,7 +425,7 @@ void LoadClut(std::uint64_t tex)
         return ReadPixel(PSMCT32, cbp, 1, x, y);
     };
     if (csm) {   // CSM2: a line from TEXCLUT's offset (16-bit palettes only)
-        std::uint64_t tc = g_regs.texclut;
+        std::uint64_t tc = texclut;
         std::uint32_t cbw = (std::uint32_t)Bits(tc, 0, 6), cou = (std::uint32_t)Bits(tc, 6, 6) * 16,
                       cov = (std::uint32_t)Bits(tc, 12, 10);
         std::uint32_t n = (psm == PSMT8 || psm == PSMT8H) ? 256 : 16;
@@ -840,6 +929,25 @@ const Draw& RunState(std::uint64_t prim, std::uint32_t type)
     if (g_stateChanged) {
         d = DrawOf(prim);
         DrawState s = StateOf(d, kKind[type]);
+        if (ClutChecking() && s.tme) {   // (SLY1_CLUT_LAZY_CHECK)
+            const std::uint32_t psm = (std::uint32_t)Bits(s.tex0, 20, 6);
+            const bool eight = psm == PSMT8 || psm == PSMT8H, four = psm == PSMT4 || psm == PSMT4HL || psm == PSMT4HH;
+            if (eight || four) {
+                ClutSettle();
+                static std::uint64_t runs, differed;
+                runs++;
+                const std::uint32_t csa = (std::uint32_t)Bits(s.tex0, 56, 5), cpsm = (std::uint32_t)Bits(s.tex0, 51, 4);
+                const std::uint32_t first = eight ? 0 : (csa & ((cpsm == PSMCT16 || cpsm == PSMCT16S) ? 31 : 15)) * 16, count = eight ? 256 : 16;
+                bool same = true;
+                for (std::uint32_t k = 0; same && k < count; k++)
+                    same = g_clut[(first + k) & 255] == g_clutRef[(first + k) & 255];
+                if (!same && differed++ < 10)
+                    std::fprintf(stderr, "clutcheck: frame %llu: a run's palette differs from the one read at once (tex0 %016llX)\n",
+                                 (unsigned long long)FramesShown(), (unsigned long long)s.tex0);
+                if ((runs & (runs - 1)) == 0 && runs >= 1024)
+                    std::fprintf(stderr, "clutcheck: %llu runs, %llu with another palette\n", (unsigned long long)runs, (unsigned long long)differed);
+            }
+        }
         if (!g_runBegun || std::memcmp(&s, &g_runState, sizeof s) != 0) {
             FlushRun();
             g_runState = s;
@@ -1078,6 +1186,7 @@ std::uint32_t BitsPerPixel(std::uint32_t psm)
 // textures as they were, and the pages are marked with a new count of uploads.
 void Touch(std::uint64_t bb, std::uint64_t pos, std::uint64_t reg)
 {
+    ClutSettle();   // (a palette waiting is read from the memory as it was)
     if (g_backend) {
         FlushRun();
         g_runBegun = false;   // the next run's texture looked at again
@@ -2134,6 +2243,7 @@ void SetBackend(Backend* backend)
 
 void DecodeTexture(const DrawState& state, std::vector<std::uint32_t>& rgba, int& width, int& height)
 {
+    ClutSettle();   // (the palette as the loads before have made it)
     Context c;
     c.tex0 = state.tex0;
     c.clamp = 0;   // the whole texture: wrapping is the sampler's
@@ -2228,6 +2338,7 @@ bool HasBackend() { return g_backend != nullptr; }
 
 std::uint64_t TextureSource(const DrawState& state)
 {
+    ClutSettle();   // (the palette as the loads before have made it)
     Context c;
     c.tex0 = state.tex0;
     Tex t = TexOf(c);

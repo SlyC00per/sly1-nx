@@ -497,6 +497,7 @@ private:
                   sends_ = 0, destinationAlpha_ = 0, unsupportedBlends_ = 0;
     long captureAt_ = -1;
     std::uint64_t indexNs_ = 0, copyNs_ = 0, copiedBytes_ = 0;
+    std::uint64_t batchNs_ = 0, layerNs_ = 0;   // (SLY1_GPU_TIMERS) DrawBatch's whole time, and Layer's in it
     std::uint64_t drawNs_ = 0, textureNs_ = 0, presentNs_ = 0, waitNs_ = 0, acquireNs_ = 0, drainNs_ = 0;
     std::uint64_t blackBatches_ = 0, litBatches_ = 0;   // batches that add a light's share: all black (left out), and not
 
@@ -1499,6 +1500,11 @@ void Renderer::FlushPending()
 // that closes it last (its control word says whether a backface is dropped).
 bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
 {
+    struct Timed {
+        std::uint64_t& total;
+        std::uint64_t start = Tick();
+        ~Timed() { total += Tick() - start; }
+    } timed{batchNs_};
     if (pending_)   // (not a surface held for its lights' shares: Layer)
         FlushPending();
     // A lit part drawn again (gs::Batch::litNow): this kick's colours by this frame's lights, made
@@ -1732,7 +1738,11 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
                 frameUsed_ += bytes;
                 copiedBytes_ += bytes;
             }
-            Layer(s, src, b);
+            {
+                const std::uint64_t l0 = Tick();
+                Layer(s, src, b);
+                layerNs_ += Tick() - l0;
+            }
             return true;
         }
     }
@@ -3029,6 +3039,16 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
                 usWas = us;
                 countWas = count;
                 scaleWas = scaleSum_;
+            }
+            {   // the GS thread's draws a frame: batches, kept ones drawn, all black left out, draws submitted;
+                // with SLY1_GPU_TIMERS their times
+                static std::uint64_t was[8];
+                const std::uint64_t is[8] = {batches_, keptDraws_, blackBatches_, runs_, batchNs_, layerNs_, drawNs_, textureNs_};
+                const double f = (double)(frames_ - framesWas);
+                std::fprintf(stderr, "perfdraw: to %llu, a frame: batches %.0f, kept drawn %.0f, black left out %.0f, draws submitted %.0f; ms: batches %.2f, kept batches' Layer %.2f, "
+                             "Submit %.2f, Begin %.2f\n", (unsigned long long)frames_, (is[0] - was[0]) / f, (is[1] - was[1]) / f, (is[2] - was[2]) / f, (is[3] - was[3]) / f,
+                             (is[4] - was[4]) / f / 1e6, (is[5] - was[5]) / f / 1e6, (is[6] - was[6]) / f / 1e6, (is[7] - was[7]) / f / 1e6);
+                std::memcpy(was, is, sizeof was);
             }
             drainWas = drainNs_;
             acquireWas = acquireNs_;
