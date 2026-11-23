@@ -4178,14 +4178,16 @@ std::uint64_t JobWaitNs()
 // A job begun elsewhere is run here again when the thread running it gives no item for a while (it
 // has been set aside: the helper, below the game's threads on their core, waits for them), not after
 // a fixed time: on the Switch the GS thread ran 2.7 ms of jobs a late frame again that the helper,
-// let go on, ended first (SLY1_JOB_BEAT=0: the fixed time only; =ab: in turn, 600 frames each).
+// let go on, ended first (SLY1_JOB_BEAT=1: by the beat; =ab: in turn, 600 frames each). Off by
+// default: in a played run on the Switch (2026-11-23) the GS thread's time on jobs was the same
+// either way (1.97 and 1.99 ms a frame): it loses the race to the helper resumed either way.
 // SLY1_JOB_STALL_US: how long without an item (120).
 std::atomic<std::uint64_t> g_jobsTakenOver{0};
 void PartJobNeed(PartJob& j, int who)
 {
     static const char* const e = std::getenv("SLY1_JOB_BEAT");
     static const std::uint64_t stallNs = std::getenv("SLY1_JOB_STALL_US") ? (std::uint64_t)std::atol(std::getenv("SLY1_JOB_STALL_US")) * 1000 : 120000;
-    const bool beat = !e || (e[0] == 'a' ? gs::FramesShown() / 600 % 2 == 0 : e[0] != '0');
+    const bool beat = e && (e[0] == 'a' ? gs::FramesShown() / 600 % 2 == 0 : e[0] != '0');
     std::uint32_t seen = j.beat.load(std::memory_order_relaxed);
     std::uint64_t seenAt = NowNs();
     while (j.state.load(std::memory_order_acquire) != 2) {
