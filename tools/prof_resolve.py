@@ -25,6 +25,8 @@ def main():
     for line in open(log, "rb").read().decode("latin1").splitlines():
         if line.startswith("prof:") and ":" in line[5:] and "samples" not in line and "base" not in line:
             for tok in line[5:].split():
+                if not re.fullmatch(r"[0-9A-F]+:[0-9A-F]+", tok):   # (another thread's output run into the line)
+                    continue
                 pc, lr = tok.split(":")
                 pairs.append(((int(pc, 16) + anchor) & 0xFFFFFFFFFFFFFFFF, (int(lr, 16) + anchor) & 0xFFFFFFFFFFFFFFFF))
     if not pairs:
@@ -34,7 +36,7 @@ def main():
     name = {}
     for k, a in enumerate(addrs):
         fn = out[2 * k] if 2 * k < len(out) else "?"
-        fn = re.sub(r"\(.*", "", fn) if fn != "??" else "(outside the program)"
+        fn = re.sub(r"\(.*", "", fn.replace("(anonymous namespace)", "{anon}")) if fn != "??" else "(outside the program)"
         name[a] = fn
     own = collections.Counter(name[pc] for pc, _ in pairs)
     withCaller = collections.Counter((name[pc], name[lr]) for pc, lr in pairs)

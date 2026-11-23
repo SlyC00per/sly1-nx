@@ -11,6 +11,8 @@
 // card file system (entries, attributes, times) and the game's own use of it.
 #include "port/memory_card.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -199,6 +201,56 @@ s32 GetCardInfo(s32 port, s32, s32* type, s32* free, s32* format)
     return Done(1, 0);
 }
 
+namespace port {
+namespace {
+// A save about to be written over is copied first, to the save folder's sibling "-backups" (not on
+// the card the game sees): its name with the card's path in it and the time, the last 30 kept. A
+// run that starts a new game in place of the player's (it has happened, cause not found) then
+// costs nothing.
+void BackUp(const std::string& host, const char* name)
+{
+    std::FILE* in = std::fopen(host.c_str(), "rb");
+    if (!in)
+        return;
+    std::vector<char> bytes;
+    char chunk[4096];
+    for (std::size_t n; (n = std::fread(chunk, 1, sizeof chunk, in)) > 0;)
+        bytes.insert(bytes.end(), chunk, chunk + n);
+    std::fclose(in);
+    const std::string dir = g_root + "-backups";
+#ifdef _WIN32
+    mkdir(dir.c_str());
+#else
+    mkdir(dir.c_str(), 0755);
+#endif
+    std::string flat = name ? name : "file";
+    for (char& c : flat)
+        if (c == '/' || c == '!' || c == '\\')
+            c = '_';
+    char stamp[32];
+    const std::time_t now = std::time(nullptr);
+    std::strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", std::localtime(&now));
+    const std::string to = dir + "/" + stamp + flat;
+    if (std::FILE* out = std::fopen(to.c_str(), "wb")) {
+        std::fwrite(bytes.data(), 1, bytes.size(), out);
+        std::fclose(out);
+        std::fprintf(stderr, "card: %s backed up to %s (%zu bytes)\n", name ? name : "?", to.c_str(), bytes.size());
+    }
+    // the oldest let go past 30
+    std::vector<std::string> all;
+    if (DIR* d = opendir(dir.c_str())) {
+        while (dirent* e = readdir(d))
+            if (e->d_name[0] != '.')
+                all.push_back(e->d_name);
+        closedir(d);
+    }
+    std::sort(all.begin(), all.end());
+    for (std::size_t k = 0; k + 30 < all.size(); k++)
+        std::remove((dir + "/" + all[k]).c_str());
+}
+}  // namespace
+}  // namespace port
+
 // Opens a file (flags: 1 read, 2 write, 0x200 create) or, with 0x40, makes a directory.
 s32 OpenCardFile(s32 port, s32, const char* name, s32 flags)
 {
@@ -226,6 +278,8 @@ s32 OpenCardFile(s32 port, s32, const char* name, s32 flags)
         }
     if (fd < 0)
         return Done(2, -7);
+    if (flags & 2)
+        BackUp(p, name);
     std::FILE* f = std::fopen(p.c_str(), "r+b");
     if (!f && (flags & 0x200))
         f = std::fopen(p.c_str(), "w+b");
@@ -264,7 +318,17 @@ s32 ReadCardFile(s32 fd, void* buf, s32 size)
     std::lock_guard<std::mutex> lk(g_card);
     if (fd < 0 || fd >= kHandles || !g_files[fd])
         return Done(5, kNotFound);
-    return Done(5, (s32)std::fread(buf, 1, (std::size_t)size, g_files[fd]));
+    const s32 n = (s32)std::fread(buf, 1, (std::size_t)size, g_files[fd]);
+    {   // (the first reads' bytes as a hash: a save read otherwise than the time before shows)
+        static int said;
+        if (said++ < 40 && n > 0) {
+            std::uint64_t h = 1469598103934665603ull;
+            for (s32 k = 0; k < n; k++)
+                h = (h ^ static_cast<const std::uint8_t*>(buf)[k]) * 1099511628211ull;
+            std::fprintf(stderr, "card: read %d bytes, hash %016llX\n", (int)n, (unsigned long long)h);
+        }
+    }
+    return Done(5, n);
 }
 
 s32 WriteCardFile(s32 fd, const void* data, s32 size)
