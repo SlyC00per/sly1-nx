@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SLY1_PROFILE=1 (the Switch): a sampling profiler of one thread. A thread of its own, on the render
-// thread's core at a high priority, pauses the profiled thread about a thousand times a second,
+// SLY1_PROFILE=gs, render or helper (the Switch; 1 is gs): a sampling profiler of that thread. A
+// thread of its own, on the render thread's core at a high priority, pauses the profiled thread about a thousand times a second,
 // reads its program counter and link register, and lets it go on. Every 20 seconds it prints what
 // it gathered as offsets from the program's base (prof: lines; tools/prof_resolve.py names them
 // from the ELF). Nothing is allocated while the thread is paused (it may hold the allocator's lock).
@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 #if defined(__SWITCH__)
 #include <switch.h>
@@ -27,7 +28,7 @@ std::uint64_t g_pc[kSamples], g_lr[kSamples];
 
 void Sampler(void*)
 {
-    const std::uintptr_t base = (std::uintptr_t)&ProfileThisThread;
+    const std::uintptr_t base = (std::uintptr_t)&ProfileThisThread;   // (the anchor tools/prof_resolve.py looks up)
     std::fprintf(stderr, "prof: base 0x%llX (ProfileThisThread)\n", (unsigned long long)base);
     std::uint32_t n = 0;
     std::uint64_t at = armGetSystemTick(), freq = armGetSystemTickFreq();
@@ -61,17 +62,20 @@ void Sampler(void*)
 
 }  // namespace
 
-void ProfileThisThread()
+void ProfileThisThread(const char* role)
 {
-    static const bool on = std::getenv("SLY1_PROFILE") != nullptr;
-    if (!on || g_profiled != INVALID_HANDLE)
+    const char* e = std::getenv("SLY1_PROFILE");
+    if (!e || g_profiled != INVALID_HANDLE)
+        return;
+    const std::string want = e[0] == '1' && e[1] == 0 ? "gs" : e;
+    if (want != role)
         return;
     g_profiled = threadGetCurHandle();
     if (R_FAILED(threadCreate(&g_sampler, Sampler, nullptr, nullptr, 0x8000, 0x20, 2)) || R_FAILED(threadStart(&g_sampler)))
         std::fprintf(stderr, "prof: the sampler did not start\n");
 }
 #else
-void ProfileThisThread() {}
+void ProfileThisThread(const char*) {}
 #endif
 
 }  // namespace port

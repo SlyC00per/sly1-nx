@@ -2304,6 +2304,7 @@ inline void HelperGiveWay()
 void HashHelperMain()
 {
     PlaceThread(ThreadRole::Helper);
+    ProfileThisThread("helper");   // (SLY1_PROFILE=helper)
     g_hashStarted.store(true, std::memory_order_release);
     std::vector<HashJob> jobs;
     std::vector<HashResult> results;
@@ -5226,7 +5227,7 @@ void RenderFlush()
 
 void GsThreadMain()
 {
-    ProfileThisThread();   // (SLY1_PROFILE)
+    ProfileThisThread("gs");   // (SLY1_PROFILE)
     gs::SetBatchSink(QueueBatch);
     g_gsStarted.store(true, std::memory_order_release);
     // Everything queued is taken at once, and the emptied buffers given back then: the lock once a
@@ -5596,6 +5597,7 @@ void GsThreadMain()
 
 void RenderThreadMain()
 {
+    ProfileThisThread("render");   // (SLY1_PROFILE=render)
     g_renderStarted.store(true, std::memory_order_release);
     for (;;) {
         RenderItem item;

@@ -31,8 +31,9 @@ std::int32_t CurrentThreadId();
 void SetGameFloatMode();
 // The pad's buttons the game last read, as its word holds them, set when pressed (port/platform/pad.cpp)
 extern std::atomic<std::uint16_t> g_padHeld;
-// SLY1_PROFILE=1: the calling thread sampled by a profiler of its own (port/platform/profiler.cpp)
-void ProfileThisThread();
+// SLY1_PROFILE=1|gs|render|helper: the calling thread, when it is the one named (1: gs), sampled by a
+// profiler of its own (port/platform/profiler.cpp)
+void ProfileThisThread(const char* role);
 // The kernel model (port/platform/kernel.cpp): the calling host thread becomes the game's main
 // thread, running; and an interrupt cause's handler is called (the clock: 2, vertical blank).
 void KernelStartMainThread();

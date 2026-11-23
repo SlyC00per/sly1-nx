@@ -19,7 +19,7 @@ def main():
     nm = subprocess.run([DEVKIT + "nm", "-C", elf], capture_output=True, text=True).stdout
     anchor = None
     for line in nm.splitlines():
-        if line.endswith(" port::ProfileThisThread()"):
+        if line.endswith(" port::ProfileThisThread()") or line.endswith(" port::ProfileThisThread(char const*)"):
             anchor = int(line.split()[0], 16)
     if anchor is None:
         sys.exit("ProfileThisThread not in the ELF")
