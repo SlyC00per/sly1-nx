@@ -934,6 +934,9 @@ std::atomic<std::uint64_t> g_batchesQueued, g_batchesRefused, g_gsBusyNs;
 // packets, 2 VIF1's DIRECT data, 3 the GIF channel's (uploads), 4 a batch, 5 a part drawn again,
 // 6 a job's items), for SLY1_PERF_LOG's perfgs line.
 std::atomic<std::uint64_t> g_gsNsByPath[8], g_gsItemsByPath[8];
+// A counter only one thread adds to: no atomic read-modify-write (each was a loop with barriers on
+// the Switch's cores, on the GS thread a few for every item and batch); readers still see whole values.
+inline void Bump(std::atomic<std::uint64_t>& a, std::uint64_t v) { a.store(a.load(std::memory_order_relaxed) + v, std::memory_order_relaxed); }
 // (perfgs) a part drawn again's time, by what in it: its batches (drawn, with their per-frame work),
 // its packets kept as register writes, its packets through the GIF
 std::atomic<std::uint64_t> g_replayNs[5];   // a part drawn again: batches, register writes, packets, its prep, before it
@@ -5335,9 +5338,9 @@ void GsThreadMain()
             ~Busy()
             {
                 const std::uint64_t ns = NowNs() - from;
-                g_gsBusyNs += ns;
-                g_gsNsByPath[path & 7] += ns;   // (SLY1_PERF_LOG's perfgs)
-                g_gsItemsByPath[path & 7]++;
+                Bump(g_gsBusyNs, ns);
+                Bump(g_gsNsByPath[path & 7], ns);   // (SLY1_PERF_LOG's perfgs)
+                Bump(g_gsItemsByPath[path & 7], 1);
             }
         } busy{gsStarted, item.path};
         // The GS held once for the item, not once for each packet and batch in it (a call may wait
@@ -5414,7 +5417,7 @@ void GsThreadMain()
             // waited for a little if it has, done this thread's own way if it is still at it
             PrepTask* prep = nullptr;
             const std::uint64_t prepFrom = NowNs();
-            g_replayNs[4] += prepFrom - gsStarted;
+            Bump(g_replayNs[4], prepFrom - gsStarted);
             if (item.prep) {
                 PrepTask& t = *item.prep;
                 if (!PrepRun(t, 1)) {
@@ -5429,7 +5432,7 @@ void GsThreadMain()
                     g_prepsMade[2]++;
             }
             std::uint64_t t0 = NowNs();
-            g_replayNs[3] += t0 - prepFrom;
+            Bump(g_replayNs[3], t0 - prepFrom);
             for (std::size_t i = 0; i < part.size(); i++) {
                 const PartKept& kept = part[i];
                 if (i + 2 < part.size()) {
@@ -5528,14 +5531,14 @@ void GsThreadMain()
                     if (!gs::DrawBatch(w[0], b))
                         g_batchesRefused++;
                     const std::uint64_t t1 = NowNs();
-                    g_replayNs[0] += t1 - t0;
+                    Bump(g_replayNs[0], t1 - t0);
                     t0 = t1;
                 } else if (kept.path == 7) {   // a packet kept as its register writes (PartKeepFinish)
                     gs::Hold hold;
                     for (std::size_t k = 0; k + 3 <= size; k += 3)
                         gs::Write(w[k], w[k + 1] | (std::uint64_t)w[k + 2] << 32);
                     const std::uint64_t t1 = NowNs();
-                    g_replayNs[1] += t1 - t0;
+                    Bump(g_replayNs[1], t1 - t0);
                     t0 = t1;
                 } else {
                     Gif& gif = kept.path == 1 ? g_path1 : g_path2;
@@ -5549,7 +5552,7 @@ void GsThreadMain()
                         k += (std::size_t)taken * 4;
                     }
                     const std::uint64_t t1 = NowNs();
-                    g_replayNs[2] += t1 - t0;
+                    Bump(g_replayNs[2], t1 - t0);
                     t0 = t1;
                 }
             }

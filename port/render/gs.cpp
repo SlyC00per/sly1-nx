@@ -181,7 +181,7 @@ std::uint32_t Expand24(std::uint32_t c)
 // palette's 16 by 16 entries with index bits 3 and 4 exchanged; a 4-bit palette's 8 by 2 at
 // CSA's place).
 
-bool Surveying();
+inline __attribute__((always_inline)) bool Surveying();   // (inline: a call a batch was 0.3% of the GS thread)
 extern std::uint32_t g_uploads;
 std::atomic<std::uint64_t> g_uploadedQuadwords{0}, g_palettes[2];   // (SLY1_PERF_LOG's perfgs: image data taken; palettes read, and copied from the cache)
 extern std::uint32_t g_pageUpload[kLocalBytes / 8192];
@@ -206,7 +206,7 @@ int g_clutWaitingCount;
 // SLY1_CLUT_LAZY_CHECK=1: each load also read at once into a palette of its own, compared with the
 // buffer at each textured run (the waiting loads made first)
 std::uint32_t g_clutRef[256];
-bool ClutChecking()
+inline __attribute__((always_inline)) bool ClutChecking()
 {
     static const bool on = std::getenv("SLY1_CLUT_LAZY_CHECK") != nullptr;
     return on;
@@ -1050,7 +1050,7 @@ void PagesOf(std::uint32_t bp, std::uint32_t bw, std::uint32_t psm, std::uint32_
 
 // SLY1_GS_SURVEY: the drawing states the game uses, for the GPU renderer (docs/RENDERER.md):
 // each distinct combination counted by its primitives, printed by SurveyReport.
-bool Surveying()
+inline __attribute__((always_inline)) bool Surveying()
 {
     static const bool on = std::getenv("SLY1_GS_SURVEY") != nullptr;   // read on first use: --env sets it late
     return on;
@@ -2094,7 +2094,7 @@ namespace {
 // SLY1_GS_SOFT_BATCH: with the reference drawing (--dump-fb), batches are taken and drawn here
 // by VertexOf's arithmetic, the renderer's, to see on the host what a GPU renderer is given.
 // Triangles with a vertex outside the view are left out (nothing is cut).
-bool SoftBatches()
+inline __attribute__((always_inline)) bool SoftBatches()
 {
     static const bool on = std::getenv("SLY1_GS_SOFT_BATCH") != nullptr;
     return on && g_rasterise;

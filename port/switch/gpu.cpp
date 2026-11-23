@@ -357,6 +357,7 @@ private:
         bool allCullable = false;
         std::uint8_t alphaMin = 0, alphaMax = 255;
         std::int8_t doubled = -1;   // Doubled's answer for its vertices, once asked (-1: not yet)
+        std::int8_t black = -1;     // DrawBatch's: a batch that adds, all its colours black (-1: not asked)
     };
     struct FreeBlock {
         std::uint32_t at, bytes;
@@ -482,7 +483,8 @@ private:
     void DumpDraw(long k);
     long listAt_ = -1;
     int listed_ = 0;
-    std::unordered_map<std::uint64_t, bool> blackKept_;   // DrawBatch: whether a kept batch that adds is all black
+    std::unordered_map<std::uint64_t, bool> blackKept_;
+    std::uint64_t blackPending_ = 0;   // (DrawBatch: a batch found not black before it was kept)   // DrawBatch: whether a kept batch that adds is all black
     int view_ = 0;   // SLY1_GPU_CAPTURE's views of the batches, a frame each after the first: 1 no depth test,
                     // 2 divided by w in the shader, 3 depths clamped, 4 no backface dropped, 5 facing
     std::uint32_t frameUsed_ = 0, draws_ = 0, textureUsed_ = 0, nextTexture_ = 0;
@@ -1553,18 +1555,26 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
             const std::uint32_t step = litColours ? 4 : b.stride * 4;
             // (a kept batch's colours are what they were: looked at once, not met cold each frame;
             // a lit part's drawn again are this frame's: looked at each time)
+            // (the answer is with the kept batch, once it is kept: no lookup of its own; one all black
+            // is never kept, and its answer is in blackKept_)
             std::uint32_t any = 0;
-            auto known = b.keep != 0 && !litColours ? blackKept_.find(b.keep) : blackKept_.end();
-            if (known != blackKept_.end()) {
+            Kept* asKept = b.keep != 0 && !litColours && keepMem_ ? kept_.find(b.keep) : nullptr;
+            auto known = b.keep != 0 && !litColours && !(asKept && asKept->black >= 0) ? blackKept_.find(b.keep) : blackKept_.end();
+            if (asKept && asKept->black >= 0) {
+                any = asKept->black ? 0 : 1;
+            } else if (known != blackKept_.end()) {
                 any = known->second ? 0 : 1;
             } else {
                 for (std::uint32_t k = 0; k < b.count && !any; k++, c += step)
                     any = (c[0] | c[1] | c[2]) & 0xFF;
-                if (b.keep != 0 && !litColours) {
+                if (asKept)
+                    asKept->black = any == 0 ? 1 : 0;
+                else if (b.keep != 0 && !litColours && any == 0) {
                     if (blackKept_.size() > 200000)   // (a key is never used again: the old ones let go)
                         blackKept_.clear();
-                    blackKept_.emplace(b.keep, any == 0);
-                }
+                    blackKept_.emplace(b.keep, true);
+                } else if (b.keep != 0 && !litColours)
+                    blackPending_ = b.keep;   // (not black: said to the batch's record when it is kept, below)
             }
             if (!any) {
                 blackBatches_++;
@@ -1681,6 +1691,8 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
                 for (std::uint32_t v = 0; v < b.count; v++)
                     std::memcpy(staging_.data() + v * 4, b.quads + v * step + b.colourAt * 4, 16);
                 std::memcpy(mem + k.colourAt, staging_.data(), (std::size_t)b.count * 16);
+                if (blackPending_ == b.keep)
+                    k.black = 0;
                 keptPlaced_++;
                 keptBytes_ += got;
                 it = kept_.emplace(b.keep, k);
