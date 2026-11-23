@@ -5265,7 +5265,11 @@ void GsThreadMain()
             if (next.path == 0 || next.path > 4 || next.kept)
                 return;
             const char* p = reinterpret_cast<const char*>(next.words.data());
-            const std::size_t n = std::min<std::size_t>(next.words.size() * 4, 8192);
+            // (SLY1_PREFETCH=bytes: how much of it, 8,192 unless set; =ab: 8,192 and 1,024 in turn,
+            // 600 frames each: the loop of prefetches was 2.4% of this thread on the Switch's profile)
+            static const char* const pfEnv = std::getenv("SLY1_PREFETCH");
+            const std::size_t most = !pfEnv ? 8192 : pfEnv[0] == 'a' ? (gs::FramesShown() / 600 % 2 == 0 ? 8192 : 1024) : (std::size_t)std::atoi(pfEnv);
+            const std::size_t n = std::min<std::size_t>(next.words.size() * 4, most);
             for (std::size_t at = 0; at < n; at += 64)
                 __builtin_prefetch(p + at);
         };

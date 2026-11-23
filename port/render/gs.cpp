@@ -2352,7 +2352,21 @@ std::uint64_t TextureSource(const DrawState& state)
             hash ^= hash >> 29;
         }
     };
-    PagesOf(t.tbp, t.tbw, t.psm, 0, 0, t.tw, t.th, [&](std::uint32_t page) { words(g_local + page * 8192, 8192); });
+    // a page in four lanes, each its own chain of multiplies, joined at the end: the core works on
+    // four at once (one chain was 1.8% of the GS thread on the Switch's profile)
+    auto page8k = [&](const std::uint8_t* b) {
+        std::uint64_t l[4] = {hash, hash ^ 0x9E3779B97F4A7C15ull, hash + 0x632BE59BD9B4E019ull, ~hash};
+        for (std::size_t k = 0; k < 8192; k += 32)
+            for (int j = 0; j < 4; j++) {
+                std::uint64_t w;
+                std::memcpy(&w, b + k + 8 * j, 8);
+                l[j] = (l[j] ^ w) * 0x9E3779B97F4A7C15ull;
+                l[j] ^= l[j] >> 29;
+            }
+        hash = ((l[0] * 31 + l[1]) * 31 + l[2]) * 31 + l[3];
+        hash ^= hash >> 29;
+    };
+    PagesOf(t.tbp, t.tbw, t.psm, 0, 0, t.tw, t.th, [&](std::uint32_t page) { page8k(reinterpret_cast<const std::uint8_t*>(g_local) + page * 8192); });
     if (t.psm == PSMT8 || t.psm == PSMT8H)
         words(g_clut, sizeof g_clut);
     else if (t.psm == PSMT4 || t.psm == PSMT4HL || t.psm == PSMT4HH)
