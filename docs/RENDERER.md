@@ -1702,3 +1702,24 @@ the helper's share). Telling the game a list is finished before its walk ends st
 (the game builds into two packet buffers in turn, reused at its frame-done semaphore, and
 PackFrameColors writes into the list while it is walked). Particles drawn by the renderer are not
 begun: each particle may set its own TEX0 from the frame table (`SLY1_STREAK_DUMP`).
+
+### Fewer parts hashed (2026-11-23)
+
+The helper hashed every part drawn again from its cache's packet each list (a quarter of its time on
+the Switch, reading the packets from memory), and 99% of those hashes found nothing changed. The
+game writes a cache only while it relights its part the long way (its header's mode 3, the only
+drawing that hands PackFrameColors its colour records): the port, at such a drawing, marks the
+memory that can then be written (the cache's two packets, and each mesh record's colour blocks, f00
+quadwords at f04 and f0C at f10, with the pointers at +0x08 and +0x14 that PackFrameColors writes
+through) in blocks of 256 bytes, kept for 40 lists. A part drawn from its cache keeps the blocks its
+packet lies on and names (`PartPages`, made once when kept); its hash is not asked again while none
+of them is marked, but every 8th list (by its key) all the same. Marks are by memory, not by cache:
+a colour block may be another cache's too (marking only the cache's own packets missed 20 changes
+over the 46 levels). `SLY1_HASH_SKIP=0`: every part hashed; `=check`: every part hashed, and a
+hash that differs where no mark was is said (`hashskip:`).
+
+All 46 levels, 300 frames each with the camera turning, `=check`: of 2,630,908 hashes 1,819,924
+(69%) were asked with no mark, 2 of them other than the hash before (one place of one level, a write
+not yet found: the 8th list catches it). A Stealthy Approach's tour: the helper hashed 105,187 parts
+in 1.02 s against 259,868 in 2.08 s, parts drawn again and stale by hash as before, the render
+thread's time the same. `SLY1_DIFF_KEY=hex` prints what differs in one part's packet from list to list.

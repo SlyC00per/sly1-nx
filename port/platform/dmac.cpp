@@ -2073,6 +2073,9 @@ struct PartRecord {
     bool ok = false;
     std::uint64_t hash = 0, hashWhole = 0;   // PartHash, and with every piece whole
     std::uint32_t verified = 0;          // the times it has been drawn again with the whole hash the same
+    std::uint32_t askedList = 0;         // the list its last hash was asked in (HashSkipMode)
+    std::vector<std::uint32_t> pages;    // the pages its packet lies on and names (PartPages), made once kept
+    std::uint32_t pagesSerial = 0;       // the record's serial they were made for (0: none, or the walk failed)
     std::uint64_t usedFrame = 0;         // the frame it was last kept or drawn again in (the ones unused longest are let go for room)
     bool moving = false;                 // its vertices change where the hash does not look: not drawn again
     // ...until movingUntil, when it is kept anew: one whose vertices changed once (its cache's
@@ -2196,17 +2199,139 @@ struct HashJob {
     bool tte, whole, slow;
     std::uint32_t list;   // the list it came in (g_listSerial)
     bool lit = false;     // (PartHash's: a part lit by VU1, its lights' words left out)
+    bool unmarked = false;   // (SLY1_HASH_SKIP=check: asked although no mark said its packet was written)
 };
 struct HashResult {
     std::uint32_t key, serial;
     std::uint64_t hash, hashWhole;
     bool whole, valid;
+    bool unmarked = false;
 };
 // The lists the render thread has begun. The chain of a part drawn the long way lies in its
 // frame's packet memory, which the game starts to write over when it has handed the next frame's
 // list to be drawn: a hash the helper makes of it is good only if no later list had begun when the
 // hash was done.
 std::uint32_t g_listSerial;
+// A part drawn from its cache's packet need not be hashed when the game cannot have written the
+// packet since the last hash: the game writes a cache (its colours, PackFrameColors) only while it
+// draws the part the long way, and the long way's hook names the cache (tools/patches.py), whose
+// two packets (refs, +0x20 and +0x24) are then marked here with the list. A part not marked since
+// its last hash was asked is not hashed again, but every 8th list (by its key) all the same, for a
+// write the marks do not see (one such, in 1.26 million, over the 46 levels). The helper's hashing was a quarter of its time on the Switch.
+// SLY1_HASH_SKIP=0: every part hashed; =check: every part hashed, and a hash that differs where no
+// mark was is counted (hashskip: in the report).
+// (the render thread's) the ranges of memory the lists may have written, in blocks of 256 bytes,
+// with the list: the last 40 lists' (a part is hashed every 8th list in any case)
+struct MarkedRange {
+    std::uint32_t list, lo, hi;
+};
+std::deque<MarkedRange> g_marks;
+std::uint64_t g_marksMade;
+constexpr std::uint32_t kMarkShift = 8;
+std::uint64_t g_hashSkipped, g_hashUnmarked, g_hashUnmarkedChanged;
+int HashSkipMode()
+{
+    static const char* const e = std::getenv("SLY1_HASH_SKIP");
+    static const int mode = !e ? 1 : e[0] == 'c' ? 2 : e[0] == '0' ? 0 : 1;
+    return mode;
+}
+void MarkRange(std::uint32_t addr, std::uint32_t bytes)
+{
+    addr &= 0x0FFFFFF0u;
+    if (addr < 0x10 || addr >= kRamSize || bytes == 0 || bytes > 0x40000 || bytes > kRamSize - addr)
+        return;
+    g_marks.push_back({g_listSerial, addr >> kMarkShift, (addr + bytes - 1) >> kMarkShift});
+    g_marksMade++;
+    while (!g_marks.empty() && g_marks.front().list + 40 < g_listSerial)
+        g_marks.pop_front();
+}
+// What the long way may write for a cache: its two packets, and the colours its relighting packs
+// (PackFrameColors writes through the words at +0x08 and +0x14 of each mesh's record, items at
+// +0x04, 0x30 bytes each, into the blocks the record's packet names by REF: f00 quadwords at f04,
+// f0C at f10). A buffer may be another cache's too: memory is marked, not caches.
+void MarkCachePackets(std::uint32_t cache)
+{
+    cache &= 0x0FFFFFF0u;
+    if (cache < 0x10 || cache + 0x28 > kRamSize)
+        return;
+    const std::uint32_t* c = static_cast<const std::uint32_t*>(Native(cache));
+    for (int k = 0; k < 2; k++)
+        if (c[8 + k] != 0)
+            MarkRange(c[8 + k], 256);
+    const std::uint32_t items = c[1] & 0x0FFFFFF0u;
+    if (items < 0x10 || items + 32 * 0x30 > kRamSize)
+        return;
+    for (int i = 0; i < 32; i++) {   // (as many as a part may have; past its meshes the marks only cost a hash)
+        const std::uint32_t* m = static_cast<const std::uint32_t*>(Native(items + (std::uint32_t)i * 0x30));
+        if (m[1] != 0 && m[0] > 0 && m[0] <= 0x4000)
+            MarkRange(m[1], m[0] * 16);   // f04, f00 quadwords
+        if (m[4] != 0 && m[3] > 0 && m[3] <= 0x4000)
+            MarkRange(m[4], m[3] * 16);   // f10, f0C quadwords
+        for (int w : {2, 5})   // the pointers written through (+0x08, +0x14), should they lie elsewhere
+            if (m[w] != 0)
+                MarkRange(m[w], 512);
+    }
+}
+// The pages a part's packet lies on and names (its tags, and what each REF and CALL reaches), for
+// the marks above: false when the walk finds anything it cannot follow.
+bool PartPages(std::uint32_t target, std::vector<std::uint32_t>& pages)
+{
+    pages.clear();
+    auto add = [&](std::uint32_t addr, std::uint32_t bytes) {
+        addr &= 0x0FFFFFF0u;
+        if (addr < 0x10 || addr >= kRamSize || bytes > kRamSize - addr)
+            return false;
+        for (std::uint32_t p = addr >> kMarkShift; p <= (addr + (bytes ? bytes - 1 : 0)) >> kMarkShift; p++)
+            if (pages.empty() || pages.back() != p)
+                pages.push_back(p);
+        return pages.size() < 2048;
+    };
+    std::uint32_t tadr = target, stack[2];
+    int depth = 0;
+    for (int guard = 0; guard < 4096; guard++) {
+        if (tadr & 0x80000000u)
+            return false;   // (scratchpad: not followed)
+        if (!add(tadr, 16))
+            return false;
+        const std::uint32_t* tag = static_cast<const std::uint32_t*>(Native(tadr & 0x0FFFFFF0u));
+        const std::uint32_t qwc = tag[0] & 0xFFFF, id = (tag[0] >> 28) & 7, addr = tag[1] & 0x7FFFFFF0;
+        const std::uint32_t after = (tadr & 0x0FFFFFF0u) + 16;
+        if ((tag[1] >> 31) && (id == 3 || id == 4 || id == 2 || id == 5))
+            return false;
+        switch (id) {
+        case 1: if (!add(after, qwc * 16)) return false; tadr = after + qwc * 16; break;
+        case 2: tadr = addr; break;
+        case 3: case 4: if (!add(addr, qwc * 16)) return false; tadr = after; break;
+        case 5:
+            if (depth >= 2 || !add(after, qwc * 16)) return false;
+            stack[depth++] = after + qwc * 16;
+            tadr = addr;
+            break;
+        case 6:
+            if (!add(after, qwc * 16)) return false;
+            if (depth == 0) {
+                std::sort(pages.begin(), pages.end());
+                pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+                return true;
+            }
+            tadr = stack[--depth];
+            break;
+        default: return false;
+        }
+    }
+    return false;
+}
+bool PagesMarkedSince(const std::vector<std::uint32_t>& pages, std::uint32_t list)
+{
+    if (list + 38 < g_listSerial)
+        return true;   // (older than the marks kept)
+    for (auto it = g_marks.rbegin(); it != g_marks.rend() && it->list + 1 >= list; ++it) {   // (its list, or the one before: a write may come late in it)
+        const auto at = std::lower_bound(pages.begin(), pages.end(), it->lo);
+        if (at != pages.end() && *at <= it->hi)
+            return true;
+    }
+    return false;
+}
 std::atomic<std::uint32_t> g_listsBegun;
 std::atomic<std::uint64_t> g_hashTooLate;
 std::mutex g_hashLock;
@@ -2368,6 +2493,7 @@ void HashHelperMain()
             }
             const HashJob& j = jobs[n];
             HashResult r = {j.key, j.serial, 0, 0, j.whole, true};
+            r.unmarked = j.unmarked;
             if (!(j.slow && g_listsBegun.load(std::memory_order_acquire) != j.list)) {
                 r.hash = PartHash(j.target, false, j.cl, j.wl, j.tte, j.slow, nullptr, false, nullptr, nullptr, j.lit);
                 if (j.whole)
@@ -2434,6 +2560,17 @@ void HashTakeResults()
         if (!h.valid)
             continue;
         r.verdictList = g_listSerial;
+        if (h.unmarked) {   // (SLY1_HASH_SKIP=check)
+            g_hashUnmarked++;
+            const std::uint64_t was = r.seen ? r.seen : r.hash;
+            if (h.hash != was) {
+                g_hashUnmarkedChanged++;
+                static int said;
+                if (said++ < 20)
+                    std::fprintf(stderr, "hashskip: frame %llu: part %08X hashed otherwise with no mark since list %u\n",
+                                 (unsigned long long)gs::FramesShown(), h.key, r.askedList);
+            }
+        }
         r.seen = h.hash;
         if (h.whole) {
             r.seenWhole = h.hashWhole;
@@ -3269,6 +3406,10 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
         PartHeader(regs.tops, header);
     }
     const bool tte = PartTte();
+    // (a part relit the long way, its header's mode 3: the only drawing that writes its cache, through
+    // PackFrameColors; the long way's NOP names the cache itself)
+    if (slow && header[37] == 3 && HashSkipMode() != 0)
+        MarkCachePackets((marker & 0x1FFFFF) << 4);
     g_callKey = key;
     std::memcpy(g_callHeader, header, sizeof header);
     g_callHeaderAt = headerAt;
@@ -3277,6 +3418,27 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     // (a part lit by VU1: its lights' words are left out of its hash, PartHasher::litFree)
     const bool litMode = slow && header[37] == 4 && PartParamsOn() && LitReplayOn();
     const auto litFree = [&](const PartRecord& r) { return litMode && !r.litStrict; };
+    {   // SLY1_DIFF_KEY=hex: that part's packet walked each list, and what differs from the list before printed
+        static const char* const dk = std::getenv("SLY1_DIFF_KEY");
+        static const std::uint32_t diffKey = dk ? (std::uint32_t)std::strtoul(dk, nullptr, 16) : 0;
+        if (dk && key == diffKey) {
+            static std::vector<std::pair<std::uint32_t, std::uint64_t>> was;
+            std::vector<std::pair<std::uint32_t, std::uint64_t>> now;
+            g_diffSegs = &now;
+            PartHash(target, true, regs.cl, regs.wl, tte, slow);
+            g_diffSegs = nullptr;
+            if (!was.empty()) {
+                if (was.size() != now.size())
+                    std::fprintf(stderr, "diffkey: frame %llu: %zu pieces against %zu\n", (unsigned long long)gs::FramesShown(), now.size(), was.size());
+                else
+                    for (std::size_t k = 0; k < now.size(); k++)
+                        if (was[k] != now[k])
+                            std::fprintf(stderr, "diffkey: frame %llu: piece %zu, code %08X (was %08X), its data's hash other: %d; target %08X slow %d mode %d\n",
+                                         (unsigned long long)gs::FramesShown(), k, now[k].first, was[k].first, (int)(was[k].second != now[k].second), target, (int)slow, (int)header[37]);
+            }
+            was = std::move(now);
+        }
+    }
     static const bool diffOn = std::getenv("SLY1_PART_DIFF") != nullptr && std::getenv("SLY1_PART_HASH_NOW") != nullptr;
     if (diffOn)
         PartDiff(key, target, regs.cl, regs.wl, tte, slow, header);
@@ -3296,11 +3458,23 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             late = true;
             hash = r.seen ? r.seen : r.hash;
             if (!r.asked) {
-                r.asked = true;
                 const bool whole = r.ok && (r.verified < 8 || ((gs::FramesShown() + key) & 31) == 0);
-                g_hashPending.push_back({key, r.serial, target, regs.cl, regs.wl, tte, whole, slow, g_listSerial, litMode});
-                if (g_hashPending.size() >= 16)
-                    HashPassOn();
+                const int skipMode = HashSkipMode();
+                if (skipMode != 0 && !slow && r.ok && r.pagesSerial != r.serial)
+                    r.pagesSerial = PartPages(target, r.pages) ? r.serial : 0;
+                const bool unmarked = skipMode != 0 && !slow && r.ok && !whole && r.askedList != 0 && r.pagesSerial == r.serial &&
+                                      ((g_listSerial + key) & 7) != 0 && !PagesMarkedSince(r.pages, r.askedList);
+                if (unmarked && skipMode == 1) {
+                    g_hashSkipped++;   // (the hash the helper last gave stands)
+                } else {
+                    r.asked = true;
+                    r.askedList = g_listSerial;
+                    HashJob job = {key, r.serial, target, regs.cl, regs.wl, tte, whole, slow, g_listSerial, litMode};
+                    job.unmarked = unmarked;
+                    g_hashPending.push_back(job);
+                    if (g_hashPending.size() >= 16)
+                        HashPassOn();
+                }
             }
         }
     }
@@ -4938,6 +5112,8 @@ void PartCountsLine(const char* what)
     std::fprintf(stderr, "partsway: %s: parts drawn again with their vertices moved by this frame's sway %llu, skinned by this frame's bones %llu\n", what,
                  (unsigned long long)g_partsSwayed, (unsigned long long)g_partsSkinned);
     std::fprintf(stderr, "partsway: %s: parts whose bones were not at their places in this frame's chain %llu\n", what, (unsigned long long)g_bonesMislaid);
+    std::fprintf(stderr, "hashskip: %s: hashes not asked (no mark since the last) %llu; asked with no mark %llu, of them other than the last %llu; ranges marked %zu\n", what,
+                 (unsigned long long)g_hashSkipped, (unsigned long long)g_hashUnmarked, (unsigned long long)g_hashUnmarkedChanged, (std::size_t)g_marksMade);
     std::fprintf(stderr, "partprep: %s: parts' per-frame work made by the helper %llu, by the GS thread %llu, done the GS thread's own way %llu, by the render thread %llu; the GS thread waited %.3f s\n", what,
                  (unsigned long long)g_prepsMade[0].load(), (unsigned long long)g_prepsMade[1].load(), (unsigned long long)g_prepsMade[2].load(),
                  (unsigned long long)g_prepsMade[3].load(), g_prepWaitNs.load() / 1e9);
@@ -5002,6 +5178,7 @@ struct LiveSink {
         std::uint32_t marker = g_vif1.TakePartBegin();
         if (!marker)
             return false;
+
         const std::uint64_t t0 = NowNs();   // (for SLY1_PERF_LOG's perfparts: where the parts' time goes)
         if (PartCall(marker, target, slow)) {
             g_vif1.PartEnd();
