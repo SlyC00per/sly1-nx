@@ -1685,3 +1685,20 @@ The first-start "save bug" was the game's own: pressing Start in the opening (th
 Paris rooftop scene, the element stack's state 3) begins a new game; a save is continued from the
 title's menu. `cardstate:` lines log the card's and the title's states. Saves are now copied before
 each write (`port/platform/save_backup.cpp`, to `save-backups/`: first/, sessions/, recent/).
+
+### Late frames, the parts' jobs and the helper (2026-11-23)
+
+`lateparts:` (a frame later than 20 ms: the jobs each thread ran and the render thread's wait).
+In a played run of A Stealthy Approach on the Switch, 471 late frames in play: about 60% held up by
+the GS thread (16.8 ms, about 345 parts drawn again, 2.7 ms of it running jobs again that the helper
+had begun and then ended first), about 35% by the render thread (17.9 ms, parts in full 4.3 ms, 43
+jobs). The helper's profile (`SLY1_PROFILE=helper`): `PartHasher::Feed` 23 to 26% of its samples,
+most of it the reads of the parts' codes from memory.
+
+Tried and measured without a gain: a job taken over when its run stops giving items
+(`SLY1_JOB_BEAT=1|ab`, off by default: the GS thread's time on jobs 1.97 against 1.99 ms a frame)
+and an unpack's words hashed in two lanes (`SLY1_HASH_LANES`, on: the same parts kept, no change in
+the helper's share). Telling the game a list is finished before its walk ends stays out of reach
+(the game builds into two packet buffers in turn, reused at its frame-done semaphore, and
+PackFrameColors writes into the list while it is walked). Particles drawn by the renderer are not
+begun: each particle may set its own TEX0 from the frame table (`SLY1_STREAK_DUMP`).
