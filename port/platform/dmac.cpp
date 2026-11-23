@@ -419,7 +419,13 @@ constexpr std::uint32_t kListPreps = 2048;
 std::shared_ptr<PrepTask> g_preps[kListPreps];
 std::atomic<std::uint32_t> g_prepCount{0}, g_prepNext{0};
 std::mutex g_prepLock;   // (the queue's slots: the render thread fills and empties them, the helper takes)
-std::atomic<std::uint64_t> g_prepsMade[3], g_prepWaitNs{0};   // by the helper, the GS thread, done the GS thread's own way
+std::atomic<std::uint64_t> g_prepsMade[4], g_prepWaitNs{0};   // by the helper, the GS thread, done the GS thread's own way, the render thread
+// SLY1_PART_PREP_RENDER=0: the render thread makes none of them when it has nothing else
+bool PrepRenderOn()
+{
+    static const bool off = std::getenv("SLY1_PART_PREP_RENDER") && std::getenv("SLY1_PART_PREP_RENDER")[0] == '0';
+    return !off;
+}
 bool PrepOn()
 {
     static const bool off = std::getenv("SLY1_PART_PREP") && std::getenv("SLY1_PART_PREP")[0] == '0';
@@ -493,6 +499,10 @@ bool PrepRun(PrepTask& t, int who)
     t.state.store(2, std::memory_order_release);
     g_prepsMade[who]++;
     return true;
+}
+bool PrepWaiting()
+{
+    return g_prepNext.load(std::memory_order_acquire) < g_prepCount.load(std::memory_order_acquire);
 }
 std::shared_ptr<PrepTask> PrepTake()
 {
@@ -778,6 +788,11 @@ void FinishLagWait()
     const std::uint64_t from = NowNs();
     bool said = false;
     while (g_finishAhead.load(std::memory_order_acquire) > 3) {
+        if (PrepRenderOn() && PrepWaiting()) {   // (as when its queue is empty: RenderThreadMain)
+            if (std::shared_ptr<PrepTask> p = PrepTake())
+                PrepRun(*p, 3);
+            continue;
+        }
         std::this_thread::sleep_for(std::chrono::microseconds(100));
         if (!said && NowNs() - from > 500000000ull) {
             said = true;
@@ -921,7 +936,7 @@ std::atomic<std::uint64_t> g_batchesQueued, g_batchesRefused, g_gsBusyNs;
 std::atomic<std::uint64_t> g_gsNsByPath[8], g_gsItemsByPath[8];
 // (perfgs) a part drawn again's time, by what in it: its batches (drawn, with their per-frame work),
 // its packets kept as register writes, its packets through the GIF
-std::atomic<std::uint64_t> g_replayNs[3];
+std::atomic<std::uint64_t> g_replayNs[5];   // a part drawn again: batches, register writes, packets, its prep, before it
 std::atomic<std::uint64_t> g_path1Joined{0};   // VU1's packets that joined the one before in its item
 bool QueueBatch(std::uint32_t tagWord1, const gs::Batch& b)
 {
@@ -4834,8 +4849,9 @@ void PartCountsLine(const char* what)
     std::fprintf(stderr, "partsway: %s: parts drawn again with their vertices moved by this frame's sway %llu, skinned by this frame's bones %llu\n", what,
                  (unsigned long long)g_partsSwayed, (unsigned long long)g_partsSkinned);
     std::fprintf(stderr, "partsway: %s: parts whose bones were not at their places in this frame's chain %llu\n", what, (unsigned long long)g_bonesMislaid);
-    std::fprintf(stderr, "partprep: %s: parts' per-frame work made by the helper %llu, by the GS thread %llu, done the GS thread's own way %llu; the GS thread waited %.3f s\n", what,
-                 (unsigned long long)g_prepsMade[0].load(), (unsigned long long)g_prepsMade[1].load(), (unsigned long long)g_prepsMade[2].load(), g_prepWaitNs.load() / 1e9);
+    std::fprintf(stderr, "partprep: %s: parts' per-frame work made by the helper %llu, by the GS thread %llu, done the GS thread's own way %llu, by the render thread %llu; the GS thread waited %.3f s\n", what,
+                 (unsigned long long)g_prepsMade[0].load(), (unsigned long long)g_prepsMade[1].load(), (unsigned long long)g_prepsMade[2].load(),
+                 (unsigned long long)g_prepsMade[3].load(), g_prepWaitNs.load() / 1e9);
     std::fprintf(stderr, "path1: %llu of VU1's packets joined the one before in its item; %llu outline edges put with the edge before\n", (unsigned long long)g_path1Joined.load(),
                  (unsigned long long)g_outlinesJoined.load());
     std::fprintf(stderr, "partjobs: making them: the shape %.2f s, the job %.2f, the copy %.2f, the queue %.2f; the render thread waited %.2f s for them at its lists' ends\n",
@@ -5396,6 +5412,8 @@ void GsThreadMain()
             // what the helper made of the part's batches this frame: made here if it has not begun,
             // waited for a little if it has, done this thread's own way if it is still at it
             PrepTask* prep = nullptr;
+            const std::uint64_t prepFrom = NowNs();
+            g_replayNs[4] += prepFrom - gsStarted;
             if (item.prep) {
                 PrepTask& t = *item.prep;
                 if (!PrepRun(t, 1)) {
@@ -5410,6 +5428,7 @@ void GsThreadMain()
                     g_prepsMade[2]++;
             }
             std::uint64_t t0 = NowNs();
+            g_replayNs[3] += t0 - prepFrom;
             for (std::size_t i = 0; i < part.size(); i++) {
                 const PartKept& kept = part[i];
                 if (i + 2 < part.size()) {
@@ -5552,6 +5571,16 @@ void RenderThreadMain()
                 lk.unlock();
                 g_partGrave.clear();
                 g_partGraveItems.clear();
+                continue;
+            }
+            if (g_renderQueue.empty() && PrepRenderOn() && PrepWaiting()) {
+                // nothing queued: a part's per-frame work the helper has not come to, made here (the
+                // render thread waits half of a slow frame, and the GS thread, which limits it, would
+                // make it itself)
+                g_renderBusy = true;
+                lk.unlock();
+                if (std::shared_ptr<PrepTask> p = PrepTake())
+                    PrepRun(*p, 3);
                 continue;
             }
             if (g_renderQueue.empty()) {
@@ -5711,7 +5740,7 @@ void RenderThreadMain()
                                      (is[2] - was[2]) / f, (is[3] - was[3]) / f, (is[4] - was[4]) / f, (is[5] - was[5]) / f, (is[6] - was[6]) / f,
                                      (is[7] - was[7]) / f, (times[0] - timesWas[0]) / f / 1e6, (times[1] - timesWas[1]) / f / 1e6);
                     {
-                        static std::uint64_t nsWas[8], itemsWas[8], qwWas, palWas[2], replayWas[3];
+                        static std::uint64_t nsWas[8], itemsWas[8], qwWas, palWas[2], replayWas[5], prepsWas[4];
                         std::uint64_t ns[8], items[8], pal[2];
                         for (int k = 0; k < 8; k++) {
                             ns[k] = g_gsNsByPath[k].load();
@@ -5723,17 +5752,21 @@ void RenderThreadMain()
                             std::fprintf(stderr, "perfgs: to %llu, the GS thread a frame:", (unsigned long long)shown);
                             for (int k = 0; k < 7; k++)
                                 std::fprintf(stderr, " %s %.2f ms (%.0f)%s", kPath[k], (ns[k] - nsWas[k]) / f / 1e6, (items[k] - itemsWas[k]) / f, k < 6 ? "," : "");
-                            std::fprintf(stderr, "; uploads %.1f KB, palettes read %.1f, from the cache %.1f; parts drawn again: batches %.2f ms, register writes %.2f, packets %.2f\n",
+                            std::fprintf(stderr, "; uploads %.1f KB, palettes read %.1f, from the cache %.1f; parts drawn again: batches %.2f ms, register writes %.2f, packets %.2f, prep %.2f, before %.2f; preps by the helper %.1f, the render thread %.1f, this thread %.1f, its own way %.1f\n",
                                          (qw - qwWas) * 16 / f / 1024.0, (pal[0] - palWas[0]) / f, (pal[1] - palWas[1]) / f, (g_replayNs[0] - replayWas[0]) / f / 1e6,
-                                         (g_replayNs[1] - replayWas[1]) / f / 1e6, (g_replayNs[2] - replayWas[2]) / f / 1e6);
+                                         (g_replayNs[1] - replayWas[1]) / f / 1e6, (g_replayNs[2] - replayWas[2]) / f / 1e6, (g_replayNs[3] - replayWas[3]) / f / 1e6,
+                                         (g_replayNs[4] - replayWas[4]) / f / 1e6, (g_prepsMade[0] - prepsWas[0]) / f, (g_prepsMade[3] - prepsWas[3]) / f,
+                                         (g_prepsMade[1] - prepsWas[1]) / f, (g_prepsMade[2] - prepsWas[2]) / f);
                         }
                         std::memcpy(nsWas, ns, sizeof nsWas);
                         std::memcpy(itemsWas, items, sizeof itemsWas);
                         qwWas = qw;
                         palWas[0] = pal[0];
                         palWas[1] = pal[1];
-                        for (int k = 0; k < 3; k++)
+                        for (int k = 0; k < 5; k++)
                             replayWas[k] = g_replayNs[k].load();
+                        for (int k = 0; k < 4; k++)
+                            prepsWas[k] = g_prepsMade[k].load();
                     }
                     {
                         static std::uint64_t keepWas[6], watchWas[3];
