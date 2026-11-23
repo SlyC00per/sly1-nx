@@ -2566,6 +2566,9 @@ struct PartHasher {
         h = (h ^ w) * 0x9E3779B97F4A7C15ull;
         h ^= h >> 29;
     }
+    std::uint64_t laneA = 0, laneB = 0;   // (Feed: an unpack's words in two lanes, SLY1_HASH_LANES)
+    std::uint32_t lanePart = 0;
+    bool laneHalf = false;
     void Feed(const std::uint32_t* w, std::size_t n)
     {
         for (std::size_t k = 0; k < n;) {
@@ -2714,6 +2717,51 @@ struct PartHasher {
             } else if (!sampled) {
                 adWatch = false;
                 std::size_t i = 0;
+                // the words in two lanes by their place in the unpack (the even pairs and the odd ones),
+                // joined when the unpack ends, so that the same words give the same hash however
+                // they come in pieces: one chain of multiplies was the helper's most sampled line on
+                // the Switch after the codes' own reads. SLY1_HASH_LANES=0: one chain, as before.
+                static const bool lanes = !std::getenv("SLY1_HASH_LANES") || std::getenv("SLY1_HASH_LANES")[0] != '0';
+                if (lanes) {
+                    if (at == 0) {
+                        laneA = h;
+                        laneB = h ^ 0x632BE59BD9B4E019ull;
+                        laneHalf = false;
+                    }
+                    if (!laneHalf) {   // (whole pairs from here: four words at a time, the lanes side by side)
+                        const bool odd = ((at + (std::uint32_t)i) >> 1) & 1;
+                        std::uint64_t& first = odd ? laneB : laneA;
+                        std::uint64_t& second = odd ? laneA : laneB;
+                        for (; i + 4 <= take; i += 4) {
+                            std::uint64_t v[2];
+                            std::memcpy(v, w + k + i, 16);
+                            first = (first ^ v[0]) * 0x9E3779B97F4A7C15ull;
+                            second = (second ^ v[1]) * 0x9E3779B97F4A7C15ull;
+                            first ^= first >> 29;
+                            second ^= second >> 29;
+                        }
+                    }
+                    for (; i < take; i++) {
+                        const std::uint32_t word = w[k + i];
+                        if (!laneHalf) {
+                            lanePart = word;
+                            laneHalf = true;
+                            continue;
+                        }
+                        laneHalf = false;
+                        const std::uint64_t v = lanePart | (std::uint64_t)word << 32;
+                        std::uint64_t& lane = (((at + (std::uint32_t)i) >> 1) & 1) ? laneB : laneA;
+                        lane = (lane ^ v) * 0x9E3779B97F4A7C15ull;
+                        lane ^= lane >> 29;
+                    }
+                    if (take == left) {   // (the unpack's end: the lanes joined, and a word left over)
+                        h = (laneA ^ (laneB * 0xC2B2AE3D27D4EB4Full)) * 0x9E3779B97F4A7C15ull;
+                        h ^= h >> 29;
+                        if (laneHalf)
+                            Mix(lanePart);
+                        laneHalf = false;
+                    }
+                }
                 for (; i + 2 <= take; i += 2) {   // two words at a time
                     std::uint64_t v;
                     std::memcpy(&v, w + k + i, 8);
