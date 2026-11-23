@@ -328,6 +328,11 @@ private:
     Texture fxTexture_;
     DkShader fxShader_, layersShader_;
     bool fxReady_ = false, fxOpen_ = false, inComposite_ = false, depthBound_ = false;
+    // The effects' picture at half the frame's size as drawn (its dynamic scale), not half the whole
+    // image's: the splashes of A Stealthy Approach's waterfall, ten screens of them, were 5.5 ms of
+    // the GPU's frame there. SLY1_FX_SCALED=0: half the whole image always; =ab: in turn, 600 frames each.
+    bool fxScaled_ = true;
+    std::uint32_t fxWidth_ = kWidth / 2, fxHeight_ = kHeight / 2;   // the part of fxImage_ drawn into
     int fxFor_ = -1;   // the frame buffer the open picture is for
     std::uint64_t fxRuns_ = 0, fxComposites_ = 0;
     bool FxRun(const gs::DrawState& s, const Source& src, int target, bool smallTexture) const;
@@ -868,8 +873,8 @@ void Renderer::BindTarget(int target)
         dkImageViewDefaults(&colour, &fxImage_);
         const DkImageView* colours[1] = {&colour};
         dkCmdBufBindRenderTargets(cmd_, colours, 1, nullptr);
-        iw = kWidth / 2;
-        ih = kHeight / 2;
+        iw = fxWidth_;
+        ih = fxHeight_;
     } else if (target >= 2) {   // a small target: no depth buffer (the game draws into it without one)
         const Small& t = small_[target - 2];
         dkImageViewDefaults(&colour, &t.image[inSelf_ ? t.cur ^ 1 : t.cur]);
@@ -1936,6 +1941,18 @@ void Renderer::OpenFx(int target)
 {
     fxOpen_ = true;
     fxFor_ = target;
+    {
+        static const char* const e = std::getenv("SLY1_FX_SCALED");
+        fxScaled_ = !e || (e[0] == 'a' ? frames_ / 600 % 2 == 0 : e[0] != '0');
+        const std::uint32_t w = fxScaled_ ? std::max<std::uint32_t>(renderWidth_[target] / 2, 16) : kWidth / 2;
+        const std::uint32_t h = fxScaled_ ? std::max<std::uint32_t>(renderHeight_[target] / 2, 16) : kHeight / 2;
+        if (w != fxWidth_ || h != fxHeight_) {
+            fxWidth_ = std::min<std::uint32_t>(w, kWidth / 2);
+            fxHeight_ = std::min<std::uint32_t>(h, kHeight / 2);
+            if (bound_ == kFxTarget)
+                bound_ = -1;   // (the viewport anew)
+        }
+    }
     BindTarget(kFxTarget);
     DkScissor all = {0, 0, kWidth / 2, kHeight / 2};
     dkCmdBufSetScissors(cmd_, 0, &all, 1);
@@ -1972,8 +1989,8 @@ void Renderer::CompositeFx()
         v[k].y = kCorner[k][1] * kFieldHeight;
         v[k].z = 0;
         v[k].r = v[k].g = v[k].b = v[k].a = 0x80;
-        v[k].s = kCorner[k][0];
-        v[k].t = kCorner[k][1];
+        v[k].s = kCorner[k][0] * (float)fxWidth_ / (float)(kWidth / 2);   // (the part of the picture drawn into)
+        v[k].t = kCorner[k][1] * (float)fxHeight_ / (float)(kHeight / 2);
         v[k].q = 1.0f;
         v[k].fog = 0.0f;
     }
@@ -2418,7 +2435,8 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     fp.fogColour[1] = (float)((s.fogcol >> 8) & 0xFF);
     fp.fogColour[2] = (float)((s.fogcol >> 16) & 0xFF);
     // (with half the frame's scale beside it: the shader reads the depth where the frame was drawn)
-    fp.fogColour[3] = fx ? (!zte || ztst == 1 ? 0.0f : (float)ztst) + 0.5f * (float)renderWidth_[lastFull_] / (float)kWidth   // gs_fx_fsh.glsl's depth test
+    fp.fogColour[3] = fx ? (!zte || ztst == 1 ? 0.0f : (float)ztst) + 0.5f * (fxScaled_ ? 1.0f : (float)renderWidth_[lastFull_] / (float)kWidth)   // gs_fx_fsh.glsl's depth test
+                              // (a picture at half the frame's scale: a pixel of it is two of the depth buffer's each way)
                          : dateRun ? (((test >> 15) & 1) ? 1.0f : 2.0f) : 0.0f;
     if (fresh || std::memcmp(&fp, &last_.fp, sizeof fp) != 0) {
         dkCmdBufPushConstants(cmd_, dkMemBlockGetGpuAddr(dataMem_) + fragmentUbo_, sizeof fp, 0, sizeof fp, &fp);

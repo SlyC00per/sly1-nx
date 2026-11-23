@@ -28,8 +28,10 @@ void main()
     float test = floor(u.fogColour.w), scale = fract(u.fogColour.w) * 2.0;
     if (test != 0.0) {
         ivec2 p = ivec2(floor(gl_FragCoord.xy) * 2.0 * scale);
-        float d = max(max(texelFetch(depth0, p, 0).r, texelFetch(depth0, p + ivec2(1, 0), 0).r),
-                      max(texelFetch(depth0, p + ivec2(0, 1), 0).r, texelFetch(depth0, p + ivec2(1, 1), 0).r));
+        // the four in one fetch: the 2x2 texels a filtered read at the corner between them would use
+        // (four texelFetch calls each pixel were the most of this shader's time on the Switch)
+        vec4 four = textureGather(depth0, (vec2(p) + 1.0) / vec2(textureSize(depth0, 0)), 0);
+        float d = max(max(four.x, four.y), max(four.z, four.w));
         if (test == 2.0 ? gl_FragCoord.z < d : gl_FragCoord.z <= d)
             discard;
     }
