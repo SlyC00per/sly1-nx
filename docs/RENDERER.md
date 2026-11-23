@@ -1742,7 +1742,8 @@ That time is not in the GS thread's busy time (`perfgs` counts items, not the wa
   thread in full and watched the next time: in the Switch's late frames held up by the render
   thread such parts are the costliest of those run in full (about 0.5 ms each). It is now made a
   job at once when another part's registers for its new shape are known (`g_shapeRegs`, as for a
-  part met for the first time). `SLY1_PART_SHAPE_TURN=0`: off; `=ab`: in turn.
+  part met for the first time). `SLY1_PART_SHAPE_TURN=0`: off; `=ab`: in turn, 1,200 frames
+  each, so that with `SLY1_JOB_AHEAD=ab` one run has each of the four.
 
 On the Mac the helper is not set aside, so `SLY1_HELPER_STALL_US=N` sets it aside for N
 microseconds in one job of eight, after the job is begun. A Stealthy Approach's tour with 300: the

@@ -4754,9 +4754,9 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
             // for the shape it has now, when they are known (a part that turns between a few shapes was
             // run here at each turn, the costliest of the parts run in full in the Switch's late
             // frames). SLY1_PART_SHAPE_TURN=0: run here, and watched when it next comes; =ab: on and
-            // off in turn, 600 frames each.
+            // off in turn, 1,200 frames each (twice SLY1_JOB_AHEAD=ab's, so that one run has all four).
             static const char* const turnEnv = std::getenv("SLY1_PART_SHAPE_TURN");
-            const bool turn = !turnEnv || (turnEnv[0] == 'a' ? gs::FramesShown() / 600 % 2 == 0 : turnEnv[0] != '0');
+            const bool turn = !turnEnv || (turnEnv[0] == 'a' ? gs::FramesShown() / 1200 % 2 == 0 : turnEnv[0] != '0');
             g_jobsShape++;
             if (!(turn && shared && !keeping && byShape(shapeNow))) {
                 r.jobOk = r.jobTwo = false;   // (watched when it next comes)
