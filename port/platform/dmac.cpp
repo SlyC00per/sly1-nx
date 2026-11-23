@@ -5126,7 +5126,24 @@ void GsThreadMain()
                     b.skin = b.skinWords ? b.quads + (std::size_t)b.count * b.stride * 4 + b.litWords + b.swayWords : nullptr;
                     b.skinMoved = false;
                     static thread_local std::vector<std::uint32_t> skinned, litSkinned;
-                    if (b.skin && boneCount != 0) {
+                    // (a batch's kicks come one after another, each with its own copy of the vertices:
+                    // skinned once, for the first; the next take what it gave)
+                    static thread_local const std::vector<PartKept>* skinnedPart = nullptr;
+                    static thread_local std::uint32_t skinnedId = 0;
+                    static thread_local bool skinnedLit = false;
+                    // (only a lit one's: the kicks' own colours are in their vertices otherwise, and those
+                    // of the first would be drawn for all)
+                    const bool again = b.skin && boneCount != 0 && b.id != 0 && skinnedPart == &part && skinnedId == b.id && skinnedLit && b.lit &&
+                                       skinned.size() == (std::size_t)b.count * b.stride * 4;
+                    if (again) {
+                        b.quads = skinned.data();
+                        b.skinMoved = true;
+                        if (litSkinned.size() == b.litWords)
+                            b.lit = litSkinned.data();
+                    } else if (b.skin && boneCount != 0) {
+                        skinnedPart = &part;
+                        skinnedId = b.id;
+                        skinnedLit = false;
                         // its vertices skinned by this frame's bones, and its normals for its lighting (a
                         // matrix with no bone known is one no vertex weighs: the keeping said so)
                         float mats[64] = {};
@@ -5140,6 +5157,7 @@ void GsThreadMain()
                             normals = reinterpret_cast<float*>(litSkinned.data() + gs::kLitHead);
                         }
                         gs::SkinQuads(b, mats, skinned.data(), normals);
+                        skinnedLit = normals != nullptr;
                         {   // SLY1_SKIN_CHECK=4: this frame's bones against those it was kept with, and the kept
                             // vertices skinned anew by the latter against themselves
                             static const bool check = std::getenv("SLY1_SKIN_CHECK") && std::getenv("SLY1_SKIN_CHECK")[0] == '4';

@@ -221,6 +221,24 @@ inline void SwayQuads(const Batch& b, const float* now, std::uint32_t* out)
             p[c] += w[0] * d[0][c] + w[1] * d[1][c] + w[2] * d[2][c] + w[3] * d[3][c];
     }
 }
+// The three kicks' colours at once (out: three runs of count * 4 words): a batch's kicks are drawn
+// one after another, and the formula gives all three for the cost of one.
+inline void LitColoursAll(const Batch& b, std::uint32_t* out)
+{
+    const float* normal = reinterpret_cast<const float*>(b.lit + kLitHead);
+    const std::uint32_t* base = b.lit + kLitHead + (std::size_t)b.count * 3;
+    for (std::uint32_t k = 0; k < b.count; k++) {
+        std::int32_t c[3][3];
+        LitColoursOf(*b.litNow, normal + k * 3, base + k * 4, c);
+        for (int kick = 0; kick < 3; kick++) {
+            std::uint32_t* o = out + ((std::size_t)kick * b.count + k) * 4;
+            o[0] = (std::uint32_t)c[kick][0];
+            o[1] = (std::uint32_t)c[kick][1];
+            o[2] = (std::uint32_t)c[kick][2];
+            o[3] = base[k * 4 + 3];
+        }
+    }
+}
 // A lit batch's colours for this frame (Batch::litNow), count times R, G, B and the alpha, as a
 // kick's vertices have them.
 inline void LitColoursNow(const Batch& b, std::uint32_t* out)

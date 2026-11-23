@@ -444,7 +444,9 @@ private:
     std::uint64_t culledDraws_ = 0, onePassDraws_ = 0, twoPassDraws_ = 0;
     std::vector<std::uint32_t> staging_;   // a batch's indices, positions or colours made before they are copied
     std::uint64_t recentHits_ = 0;   // textures found again with nothing uploaded since
-    std::vector<std::uint32_t> litStaging_;   // a lit part's colours for this frame (DrawBatch)
+    std::vector<std::uint32_t> litStaging_;   // a lit part's colours for this frame, its three kicks' (DrawBatch)
+    std::uint32_t litId_ = 0;
+    std::uint64_t litFrame_ = ~0ull;
     std::uint64_t litNowBatches_ = 0;
     std::uint64_t batches_ = 0, batchVertices_ = 0;
     float cullFront_ = 1.0f;
@@ -1491,10 +1493,15 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
     // here (the vertices kept are those of the frame the part was kept in).
     const std::uint32_t* litColours = nullptr;
     if (b.lit && b.litNow && b.keep != 0) {
-        litStaging_.resize((std::size_t)b.count * 4);
-        gs::LitColoursNow(b, litStaging_.data());
-        litColours = litStaging_.data();
-        litNowBatches_++;
+        // (all three kicks' colours made at the first: the others come next with the same id)
+        if (b.id == 0 || b.id != litId_ || frames_ != litFrame_ || litStaging_.size() != (std::size_t)b.count * 12) {
+            litStaging_.resize((std::size_t)b.count * 12);
+            gs::LitColoursAll(b, litStaging_.data());
+            litId_ = b.id;
+            litFrame_ = frames_;
+            litNowBatches_++;
+        }
+        litColours = litStaging_.data() + (std::size_t)(b.litKick < 3 ? b.litKick : 0) * b.count * 4;
     }
     {
         const bool adds = s.abe && (s.alpha & 0xFF) == 0x48;
