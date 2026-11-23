@@ -1641,3 +1641,47 @@ drawn again); level 10, against `SLY1_PART_REPLAY=0 SLY1_GPU_SPRITES=0`: mean 0.
 255, at most 0.24% of values further than 8, in a strip at the screen's sides (triangles across the
 view's edge, which the program's clipper cut and the GPU cuts). `--verify-levels` with
 `SLY1_PART_JOBS_CHECK=1`: all 46 levels, 294,429 jobs against 333,185, 1 wrong (caught).
+
+## The GS thread's profile, palettes, and the waterfall's splashes (2026-11-23)
+
+What a part drawn again costs the GS thread, split by `perfgs:` (A Stealthy Approach on the
+Switch, 6.4 ms a frame): its batches 3.8 ms, its register writes 1.7, its prep 0.6, the GS held
+before it 0.1. The render thread now makes the preps the helper has not come to when its queue is
+empty or it waits for the GS thread (`SLY1_PART_PREP_RENDER=0`: not): it made more than the helper.
+
+A palette's load waits until something reads the palette (`ClutSettle`: a texture decoded or
+hashed, or the GS's memory about to change): the renderer finds most textures without either, and a
+kept part loads a palette with each TEX0 write it replays. The register writes went from 1.83 to
+0.85 ms a frame on the Switch (`SLY1_CLUT_LAZY=0|ab`). `SLY1_CLUT_LAZY_CHECK=1` also reads each
+load at once into a palette of its own and compares it at every textured run: all 46 levels,
+16,777,216 runs, none with another palette.
+
+`SLY1_PROFILE=1` samples the GS thread on the Switch: a thread of its own pauses it about 1,300
+times a second and reads its program counter and link register (`prof:` lines, offsets from the
+program's base); `tools/prof_resolve.py LOG ELF [--lines NAME]` names them from the ELF of the
+build that ran (a later build's addresses differ). It found, and these were cut: the map of kept
+batches' all-black answers (3.8%: the answer is now in the kept batch's record), three switch
+checks that were calls (1.1%: inline), the GS thread's counters as atomic read-modify-writes (0.9%:
+relaxed stores, one writer), the hash of a texture's pages as one chain of multiplies (1.8%: four
+lanes). Still there: waits on memory where the GS thread walks a part's items, and copies of
+batch records. `SLY1_PREFETCH=ab` compared prefetching 8 KB of the next item with 1 KB: 8 KB
+stays. No kept batch follows another with nothing between (`SLY1_FUSE_SURVEY`): each has its
+register writes before it, so batches cannot be joined as they come.
+
+`perfdraw:` (each 60 frames) counts the GPU renderer's batches, kept ones drawn, black ones left
+out and draws submitted, and with `SLY1_GPU_TIMERS=1` times DrawBatch, a kept batch's Layer, Submit
+and Begin: about 1,060 batches a frame at about 3 microseconds each, the cost spread thin.
+
+At A Stealthy Approach's waterfall the GPU took 16.5 to 17.3 ms a frame. `SLY1_GPU_VARY=2` (the
+player standing still): without the runs into the effects' half-size picture (the splashes, about
+ten screens of them in 27 runs, `gpuarea:`), 11.4 ms. That picture was half the whole image each
+way whatever the frame's dynamic scale; it is now half the frame's size as drawn
+(`SLY1_FX_SCALED=0|ab`), and gs_fx_fsh.glsl reads the four depths under a pixel with one
+textureGather, not four texelFetch calls. In a played run with `SLY1_FX_SCALED=ab`: 96% of 3D
+windows at 60 against 90%, the GPU 11.7 ms a frame against 13.0, windows with the GPU over 13 ms 31
+against 98; the splashes looked right, and no change was seen between the two.
+
+The first-start "save bug" was the game's own: pressing Start in the opening (the movie, then the
+Paris rooftop scene, the element stack's state 3) begins a new game; a save is continued from the
+title's menu. `cardstate:` lines log the card's and the title's states. Saves are now copied before
+each write (`port/platform/save_backup.cpp`, to `save-backups/`: first/, sessions/, recent/).
