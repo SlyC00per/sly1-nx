@@ -775,6 +775,11 @@ bool KickDeferred(Runner& r, std::uint16_t top, std::uint16_t tag)
             static thread_local std::vector<std::uint32_t> blob;
             blob.assign(gs::LitWords(count), 0);
             std::memcpy(blob.data(), &c.p, sizeof c.p);
+            {   // (the lights past its count are left as the thread's last setup had them: not the
+                // batch's, and they made a job's words other than the same run's on another thread)
+                const std::uint32_t used = std::min<std::uint32_t>(c.p.lights, 4);
+                std::memset(reinterpret_cast<char*>(blob.data()) + offsetof(gs::LitParams, light) + used * sizeof(gs::LitLight), 0, (4 - used) * sizeof(gs::LitLight));
+            }
             const float add = c.p.start[1] - Load(r, 3).y;
             std::memcpy(&blob[gs::kLitParamWords], &add, 4);
             blob[gs::kLitParamWords + 1] = count;

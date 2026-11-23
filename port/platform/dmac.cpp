@@ -4177,9 +4177,12 @@ std::mutex g_jobFreeLock;   // (the render thread and the GS thread: never the h
 std::vector<std::uint32_t> g_jobWrongKeys;         // parts whose job left other registers than foretold
 std::atomic<std::uint32_t> g_jobsOut;              // jobs made and not yet done
 std::atomic<std::uint64_t> g_jobsBy[3], g_jobNsBy[3], g_jobsWrong;   // by the helper, the render thread, the GS thread
+std::uint64_t g_jobsShapeTurned;   // parts whose shape had turned made jobs by the registers known for the new one
 std::uint64_t g_jobsMade, g_jobsShape, g_jobSerial, g_jobWordsCopied, g_jobsNotCopied, g_drainsLater;
 bool g_listJobsLive, g_drainOwed;   // (the render thread's) a job of this list reads the game's memory; the list's jobs are yet to be seen done
 std::atomic<std::uint64_t> g_jobsAgain, g_jobsChecked, g_jobsDiffered;   // jobs run a second time by a thread that needed them
+std::atomic<std::uint64_t> g_jobsLost[3], g_jobLostNs[3];   // runs whose items were dropped (another thread ended the job first), by thread
+std::atomic<std::uint64_t> g_jobsAhead;   // jobs run by a thread while the one it needed was another's, not ended
 std::uint64_t g_jobDrainWaitNs;
 std::uint64_t g_jobMakeNs[4];   // making a job: the shape's hash, the job taken, VU1 copied, queued
 
@@ -4254,8 +4257,15 @@ template <class Sink> bool WalkPart(std::uint32_t target, bool tte, Sink& vif)
 
 // The job's work on this thread's own copy of its lane: what it queues for the GS into out.
 // False when the packet did not leave VIF1's registers as foretold.
-bool PartJobWork(PartJob& j, Collect& out)
+bool PartJobWork(PartJob& j, Collect& out, int who = 1)
 {
+    // SLY1_HELPER_STALL_US=N (for the Mac): the helper set aside for N microseconds in one job of
+    // eight, after the job is begun, as the game's threads set it aside on the Switch's core 0
+    static const char* const stallEnv = std::getenv("SLY1_HELPER_STALL_US");
+    static const std::uint64_t stallUs = stallEnv ? (std::uint64_t)std::atol(stallEnv) : 0;
+    static thread_local std::uint32_t stallTurn;
+    if (stallUs && who == 0 && (++stallTurn & 7) == 0)
+        std::this_thread::sleep_for(std::chrono::microseconds(stallUs));
     static thread_local vu1::Lane* work = nullptr;
     static thread_local Vif* vif = nullptr;   // (the thread's own, kept: its buffers are not made again for each job)
     if (!work)
@@ -4321,10 +4331,13 @@ bool PartJobRun(PartJob& j, int who, bool again = false)
     static thread_local Collect* mine = nullptr;
     if (!mine)
         mine = new Collect;
-    const bool right = PartJobWork(j, *mine);
+    const bool right = PartJobWork(j, *mine, who);
     g_jobNsBy[who] += NowNs() - t0;
-    if (j.gen.load(std::memory_order_seq_cst) != gen || j.given.exchange(true, std::memory_order_acq_rel))
+    if (j.gen.load(std::memory_order_seq_cst) != gen || j.given.exchange(true, std::memory_order_acq_rel)) {
+        g_jobsLost[who]++;
+        g_jobLostNs[who] += NowNs() - t0;
         return true;   // another thread ended it first (or the job is another part's now): this run's items are dropped
+    }
     std::swap(j.out, *mine);
     j.right = right;
     if (!right) {
@@ -4362,11 +4375,24 @@ void PartJobNeed(PartJob& j, int who)
     static const char* const e = std::getenv("SLY1_JOB_BEAT");
     static const std::uint64_t stallNs = std::getenv("SLY1_JOB_STALL_US") ? (std::uint64_t)std::atol(std::getenv("SLY1_JOB_STALL_US")) * 1000 : 120000;
     const bool beat = e && (e[0] == 'a' ? gs::FramesShown() / 600 % 2 == 0 : e[0] != '0');
+    // While the job is another thread's and not ended, the list's next job no thread has taken is
+    // run here: its items are the list's anyway, where a second run of this one is lost when the
+    // other thread, let go on, ends it first. Only with none to take is it waited for, then run
+    // again. (SLY1_JOB_AHEAD=0: off; =ab: on and off in turn, 600 frames each)
+    static const char* const aheadEnv = std::getenv("SLY1_JOB_AHEAD");
+    const bool ahead = !aheadEnv || (aheadEnv[0] == 'a' ? gs::FramesShown() / 600 % 2 == 0 : aheadEnv[0] != '0');
     std::uint32_t seen = j.beat.load(std::memory_order_relaxed);
     std::uint64_t seenAt = NowNs();
     while (j.state.load(std::memory_order_acquire) != 2) {
         if (PartJobRun(j, who))
             continue;
+        if (ahead) {
+            if (PartJob* other = PartJobTake()) {
+                if (PartJobRun(*other, who))
+                    g_jobsAhead++;
+                continue;
+            }
+        }
         const std::uint64_t now = NowNs();
         if (beat) {
             const std::uint32_t b = j.beat.load(std::memory_order_relaxed);
@@ -4661,29 +4687,33 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
         return x == g_callRegs;
     };
     bool first = r.jobOk && sameRegs(r.jobBefore), second = !first && r.jobOk && r.jobTwo && sameRegs(r.jobBefore2);
-    if (!first && !second) {
-        // (another part's registers for this shape: SLY1_PART_SHAPE_REGS=0: not)
-        static const bool shared = !std::getenv("SLY1_PART_SHAPE_REGS") || std::getenv("SLY1_PART_SHAPE_REGS")[0] != '0';
-        std::uint8_t use = 1;
-        const std::uint64_t shape = shared ? PartHash(target, false, g_callRegs.cl, g_callRegs.wl, g_callTte, slow, nullptr, true, nullptr, &use) : 0;
+    // (another part's registers for this shape: SLY1_PART_SHAPE_REGS=0: not)
+    static const bool shared = !std::getenv("SLY1_PART_SHAPE_REGS") || std::getenv("SLY1_PART_SHAPE_REGS")[0] != '0';
+    const auto byShape = [&](std::uint64_t shape) {
         auto known = shape != 0 ? g_shapeRegs.find(shape) : g_shapeRegs.end();
-        if (known != g_shapeRegs.end()) {
-            const ShapeRegs& sr = known->second;
-            const bool maskReadWas = r.maskRead;
-            r.maskRead = sr.maskRead;
-            for (int k = 0; k < sr.pairs && !first; k++)
-                if (sameRegs(sr.before[k])) {
-                    r.shape = shape;
-                    r.jobBefore = sr.before[k];
-                    r.jobAfter = sr.after[k];
-                    r.jobOk = true;
-                    r.jobTwo = false;
-                    r.maskSet = sr.maskSet;
-                    first = true;
-                    g_jobsByShape++;
-                }
-            if (!first)
-                r.maskRead = maskReadWas;
+        if (known == g_shapeRegs.end())
+            return false;
+        const ShapeRegs& sr = known->second;
+        const bool maskReadWas = r.maskRead;
+        r.maskRead = sr.maskRead;
+        for (int k = 0; k < sr.pairs; k++)
+            if (sameRegs(sr.before[k])) {
+                r.shape = shape;
+                r.jobBefore = sr.before[k];
+                r.jobAfter = sr.after[k];
+                r.jobOk = true;
+                r.jobTwo = false;
+                r.maskSet = sr.maskSet;
+                return true;
+            }
+        r.maskRead = maskReadWas;
+        return false;
+    };
+    if (!first && !second && shared) {
+        std::uint8_t use = 1;
+        if (byShape(PartHash(target, false, g_callRegs.cl, g_callRegs.wl, g_callTte, slow, nullptr, true, nullptr, &use))) {
+            first = true;
+            g_jobsByShape++;
         }
     }
     if (keeping && (&r != keeping || (!first && !second))) {
@@ -4711,22 +4741,37 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
         }
         return false;
     }
-    Vif::Regs jobAfter = first ? r.jobAfter : r.jobAfter2;
-    if (!r.maskSet)   // (it leaves the mask as it finds it)
-        jobAfter.mask = g_callRegs.mask;
     {   // SLY1_PART_JOBS_ONLY=slow, cached, or a mode's number: jobs of those parts alone (diagnosis)
         static const char* only = std::getenv("SLY1_PART_JOBS_ONLY");
         if (only && (only[0] == 's' ? !slow : only[0] == 'c' ? slow : (int)g_callHeader[37] != std::atoi(only)))
             return false;
     }
     const std::uint64_t tCall = NowNs();
-    if (PartHash(target, false, g_callRegs.cl, g_callRegs.wl, g_callTte, slow, nullptr, true) != r.shape) {
-        r.jobOk = r.jobTwo = false;   // (watched when it next comes)
-        r.shape = 0;
-        g_jobsShape++;
-        g_fullWhy = 6;
-        return false;
+    {
+        const std::uint64_t shapeNow = PartHash(target, false, g_callRegs.cl, g_callRegs.wl, g_callTte, slow, nullptr, true);
+        if (shapeNow != r.shape) {
+            // Its shape is another than its record's: a job all the same by another part's registers
+            // for the shape it has now, when they are known (a part that turns between a few shapes was
+            // run here at each turn, the costliest of the parts run in full in the Switch's late
+            // frames). SLY1_PART_SHAPE_TURN=0: run here, and watched when it next comes; =ab: on and
+            // off in turn, 600 frames each.
+            static const char* const turnEnv = std::getenv("SLY1_PART_SHAPE_TURN");
+            const bool turn = !turnEnv || (turnEnv[0] == 'a' ? gs::FramesShown() / 600 % 2 == 0 : turnEnv[0] != '0');
+            g_jobsShape++;
+            if (!(turn && shared && !keeping && byShape(shapeNow))) {
+                r.jobOk = r.jobTwo = false;   // (watched when it next comes)
+                r.shape = 0;
+                g_fullWhy = 6;
+                return false;
+            }
+            first = true;
+            second = false;
+            g_jobsShapeTurned++;
+        }
     }
+    Vif::Regs jobAfter = first ? r.jobAfter : r.jobAfter2;
+    if (!r.maskSet)   // (it leaves the mask as it finds it)
+        jobAfter.mask = g_callRegs.mask;
     const std::uint64_t tShape = NowNs();
     std::shared_ptr<PartJob> job;
     const auto back = [](PartJob* j) {
@@ -5125,6 +5170,9 @@ void PartCountsLine(const char* what)
                  "the GS thread %llu (%.2f s)\n", what, (unsigned long long)g_jobsMade, (unsigned long long)g_jobsShape, (unsigned long long)g_jobsWrong.load(), (unsigned long long)g_jobsAgain.load(),
                  (unsigned long long)g_jobsBy[0].load(), g_jobNsBy[0].load() / 1e9, (unsigned long long)g_jobsBy[1].load(), g_jobNsBy[1].load() / 1e9,
                  (unsigned long long)g_jobsBy[2].load(), g_jobNsBy[2].load() / 1e9);
+    std::fprintf(stderr, "partjobs: %s: runs lost (another thread ended the job first): the helper %llu (%.2f s), the render thread %llu (%.2f s), the GS thread %llu (%.2f s); "
+                 "jobs run ahead while waiting %llu\n", what, (unsigned long long)g_jobsLost[0].load(), g_jobLostNs[0].load() / 1e9, (unsigned long long)g_jobsLost[1].load(),
+                 g_jobLostNs[1].load() / 1e9, (unsigned long long)g_jobsLost[2].load(), g_jobLostNs[2].load() / 1e9, (unsigned long long)g_jobsAhead.load());
     std::fprintf(stderr, "partcounts: %s: drawn again %llu (long way %llu, texture moved %llu), kept %llu, refused %llu, stale by hash %llu regs %llu header %llu, fickle %llu, "
                  "moving %llu, hashed here %.2f s, too late %llu, kept words %.1f MB, let go %llu, batches queued %llu\n", what,
                  (unsigned long long)g_partsReplayed, (unsigned long long)g_partsSlowReplayed, (unsigned long long)g_partsTexMoved,
@@ -5549,22 +5597,49 @@ void GsThreadMain()
                 static int printed;
                 bool same = j.ref.used == j.out.used;
                 std::size_t at = 0, word = 0;
+                // A batch's record is compared by its fields: not its pointers (where its vertices,
+                // lighting, sway and skin lay in each run's own buffers), not what the GS thread fills
+                // in (cull, ofx, ofy, id), not the padding between fields.
+                const auto batchSame = [](const std::uint32_t* wa, const std::uint32_t* wb) {
+                    gs::Batch a, b;
+                    std::memcpy(static_cast<void*>(&a), wa, sizeof a);
+                    std::memcpy(static_cast<void*>(&b), wb, sizeof b);
+#define SAME(f) (std::memcmp(&a.f, &b.f, sizeof a.f) == 0)
+                    return SAME(count) && SAME(stride) && SAME(positionAt) && SAME(stqAt) && SAME(colourAt) && SAME(matrix) && SAME(scale) && SAME(offset) &&
+                           SAME(fogScale) && SAME(wMax) && SAME(keep) && SAME(alphaScale) && SAME(stOffset) && SAME(alphaDeferred) && SAME(stApplied) &&
+                           SAME(stSource) && SAME(litWords) && SAME(litKick) && SAME(swayWords) && SAME(swaySource) && SAME(swayMoved) && SAME(skinWords) &&
+                           SAME(boneSource) && SAME(skinMoved) && SAME(projected) && SAME(proj) && SAME(projLimits) && SAME(projColour) && SAME(projSource) &&
+                           (a.lit == nullptr) == (b.lit == nullptr) && (a.sway == nullptr) == (b.sway == nullptr) && (a.skin == nullptr) == (b.skin == nullptr) &&
+                           (a.litNow == nullptr) == (b.litNow == nullptr) && (a.coloursNow == nullptr) == (b.coloursNow == nullptr);
+#undef SAME
+                };
+                constexpr std::size_t kBatchWords = (sizeof(gs::Batch) + 3) / 4;
                 for (; same && at < j.out.used; at++) {
                     const GsItem& a = j.out.items[at], &b = j.ref.items[at];
                     same = a.path == b.path && a.words.size() == b.words.size();
-                    // (a batch's record has where its vertices lay in the thread's lane: not compared)
-                    const std::size_t skip = a.path == 4 ? 1 + offsetof(gs::Batch, quads) / 4 : ~std::size_t(0);
-                    for (word = 0; same && word < a.words.size(); word++)
-                        same = word == skip || word == skip + 1 || (a.path == 4 && (word == 1 + offsetof(gs::Batch, ofx) / 4 || word == 1 + offsetof(gs::Batch, ofy) / 4 ||
-                                                                                     word == offsetof(gs::Batch, cull) / 4 + 1 || word == offsetof(gs::Batch, id) / 4 + 2)) ||
-                               a.words[word] == b.words[word];   // (nor what the GS thread fills in, nor the padding beside cull)
+                    word = 0;
+                    if (same && a.path == 4 && a.words.size() >= 1 + kBatchWords) {
+                        same = a.words[0] == b.words[0] && batchSame(a.words.data() + 1, b.words.data() + 1);
+                        word = same ? 1 + kBatchWords : 1;
+                    }
+                    for (; same && word < a.words.size(); word++)
+                        same = a.words[word] == b.words[word];
                     if (!same)
                         break;
                 }
                 g_jobsChecked++;
-                if (!same && printed++ < 40)
+                if (!same && printed++ < 40) {
                     std::fprintf(stderr, "jobcheck: frame %llu, part %08X at 0x%08X: %zu items against %zu; item %zu differs at word %zu\n",
                                  (unsigned long long)gs::FramesShown(), j.key, j.target, j.out.used, j.ref.used, at, word ? word - 1 : 0);
+                    if (at < j.out.used && j.out.items[at].path == 4 && word > kBatchWords + 1) {   // (where in the batch's words, and the two values)
+                        gs::Batch bb;
+                        std::memcpy(static_cast<void*>(&bb), j.out.items[at].words.data() + 1, sizeof bb);
+                        const std::size_t w = word - 1, vEnd = 1 + kBatchWords + (std::size_t)bb.count * bb.stride * 4;
+                        std::fprintf(stderr, "jobcheck:   count %u stride %u lit %u (lights %u) sway %u skin %u words %zu; word %zu is %s (+%zu): %08X against %08X\n", bb.count, bb.stride,
+                                     bb.litWords, bb.litWords && vEnd < j.out.items[at].words.size() ? j.out.items[at].words[vEnd] : 0u, bb.swayWords, bb.skinWords, j.out.items[at].words.size(), w, w < vEnd ? "vertices" : w < vEnd + bb.litWords ? "lighting" : w < vEnd + bb.litWords + bb.swayWords ? "sway" : "skin or after",
+                                     w < vEnd ? (w - 1 - kBatchWords) : w - vEnd, j.out.items[at].words[w], j.ref.items[at].words[w]);
+                    }
+                }
                 if (!same)
                     g_jobsDiffered++;
             }
@@ -6097,9 +6172,9 @@ void RenderThreadMain()
                                          (g_keepWhy[3] - keepWas[3]) / f, (g_keepWhy[4] - keepWas[4]) / f, (g_keepWhy[5] - keepWas[5]) / f, (g_watchWhy[0] - watchWas[0]) / f,
                                          (g_watchWhy[1] - watchWas[1]) / f, (g_watchWhy[2] - watchWas[2]) / f, g_partWords * 4 / 1e6, (unsigned long long)g_partsCleared);
                         std::fprintf(stderr, "perfkeep: to %llu: %llu parts let go for room so far, %llu of them drawn in the 120 frames before; %llu keepings put off to a later list, "
-                                     "%llu parts made jobs at first sight by their shape; %llu parts kept from their jobs, %llu not (the job's run was not a part's)\n", (unsigned long long)shown,
+                                     "%llu parts made jobs at first sight by their shape, %llu when their shape turned; %llu parts kept from their jobs, %llu not (the job's run was not a part's)\n", (unsigned long long)shown,
                                      (unsigned long long)g_partsLetGo, (unsigned long long)g_partsLetGoRecent, (unsigned long long)g_partsKeepPutOff, (unsigned long long)g_jobsByShape,
-                                     (unsigned long long)g_keptByJob, (unsigned long long)g_keptByJobRefused);
+                                     (unsigned long long)g_jobsShapeTurned, (unsigned long long)g_keptByJob, (unsigned long long)g_keptByJobRefused);
                         std::memcpy(keepWas, g_keepWhy, sizeof keepWas);
                         std::memcpy(watchWas, g_watchWhy, sizeof watchWas);
                     }
@@ -6117,6 +6192,19 @@ void RenderThreadMain()
                                          (jobs[2] - jobsWas[2]) / f, (ns[2] - nsWas[2]) / f / 1e6, (g_jobDrainWaitNs - drainWas) / f / 1e6, (int)(JobWaitNs() / 1000),
                                          (g_partsWaited - waitedWas) / f, (g_gsSpareHad.load() - spareWas[0]) / f, (g_gsSpareNone.load() - spareWas[1]) / f, (g_gsSpareGrown.load() - spareWas[2]) / f, (unsigned long long)g_jobStaleCodes.load(), (unsigned long long)g_jobsNotCopied, (g_jobWordsCopied - copiedWas) / f);
                         copiedWas = g_jobWordsCopied;
+                        {   // the runs lost (another thread ended the job first) and the jobs run ahead while waiting
+                            static std::uint64_t lostWas[3], lostNsWas[3], aheadWas;
+                            if (since)
+                                std::fprintf(stderr, "perflost: to %llu, a frame: runs lost by the helper %.2f (%.3f ms), the render thread %.2f (%.3f ms), the GS thread %.2f (%.3f ms); jobs run ahead while waiting %.2f\n",
+                                             (unsigned long long)shown, (g_jobsLost[0].load() - lostWas[0]) / f, (g_jobLostNs[0].load() - lostNsWas[0]) / f / 1e6,
+                                             (g_jobsLost[1].load() - lostWas[1]) / f, (g_jobLostNs[1].load() - lostNsWas[1]) / f / 1e6,
+                                             (g_jobsLost[2].load() - lostWas[2]) / f, (g_jobLostNs[2].load() - lostNsWas[2]) / f / 1e6, (g_jobsAhead.load() - aheadWas) / f);
+                            for (int k = 0; k < 3; k++) {
+                                lostWas[k] = g_jobsLost[k].load();
+                                lostNsWas[k] = g_jobLostNs[k].load();
+                            }
+                            aheadWas = g_jobsAhead.load();
+                        }
                         {
                             static std::uint64_t was[2][8][3];
                             if (since) {

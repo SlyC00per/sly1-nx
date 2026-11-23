@@ -1723,3 +1723,40 @@ All 46 levels, 300 frames each with the camera turning, `=check`: of 2,630,908 h
 not yet found: the 8th list catches it). A Stealthy Approach's tour: the helper hashed 105,187 parts
 in 1.02 s against 259,868 in 2.08 s, parts drawn again and stale by hash as before, the render
 thread's time the same. `SLY1_DIFF_KEY=hex` prints what differs in one part's packet from list to list.
+
+### Jobs run ahead, and a part whose shape turns (2026-11-23)
+
+In the Switch's late frames held up by the GS thread (run 14 of A Stealthy Approach: 177 of them,
+the GS thread busy 17.5 ms), the GS thread also spent about 2.4 ms running jobs again that the
+helper had begun: the helper, below the game's threads on core 0, was set aside in the middle of a
+job; after `JobWaitNs` the GS thread ran the job itself, and the helper, let go on, ended it first.
+That time is not in the GS thread's busy time (`perfgs` counts items, not the waits before them).
+
+- **Jobs run ahead.** A thread that needs a job another thread has begun and not ended now runs the
+  list's next job no thread has taken (`PartJobTake`, by number, so the list's order is kept) and
+  looks again; only with none left to take does it wait, then run the job again. A job run so is
+  never lost: its items are the list's. `SLY1_JOB_AHEAD=0`: off; `=ab`: on and off in turn, 600
+  frames each. `perflost:` (with `SLY1_PERF_LOG`) gives the runs lost by each thread a frame and
+  the jobs run ahead.
+- **A part whose shape turned** (its packet's shape other than its record's) was run on the render
+  thread in full and watched the next time: in the Switch's late frames held up by the render
+  thread such parts are the costliest of those run in full (about 0.5 ms each). It is now made a
+  job at once when another part's registers for its new shape are known (`g_shapeRegs`, as for a
+  part met for the first time). `SLY1_PART_SHAPE_TURN=0`: off; `=ab`: in turn.
+
+On the Mac the helper is not set aside, so `SLY1_HELPER_STALL_US=N` sets it aside for N
+microseconds in one job of eight, after the job is begun. A Stealthy Approach's tour with 300: the
+GS thread's runs lost 618 (0.22 s) against 1,263 (0.28 s), the render thread's wait at its lists'
+ends 0.16 s against 0.25 s, 24,946 jobs run ahead. Without the stall, the shape turn: parts run in
+full because their shape turned 0.05 a frame against 0.14 (319 parts made jobs instead), 0 jobs
+wrong.
+
+Checked: `SLY1_PART_JOBS_CHECK=1` compared a batch's record word for word, so it counted every lit
+batch as different (its `lit` pointer is into each run's own buffer, and the padding beside the
+one-byte fields is left as it is): it now compares the record field by field, without its pointers
+and what the GS thread fills in. What it then found was older than these changes, the same with them
+off: a lit batch's record carried, past its count of lights, the lights of the thread's last setup
+(`t_lit`, per thread), so a job's words differed from the render thread's run of the same packet.
+Nothing reads those lights; they are now cleared when the record is written. The parts not made
+shapes (`perffull`'s "no shape") are those whose packets raise an interrupt (the colour relight) or
+load a microprogram: they stay the render thread's.
