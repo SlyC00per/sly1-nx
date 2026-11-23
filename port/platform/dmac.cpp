@@ -619,6 +619,9 @@ struct Collect {
     bool trouble = false;   // a batch of the run was not handed over as unpacked (vu1::PartTrouble)
 };
 thread_local Collect* t_collect = nullptr;
+// (a job's) counted up with each item it gives: a thread waiting for the job sees whether the one
+// running it is getting on or has been set aside (PartJobNeed)
+thread_local std::atomic<std::uint32_t>* t_jobBeat = nullptr;
 // SLY1_SKIN_VERIFY=1 (with SLY1_PART_JOBS=0): a skinned part that would be drawn again is run as
 // ever, and each batch it gives is compared with the one its keeping would have drawn.
 struct SkinVerify {
@@ -840,6 +843,8 @@ void GsEnqueue(GsItem&& item)
         else
             c->items.push_back(std::move(item));
         c->used++;
+        if (t_jobBeat)
+            t_jobBeat->fetch_add(1, std::memory_order_relaxed);
         return;
     }
     if (g_skinVerify.on && item.path == 4) {
@@ -1421,6 +1426,8 @@ private:
             case 0x05: mode_ = imm & 3; left_ = 0; break;        // STMOD
             case 0x14: case 0x15: case 0x17:   // MSCAL, MSCALF, MSCNT
                 left_ = 0;
+                if (t_jobBeat)   // (a job's run getting on: each program it starts, as each item it gives)
+                    t_jobBeat->fetch_add(1, std::memory_order_relaxed);
                 if (vu0_) {
                     vu0::Run(cmd == 0x17 ? vu0::Vu0().pc * 8 : (imm & 0x1FF) * 8);
                 } else {
@@ -3919,6 +3926,7 @@ struct PartJob {
     Vif::Regs before, after;
     Collect out;
     std::atomic<int> state{0};   // 0 waiting, 1 begun by a thread, 2 done
+    std::atomic<std::uint32_t> beat{0};   // items given by the runs of it so far (t_jobBeat)
     // The lane stays as the job began: a thread runs the job on a copy of its own, and the first
     // to end gives the job its items. So a thread that needs a job another has begun and not
     // ended (the helper, set aside by the game's threads in the middle of one) runs it again
@@ -4036,6 +4044,7 @@ bool PartJobWork(PartJob& j, Collect& out)
     out.used = 0;
     vu1::LaneEnter(work);
     t_collect = &out;
+    t_jobBeat = &j.beat;
     t_jobStCount = vif->StUnpacksAt();
     t_jobStBase = vif->StUnpacks();
     t_jobSwayCount = vif->SwayUnpacksAt();
@@ -4061,6 +4070,7 @@ bool PartJobWork(PartJob& j, Collect& out)
         vif = nullptr;
     }
     t_collect = nullptr;
+    t_jobBeat = nullptr;
     vu1::LaneEnter(nullptr);
     return right;
 }
@@ -4117,15 +4127,40 @@ std::uint64_t JobWaitNs()
         return gs::FramesShown() / 600 % 2 ? 150000 : 400000;
     return fixed;
 }
+// A job begun elsewhere is run here again when the thread running it gives no item for a while (it
+// has been set aside: the helper, below the game's threads on their core, waits for them), not after
+// a fixed time: on the Switch the GS thread ran 2.7 ms of jobs a late frame again that the helper,
+// let go on, ended first (SLY1_JOB_BEAT=0: the fixed time only; =ab: in turn, 600 frames each).
+// SLY1_JOB_STALL_US: how long without an item (120).
+std::atomic<std::uint64_t> g_jobsTakenOver{0};
 void PartJobNeed(PartJob& j, int who)
 {
+    static const char* const e = std::getenv("SLY1_JOB_BEAT");
+    static const std::uint64_t stallNs = std::getenv("SLY1_JOB_STALL_US") ? (std::uint64_t)std::atol(std::getenv("SLY1_JOB_STALL_US")) * 1000 : 120000;
+    const bool beat = !e || (e[0] == 'a' ? gs::FramesShown() / 600 % 2 == 0 : e[0] != '0');
+    std::uint32_t seen = j.beat.load(std::memory_order_relaxed);
+    std::uint64_t seenAt = NowNs();
     while (j.state.load(std::memory_order_acquire) != 2) {
         if (PartJobRun(j, who))
             continue;
-        if (NowNs() - j.begunAt > JobWaitNs())
+        const std::uint64_t now = NowNs();
+        if (beat) {
+            const std::uint32_t b = j.beat.load(std::memory_order_relaxed);
+            if (b != seen) {
+                seen = b;
+                seenAt = now;
+            }
+            // (at the latest after the fixed time's four times over, whatever the beat)
+            if (now - seenAt > stallNs || now - j.begunAt > 4 * JobWaitNs()) {
+                g_jobsTakenOver++;
+                PartJobRun(j, who, true);
+                continue;
+            }
+        } else if (now - j.begunAt > JobWaitNs()) {
             PartJobRun(j, who, true);
-        else
-            std::this_thread::yield();
+            continue;
+        }
+        std::this_thread::yield();
     }
 }
 
