@@ -776,6 +776,32 @@ int main(int argc, char** argv)
         pthread_create(&watch, nullptr, Watch, nullptr);
         pthread_detach(watch);
     }
+    {   // The memory card's state and the title's (the element stack's) as they change, with the time:
+        // pressing Start on the title continues from the newest save only once the card's slots are
+        // read (state 5); before, it starts a new game. (The first-start bug: a run began a new game
+        // with three saves on the card.) Cheap: two words read every 20 ms.
+        pthread_t cardWatch;
+        pthread_create(&cardWatch, nullptr, [](void*) -> void* {
+            auto word = [](std::uint32_t a) -> std::int32_t { return *(volatile std::int32_t*)port::Native(a); };
+            constexpr std::uint32_t kCard = 0x00264A40, kStack = 0x00275BC0;
+            const auto t0 = std::chrono::steady_clock::now();
+            std::int32_t was[4] = {-99, -99, -99, -99};
+            for (int said = 0; said < 60;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+                if (!g_started)
+                    continue;
+                const std::int32_t now[4] = {word(kCard + 0x0C), word(kCard + 0x14), word(kCard + 0x4F48) != 0, word(kStack + 4)};
+                if (std::memcmp(now, was, sizeof now) != 0) {
+                    std::memcpy(was, now, sizeof was);
+                    said++;
+                    std::fprintf(stderr, "cardstate: %.2f s, frame %llu: card state %d, target %d, a save picked %d; title state %d\n",
+                                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), (unsigned long long)port::gs::FramesShown(), now[0], now[1], now[2], now[3]);
+                }
+            }
+            return nullptr;
+        }, nullptr);
+        pthread_detach(cardWatch);
+    }
     if (g_verifyFrom >= 0) {
         if (g_verifyFrom >= 46)
             g_verifyFrom = 45;
