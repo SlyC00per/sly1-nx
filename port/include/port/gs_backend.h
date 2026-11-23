@@ -157,7 +157,44 @@ struct Batch {
     // A lit part drawn again whose colours for this kick were made already (count * 4 words, as
     // LitColoursNow makes them: the helper's, port/platform/dmac.cpp's PrepTask): drawn as they are.
     const std::uint32_t* coloursNow = nullptr;
+    // A batch drawn again by 0x076 of chunk E1624411 (a texture laid on a mesh from another view: the
+    // shadow under a character): the same vertices, each one's S, T and Q from its clip position
+    // through proj (four columns), Q kept within projLimits' x and y (the S and T moved by half the
+    // change, the alpha 0 below projLimits' w when it was), the colour projColour (RGBA words).
+    // projSource: which of its packet's unpacks to 22 proj was made of (as swaySource).
+    bool projected = false;
+    float proj[16] = {};
+    float projLimits[4] = {};
+    std::uint32_t projColour[4] = {};
+    std::uint8_t projSource = 0xFF;
 };
+// A projected batch's vertex: its S, T and Q (undivided, as a batch's STQ) and its colour, from its
+// clip position (0x076's arithmetic).
+inline void ProjectedOf(const Batch& b, const float clip[4], float stq[3], std::uint32_t colour[4])
+{
+    float c[4];
+    for (int i = 0; i < 4; i++)
+        c[i] = b.proj[i] * clip[0] + b.proj[4 + i] * clip[1] + b.proj[8 + i] * clip[2] + b.proj[12 + i] * clip[3];
+    float q = c[3], s = c[0], t = c[1];
+    colour[0] = b.projColour[0];
+    colour[1] = b.projColour[1];
+    colour[2] = b.projColour[2];
+    colour[3] = b.projColour[3];
+    const float below = c[3] - b.projLimits[0], above = c[3] - b.projLimits[1];
+    const bool small = below < 0.0f;
+    if (small || !(above < 0.0f)) {
+        const float limit = small ? b.projLimits[0] : b.projLimits[1];
+        const float shift = (limit - c[3]) * 0.5f;
+        q = limit;
+        s += shift;
+        t += shift;
+        if (c[3] - b.projLimits[3] < 0.0f)
+            colour[3] = 0;
+    }
+    stq[0] = s;
+    stq[1] = t;
+    stq[2] = q;
+}
 constexpr std::size_t kSkinHead = 2 + 64;   // (and the four matrices it was skinned by, 2 to 65)
 inline std::size_t SkinWords(std::uint32_t count) { return kSkinHead + (std::size_t)count * 10; }
 // Whether any vertex of a skinned batch weighs its matrix j (a mesh of fewer than four bones

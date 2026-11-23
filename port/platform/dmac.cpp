@@ -374,7 +374,7 @@ struct GsItem {
 struct ReplayLayout {
     std::uint32_t stCount = 0, swayCount = 0, boneCount = 0;
     bool hasLit = false;
-    std::size_t litAt = 0, swayAt = 0, boneAt = 0, fix = 0;
+    std::size_t litAt = 0, swayAt = 0, boneAt = 0, projAt = 0, fix = 0;
     explicit ReplayLayout(const std::uint32_t* iw)
     {
         stCount = iw[27] & 0xFFFF;
@@ -384,7 +384,8 @@ struct ReplayLayout {
         litAt = 28 + 2 * (std::size_t)stCount;
         swayAt = litAt + (hasLit ? gs::kLitParamWords : 0);
         boneAt = swayAt + 12 * (std::size_t)swayCount;
-        fix = boneAt + 16 * (std::size_t)boneCount;
+        projAt = boneAt + 16 * (std::size_t)boneCount;
+        fix = projAt + 24 * (std::size_t)swayCount;
     }
 };
 struct BatchScratch {
@@ -807,9 +808,13 @@ void GsEnqueue(GsItem&& item)
                 const std::uint32_t seen = *t_jobStCount - t_jobStBase;
                 b.stSource = seen >= 1 && seen <= 64 ? (std::uint8_t)(seen - 1) : 0xFF;
             }
-            if (b.swayWords != 0 && t_jobSwayCount) {
+            if ((b.swayWords != 0 || b.projected) && t_jobSwayCount) {
                 const std::uint32_t seen = *t_jobSwayCount - t_jobSwayBase;
-                b.swaySource = seen >= 1 && seen <= 64 ? (std::uint8_t)(seen - 1) : 0xFF;
+                const std::uint8_t source = seen >= 1 && seen <= 64 ? (std::uint8_t)(seen - 1) : 0xFF;
+                if (b.swayWords != 0)
+                    b.swaySource = source;
+                if (b.projected)
+                    b.projSource = source;
             }
             if (b.skinWords != 0 && t_jobVif)
                 BoneSources(b, item.words, *t_jobVif, t_jobBoneBase);
@@ -2464,9 +2469,13 @@ void PartRecordItem(const GsItem& item)
             const std::uint32_t seen = g_vif1.StUnpacks() - r.stBase;
             b.stSource = seen >= 1 && seen <= 64 ? (std::uint8_t)(seen - 1) : 0xFF;
         }
-        if (b.swayWords != 0) {   // which of the packet's sways moved it: likewise
+        if (b.swayWords != 0 || b.projected) {   // which of the packet's unpacks to 22 moved or laid it: likewise
             const std::uint32_t seen = g_vif1.SwayUnpacks() - r.swayBase;
-            b.swaySource = seen >= 1 && seen <= 64 ? (std::uint8_t)(seen - 1) : 0xFF;
+            const std::uint8_t source = seen >= 1 && seen <= 64 ? (std::uint8_t)(seen - 1) : 0xFF;
+            if (b.swayWords != 0)
+                b.swaySource = source;
+            if (b.projected)
+                b.projSource = source;
         }
         if (b.skinWords != 0)   // which of the packet's bones its four matrices were
             BoneSources(b, words, g_vif1, r.boneBase);
@@ -3344,6 +3353,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
         // a mesh's sway: its rows as the packet has them now, turned into the part's space by the
         // header's 4 to 7 as 0x22B turns them, or the words as they were (swayStrict)
         float swayNow[16][12];
+        std::uint32_t projNow[16][24];   // each unpack to 22 as 0x076 makes of it: its matrix, colour and limits
         std::uint32_t swayCount = 0;
         if (same && !r.swayAt.empty()) {
             if (r.swayStrict) {
@@ -3351,8 +3361,15 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
                     same = !r.swayAt[k] || std::memcmp(r.swayAt[k], &r.swayWas[k * 24], 96) == 0;   // (a null one is in the hash)
             } else {
                 const float* h = reinterpret_cast<const float*>(header);
+                const float* g = reinterpret_cast<const float*>(vu1::Data() + 8 * 16);   // (0x076's: data memory 8 to 11)
                 for (std::size_t k = 0; k < r.swayAt.size() && k < 16; k++) {
                     const float* rows = reinterpret_cast<const float*>(r.swayAt[k]);
+                    float m[16];
+                    for (int q = 0; q < 4; q++)   // 0x22B: result row q the rows weighted by g's row q
+                        for (int c = 0; c < 4; c++)
+                            m[q * 4 + c] = rows[c] * g[q * 4] + rows[4 + c] * g[q * 4 + 1] + rows[8 + c] * g[q * 4 + 2] + rows[12 + c] * g[q * 4 + 3];
+                    std::memcpy(projNow[k], m, 64);
+                    std::memcpy(projNow[k] + 16, r.swayAt[k] + 16, 32);
                     for (int i = 0; i < 4; i++)
                         for (int c = 0; c < 3; c++)
                             swayNow[k][i * 3 + c] = rows[i * 4] * h[16 + c] + rows[i * 4 + 1] * h[20 + c] + rows[i * 4 + 2] * h[24 + c] + rows[i * 4 + 3] * h[28 + c];
@@ -3468,7 +3485,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             item.path = 5;
             item.part = r.kept;
             item.words = GsSpare();
-            item.words.resize(28 + 2 * stCount + (hasLit ? gs::kLitParamWords : 0) + 12 * swayCount + 16 * boneCount);
+            item.words.resize(28 + 2 * stCount + (hasLit ? gs::kLitParamWords : 0) + 12 * swayCount + 16 * boneCount + 24 * swayCount);
             float matrix[16];
             if (r.slow) {
                 vu1::PartMatrixFrom(reinterpret_cast<const float*>(header), matrix);
@@ -3487,6 +3504,8 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             // offset is from what the kept vertices have in them
             item.words[26] = header[36];
             item.words[27] = stCount | (hasLit ? 0x10000u : 0u) | swayCount << 20 | boneCount << 24;
+            if (swayCount)   // (after the bones: what 0x076 lays each unpack to 22 on with)
+                std::memcpy(&item.words[28 + 2 * stCount + (hasLit ? gs::kLitParamWords : 0) + 12 * swayCount + 16 * boneCount], projNow, 96 * swayCount);
             if (hasLit) {
                 std::memcpy(&item.words[28 + 2 * stCount], &litNow, sizeof litNow);
                 g_partsLitNow++;
@@ -4601,6 +4620,12 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
                 else
                     swayStrict = true;
             }
+            if (b.projected) {   // a texture laid on it from another view: made anew of its unpack to 22
+                if (b.projSource < r->swayAt.size() && r->swayAt[b.projSource])
+                    swayUsed |= 1ull << b.projSource;
+                else
+                    swayStrict = true;
+            }
             if (b.skinWords != 0) {   // a skinned batch: each of its matrices a bone of the packet's
                 const std::size_t skinAt = kBatchHead + (std::size_t)b.count * b.stride * 4 + b.litWords + b.swayWords;
                 const std::uint32_t* skin = skinAt + b.skinWords <= w.size() ? &w[skinAt] : nullptr;
@@ -5423,6 +5448,12 @@ void GsThreadMain()
                         b.alphaScale = alphaNow;
                     if (b.stApplied && b.stSource < stCount)
                         std::memcpy(b.stOffset, &item.words[28 + 2 * b.stSource], 8);
+                    if (b.projected && b.projSource < layout.swayCount) {   // laid on with this frame's matrix
+                        const std::uint32_t* pj = &item.words[layout.projAt + 24 * (std::size_t)b.projSource];
+                        std::memcpy(b.proj, pj, 64);
+                        std::memcpy(b.projColour, pj + 16, 16);
+                        std::memcpy(b.projLimits, pj + 20, 16);
+                    }
                     b.quads = w + head;
                     if (prep) {
                         if (!prep->quads[i].empty()) {

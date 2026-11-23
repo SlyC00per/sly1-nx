@@ -98,6 +98,10 @@ struct BatchParams {   // batch_vsh.glsl's
     float depth[4];
     float fog[4];
     float layers[4];   // x, y: 1 for each of the two lights' shares drawn with the batch
+    float proj[16];    // a projected batch's (gs::Batch::proj), and its limits and colour; mode.x 1 for one
+    float projLimits[4];
+    float projColour[4];
+    float mode[4];
 };
 
 // What a draw's vertices are: the GS's (gs_vsh.glsl) or a batch's (batch_vsh.glsl).
@@ -804,6 +808,14 @@ void Renderer::BindSource(const Source& src)
         bp.layers[1] = src.layers >= 2 ? 1.0f : 0.0f;
         bp.layers[2] = b->stOffset[0];
         bp.layers[3] = b->stOffset[1];
+        std::memset(bp.proj, 0, sizeof bp.proj + sizeof bp.projLimits + sizeof bp.projColour + sizeof bp.mode);
+        if (b->projected) {
+            std::memcpy(bp.proj, b->proj, sizeof bp.proj);
+            std::memcpy(bp.projLimits, b->projLimits, sizeof bp.projLimits);
+            for (int k = 0; k < 4; k++)
+                bp.projColour[k] = (float)(b->projColour[k] & 0xFF);
+            bp.mode[0] = 1.0f;
+        }
         if (!batchSet_ || std::memcmp(&bp, &lastBatch_, sizeof bp) != 0) {
             dkCmdBufPushConstants(cmd_, data + batchUbo_, sizeof bp, 0, sizeof bp, &bp);
             lastBatch_ = bp;

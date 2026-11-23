@@ -933,6 +933,11 @@ int main(int argc, char** argv)
                 }
                 if (b.alphaScale != 1.0f)
                     Mix(&b.alphaScale, 4);
+                if (b.projected) {   // (its S, T, Q and colour are made of these)
+                    Mix(b.proj, sizeof b.proj);
+                    Mix(b.projLimits, sizeof b.projLimits);
+                    Mix(b.projColour, sizeof b.projColour);
+                }
                 Mix(b.matrix, sizeof b.matrix);
                 Mix(b.scale, sizeof b.scale);
                 Mix(b.offset, sizeof b.offset);

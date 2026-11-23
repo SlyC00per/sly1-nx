@@ -468,7 +468,7 @@ bool PartParams()
 }
 struct LaneCounts {
     std::map<std::uint64_t, std::uint64_t> lateBy;   // late transforms by program (hash << 12 | entry)
-    std::uint64_t lateNs = 0, lateVertices = 0, skippedOverwritten = 0, notTaken = 0, taken = 0, swayed = 0;
+    std::uint64_t lateNs = 0, lateVertices = 0, skippedOverwritten = 0, notTaken = 0, taken = 0, swayed = 0, spritesAsBatches = 0;
 };
 Deferred g_mainDeferred;
 LaneCounts g_mainCounts;
@@ -2779,10 +2779,82 @@ void MatrixProduct(Runner& r, float (*vf)[4], std::uint16_t in, std::uint16_t gl
 
 bool Clippable(Runner& r, std::uint16_t top, int stride);
 
+// The sprites' pass as a batch for the renderer (gs::Batch::projected): when the mesh it is laid
+// on has its transform left to the renderer, its vertices are drawn again from the same record with
+// 0x076's texture coordinates and colour made by the renderer, and the mesh's transform is never
+// done here (it was, for this pass alone, on every such mesh: the shadows under characters).
+// SLY1_GPU_SPRITES=0: not. False, with nothing done, when the batch's tag is not one it takes.
+bool SpritesAsBatch(Runner& r, std::uint16_t top)
+{
+    static const bool off = std::getenv("SLY1_GPU_SPRITES") && std::getenv("SLY1_GPU_SPRITES")[0] == '0';
+    const Deferred& d = Def();
+    if (off || !DeferredFor(top) || d.overwritten || Half(Load(r, top + 13).z) != 0)
+        return false;
+    V hdr = Load(r, top + 11);
+    std::uint16_t first = (std::uint16_t)(top + Half(hdr.x)), end = (std::uint16_t)(top + Half(hdr.y));
+    if (Half(Load(r, top + 13).x) != (std::uint16_t)d.stride || first != d.first || end != d.end)
+        return false;
+    const std::uint32_t count = (std::uint32_t)((std::uint16_t)(end - first) / d.stride);
+    V t = Load(r, (std::uint16_t)(first - 1));   // the batch's tag, as its last kick left it
+    std::uint32_t word0 = Bits(t.x), word1 = Bits(t.y), nreg = (word1 >> 28) & 0xF, flg = (word1 >> 26) & 3;
+    std::uint64_t regs = Bits(t.z) | (std::uint64_t)Bits(t.w) << 32;
+    int stqAt = -1, colourAt = -1;
+    bool ok = flg == 0 && (int)nreg == d.stride && (word0 & 0x7FFF) == count && ((regs >> (4 * (nreg - 1))) & 0xF) == 4;
+    for (std::uint32_t k = 0; ok && k + 1 < nreg; k++) {
+        unsigned reg = (unsigned)(regs >> (4 * k)) & 0xF;
+        if (reg == 2 && stqAt < 0)
+            stqAt = (int)k;
+        else if (reg == 1 && colourAt < 0)
+            colourAt = (int)k;
+        else if (reg != 0xF)
+            ok = false;
+    }
+    if (!ok || stqAt < 0 || colourAt < 0)
+        return false;
+    // as the program: the matrix at 22 to 25 times the one at 8 to 11 of data memory, in place
+    float vf[32][4];
+    std::memcpy(vf, r.s.vf, sizeof vf);
+    MatrixProduct(r, vf, (std::uint16_t)(top + 22), 8, (std::uint16_t)(top + 22));
+    std::memcpy(r.s.vf, vf, sizeof vf);
+    gs::Batch b;
+    b.stride = (std::uint32_t)d.stride;
+    b.count = count;
+    b.positionAt = (std::uint32_t)d.stride - 1;
+    b.stqAt = (std::uint32_t)stqAt;
+    b.colourAt = (std::uint32_t)colourAt;
+    b.quads = reinterpret_cast<const std::uint32_t*>(r.Qword(first));
+    for (int c = 0; c < 4; c++)
+        std::memcpy(&b.matrix[c * 4], r.Qword((std::uint16_t)(top + 14 + c)), 16);
+    std::memcpy(b.scale, r.Qword(0), 16);
+    std::memcpy(b.offset, r.Qword(1), 16);
+    V params = Load(r, top + 8);
+    b.fogScale = params.y;
+    b.wMax = params.z;
+    b.cull = Half(Load(r, top + 9).z) != 0;
+    b.id = d.serial;
+    b.projected = true;
+    for (int c = 0; c < 4; c++)
+        std::memcpy(&b.proj[c * 4], r.Qword((std::uint16_t)(top + 22 + c)), 16);
+    std::memcpy(b.projColour, r.Qword((std::uint16_t)(top + 26)), 16);
+    std::memcpy(b.projLimits, r.Qword((std::uint16_t)(top + 27)), 16);
+    for (int k = 0; k < 4; k++)
+        std::memcpy(r.s.vf[2 + k], &b.proj[k * 4], 16);
+    std::memcpy(r.s.vf[15], b.projColour, 16);
+    Kick(r, (std::uint16_t)(top + 28));
+    SetVf(r.s, 3, t);
+    gs::KickBatch(word1, b);
+    Cnt().spritesAsBatches++;
+    r.s.pc = 0x0C5;
+    return true;
+}
+
 bool Sprites(Runner& r)
 {
     State& st = r.s;
     std::uint16_t top = (std::uint16_t)r.ctx.top;
+    if (SpritesAsBatch(r, top))
+        return true;
+    Materialise(r, true);   // (the vertices' screen positions are read: the transform done now)
     V hdr = Load(r, top + 11);
     std::uint16_t step = Half(Load(r, top + 13).x);
     const bool clips = Half(Load(r, top + 13).z) != 0;
@@ -4156,7 +4228,7 @@ void BeforeProgram(Handler fn, core::Runner& r)
     static const Handler kSafe[] = {BatchFinish, BatchSecond, UnlitFinish, MatrixAt14, CopyFromOtherBuffer, BatchSetup,
                                     DirectionalLight, PointLight, SpotLight, LitColours, Skin, SkinNormals, UnitNormals,
                                     MorphFromStride, MorphFromStart, OffsetXy, LitBatchTransform, BatchTransform274,
-                                    BatchTransform28E};
+                                    BatchTransform28E, Sprites};   // (Sprites: done as a batch, or the transform done then)
     for (Handler h : kSafe)
         if (fn == h)
             return;

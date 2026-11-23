@@ -2023,6 +2023,11 @@ void SoftBatch(const Batch& b)
         std::memcpy(stq, q + b.stqAt * 4, 12);
         stq[0] += b.stOffset[0];
         stq[1] += b.stOffset[1];
+        if (b.projected) {   // (0x076's: S, T and Q from the clip position, one colour)
+            std::uint32_t col[4];
+            ProjectedOf(b, bv.clip, stq, col);
+            o.r = (std::uint8_t)col[0]; o.g = (std::uint8_t)col[1]; o.b = (std::uint8_t)col[2]; o.a = (std::uint8_t)col[3];
+        }
         o.s = stq[0] / w; o.t = stq[1] / w; o.q = stq[2] / w;
         o.u = o.v = 0;
     }

@@ -30,6 +30,10 @@ layout (std140, binding = 0) uniform BatchParams {
     vec4 depth;    // clip z scaled (x) and w's part added (y): over w, the GS's depth as a fraction of 2 to the 32nd
     vec4 fog;      // x the scale, y the largest w, z 1 when backfaces are dropped, w the alpha's scale
     vec4 layers;   // x, y: 1 for each share drawn with the batch; z, w: added to S and T
+    mat4 proj;     // a projected batch's (gs::Batch::proj, gs::ProjectedOf): S, T, Q from the clip position
+    vec4 projLimits;
+    vec4 projColour;
+    vec4 mode;     // x: 1 for a projected batch
 } u;
 
 void main()
@@ -44,6 +48,22 @@ void main()
     outColour = vec4(inColour & 0xFFu);
     outColour.a = floor(outColour.a * u.fog.w);
     outStq = inStq + vec3(u.layers.zw, 0.0);
+    if (u.mode.x != 0.0) {   // 0x076's: S, T and Q through proj, Q kept within the limits, one colour
+        vec4 c = u.proj * clip;
+        float q = c.w, s = c.x, t = c.y;
+        outColour = u.projColour;
+        bool small = c.w - u.projLimits.x < 0.0;
+        if (small || !(c.w - u.projLimits.y < 0.0)) {
+            float limit = small ? u.projLimits.x : u.projLimits.y;
+            float shift = (limit - c.w) * 0.5;
+            q = limit;
+            s += shift;
+            t += shift;
+            if (c.w - u.projLimits.w < 0.0)
+                outColour.a = 0.0;
+        }
+        outStq = vec3(s, t, q);
+    }
     vec4 s1 = vec4(inShare1 & 0xFFu) * u.layers.x, s2 = vec4(inShare2 & 0xFFu) * u.layers.y;
     s1.a = floor(s1.a * u.fog.w);
     s2.a = floor(s2.a * u.fog.w);

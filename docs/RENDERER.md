@@ -1616,3 +1616,28 @@ skinning); the host cannot say where (its renderer only counts what it is given)
   the Switch's cores wait on memory, and the items were scattered over the heap.
 
 Level 4 under lockstep: 29 frames within 1 of 255 of `SLY1_PART_REPLAY=0`.
+
+### The sprites' pass as a batch (2026-11-22)
+
+0x076 of chunk E1624411 runs on a mesh already transformed: it takes each vertex's screen position
+back to its clip position, through a matrix (22 to 25 times data memory's 8 to 11, made in place
+by 0x22B) to S, T and Q, keeps Q within 27's x and y (moving S and T by half the change, the alpha
+0 below 27's w when it did), colours every vertex with 26, and kicks the mesh's own tag again: a
+texture laid on the mesh from another view (the shadows under characters, the light in Treasure in
+the Depths). It read the screen positions, so every mesh it ran on was transformed here, and its
+part was refused when kept (its packet carried vertices).
+
+When the mesh's transform is the renderer's, 0x076 is now a second batch of the same record
+(`gs::Batch::projected`: `proj`, `projLimits`, `projColour`; `gs::ProjectedOf` is the arithmetic,
+batch_vsh.glsl does it on the Switch, the software batches and the counting renderer on the host),
+after the packet at 28 (`SpritesAsBatch`; `SLY1_GPU_SPRITES=0`: as before). A part drawn again
+has its batch laid on with this frame's matrix, colour and limits, made of the unpack to 22 it came
+from (`projSource`, counted as a sway's) and data memory's 8 to 11 now.
+
+On the host's tours: Treasure in the Depths, jobs 9.0 a frame against 83.5 (the parts drawn the
+long way and lit by their cache: 0.5 against 75); A Cunning Disguise, 42.6 against 69.6. Checked:
+level 4 under lockstep, 29 frames within 1 of 255 of `SLY1_PART_REPLAY=0` (with and without parts
+drawn again); level 10, against `SLY1_PART_REPLAY=0 SLY1_GPU_SPRITES=0`: mean 0.1, at most 25 of
+255, at most 0.24% of values further than 8, in a strip at the screen's sides (triangles across the
+view's edge, which the program's clipper cut and the GPU cuts). `--verify-levels` with
+`SLY1_PART_JOBS_CHECK=1`: all 46 levels, 294,429 jobs against 333,185, 1 wrong (caught).
