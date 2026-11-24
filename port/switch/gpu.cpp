@@ -2391,11 +2391,12 @@ void Renderer::PushSlots(std::uint32_t at, std::uint32_t n)
 
 // A list called from the frame's commands. Each call takes the GPU channel two entries or more,
 // and a channel's kickoff takes 512 at most (Ryujinx refuses more, deko3d then stops the program,
-// dkQueuePresentImage): the frame's commands so far are given to the GPU every 64 calls. The
-// state set stays the GPU's from one submission to the next.
+// dkQueuePresentImage): the frame's commands so far are given to the GPU every 128 calls (at 64,
+// 132 entries a kickoff at most in Ryujinx's tour of level 4). The state set stays the GPU's from
+// one submission to the next.
 void Renderer::ListCalled()
 {
-    if (++listCalls_ < 64)
+    if (++listCalls_ < 128)
         return;
     listCalls_ = 0;
     dkQueueSubmitCommands(queue_, dkCmdBufFinishList(cmd_));
