@@ -55,6 +55,15 @@ The game sends commands to two services of the IOP (`port/platform/iop.cpp`):
   - a wait's unit, 1/240 s: with it a record of 0.03 s clicks 10 apart is a rattle, and a
     one-second creak comes back every 7 to 11 seconds; at 1/60 s the same would be four times
     as slow;
+  - kind 5, another record of the same bank started (the record at +0x14, a volume of 127 at
+    +8; read from all ten in the global banks, each naming a record of its bank). It is how the
+    ambient programs are made: bank 871394's record 26 starts a bed (7), a round that starts one
+    of three calls at random every 6 to 11 seconds (12: 13, 14, 15), and every 25 to 30 seconds
+    another (11); bank 782334's record 88 starts three rounds of its own. The record started is a
+    voice of the one that started it, mixed at its volume, pan and pitch and stopped with it (a
+    choice of kind 25 may start one too). Before, kind 5 was passed over and these programs were
+    silent. `SLY1_SND_CHILDREN=0`: passed over; `SLY1_SND_KINDS=1` prints every record's program
+    when a global bank is loaded;
   - kinds 27 (a value before a sample, 100 for most, else 75, 50, 65: a level or a chance),
     31 (two values such as 80 and 120: a range, of volume or pitch), 4, 5, 20 and the rare
     ones: passed over;

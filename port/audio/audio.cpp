@@ -322,6 +322,10 @@ struct Voice {
     int wait = 2;                          // chunks before it sounds (its volume comes in the commands after its start)
     bool paused = false, over = false, program = false;
     int overFor = 0;   // chunks since it ended
+    // the records its program started (kind 5): mixed with it, at its volume, pan and pitch, and
+    // stopped with it
+    std::vector<std::shared_ptr<Voice>> children;
+    float childVolume = 1.0f;   // (a child's) the volume its parent's tone gave it
 
     void Mix(std::int32_t* out, int frames, float master)
     {
@@ -362,6 +366,22 @@ struct Voice {
                 }
             }
             any = any || !n.over;
+        }
+        for (std::size_t k = 0; k < children.size();) {
+            Voice& c = *children[k];
+            c.volume = volume * c.childVolume;
+            c.left = left;
+            c.right = right;
+            c.pitch = pitch;
+            c.gain = gain;
+            c.gainStep = gainStep;
+            c.Mix(out, frames, master);
+            if (c.over) {
+                children.erase(children.begin() + (std::ptrdiff_t)k);
+            } else {
+                any = true;
+                k++;
+            }
         }
         gain -= gainStep * (float)frames;
         if (!any || gain <= 0.0f)
@@ -1157,6 +1177,28 @@ std::uint32_t LoadBank(std::uint32_t sector)
     std::lock_guard<std::mutex> lk(g_lock);
     const std::uint32_t handle = g_nextBank++;
     g_banks[handle] = bank;
+    if (std::getenv("SLY1_SND_KINDS") && bank->global) {   // every record's program, a line each (reading the tones' kinds)
+        auto le = [](const std::uint8_t* p) { return (std::int32_t)((std::uint32_t)p[0] | (std::uint32_t)p[1] << 8 | (std::uint32_t)p[2] << 16 | (std::uint32_t)p[3] << 24); };
+        for (std::uint32_t r = 0; r < bank->records && bank->recordAt + (r + 1) * 12 <= bank->block.size(); r++) {
+            const std::uint8_t* rec = bank->block.data() + bank->recordAt + r * 12;
+            const std::uint32_t count = rec[4] | rec[5] << 8;
+            const std::int32_t first = le(rec + 8);
+            std::fprintf(stderr, "sndkinds: sector %u record %u (bytes %u %u, word6 %u):", sector, r, rec[0], rec[1], (unsigned)(rec[6] | rec[7] << 8));
+            for (std::uint32_t k = 0; k < count && first >= 0 && bank->toneAt + (std::size_t)first + (k + 1) * 0x28 <= bank->block.size(); k++) {
+                const std::uint8_t* t = bank->block.data() + bank->toneAt + (std::size_t)first + k * 0x28;
+                const std::int32_t kind = le(t);
+                if (kind == 1)
+                    std::fprintf(stderr, " [1]");
+                else {
+                    std::fprintf(stderr, " [%d:", kind);
+                    for (int w = 1; w < 10; w++)
+                        std::fprintf(stderr, " %d", le(t + w * 4));
+                    std::fprintf(stderr, "]");
+                }
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
     static const bool log = std::getenv("SLY1_SND_LOG") != nullptr;
     if (log)
         std::fprintf(stderr, "sndlog: bank %u at sector %u: %s, %u records, %u tones, %zu bytes of samples\n", handle, sector, bank->global ? "global" : bank->level ? "a level's" : "not understood",
@@ -1236,6 +1278,25 @@ void Voice::Step(int frames)
         return n ? (seed >> 8) % n : 0;
     };
     auto word = [](const std::uint8_t* p) { return (std::int32_t)((std::uint32_t)p[0] | (std::uint32_t)p[1] << 8 | (std::uint32_t)p[2] << 16 | (std::uint32_t)p[3] << 24); };
+    // a record of the bank started by the program (kind 5: the record at +0x14, a volume of 127 at +8)
+    auto startRecord = [&](const std::uint8_t* t) {
+        static const bool off = std::getenv("SLY1_SND_CHILDREN") && std::getenv("SLY1_SND_CHILDREN")[0] == '0';
+        const std::int32_t record = word(t + 0x14), level = word(t + 8);
+        static int depth = 0;   // (a record that starts itself at once: not followed past four)
+        if (off || record < 0 || children.size() >= 8 || depth >= 4)
+            return;
+        depth++;
+        std::shared_ptr<Voice> c = StartVoice(bank, (std::uint32_t)record);
+        depth--;
+        if (c->notes.empty() && !c->program)
+            return;
+        c->wait = 0;
+        c->childVolume = level > 0 ? (float)level / 127.0f : 1.0f;
+        children.push_back(c);
+        static const bool log = std::getenv("SLY1_SND_LOG") != nullptr;
+        if (log)
+            std::fprintf(stderr, "sndlog: record %d of the bank started by a voice's program, volume %d\n", record, level);
+    };
     waitFrames -= frames;
     int steps = 0;
     while (pc < tones && waitFrames <= 0 && steps++ < 256) {
@@ -1249,14 +1310,18 @@ void Voice::Step(int frames)
             const std::int32_t base = word(t + 8), more = word(t + 4);
             const std::int32_t ticks = (base > 0 ? base : 0) + (more > 0 ? (std::int32_t)random((std::uint32_t)more + 1) : 0);
             waitFrames += (std::int32_t)((std::int64_t)ticks * kRate / 240);
-        } else if (kind == 25) {
+        } else if (kind == 25) {   // one of the next n: a sample, or a record started
             const std::uint32_t n = t[8] | t[9] << 8;
             if (n >= 1 && pc + n <= tones) {
                 const std::uint8_t* c = t + (std::size_t)(1 + random(n)) * 0x28;
                 if (word(c) == 1 && notes.size() < 16)
                     Play(c);
+                else if (word(c) == 5)
+                    startRecord(c);
                 pc += n;
             }
+        } else if (kind == 5) {
+            startRecord(t);
         } else if (kind == 21) {
             loopPc = (std::int32_t)pc;
         } else if (kind == 22) {
