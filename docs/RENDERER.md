@@ -1818,12 +1818,11 @@ Switch) a kept part's commands are kept as a deko3d command list of its own:
   for each frame buffer (FRAME differs). Every list is forgotten when the textures' cache, the kept
   batches' memory or the lists' own memory (24 MB, a reserve of 4) is made anew.
 - **This frame's vertices and colours** (a part the helper prepared: lit, swayed, skinned): the
-  recording puts them in the list's own data (`listData_`: two blocks, one for each set of the
-  frame's memory, the same places in both) instead of the frame's memory, and a list given again
-  has this frame's copied there first (`PartEnd`). Such a list is given only in frames of the set it
-  was recorded in (the frame buffers pair with the sets: its variant's), so that what it reads is
-  written only once the GPU has done with that set's last frame. Which of its batches have them is in
-  the key. While recording, a share that adds this frame's colours is drawn even when they are all
+  recording puts them at places of the list's own (`listData_`) instead of the frame's memory, and a
+  list given again has this frame's copied there first (`PartEnd`). It is given only when the GPU has
+  done with the frame that last drew from them (`DataFree`: three frames since, the sets of the
+  frame's memory being three, or that frame's fence signalled); else the part is drawn as ever that
+  frame (`perflists`' "data in use"). Which of its batches have them is in the key. While recording, a share that adds this frame's colours is drawn even when they are all
   black (left out otherwise): adding black changes nothing, and the list holds for any frame's.
 - **The alpha's scale**: a part whose batches take it is recorded with no alpha test decided by its
   vertices' alpha (two draws where one would do, the same picture), so that its list holds for any

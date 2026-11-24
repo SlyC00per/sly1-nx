@@ -490,7 +490,8 @@ private:
         std::uint32_t uploads = 0;   // gs::UploadSerial() when its textures were last found the same
         std::uint64_t sig = 0;       // what its commands were made from (partSig_)
         std::vector<PartData> data;  // its batches' vertices and colours of each frame
-        int set = -1;                // the set of the frame's memory it was recorded in (with data: given only then)
+        int set = -1;                // the set of the frame's memory of the frame that last drew from them,
+        std::uint64_t frame = 0;     // and that frame's number (frames_)
     };
     struct PartLists {
         PartList variant[2];         // (the frame buffers in turn: a part's state differs by FRAME)
@@ -500,12 +501,13 @@ private:
     std::unordered_map<const void*, PartLists> partLists_;
     static constexpr std::uint32_t kListMemory = 24u << 20, kListReserve = 4u << 20, kParamMemory = 8u << 20, kParamSlot = 256;
     DkMemBlock listMem_ = nullptr, paramMem_ = nullptr;
-    // A list's vertices and colours of each frame (a lit, swayed or skinned part's): two blocks, one
-    // for each set of the frame's memory, the same places in both; a list draws from the one of the
-    // set it was recorded in, and is given again only in that set's frames, so that the block is
-    // written when the GPU has done with it (the set's fence)
-    static constexpr std::uint32_t kListData = 12u << 20;
-    DkMemBlock listData_[2] = {nullptr, nullptr};
+    // A list's vertices and colours of each frame (a lit, swayed or skinned part's), at places of its
+    // own: written for a frame only once the GPU has done with the frame that last drew from them
+    // (DataFree), else the part is drawn as ever that frame
+    static constexpr std::uint32_t kListData = 24u << 20;
+    DkMemBlock listData_ = nullptr;
+    bool DataFree(int set, std::uint64_t frame);
+    std::uint64_t partDataBusy_ = 0;   // lists not given because the GPU might still draw from their data
     std::uint32_t dataUsed_ = 0;
     DkCmdBuf listCmd_ = nullptr, mainCmd_ = nullptr;
     std::uint32_t paramUsed_ = 0, listBytes_ = 0;
@@ -779,8 +781,7 @@ bool Renderer::Create()
     {   // the kept parts' lists, and their batches' slots (Renderer::PartBegin)
         listMem_ = Block(kListMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
         paramMem_ = Block(kParamMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
-        for (DkMemBlock& d : listData_)
-            d = Block(kListData, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
+        listData_ = Block(kListData, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
         if (listMem_ && paramMem_) {
             DkCmdBufMaker listMaker;
             dkCmdBufMakerDefaults(&listMaker, device_);
@@ -1865,14 +1866,14 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
             src.doubled = &it->doubled;
             // (a part being recorded: this frame's vertices and colours in the list's own data, which a
             // list given again has written anew: PartEnd)
-            const bool toList = partMode_ == 1 && listData_[0] && listData_[1] && dataUsed_ + b.count * 48 + 64 <= kListData;
+            const bool toList = partMode_ == 1 && listData_ && dataUsed_ + b.count * 48 + 64 <= kListData;
             if (partMode_ == 1 && !toList && (b.swayMoved || b.skinMoved || litColours) && !partBad_) {
                 partBad_ = true;
                 partWhy_ = "lists' data full";
             }
             if (toList && (b.swayMoved || b.skinMoved)) {
                 const std::uint32_t at = Align(dataUsed_, 64);
-                std::uint8_t* out = static_cast<std::uint8_t*>(dkMemBlockGetCpuAddr(listData_[set_ & 1])) + at;
+                std::uint8_t* out = static_cast<std::uint8_t*>(dkMemBlockGetCpuAddr(listData_)) + at;
                 const std::uint32_t step = b.stride * 4;
                 for (std::uint32_t v = 0; v < b.count; v++, out += 32) {
                     const std::uint32_t* q = b.quads + v * step;
@@ -1880,7 +1881,7 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
                     std::memcpy(out + 16, q + b.stqAt * 4, 16);
                 }
                 src.vertexAt = at;
-                src.vertexBase = dkMemBlockGetGpuAddr(listData_[set_ & 1]);
+                src.vertexBase = dkMemBlockGetGpuAddr(listData_);
                 partList_->data.push_back({partBatch_, 0, at, b.count});
                 dataUsed_ = at + b.count * 32;
             } else if (b.swayMoved || b.skinMoved) {   // its vertices moved (sway, skinning) this frame: positions and STQ in the frame's memory
@@ -1902,9 +1903,9 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
             }
             if (toList && litColours) {
                 const std::uint32_t at = Align(dataUsed_, 64);
-                std::memcpy(static_cast<std::uint8_t*>(dkMemBlockGetCpuAddr(listData_[set_ & 1])) + at, litColours, b.count * 16);
+                std::memcpy(static_cast<std::uint8_t*>(dkMemBlockGetCpuAddr(listData_)) + at, litColours, b.count * 16);
                 src.colourAt = at;
-                src.colourBase = dkMemBlockGetGpuAddr(listData_[set_ & 1]);
+                src.colourBase = dkMemBlockGetGpuAddr(listData_);
                 partList_->data.push_back({partBatch_, 1, at, b.count});
                 dataUsed_ = at + b.count * 16;
             } else if (litColours) {   // its colours in the frame's memory, as a batch not kept has them
@@ -2252,6 +2253,20 @@ bool Renderer::PartListsOn() const
     return e[0] == 'a' ? frames_ / 600 % 2 == 0 : true;   // (=check: on, every list checked, none given)
 }
 
+// Whether the GPU has done with the frame (its number and its set of the frame's memory): one at
+// least kSets frames ago (its set has been used again, after its fence was waited for), or one
+// whose fence is signalled.
+bool Renderer::DataFree(int set, std::uint64_t frame)
+{
+    if (set < 0 || frame >= frames_ + 1)
+        return frame + kSets <= frames_;
+    if (frame + kSets <= frames_)
+        return true;
+    if (frame == frames_ || !fenced_[set])
+        return false;   // (this frame's own, or not yet presented)
+    return dkFenceWait(&fences_[set], 0) == DkResult_Success;
+}
+
 // Every list forgotten and their memory used again (the GPU has done with them).
 void Renderer::PartListsReset()
 {
@@ -2287,8 +2302,12 @@ int Renderer::PartBegin(const void* part, std::uint64_t key, std::uint32_t batch
            ((std::uint64_t)(cullFront_ != 0.0f) << 63);
     PartLists& lists = partLists_[part];
     for (PartList& v : lists.variant) {
-        if (!v.list || v.key != key || v.epoch != partEpoch_ || (!v.data.empty() && v.set != (set_ & 1)))
+        if (!v.list || v.key != key || v.epoch != partEpoch_)
             continue;
+        if (!v.data.empty() && !DataFree(v.set, v.frame)) {   // (the GPU may still draw from its data: drawn as ever this once)
+            partDataBusy_++;
+            return 0;
+        }
         // its textures as they were: looked at again only when anything has been uploaded since, and
         // decoded again in place where their pages have changed (as a draw would have them)
         bool same = true;
@@ -2343,7 +2362,8 @@ int Renderer::PartBegin(const void* part, std::uint64_t key, std::uint32_t batch
     into->slots.clear();
     into->textures.clear();
     into->data.clear();
-    into->set = set_ & 1;
+    into->set = set_;
+    into->frame = frames_;
     into->paramAt = paramUsed_;
     into->uploads = gs::UploadSerial();
     into->used = frames_;
@@ -2473,7 +2493,7 @@ void Renderer::PartEnd(bool clean)
             break;
         }
         const gs::Batch& b = partNowBatches_[d.batch];
-        std::uint8_t* out = static_cast<std::uint8_t*>(dkMemBlockGetCpuAddr(listData_[l.set])) + d.at;
+        std::uint8_t* out = static_cast<std::uint8_t*>(dkMemBlockGetCpuAddr(listData_)) + d.at;
         if (d.kind == 0) {
             if (!(b.swayMoved || b.skinMoved) || b.count != d.count) {
                 all = false;
@@ -2501,6 +2521,8 @@ void Renderer::PartEnd(bool clean)
         dkCmdBufCallList(cmd_, l.list);
         ResetTracking();
         partReplays_++;
+        l.set = set_;
+        l.frame = frames_;
     }
     if (!clean || !all) {   // (not to be given again: kept anew when the part next comes)
         l.list = 0;
@@ -2738,9 +2760,7 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
                 (std::uint64_t)(src.doubled ? (std::uint8_t)*src.doubled : 0xEE) << 32);
         for (int k = 0; k < 2; k++) {   // (a place in a list's data: which one is the recording's own)
             const DkGpuAddr a = src.layerColours[k];
-            bool inData = false;
-            for (DkMemBlock d : listData_)
-                inData = inData || (d && a >= dkMemBlockGetGpuAddr(d) && a < dkMemBlockGetGpuAddr(d) + kListData);
+            const bool inData = listData_ && a >= dkMemBlockGetGpuAddr(listData_) && a < dkMemBlockGetGpuAddr(listData_) + kListData;
             PartSig(inData ? 0xDA7A2 : a);
         }
         PartSig(src.batch ? src.batch->count | (std::uint64_t)src.batch->cull << 32 : 0);
@@ -3605,9 +3625,10 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
                 const std::uint64_t is[7] = {partReplays_, partRecordsKept_, partRecords_ - partRecordsKept_, partStale_, partBatchesSkipped_, partChecksSame_, partChecksOther_};
                 const double f = (double)(frames_ - framesWas);
                 std::fprintf(stderr, "perflists: to %llu, a frame: parts given from their lists %.1f (%.0f batches), recorded and kept %.2f, recorded and not %.2f, found stale %.2f; "
-                             "%zu parts with lists, slots %.1f of %u MB, lists made anew %llu times; checked the same %llu, otherwise %llu%s\n", (unsigned long long)frames_, (is[0] - was[0]) / f, (is[4] - was[4]) / f,
+                             "%zu parts with lists, slots %.1f of %u MB, lists made anew %llu times; checked the same %llu, otherwise %llu; data in use %llu%s\n", (unsigned long long)frames_, (is[0] - was[0]) / f, (is[4] - was[4]) / f,
                              (is[1] - was[1]) / f, (is[2] - was[2]) / f, (is[3] - was[3]) / f, partLists_.size(), paramUsed_ / 1048576.0, kParamMemory >> 20,
-                             (unsigned long long)partResets_, (unsigned long long)partChecksSame_, (unsigned long long)partChecksOther_, PartListsOn() ? "" : " (off)");
+                             (unsigned long long)partResets_, (unsigned long long)partChecksSame_, (unsigned long long)partChecksOther_, (unsigned long long)partDataBusy_,
+                             PartListsOn() ? "" : " (off)");
                 if (!partGiveUps_.empty()) {
                     std::fprintf(stderr, "perflists: not kept so far:");
                     for (const auto& w : partGiveUps_)
