@@ -5756,6 +5756,14 @@ void GsThreadMain()
                                              (unsigned long long)(ji[2] - jw[2]), (ji[3] - jw[3]) / 1e6, (unsigned long long)(ji[4] - jw[4]), (ji[5] - jw[5]) / 1e6, (ji[6] - jw[6]) / 1e6);
                             std::memcpy(jw, ji, sizeof jw);
                         }
+                        {   // (SLY1_VU1_PROFILE) latevu1: the render thread's programs' time in the same frames
+                            static const bool vu1Profile = std::getenv("SLY1_VU1_PROFILE") != nullptr;
+                            static std::uint64_t vw;
+                            const std::uint64_t vi = vu1Profile ? vu1::RenderHandlerNs() : 0;
+                            if (vu1Profile && dt > 20.0 && dt < 200.0 && said <= 8)
+                                std::fprintf(stderr, "latevu1: frame %llu: the render thread's programs %.1f ms\n", (unsigned long long)gs::FramesShown(), (vi - vw) / 1e6);
+                            vw = vi;
+                        }
                         std::memcpy(pathWas, pathIs, sizeof pathWas);
                         at = now;
                         std::memcpy(was, is, sizeof was);
@@ -6072,6 +6080,7 @@ void GsThreadMain()
 void RenderThreadMain()
 {
     ProfileThisThread("render");   // (SLY1_PROFILE=render)
+    vu1::MarkRenderThread();
     g_renderStarted.store(true, std::memory_order_release);
     for (;;) {
         RenderItem item;
@@ -6327,6 +6336,9 @@ void RenderThreadMain()
                                              (g_jobsLost[2].load() - lostWas[2]) / f, (g_jobLostNs[2].load() - lostNsWas[2]) / f / 1e6, (g_jobsAhead.load() - aheadWas) / f,
                                              (g_prepsAhead.load() - prepsAheadWas) / f);
                             prepsAheadWas = g_prepsAhead.load();
+                            static const bool vu1Profile = std::getenv("SLY1_VU1_PROFILE") != nullptr;
+                            if (vu1Profile)
+                                vu1::RenderProfileLine(shown, f);
                             for (int k = 0; k < 3; k++) {
                                 lostWas[k] = g_jobsLost[k].load();
                                 lostNsWas[k] = g_jobLostNs[k].load();

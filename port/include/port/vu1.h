@@ -43,6 +43,11 @@ void PartMatrix(std::uint32_t top, float out[16]);
 // inside its own packet).
 void PartMatrixFrom(const float* header, float out[16]);
 std::uint64_t PartTrouble();
+// SLY1_VU1_PROFILE: the render thread's programs' time apart from the jobs' (MarkRenderThread on it):
+// in all, and a line of the costliest a frame since the last line.
+void MarkRenderThread();
+std::uint64_t RenderHandlerNs();
+void RenderProfileLine(std::uint64_t shown, double frames);
 // SLY1_LIT_NOW_CHECK (port/platform/dmac.cpp): the lighting a part drawn again would have been
 // given this frame (words of a gs::LitParams, or null), for the handlers to compare with what the
 // programs light the part's batches with as it runs.
