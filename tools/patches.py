@@ -397,6 +397,15 @@ PATCHES = [
      "    case 31:\n        switch (sel) {\n        case 27: {\n            g_saveData->u19EC ^= 0x10000;\n            s32 keep = self->cursor;\n            BuildPauseMenuPage(self);\n            self->cursor = keep;\n            return;\n        }\n        case 0x18: {",
      "choosing the Camera setting turns it over"),
 
+    # The Options page without "Center Screen...": the PS2's picture could be moved on a television
+    # that showed it off centre; the Switch's screen and its dock's picture are where they are
+    # (the user, 2026-11-24). The item is left out of the page as it is built; the game's own
+    # adjustment page and its code stay, unreached.
+    ("src/main/pause_menu.cpp",
+     "            case 8:\n                show = g_elementStack.resumeState != 1;\n                break;\n            }",
+     "            case 8:\n                show = g_elementStack.resumeState != 1;\n                break;\n            case 14:\n                show = 0;\n                break;\n            }",
+     "the Options page without Center Screen"),
+
     # Frame layout: g++ 2.95 put t right after arr[32] in the frame, and the cleanup walks back from
     # &t; a modern compiler places locals as it likes.
     ("src/main/pose_source.cpp",

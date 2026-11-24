@@ -13,6 +13,7 @@ is a port bug.
 | Saving | memory card, with its checks, slot selection and prompts | no memory card: progress saved to the console's save data, none of the card screens |
 | Resolution | 640×448 | HD output: 1280×720 handheld, 1920×1080 docked |
 | Frame rate | 60 Hz | locked 60 FPS |
+| Options | "Center Screen..." moves the picture on the television | no such item: the screen's picture is where it is (the maintainer's choice, 2026-11-24; not checked against the PS3 release) |
 
 Further PS3 differences are added to this table as they are observed. PS3 platform features
 with no Switch equivalent (trophies, stereoscopic 3D) are not planned unless the maintainer
