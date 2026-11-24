@@ -414,6 +414,7 @@ struct PrepTask {
     std::uint64_t begunAt = 0;
 };
 std::vector<PrepTask*> g_prepFree;
+std::atomic<std::uint64_t> g_prepTasksMade, g_partJobsMade, g_jobsTrimmed;   // (MemoryReport)
 std::mutex g_prepFreeLock;
 constexpr std::uint32_t kListPreps = 2048;
 std::shared_ptr<PrepTask> g_preps[kListPreps];
@@ -442,8 +443,10 @@ std::shared_ptr<PrepTask> PrepNew()
                 g_prepFree.erase(g_prepFree.begin() + (std::ptrdiff_t)k);
             }
     }
-    if (!t)
+    if (!t) {
         t = new PrepTask;
+        g_prepTasksMade++;
+    }
     t->state.store(0, std::memory_order_relaxed);
     t->begunAt = 0;
     return std::shared_ptr<PrepTask>(t, [](PrepTask* x) {
@@ -1986,6 +1989,7 @@ std::mutex g_renderLock;
 std::condition_variable g_renderWake, g_renderIdle;
 std::deque<RenderItem> g_renderQueue;
 std::vector<std::vector<std::uint32_t>> g_renderSpare;   // emptied items' buffers, for reuse
+constexpr std::size_t kRenderSpareMostWords = 1u << 16;   // (256 KB: a larger one is let go; the lists copied are under 64 KB)
 bool g_renderBusy, g_renderWaiting;
 std::atomic<bool> g_renderStarted;
 std::atomic<std::uint64_t> g_renderQueuedWords, g_renderMaxQueued;
@@ -2077,6 +2081,7 @@ struct PartRecord {
     std::vector<std::uint32_t> pages;    // the pages its packet lies on and names (PartPages), made once kept
     std::uint32_t pagesSerial = 0;       // the record's serial they were made for (0: none, or the walk failed)
     std::uint64_t usedFrame = 0;         // the frame it was last kept or drawn again in (the ones unused longest are let go for room)
+    std::uint64_t seenFrame = 0;         // the frame it was last met in (PartRecordsPrune)
     bool moving = false;                 // its vertices change where the hash does not look: not drawn again
     // ...until movingUntil, when it is kept anew: one whose vertices changed once (its cache's
     // colours written again when a light changed) is then drawn again as before. Left alone for
@@ -2180,6 +2185,29 @@ struct PartRecord {
     Vif::Regs jobBefore, jobAfter;
 };
 std::unordered_map<std::uint32_t, PartRecord> g_parts;
+// The records of parts not met for 1,800 frames (30 s), holding nothing (not kept, no job keeping
+// them, neither recorded nor watched now), forgotten: one is made anew when the part comes again.
+// Each level met added about 4,000 that were never let go (95,000 by the 25th in Ryujinx's tour,
+// with their headers and registers, a kilobyte or two each). Every 600 frames, past 20,000.
+std::uint64_t g_partRecordsPruned;
+void PartRecordsPrune()
+{
+    static std::uint64_t last;
+    const std::uint64_t now = gs::FramesShown();
+    if (now < last + 600 || g_parts.size() <= 8000)
+        return;
+    last = now;
+    for (auto it = g_parts.begin(); it != g_parts.end();) {
+        const PartRecord& r = it->second;
+        if (&r != g_partRecording && &r != g_partObserving && !r.kept && !r.pending && r.items.empty() && r.words == 0 &&
+            r.seenFrame + 1800 < now && r.usedFrame + 1800 < now) {
+            it = g_parts.erase(it);
+            g_partRecordsPruned++;
+        } else {
+            ++it;
+        }
+    }
+}
 // What a part kept before it was found changed: let go when the render thread has nothing queued,
 // not in the list's walk (a part's packets freed one by one were 3% of the walk in slow frames on
 // the Switch, the allocator's lock shared with the GS thread).
@@ -3442,7 +3470,10 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     static const bool diffOn = std::getenv("SLY1_PART_DIFF") != nullptr && std::getenv("SLY1_PART_HASH_NOW") != nullptr;
     if (diffOn)
         PartDiff(key, target, regs.cl, regs.wl, tte, slow, header);
+    PartRecordsPrune();
     auto it = g_parts.find(key);
+    if (it != g_parts.end())
+        it->second.seenFrame = gs::FramesShown();
     std::uint64_t hash = 0;
     bool late = false;   // the hash is what the helper last found, not this frame's
     if (PartHashLate() && it != g_parts.end()) {
@@ -4138,6 +4169,7 @@ struct JobCopy {
         used += (std::uint32_t)n;
     }
 };
+std::atomic<std::uint32_t> g_levelLoads{0};   // (LevelLoadNoted)
 struct PartJob {
     std::unique_ptr<std::uint32_t[]> words{new std::uint32_t[kJobWords]};
     std::uint32_t wordCount = 0;
@@ -4170,6 +4202,7 @@ struct PartJob {
     std::uint64_t keepSerial = 0;
     float keepMatrix[16];
     bool right = false;   // the run that gave the job its items left VIF1's registers as foretold
+    std::uint32_t trimEpoch = 0;   // the level's load its items' buffers were last let go at (g_levelLoads)
 };
 std::vector<std::shared_ptr<PartJob>> g_keepJobs;   // (the render thread's) this list's jobs whose parts are to be kept from them
 std::vector<PartJob*> g_jobFree;
@@ -4668,6 +4701,7 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
         it = g_parts.emplace(g_callKey, PartRecord()).first;
         it->second.slow = slow;
     }
+    it->second.seenFrame = gs::FramesShown();
     PartRecord& r = it->second;
     // The registers a part is met with, but for those it does not read (as PartDecide's sameRegs:
     // the mask, when its packet unpacks through none before setting one; for a part drawn the
@@ -4792,6 +4826,7 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
         }
     }
     if (!job) {
+        g_partJobsMade++;
         job.reset(new PartJob, back);
         job->gen.fetch_add(1, std::memory_order_seq_cst);
     }
@@ -4814,6 +4849,23 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
     job->before = g_callRegs;
     job->after = jobAfter;
     job->out.used = 0;
+    {   // Its items' buffers, as many and as large as any run of it gave (a run's are swapped in
+        // from the thread that ran it): all let go the first time the job is made anew after a
+        // level's load. Kept for good, the 800 jobs' buffers grew with each level met, 100 to
+        // 300 MB at each change of level, until the Switch's heap ran out (Ryujinx's tour of the
+        // levels, at the 39th). Let go at each making past a limit, as first done, the Switch's
+        // allocator cost each job 100 us more and the render thread 2.7 ms a frame (run 18: 48% of
+        // the windows in 3D at 60 against 86 to 92%). SLY1_JOB_TRIM=0: never.
+        static const bool trim = !(std::getenv("SLY1_JOB_TRIM") && std::getenv("SLY1_JOB_TRIM")[0] == '0');
+        const std::uint32_t epoch = g_levelLoads.load(std::memory_order_relaxed);
+        if (trim && job->trimEpoch != epoch) {
+            job->trimEpoch = epoch;
+            Collect none, noRef;
+            std::swap(job->out, none);
+            std::swap(job->ref, noRef);
+            g_jobsTrimmed++;
+        }
+    }
     job->given.store(false, std::memory_order_release);
     job->begunAt = 0;
     job->state.store(0, std::memory_order_release);
@@ -5140,6 +5192,11 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
         g_partWords -= std::min<std::uint64_t>(g_partWords, r->words);
         r->words = 0;
         r->keys = 0;   // the renderer never saw them
+        // (nor is anything drawn from them: let go. Held, they were in no count and no record let go
+        // for room ever reached them, words being 0: 100 to 450 MB more at each level change, and
+        // Ryujinx's tour of the levels out of memory at the 39th.)
+        g_partGrave.push_back(std::move(r->kept));
+        r->kept.reset();
         r->lockout = std::min<std::uint32_t>(std::max<std::uint32_t>(r->lockout * 2, 30), 960);
         r->notBefore = gs::FramesShown() + r->lockout;   // not tried again at once
     }
@@ -5472,7 +5529,7 @@ void RunDmaChain(std::uint32_t regs, std::uint32_t tadr)
         if (regs == kVif1 && g_interruptScan.Count(item.words.data(), item.words.size()) != 0 && !copyAll) {
             {
                 std::lock_guard<std::mutex> lk(g_renderLock);
-                if (g_renderSpare.size() < 64)
+                if (g_renderSpare.size() < 64 && item.words.capacity() <= kRenderSpareMostWords)
                     g_renderSpare.push_back(std::move(item.words));
             }
             item.words = {};
@@ -5553,8 +5610,11 @@ void GsThreadMain()
             // (A frame has a thousand items and more where much is in sight. With a stock of 256 the
             // render thread ran out each frame and allocated the rest: a third of its work, walking
             // through A Stealthy Approach on the Switch, the allocator's lock among it.)
+            // (a buffer far larger than a stock one is let go: a GIF chain's copy, a texture's upload
+            // of hundreds of kilobytes, came back here and stayed, each level adding its own, 175 MB
+            // over eight levels in Ryujinx, and was then handed out for an item of a few words)
             for (auto& v : emptied)
-                if (g_gsSpare.size() < kGsSpareMost)
+                if (g_gsSpare.size() < kGsSpareMost && v.capacity() <= 4 * kGsSpareWords)
                     g_gsSpare.push_back(std::move(v));
             emptied.clear();
             g_gsBusy = false;
@@ -6280,7 +6340,7 @@ void RenderThreadMain()
         g_renderItems[kind < 3 ? kind : 0]++;
         if (item.words.capacity()) {
             std::lock_guard<std::mutex> lk(g_renderLock);
-            if (g_renderSpare.size() < 64)
+            if (g_renderSpare.size() < 64 && item.words.capacity() <= kRenderSpareMostWords)
                 g_renderSpare.push_back(std::move(item.words));
         }
     }
@@ -6355,4 +6415,44 @@ void DmacDump()
     }
 }
 
+// A level's load has begun (kernel.cpp): what grew with the last level is let go as it is next used.
+void LevelLoadNoted()
+{
+    g_levelLoads.fetch_add(1, std::memory_order_relaxed);
+}
+
+// What the tables that live from level to level hold (--verify-levels prints it after each level;
+// sizes read without their locks: for a diagnosis).
+void MemoryReport(int level)
+{
+    std::size_t itemsWords = 0, keptParts = 0;
+    for (const auto& kv : g_parts)
+        if (kv.second.kept)
+            keptParts++;
+    (void)itemsWords;
+    std::size_t prepWords = 0, prepFree = 0, jobWords = 0, jobFree = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_prepFreeLock);
+        prepFree = g_prepFree.size();
+        for (const PrepTask* t : g_prepFree) {
+            prepWords += t->words.capacity() + t->all3.capacity() + t->moved.capacity() / 4 + t->sc.skinned.capacity() + t->sc.litSkinned.capacity() + t->sc.moved.capacity();
+            for (const auto& v : t->quads)
+                prepWords += v.capacity();
+            for (const auto& v : t->colours)
+                prepWords += v.capacity();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_jobFreeLock);
+        jobFree = g_jobFree.size();
+        for (const PartJob* j : g_jobFree)
+            for (const GsItem& it : j->out.items)
+                jobWords += it.words.capacity();
+    }
+    std::fprintf(stderr, "memreport: level %d: a part's record %zu bytes, %llu records forgotten\n", level, sizeof(PartRecord), (unsigned long long)g_partRecordsPruned);
+    std::fprintf(stderr, "memreport: level %d: free preps %zu hold %.1f MB, free jobs %zu hold %.1f MB in their items\n", level, prepFree, prepWords / 262144.0, jobFree, jobWords / 262144.0);
+    std::fprintf(stderr, "memreport: level %d: part records %zu (%zu kept), shapes %zu, jobs made %llu (free %zu), preps made %llu (free %zu), grave %zu+%zu, diff seen %zu, jobs' buffers let go %llu\n", level,
+                 g_parts.size(), keptParts, g_shapeRegs.size(), (unsigned long long)g_partJobsMade.load(), g_jobFree.size(), (unsigned long long)g_prepTasksMade.load(),
+                 g_prepFree.size(), g_partGrave.size(), g_partGraveItems.size(), g_diffSeen.size(), (unsigned long long)g_jobsTrimmed.load());
+}
 }  // namespace port

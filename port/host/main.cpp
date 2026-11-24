@@ -26,6 +26,17 @@ namespace port { inline void CheckDevTable(const char*) {} }
 #include <exception>
 #include <cstdlib>
 #include <cstring>
+namespace port {
+void MemoryReport(int level);   // (dmac.cpp)
+#if defined(__SWITCH__)
+__attribute__((weak)) void HeapProfileReport(int level);   // (switch/heap_profile.cpp, SLY1_HEAP_PROFILE)
+#endif
+}
+#if defined(__SWITCH__)
+#include <malloc.h>
+#elif defined(__APPLE__)
+#include <malloc/malloc.h>
+#endif
 #include <string>
 #include <thread>
 #include <set>
@@ -496,6 +507,23 @@ void VerifyLevels()
         }
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "verify: level %2d loaded and ran 60 frames (%.1f s)\n", i + 1, s);
+        port::MemoryReport(i + 1);
+#if defined(__SWITCH__)
+        if (port::HeapProfileReport)
+            port::HeapProfileReport(i + 1);
+#endif
+#if defined(__SWITCH__)
+        {   // (the heap in use after each level: what grows from level to level)
+            const struct mallinfo mi = mallinfo();
+            std::fprintf(stderr, "verify: level %2d: heap in use %.1f MB of %.1f MB taken\n", i + 1, mi.uordblks / 1048576.0, mi.arena / 1048576.0);
+        }
+#elif defined(__APPLE__)
+        {
+            malloc_statistics_t st;
+            malloc_zone_statistics(nullptr, &st);
+            std::fprintf(stderr, "verify: level %2d: heap in use %.1f MB of %.1f MB taken\n", i + 1, st.size_in_use / 1048576.0, st.size_allocated / 1048576.0);
+        }
+#endif
         {
             char what[32];
             std::snprintf(what, sizeof what, "after level %d", i + 1);
