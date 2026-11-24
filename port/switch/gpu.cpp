@@ -463,6 +463,8 @@ private:
     void PartParams(std::uint32_t index, const gs::Batch& b) override;
     void PartEnd(bool clean) override;
     void PartRecordEnd();
+    void PushSlots(std::uint32_t at, std::uint32_t n);
+    void ListCalled();
     void PartNoteTexture(const Texture* texture, const gs::DrawState& s);
     void ResetTracking();
     void PartListsReset();
@@ -571,6 +573,8 @@ private:
     struct PartList;
     void KillList(PartList& l);
     std::uint64_t partKills_ = 0, partChunkRetires_ = 0, partNoRoom_ = 0;
+    std::uint32_t listCalls_ = 0;   // (lists called since the frame's commands were last given to the GPU)
+    std::uint64_t listSends_ = 0;
     struct PartList {
         std::uint64_t key = 0, epoch = 0, used = 0;   // used: the frame it was last given
         DkCmdList list = 0;
@@ -591,7 +595,7 @@ private:
         std::uint64_t retryAt = 0;   // after a list that could not be kept: not tried again before this frame
     };
     std::unordered_map<const void*, PartLists> partLists_;
-    static constexpr std::uint32_t kListMemory = 24u << 20, kListReserve = 4u << 20, kParamMemory = 8u << 20, kParamSlot = 256;
+    static constexpr std::uint32_t kListMemory = 48u << 20, kListReserve = 4u << 20, kParamMemory = 8u << 20, kParamSlot = 256;
     DkMemBlock listMem_ = nullptr, paramMem_ = nullptr;
     // A list's vertices and colours of each frame (a lit, swayed or skinned part's), at places of its
     // own: written for a frame only once the GPU has done with the frame that last drew from them
@@ -963,7 +967,7 @@ void Renderer::BeginCommands()
     dkCmdBufSetPointSize(cmd_, 2.0f);
     // window pixels to clip space: x right, y up, the image's first row at the top
     VertexParams vp = {{2.0f / kFieldWidth, -2.0f / kFieldHeight, -1.0f, 1.0f}};
-    dkCmdBufPushConstants(cmd_, data + vertexUbo_, sizeof vp, 0, sizeof vp, &vp);
+    dkCmdBufPushConstants(cmd_, data + vertexUbo_, (std::uint32_t)Align(sizeof vp, DK_UNIFORM_BUF_ALIGNMENT), 0, sizeof vp, &vp);
 }
 
 // The shaders, the vertices' layout, the vertex shader's parameters and the viewport's depths for
@@ -1021,7 +1025,7 @@ void Renderer::BindSource(const Source& src)
             // or a whole one aside, and which neighbours a pixel averages goes by where it is taken.
             const float half = small ? 0.5f : 0.0f;
             VertexParams vp = {{2.0f / fieldWidth_, -2.0f / fieldHeight_, -1.0f + half * 2.0f / fieldWidth_, 1.0f - half * 2.0f / fieldHeight_}};
-            dkCmdBufPushConstants(cmd_, data + vertexUbo_, sizeof vp, 0, sizeof vp, &vp);
+            dkCmdBufPushConstants(cmd_, data + vertexUbo_, (std::uint32_t)Align(sizeof vp, DK_UNIFORM_BUF_ALIGNMENT), 0, sizeof vp, &vp);
         }
         batchSet_ = false;
         source_ = source;
@@ -1058,7 +1062,7 @@ void Renderer::BindSource(const Source& src)
                 batchSet_ = false;
             }
             if (!batchSet_ || std::memcmp(&bp, &lastBatch_, sizeof bp) != 0) {
-                dkCmdBufPushConstants(cmd_, data + batchUbo_, sizeof bp, 0, sizeof bp, &bp);
+                dkCmdBufPushConstants(cmd_, data + batchUbo_, (std::uint32_t)Align(sizeof bp, DK_UNIFORM_BUF_ALIGNMENT), 0, sizeof bp, &bp);
                 lastBatch_ = bp;
                 batchSet_ = true;
             }
@@ -1087,6 +1091,7 @@ void Renderer::Send(bool wait)
     QueryEnd();
     dkQueueSubmitCommands(queue_, dkCmdBufFinishList(cmd_));
     sends_++;
+    listCalls_ = 0;
     static const bool serial = std::getenv("SLY1_GPU_VARY") != nullptr;
     if (wait || serial) {
         const std::uint64_t w0 = NowNs();
@@ -2371,6 +2376,33 @@ bool Renderer::PartListsOn() const
     return e[0] == 'a' ? frames_ / 600 % 2 == 0 : true;   // (=check: on, every list checked, none given)
 }
 
+// This frame's numbers (partPush_) into a list's n slots at at, in pushes of 4 slots (1 KB) each, as
+// small as the renderer's other pushes: Ryujinx's GPU faulted on pushes of 16 KB (its constant
+// buffer updates are gathered in a buffer of its own).
+void Renderer::PushSlots(std::uint32_t at, std::uint32_t n)
+{
+    const DkGpuAddr base = dkMemBlockGetGpuAddr(paramMem_) + at;
+    const std::uint32_t each = 4;   // (slots a push)
+    for (std::uint32_t k = 0; k < n; k += each) {
+        const std::uint32_t count = std::min<std::uint32_t>(each, n - k);
+        dkCmdBufPushConstants(cmd_, base + (DkGpuAddr)k * kParamSlot, count * kParamSlot, 0, count * kParamSlot, partPush_.data() + (std::size_t)k * kParamSlot);
+    }
+}
+
+// A list called from the frame's commands. Each call takes the GPU channel two entries or more,
+// and a channel's kickoff takes 512 at most (Ryujinx refuses more, deko3d then stops the program,
+// dkQueuePresentImage): the frame's commands so far are given to the GPU every 64 calls. The
+// state set stays the GPU's from one submission to the next.
+void Renderer::ListCalled()
+{
+    if (++listCalls_ < 64)
+        return;
+    listCalls_ = 0;
+    dkQueueSubmitCommands(queue_, dkCmdBufFinishList(cmd_));
+    dkQueueFlush(queue_);
+    listSends_++;
+}
+
 // Whether the GPU has done with the frame (its number and its set of the frame's memory): one at
 // least kSets frames ago (its set has been used again, after its fence was waited for), or one
 // whose fence is signalled.
@@ -2616,10 +2648,11 @@ void Renderer::PartRecordEnd()
         partPush_.resize((std::size_t)n * kParamSlot);
         for (std::uint32_t k = 0; k < n; k++)
             std::memcpy(partPush_.data() + (std::size_t)k * kParamSlot, &partParams_[k], sizeof(BatchParams));
-        dkCmdBufPushConstants(cmd_, dkMemBlockGetGpuAddr(paramMem_) + l.paramAt, n * kParamSlot, 0, n * kParamSlot, partPush_.data());
+        PushSlots(l.paramAt, n);
     }
     dkCmdBufCallList(cmd_, list);
     ResetTracking();
+    ListCalled();
     PartLists& lists = partLists_[partNow_];
     if (partChecking_) {   // (SLY1_GPU_PART_LISTS=check) what the list given would have been made from, against now
         partChecking_ = false;
@@ -2720,9 +2753,10 @@ void Renderer::PartEnd(bool clean)
         }
     }
     if (all) {
-        dkCmdBufPushConstants(cmd_, dkMemBlockGetGpuAddr(paramMem_) + l.paramAt, n * kParamSlot, 0, n * kParamSlot, partPush_.data());
+        PushSlots(l.paramAt, n);
         dkCmdBufCallList(cmd_, l.list);
         ResetTracking();
+        ListCalled();
         partReplays_++;
         l.set = set_;
         l.frame = frames_;
@@ -3183,7 +3217,7 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
                               // (a picture at half the frame's scale: a pixel of it is two of the depth buffer's each way)
                          : dateRun ? (((test >> 15) & 1) ? 1.0f : 2.0f) : 0.0f;
     if (fresh || std::memcmp(&fp, &last_.fp, sizeof fp) != 0) {
-        dkCmdBufPushConstants(cmd_, dkMemBlockGetGpuAddr(dataMem_) + fragmentUbo_, sizeof fp, 0, sizeof fp, &fp);
+        dkCmdBufPushConstants(cmd_, dkMemBlockGetGpuAddr(dataMem_) + fragmentUbo_, (std::uint32_t)Align(sizeof fp, DK_UNIFORM_BUF_ALIGNMENT), 0, sizeof fp, &fp);
         last_.fp = fp;
     }
     if (texture) {

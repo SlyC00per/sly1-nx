@@ -1816,7 +1816,7 @@ Switch) a kept part's commands are kept as a deko3d command list of its own:
   the part writes before its first batch, noted the first time: their values as it comes are never
   seen), the image's size (dynamic resolution) and the faces dropped. A part keeps two lists, one
   for each frame buffer (FRAME differs). Every list is forgotten when the textures' cache, the kept
-  batches' memory or the lists' own memory (24 MB, a reserve of 4) is made anew.
+  batches' memory or the lists' own memory (48 MB, a reserve of 4) is made anew.
 - **This frame's vertices and colours** (a part the helper prepared: lit, swayed, skinned): the
   recording puts them at places of the list's own (`listData_`) instead of the frame's memory, and a
   list given again has this frame's copied there first (`PartEnd`). It is given only when the GPU has
@@ -1837,9 +1837,20 @@ the GS's and the renderer's state), 11.3 kept anew. The alpha's scale in every k
 the parts' frames new keys (`SLY1_PART_KEY_WHY=1` says which of the item's numbers changed, and why
 a part was not offered).
 
-Not yet run on a GPU. Ryujinx shows no frame of the current build in two minutes, with the lists
-on and with them off alike (the program starts, the level's load never ends): the emulator cannot
-check it, the Switch must. For that, `SLY1_GPU_PART_LISTS=check`: every part that could be given
+**In Ryujinx** (A Stealthy Approach, the camera turning, `SLY1_PAD_TURN=300`): with
+`SLY1_GPU_PART_LISTS=check`, 453,883 parts checked over 3,000 frames, none drawn otherwise; with
+`=ab` (on and off by turns of 600 frames, a frame captured in each), 172 to 256 parts a frame given
+from their lists in the on turns and the pictures as in the off turns. Two faults were found on the
+way. A channel's kickoff takes 512 entries at most (Ryujinx refuses more; deko3d then stops the
+program at `dkQueuePresentImage`), and each list called takes two or more: the frame's commands
+are submitted and flushed every 64 calls (`ListCalled`), at most 132 entries a kickoff since.
+Ryujinx's GPU also faulted on a push of a whole list's slots at once (up to 64 KB); they are pushed
+4 slots (1 KB) at a time. deko3d's checked build names a fault where the release build only stops:
+`cmake -DSLY1_DEKO3D_DEBUG=ON` links it, and wraps the channel's kickoff to print the entries it
+carried and its result (`port/switch/nv_wrap.cpp`). With it, the renderer's other pushes were found
+to give their uniform buffers' sizes unaligned; they give them rounded to 256 bytes now.
+
+For the Switch, `SLY1_GPU_PART_LISTS=check`: every part that could be given
 from its list is recorded again instead, and the two recordings' signatures compared: everything
 the commands are made from, draw by draw (each draw's state, its streams' places, the decisions
 taken for it, its textures' places and alpha ranges, its depths, the image's size). `perflists:`
