@@ -1761,3 +1761,24 @@ off: a lit batch's record carried, past its count of lights, the lights of the t
 Nothing reads those lights; they are now cleared when the record is written. The parts not made
 shapes (`perffull`'s "no shape") are those whose packets raise an interrupt (the colour relight) or
 load a microprogram: they stay the render thread's.
+
+On the Switch (2026-11-23, A Stealthy Approach played, f40dd8f): run 15 with `SLY1_JOB_AHEAD=ab` and
+`SLY1_PART_SHAPE_TURN=ab` together, windows in 3D by the four turns:
+
+| jobs ahead | shape turn | windows | at 60 | late frames in 3D per 100 windows | GS thread's runs lost |
+| --- | --- | --- | --- | --- | --- |
+| on | on | 80 | 92% | 90 | 1.52 ms a frame |
+| on | off | 87 | 77% | 117 | 0.97 |
+| off | on | 86 | 85% | 94 | 2.21 |
+| off | off | 80 | 84% | 131 | 1.74 |
+
+The shape turn takes about a quarter of the late frames away (the parts run in full for a turned
+shape 0.02 to 0.03 ms a frame against 0.11); jobs run ahead take about 0.7 ms of runs lost from the
+GS thread, which still loses some (a job begun elsewhere with none left to take). Both stay on. The
+GS thread's profile (`SLY1_PROFILE=gs`) now shows its share of the jobs' work (LitColours,
+LightFourWide, SkinLoop: about 3%), and the prefetch of an item's words 2.3%.
+
+Run 16, every part hashed (`SLY1_HASH_SKIP=0`), the rest as default, the same stretch played: 86% of
+264 windows in 3D at 60 against run 15's 92% of 80 with both on, 94 late frames per 100 windows
+against 85, the helper's job 340 against 333 us. Two runs on routes that differ: the skipping of
+hashes stays on, with no more than a small gain seen.
