@@ -317,6 +317,7 @@ struct Voice {
     std::uint32_t tones = 0, pc = 0;
     std::int32_t loopPc = -1;     // the step a round starts at, once passed
     std::int32_t waitFrames = 0;  // output frames until the next step
+    bool stepWaited = false;      // the step at pc has had its own wait (the word at +4)
     float recordVolume = 1.0f;
     int channel = 0;              // the game's volume channel: the record's second byte
     float volume = 1.0f, left = 0.7071f, right = 0.7071f, pitch = 1.0f;
@@ -1297,6 +1298,9 @@ void Finish()
                  (unsigned long long)g_voicesEmpty);
 }
 
+namespace {
+float ToneRate(const std::uint8_t* tone);
+}
 std::uint32_t LoadBank(std::uint32_t sector)
 {
     auto bank = std::make_shared<Bank>();
@@ -1339,7 +1343,7 @@ std::uint32_t LoadBank(std::uint32_t sector)
     g_banks[handle] = bank;
     if (std::getenv("SLY1_SND_AUDIT"))
         AuditBank(bank);
-    if (std::getenv("SLY1_SND_KINDS") && bank->global) {   // every record's program, a line each (reading the tones' kinds)
+    if (std::getenv("SLY1_SND_KINDS") && (bank->global || std::getenv("SLY1_SND_KINDS")[0] == 'a')) {   // (=all: every bank's)   // every record's program, a line each (reading the tones' kinds)
         auto le = [](const std::uint8_t* p) { return (std::int32_t)((std::uint32_t)p[0] | (std::uint32_t)p[1] << 8 | (std::uint32_t)p[2] << 16 | (std::uint32_t)p[3] << 24); };
         for (std::uint32_t r = 0; r < bank->records && bank->recordAt + (r + 1) * 12 <= bank->block.size(); r++) {
             const std::uint8_t* rec = bank->block.data() + bank->recordAt + r * 12;
@@ -1350,7 +1354,19 @@ std::uint32_t LoadBank(std::uint32_t sector)
                 const std::uint8_t* t = bank->block.data() + bank->toneAt + (std::size_t)first + k * 0x28;
                 const std::int32_t kind = le(t);
                 if (kind == 1)
-                    std::fprintf(stderr, " [1]");
+                {   // (its wait at +4, its volume, and how long its sample lasts: blocks of 28 to the one flagged the end)
+                    const std::size_t at = (std::size_t)le(t + 0x18);
+                    std::size_t blocks = 0;
+                    bool loops = false;
+                    for (std::size_t q = at; q + 16 <= bank->samples.size() && blocks < 100000; q += 16, blocks++)
+                        if (bank->samples[q + 1] & 1) {
+                            loops = (bank->samples[q + 1] & 2) != 0;
+                            blocks++;
+                            break;
+                        }
+                    std::fprintf(stderr, " [1: wait %d, volume %u, %.2f s%s, env %04X/%04X]", le(t + 4), t[9], (double)blocks * 28.0 / ToneRate(t), loops ? " looping" : "",
+                                 (unsigned)(t[0x12] | t[0x13] << 8), (unsigned)(t[0x14] | t[0x15] << 8));
+                }
                 else {
                     std::fprintf(stderr, " [%d:", kind);
                     for (int w = 1; w < 10; w++)
@@ -1393,7 +1409,8 @@ float ToneRate(const std::uint8_t* tone)
 // A bank's record started: a voice that runs the record's tones as a program, a step each
 // (docs/AUDIO.md; the kinds are readings of the bytes):
 //    1  a sample started (the program goes on at once)
-//   26  a wait: the word at +8 and a random part up to the word at +4, in 240ths of a second
+//   26  a wait: the word at +4 and a random part up to the word at +8, in 240ths of a second
+//   any step but 26 with a word at +4: that wait before the step
 //   25  one of the next n tones taken at random (n at +8), the others passed over; one that is
 //       not a sample is silence
 //   21  a round's start, 22 its end: back to the start
@@ -1437,13 +1454,15 @@ void Voice::Play(const std::uint8_t* tone)
     notes.push_back(note);
 }
 
-// A wait's unit (kind 26): 120ths of a second. Read as 240ths before, a dog's barks (bank 871394's
-// record 25: a bark of 0.95 s chosen at random, a wait of 225 to 245, again) came back to back,
-// two in the 1.45 s the game lets it sound, where retail barks once; at 120ths the game stops it
-// before a second. Not measured: 60ths would do as well for the dog. SLY1_SND_TICK=n: n a second.
+// A wait's unit: 240ths of a second. The siren's record (bank 871394's record 11) measures it:
+// its sample lasts 1.73 s and the next begins 402 after it, 1.80 s and 412 further on as its
+// pitch falls: back to back at 232 a second, a 240th with the end of one under the start of the
+// next. (Read as 120ths for a day: a dog's barks, record 25, came two in the 1.45 s the game
+// lets it sound, which was the wait's two words taken the wrong way round, 20 and up to 225 more
+// where it is 225 and up to 20 more.) SLY1_SND_TICK=n: n a second.
 int WaitTicksPerSecond()
 {
-    static const int n = std::getenv("SLY1_SND_TICK") && std::atoi(std::getenv("SLY1_SND_TICK")) > 0 ? std::atoi(std::getenv("SLY1_SND_TICK")) : 120;
+    static const int n = std::getenv("SLY1_SND_TICK") && std::atoi(std::getenv("SLY1_SND_TICK")) > 0 ? std::atoi(std::getenv("SLY1_SND_TICK")) : 240;
     return n;
 }
 
@@ -1479,12 +1498,23 @@ void Voice::Step(int frames)
     while (pc < tones && waitFrames <= 0 && steps++ < 256) {
         const std::uint8_t* t = bank->block.data() + toneAt + (std::size_t)pc * 0x28;
         const std::int32_t kind = word(t);
+        // A step's own wait, the word at +4, before it is taken (a wait's, kind 26, is its fixed
+        // part, below). Bank 871394's record 11, the title screen's siren, is one sample eleven
+        // times, each after the first with a wait of 402 to 412 and its volume up from 15 to 50 and
+        // down again: a siren passing. All eleven began at once before, heard as one.
+        if (kind != 26 && !stepWaited && word(t + 4) > 0) {
+            stepWaited = true;
+            waitFrames += (std::int32_t)((std::int64_t)word(t + 4) * kRate / WaitTicksPerSecond());
+            if (waitFrames > 0)
+                break;
+        }
+        stepWaited = false;
         pc++;
         if (kind == 1) {
             if (notes.size() < 16)
                 Play(t);
         } else if (kind == 26) {
-            const std::int32_t base = word(t + 8), more = word(t + 4);
+            const std::int32_t base = word(t + 4), more = word(t + 8);   // (its fixed part as any step's, a random part up to the word at +8)
             const std::int32_t ticks = (base > 0 ? base : 0) + (more > 0 ? (std::int32_t)random((std::uint32_t)more + 1) : 0);
             waitFrames += (std::int32_t)((std::int64_t)ticks * kRate / WaitTicksPerSecond());
         } else if (kind == 25) {   // one of the next n: a sample, or a record started

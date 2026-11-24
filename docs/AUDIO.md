@@ -177,3 +177,18 @@ sequence is stopped of a twentieth of a second; no reverb.
 - Stereo streams, if there are any (the first one, the opening's narration, is mono 44.1 kHz).
 - Unmeasured: the unit of a fade's time (0x22: a fifth of a second is used); commands 0x0E, 0x0F, 0x51 (answered
   0, their meaning not looked for yet); a stream's pan.
+
+## A step's own wait, and the wait's unit (2026-11-24)
+
+Every step of a sound's program may carry a wait in its word at +4, taken before the step. The title
+screen's siren showed it (bank 871394's record 11, started by record 26's round): one sample eleven
+times, each after the first with 402 to 412 at +4, its volume 15, 25, 30, 40, 50, 45, 40, 35, 25, 20,
+15: a siren that comes and goes. All eleven began at once before, heard as one siren, once.
+
+The same record measures the unit: the sample lasts 1.73 s and the next begins 402 later, 1.80 s and
+412 as its pitch falls, so back to back is 232 a second: 240ths, one sample's end under the next's
+start. A wait (kind 26) is its word at +4 as any step's, and a random part up to its word at +8; the
+two had been read the other way round, which is what made a dog (record 25: 225 and up to 20 more)
+bark twice in quick succession, and why 120ths had seemed right for a day.
+
+`SLY1_SND_KINDS=all` prints every bank's records with each sample's wait, volume and length.
