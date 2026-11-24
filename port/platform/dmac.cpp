@@ -1989,7 +1989,7 @@ std::mutex g_renderLock;
 std::condition_variable g_renderWake, g_renderIdle;
 std::deque<RenderItem> g_renderQueue;
 std::vector<std::vector<std::uint32_t>> g_renderSpare;   // emptied items' buffers, for reuse
-constexpr std::size_t kRenderSpareMostWords = 1u << 20;   // (4 MB: a larger one is let go)
+constexpr std::size_t kRenderSpareMostWords = 1u << 16;   // (256 KB: a larger one is let go; the lists copied are under 64 KB)
 bool g_renderBusy, g_renderWaiting;
 std::atomic<bool> g_renderStarted;
 std::atomic<std::uint64_t> g_renderQueuedWords, g_renderMaxQueued;
