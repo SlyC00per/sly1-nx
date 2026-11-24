@@ -4182,7 +4182,7 @@ std::uint64_t g_jobsMade, g_jobsShape, g_jobSerial, g_jobWordsCopied, g_jobsNotC
 bool g_listJobsLive, g_drainOwed;   // (the render thread's) a job of this list reads the game's memory; the list's jobs are yet to be seen done
 std::atomic<std::uint64_t> g_jobsAgain, g_jobsChecked, g_jobsDiffered;   // jobs run a second time by a thread that needed them
 std::atomic<std::uint64_t> g_jobsLost[3], g_jobLostNs[3];   // runs whose items were dropped (another thread ended the job first), by thread
-std::atomic<std::uint64_t> g_jobsAhead;   // jobs run by a thread while the one it needed was another's, not ended
+std::atomic<std::uint64_t> g_jobsAhead, g_prepsAhead;   // jobs run by a thread while the one it needed was another's, not ended
 std::uint64_t g_jobDrainWaitNs;
 std::uint64_t g_jobMakeNs[4];   // making a job: the shape's hash, the job taken, VU1 copied, queued
 
@@ -4392,6 +4392,19 @@ void PartJobNeed(PartJob& j, int who)
                     g_jobsAhead++;
                 continue;
             }
+            // (the GS thread with no job left to take: a part's prep the helper has not taken, which
+            // this thread would make itself when it comes to the part: useful work, where a second
+            // run of the job waited for is lost to the helper)
+            // (SLY1_PREPS_AHEAD=1: on; =ab: on and off in turn, 600 frames each; off by default: on the Mac
+            // with the helper set aside it moved work, the helper's runs lost the more)
+            static const char* const prepsEnv = std::getenv("SLY1_PREPS_AHEAD");
+            const bool preps = prepsEnv && (prepsEnv[0] == 'a' ? gs::FramesShown() / 600 % 2 == 0 : prepsEnv[0] != '0');
+            if (who == 2 && preps)
+                if (std::shared_ptr<PrepTask> p = PrepTake()) {
+                    PrepRun(*p, 1);
+                    g_prepsAhead++;
+                    continue;
+                }
         }
         const std::uint64_t now = NowNs();
         if (beat) {
@@ -6306,12 +6319,14 @@ void RenderThreadMain()
                                          (g_partsWaited - waitedWas) / f, (g_gsSpareHad.load() - spareWas[0]) / f, (g_gsSpareNone.load() - spareWas[1]) / f, (g_gsSpareGrown.load() - spareWas[2]) / f, (unsigned long long)g_jobStaleCodes.load(), (unsigned long long)g_jobsNotCopied, (g_jobWordsCopied - copiedWas) / f);
                         copiedWas = g_jobWordsCopied;
                         {   // the runs lost (another thread ended the job first) and the jobs run ahead while waiting
-                            static std::uint64_t lostWas[3], lostNsWas[3], aheadWas;
+                            static std::uint64_t lostWas[3], lostNsWas[3], aheadWas, prepsAheadWas;
                             if (since)
-                                std::fprintf(stderr, "perflost: to %llu, a frame: runs lost by the helper %.2f (%.3f ms), the render thread %.2f (%.3f ms), the GS thread %.2f (%.3f ms); jobs run ahead while waiting %.2f\n",
+                                std::fprintf(stderr, "perflost: to %llu, a frame: runs lost by the helper %.2f (%.3f ms), the render thread %.2f (%.3f ms), the GS thread %.2f (%.3f ms); jobs run ahead while waiting %.2f, preps %.2f\n",
                                              (unsigned long long)shown, (g_jobsLost[0].load() - lostWas[0]) / f, (g_jobLostNs[0].load() - lostNsWas[0]) / f / 1e6,
                                              (g_jobsLost[1].load() - lostWas[1]) / f, (g_jobLostNs[1].load() - lostNsWas[1]) / f / 1e6,
-                                             (g_jobsLost[2].load() - lostWas[2]) / f, (g_jobLostNs[2].load() - lostNsWas[2]) / f / 1e6, (g_jobsAhead.load() - aheadWas) / f);
+                                             (g_jobsLost[2].load() - lostWas[2]) / f, (g_jobLostNs[2].load() - lostNsWas[2]) / f / 1e6, (g_jobsAhead.load() - aheadWas) / f,
+                                             (g_prepsAhead.load() - prepsAheadWas) / f);
+                            prepsAheadWas = g_prepsAhead.load();
                             for (int k = 0; k < 3; k++) {
                                 lostWas[k] = g_jobsLost[k].load();
                                 lostNsWas[k] = g_jobLostNs[k].load();
