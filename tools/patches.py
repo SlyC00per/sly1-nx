@@ -106,6 +106,15 @@ PATCHES = [
      "            g_movieChecksumFailed = 1;",
      "            /* port: the genuine copy's outcome, the flag stays 0 (tools/patches.py) */",
      "the movie-time code checksum covers retail's machine code, which the port does not have"),
+    # The fourth: an object a level places (class CodeChecksum; only "Into the Machine" has one,
+    # by a census of the 46 levels on the Mac, 2026-11-24). While it is updated it takes a CRC over
+    # 0x148D64 bytes from 0x100018, 64 words a frame, and at the end, when the sum is not 0, sets
+    # g_checksumMismatch and sends its level's script event 2: what then happens is the level's
+    # script's. In the port it ended with a sum of 0x16F3063. Neither is done now.
+    ("src/main/placed_object.cpp",
+     "        if (n == 0 && crc != 0) {\n            g_checksumMismatch[0] = 1;\n            TriggerScriptEvent(self, 2, 0, 0);\n        }",
+     "        /* port: the genuine copy's outcome, no mismatch and no script event (tools/patches.py) */",
+     "the placed code checksum covers retail's machine code, which the port does not have"),
     # The handler of interrupt cause 5 is retail's address 0x15E6A8, written as an offset from a
     # stripped function's leftover (func_0015E678 + 0x30): the function that begins there.
     ("src/main/render_frame.cpp",
