@@ -343,21 +343,6 @@ public:
     virtual void KeptAhead(std::uint64_t) {}
     // The game swapped its double buffer: DISPFB's buffer is the one to show.
     virtual void Present(std::uint64_t dispfb, std::uint64_t display) = 0;
-    // A kept model part drawn again (port/platform/dmac.cpp, gs::PartBegin): the renderer may keep
-    // the commands its batches give, and give them again in a later frame without the batches
-    // drawn one by one. PartBegin's answer: 0 the part is drawn as ever; 1 drawn as ever and its
-    // commands kept (PartBatch says which of the part's batches comes next to DrawBatch); 2 kept
-    // commands given again: no batch comes to DrawBatch, each comes to PartParams with this frame's
-    // numbers instead. PartEnd after the part's last batch; clean is false when anything but its
-    // batches was drawn in the meantime (the commands kept are then not to be used).
-    virtual bool TakesParts() const { return false; }
-    // (flags: 1 the part's alpha's scale changes from frame to frame: its alpha tests are not to be
-    // decided by its vertices' alpha, so that its commands do not depend on it)
-    virtual int PartBegin(const void*, std::uint64_t, std::uint32_t, std::uint32_t) { return 0; }
-    virtual void PartBatch(std::uint32_t) {}
-    virtual void PartParams(std::uint32_t, const Batch&) {}
-    virtual void PartEnd(bool) {}
-    virtual void MemoryReport(int) {}   // (--verify-levels: what the renderer's tables hold)
 };
 
 // The renderer the GS draws through, or none (the reference drawing, when --dump-fb asks).
@@ -367,20 +352,6 @@ void SetBackend(Backend* backend);
 // tag's vertices would have been, in order with everything else. False, with nothing drawn, when
 // there is no renderer that takes it or the primitive is not a smooth-shaded strip with S, T, Q.
 bool DrawBatch(std::uint32_t tagWord1, Batch& batch);
-
-// A kept model part drawn again, through the renderer's part calls (Backend::PartBegin): the
-// GS's run before it drawn, and the renderer told the part, its key and how many batches it has;
-// the key is joined with the registers' (but for what goes with the vertices, the transfers and
-// XYOFFSET, which the batches take as numbers of their own). PartReplayBatch, when PartBegin gave
-// 2: a batch's tag taken as DrawBatch takes it (PRIM), its XYOFFSET put in, and the batch given to
-// the renderer's PartParams; false where DrawBatch would draw nothing. PartEnd tells the renderer
-// whether the GS drew anything else meanwhile or had anything uploaded.
-void BackendMemoryReport(int level);
-bool PartsTaken();   // whether the renderer takes kept parts at all now (PartBegin is worth asking)
-int PartBegin(const void* part, std::uint64_t sig, std::uint64_t key, std::uint32_t batches, std::uint32_t flags);
-void PartBatch(std::uint32_t index);
-bool PartReplayBatch(std::uint32_t tagWord1, Batch& batch, std::uint32_t index);
-void PartEnd();
 
 // A batch from VU1's handlers: DrawBatch at once, or handed to whoever SetBatchSink named (the GS
 // thread's queue, port/platform/dmac.cpp: the batch is then drawn later, in order with the GS's

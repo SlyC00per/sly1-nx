@@ -26,21 +26,9 @@ namespace port { inline void CheckDevTable(const char*) {} }
 #include <exception>
 #include <cstdlib>
 #include <cstring>
-namespace port {
-void MemoryReport(int level);   // (dmac.cpp)
-#if defined(__SWITCH__)
-__attribute__((weak)) void HeapProfileReport(int level);   // (switch/heap_profile.cpp, SLY1_HEAP_PROFILE)
-#endif
-}
-#if defined(__SWITCH__)
-#include <malloc.h>
-#elif defined(__APPLE__)
-#include <malloc/malloc.h>
-#endif
 #include <string>
 #include <thread>
 #include <set>
-#include <unordered_map>
 #include <vector>
 
 #include <pthread.h>
@@ -508,23 +496,6 @@ void VerifyLevels()
         }
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "verify: level %2d loaded and ran 60 frames (%.1f s)\n", i + 1, s);
-        port::MemoryReport(i + 1);
-#if defined(__SWITCH__)
-        if (port::HeapProfileReport)
-            port::HeapProfileReport(i + 1);
-#endif
-#if defined(__SWITCH__)
-        {   // (the heap in use after each level: what grows from level to level)
-            const struct mallinfo mi = mallinfo();
-            std::fprintf(stderr, "verify: level %2d: heap in use %.1f MB of %.1f MB taken\n", i + 1, mi.uordblks / 1048576.0, mi.arena / 1048576.0);
-        }
-#elif defined(__APPLE__)
-        {
-            malloc_statistics_t st;
-            malloc_zone_statistics(nullptr, &st);
-            std::fprintf(stderr, "verify: level %2d: heap in use %.1f MB of %.1f MB taken\n", i + 1, st.size_in_use / 1048576.0, st.size_allocated / 1048576.0);
-        }
-#endif
         {
             char what[32];
             std::snprintf(what, sizeof what, "after level %d", i + 1);
@@ -913,75 +884,6 @@ int main(int argc, char** argv)
                     hash = (hash ^ b[k]) * 1099511628211ull;
             }
             bool TakesBatches() const override { static const bool on = std::getenv("SLY1_GS_COUNT_BATCHES") != nullptr; return on; }
-            // SLY1_GS_COUNT_PARTS=1: kept parts taken as the Switch's renderer takes them into lists
-            // (gpu.cpp's PartBegin), counted: given again when a part comes with a key it came with
-            // before, kept otherwise; how many parts and batches a frame each way
-            // (=check: a part that comes with a key it came with before is drawn as ever, and what its
-            // batches were drawn by, batch by batch, compared with what they were drawn by when it was
-            // kept: the key's test, the same or other)
-            struct PartKeys {
-                std::uint64_t key[2] = {0, 0}, sig[2] = {0, 0};
-                int next = 0;
-            };
-            std::uint64_t partSig = 0, partExpect = 0, partsSame = 0, partsOther = 0;
-            int partSlot = -1, partOtherSaid = 0;
-            bool partChecking = false;
-            std::uint64_t partPrevId = 0;
-            void PartSig(std::uint64_t v)
-            {
-                partSig = (partSig ^ v) * 0x100000001B3ull;
-                partSig ^= partSig >> 29;
-            }
-            std::unordered_map<const void*, PartKeys> partKeys;
-            std::uint64_t partsFirst = 0, partsGiven = 0, partsRecorded = 0, partsUnclean = 0, partBatchesGiven = 0, partsOffered = 0;
-            int partMode = 0;
-            const void* partNow = nullptr;
-            bool TakesParts() const override { static const bool on = std::getenv("SLY1_GS_COUNT_PARTS") != nullptr; return on; }
-            int PartBegin(const void* part, std::uint64_t key, std::uint32_t, std::uint32_t) override
-            {
-                partsOffered++;
-                PartKeys& k = partKeys[part];
-                partNow = part;
-                static const bool check = std::getenv("SLY1_GS_COUNT_PARTS")[0] == 'c';
-                partSig = 0xCBF29CE484222325ull;
-                partPrevId = ~0ull;
-                partChecking = false;
-                if (key != 0 && (k.key[0] == key || k.key[1] == key)) {
-                    partsGiven++;
-                    if (!check)
-                        return partMode = 2;
-                    partChecking = true;
-                    partSlot = k.key[0] == key ? 0 : 1;
-                    partExpect = k.sig[partSlot];
-                    return partMode = 1;
-                }
-                partsFirst += k.key[0] == 0 && k.key[1] == 0;
-                partSlot = k.next;
-                k.key[k.next] = key;
-                k.next ^= 1;
-                partsRecorded++;
-                return partMode = 1;
-            }
-            void PartParams(std::uint32_t, const port::gs::Batch&) override { partBatchesGiven++; }
-            void PartEnd(bool clean) override
-            {
-                if (!clean) {
-                    partsUnclean++;
-                    partKeys.erase(partNow);
-                } else if (partMode == 1 && partSlot >= 0) {
-                    PartKeys& k = partKeys[partNow];
-                    if (partChecking) {
-                        const bool same = partSig == partExpect;
-                        (same ? partsSame : partsOther)++;
-                        if (!same && partOtherSaid++ < 20)
-                            std::fprintf(stderr, "partcheck: frame %llu: part %p drawn by other states than when it was kept, with the same key\n", (unsigned long long)frames,
-                                         partNow);
-                    }
-                    k.sig[partSlot] = partSig;
-                }
-                partMode = 0;
-                partChecking = false;
-            }
             // SLY1_GS_LIST=N: frame N's runs and batches, with their depth test and depths
             long listAt = std::getenv("SLY1_GS_LIST") ? std::atol(std::getenv("SLY1_GS_LIST")) : -1;
             void List(const char* what, const port::gs::DrawState& s, std::size_t n, double zmin, double zmax)
@@ -1044,16 +946,6 @@ int main(int argc, char** argv)
             }
             bool DrawBatch(const port::gs::DrawState& s, const port::gs::Batch& b) override
             {
-                if (partMode == 1) {   // (SLY1_GS_COUNT_PARTS=check) what the batch is drawn by, but its numbers
-                    PartSig(s.kind); PartSig(s.tme); PartSig(s.fge); PartSig(s.abe); PartSig(s.fba);
-                    PartSig(s.tex0); PartSig(s.tex1); PartSig(s.clamp); PartSig(s.alpha); PartSig(s.test); PartSig(s.frame);
-                    PartSig(s.zbuf); PartSig(s.scissor); PartSig(s.texa); PartSig(s.fogcol);
-                    PartSig(b.count); PartSig(b.keep); PartSig(b.cull); PartSig(b.alphaDeferred); PartSig(b.projected);
-                    PartSig(b.stride | (std::uint64_t)b.positionAt << 8 | (std::uint64_t)b.stqAt << 16 | (std::uint64_t)b.colourAt << 24);
-                    PartSig(b.id == 0 ? 1 : b.id == partPrevId ? 2 : 3);   // (a batch's kicks share their id)
-                    PartSig((b.swayMoved || b.skinMoved ? 1 : 0) | (b.coloursNow ? 2 : 0));
-                    partPrevId = b.id;
-                }
                 batches++;
                 vertices += b.count;
                 static const bool reuseOn = std::getenv("SLY1_GS_REUSE") != nullptr;
@@ -1215,14 +1107,6 @@ int main(int argc, char** argv)
                     std::fprintf(stderr, "gs count: %llu frames, %llu runs, %llu vertices, %llu indices, all drawn hashed %016llX\n",
                                  (unsigned long long)frames, (unsigned long long)runs, (unsigned long long)vertices,
                                  (unsigned long long)indices, (unsigned long long)hash);
-                if (TakesParts() && (frames % 120) == 0) {   // SLY1_GS_COUNT_PARTS: a line each 120 frames
-                    static std::uint64_t was[6];
-                    const std::uint64_t is[6] = {partsOffered, partsGiven, partsRecorded, partsUnclean, partBatchesGiven, partsFirst};
-                    std::fprintf(stderr, "partlists: to %llu, a frame: parts offered %.1f, given again %.1f (%.0f batches), kept anew %.1f (first seen %.1f), not clean %.2f; checked the same %llu, otherwise %llu\n",
-                                 (unsigned long long)frames, (is[0] - was[0]) / 120.0, (is[1] - was[1]) / 120.0, (is[4] - was[4]) / 120.0, (is[2] - was[2]) / 120.0,
-                                 (is[5] - was[5]) / 120.0, (is[3] - was[3]) / 120.0, (unsigned long long)partsSame, (unsigned long long)partsOther);
-                    std::memcpy(was, is, sizeof was);
-                }
             }
         };
         static Counting counting;

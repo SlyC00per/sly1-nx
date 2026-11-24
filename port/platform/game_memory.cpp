@@ -228,11 +228,6 @@ std::uint32_t GameAddrSlow(const void* p)
     // is a 32-bit word. No host pointer lies below the image, so this hides no real error.
     if (v < ImageBase() && v <= 0xFFFFFFFFu)
         return static_cast<std::uint32_t>(v);
-    // (the same for the PS2's own register blocks, the EE's and VU memory at 0x10000000 to 0x1100FFFF and
-    // the GS's at 0x12000000: a DMA channel's address held as a pointer. Ryujinx loads the program
-    // below them, at 0x8500000, where the Switch loads it above: the test above let them by there only)
-    if (v <= 0xFFFFFFFFu && ((v >= 0x10000000u && v < 0x11010000u) || (v >= 0x12000000u && v < 0x12002000u)))
-        return static_cast<std::uint32_t>(v);
     if (g_eeRegisters && v - reinterpret_cast<std::uintptr_t>(g_eeRegisters) < kEeRegistersSize)
         return kEeRegisters + static_cast<std::uint32_t>(v - reinterpret_cast<std::uintptr_t>(g_eeRegisters));
     if (g_gsRegisters && v - reinterpret_cast<std::uintptr_t>(g_gsRegisters) < kGsRegistersSize)

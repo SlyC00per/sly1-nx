@@ -61,11 +61,10 @@ void CallIopService(RemoteCallClient* client, std::int32_t cmd, const void* send
             std::fprintf(stderr, "\n");
         }
     }
-    if (g_logged.insert({service, cmd}).second) {   // (each command once)
+    if (g_logged.insert({service, cmd}).second)
         port::CheckDevTable("an IOP command");
         std::fprintf(stderr, "iop: service 0x%08X command 0x%X (send %d, receive %d bytes)\n",
                      service, (unsigned)cmd, (int)sendSize, (int)recvSize);
-    }
     // The sound driver's command channel: the driver writes its reply straight into the buffer the
     // game armed, between two marker words 0xFFFFFFFF (IsIopReplyReady waits for both): one word
     // for a command sent alone, or one for each command of a buffer of them (service command

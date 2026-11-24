@@ -28,7 +28,6 @@
 #include "vu1_live.h"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <map>
 #include <string>
@@ -85,9 +84,6 @@ const int* Owner() { const MicroImage* image = Image(); return image ? image->ow
 std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> g_profile;   // SLY1_VU1_PROFILE
 std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> g_profileCalls;
 std::uint64_t g_handlerNs[64], g_handlerCalls[64], g_fallbacks[64], g_handlerKickNs[64];
-// (SLY1_VU1_PROFILE) the render thread's own: what its programs cost it, apart from the jobs' runs
-std::atomic<std::uint64_t> g_renderHandlerNs[64], g_renderHandlerCalls[64];
-thread_local bool t_renderThread;
 
 // SLY1_VU1_PROFILE: a kick passed on and timed, to tell the GS's share from the handler's.
 struct TimedKick {
@@ -442,13 +438,8 @@ std::uint64_t Run(std::uint32_t start, const Context& ctx)
             g_fallbacks[h - kHandlers]++;
             LeftToMicrocode(rt);
         }
-        const std::uint64_t took = NowNs() - t0;
-        g_handlerNs[h - kHandlers] += took;
+        g_handlerNs[h - kHandlers] += NowNs() - t0;
         g_handlerCalls[h - kHandlers]++;
-        if (t_renderThread) {
-            g_renderHandlerNs[h - kHandlers].fetch_add(took, std::memory_order_relaxed);
-            g_renderHandlerCalls[h - kHandlers].fetch_add(1, std::memory_order_relaxed);
-        }
         return done ? 0 : Interpret(start, ctx);
     }
     // Both, from the same state: the handler's results kept aside, the interpreter's kept.
@@ -528,40 +519,6 @@ void ReportLive()
 }
 
 std::uint64_t TranslatedInstructions() { return g_translatedRun; }
-
-void MarkRenderThread() { t_renderThread = true; }
-
-std::uint64_t RenderHandlerNs()
-{
-    std::uint64_t sum = 0;
-    for (std::size_t k = 0; k < kHandlerCount && k < 64; k++)
-        sum += g_renderHandlerNs[k].load(std::memory_order_relaxed);
-    return sum;
-}
-
-void RenderProfileLine(std::uint64_t shown, double frames)
-{
-    static std::uint64_t was[64], callsWas[64];
-    std::vector<std::pair<std::uint64_t, std::size_t>> rows;
-    std::uint64_t all = 0;
-    for (std::size_t k = 0; k < kHandlerCount && k < 64; k++) {
-        const std::uint64_t now = g_renderHandlerNs[k].load(std::memory_order_relaxed);
-        rows.push_back({now - was[k], k});
-        all += now - was[k];
-    }
-    std::sort(rows.rbegin(), rows.rend());
-    std::fprintf(stderr, "perfvu1: to %llu, a frame: the render thread's programs %.2f ms;", (unsigned long long)shown, frames > 0 ? all / frames / 1e6 : 0.0);
-    for (std::size_t r = 0; r < rows.size() && r < 8 && rows[r].first > 0; r++) {
-        const std::size_t k = rows[r].second;
-        std::fprintf(stderr, " %s %.2f (%.0f)", kHandlers[k].name, rows[r].first / frames / 1e6,
-                     (g_renderHandlerCalls[k].load(std::memory_order_relaxed) - callsWas[k]) / frames);
-    }
-    std::fprintf(stderr, "\n");
-    for (std::size_t k = 0; k < kHandlerCount && k < 64; k++) {
-        was[k] = g_renderHandlerNs[k].load(std::memory_order_relaxed);
-        callsWas[k] = g_renderHandlerCalls[k].load(std::memory_order_relaxed);
-    }
-}
 
 }  // namespace vu1
 }  // namespace port

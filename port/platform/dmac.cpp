@@ -414,7 +414,6 @@ struct PrepTask {
     std::uint64_t begunAt = 0;
 };
 std::vector<PrepTask*> g_prepFree;
-std::atomic<std::uint64_t> g_prepTasksMade, g_partJobsMade, g_jobsTrimmed;   // (MemoryReport)
 std::mutex g_prepFreeLock;
 constexpr std::uint32_t kListPreps = 2048;
 std::shared_ptr<PrepTask> g_preps[kListPreps];
@@ -443,10 +442,8 @@ std::shared_ptr<PrepTask> PrepNew()
                 g_prepFree.erase(g_prepFree.begin() + (std::ptrdiff_t)k);
             }
     }
-    if (!t) {
+    if (!t)
         t = new PrepTask;
-        g_prepTasksMade++;
-    }
     t->state.store(0, std::memory_order_relaxed);
     t->begunAt = 0;
     return std::shared_ptr<PrepTask>(t, [](PrepTask* x) {
@@ -1989,7 +1986,6 @@ std::mutex g_renderLock;
 std::condition_variable g_renderWake, g_renderIdle;
 std::deque<RenderItem> g_renderQueue;
 std::vector<std::vector<std::uint32_t>> g_renderSpare;   // emptied items' buffers, for reuse
-constexpr std::size_t kRenderSpareMostWords = 1u << 16;   // (256 KB: a larger one is let go; the lists copied are under 64 KB)
 bool g_renderBusy, g_renderWaiting;
 std::atomic<bool> g_renderStarted;
 std::atomic<std::uint64_t> g_renderQueuedWords, g_renderMaxQueued;
@@ -2081,7 +2077,6 @@ struct PartRecord {
     std::vector<std::uint32_t> pages;    // the pages its packet lies on and names (PartPages), made once kept
     std::uint32_t pagesSerial = 0;       // the record's serial they were made for (0: none, or the walk failed)
     std::uint64_t usedFrame = 0;         // the frame it was last kept or drawn again in (the ones unused longest are let go for room)
-    std::uint64_t seenFrame = 0;         // the frame it was last met in (PartRecordsPrune)
     bool moving = false;                 // its vertices change where the hash does not look: not drawn again
     // ...until movingUntil, when it is kept anew: one whose vertices changed once (its cache's
     // colours written again when a light changed) is then drawn again as before. Left alone for
@@ -2185,29 +2180,6 @@ struct PartRecord {
     Vif::Regs jobBefore, jobAfter;
 };
 std::unordered_map<std::uint32_t, PartRecord> g_parts;
-// The records of parts not met for 1,800 frames (30 s), holding nothing (not kept, no job keeping
-// them, neither recorded nor watched now), forgotten: one is made anew when the part comes again.
-// Each level met added about 4,000 that were never let go (95,000 by the 25th in Ryujinx's tour,
-// with their headers and registers, a kilobyte or two each). Every 600 frames, past 20,000.
-std::uint64_t g_partRecordsPruned;
-void PartRecordsPrune()
-{
-    static std::uint64_t last;
-    const std::uint64_t now = gs::FramesShown();
-    if (now < last + 600 || g_parts.size() <= 8000)
-        return;
-    last = now;
-    for (auto it = g_parts.begin(); it != g_parts.end();) {
-        const PartRecord& r = it->second;
-        if (&r != g_partRecording && &r != g_partObserving && !r.kept && !r.pending && r.items.empty() && r.words == 0 &&
-            r.seenFrame + 1800 < now && r.usedFrame + 1800 < now) {
-            it = g_parts.erase(it);
-            g_partRecordsPruned++;
-        } else {
-            ++it;
-        }
-    }
-}
 // What a part kept before it was found changed: let go when the render thread has nothing queued,
 // not in the list's walk (a part's packets freed one by one were 3% of the walk in slow frames on
 // the Switch, the allocator's lock shared with the GS thread).
@@ -3470,10 +3442,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     static const bool diffOn = std::getenv("SLY1_PART_DIFF") != nullptr && std::getenv("SLY1_PART_HASH_NOW") != nullptr;
     if (diffOn)
         PartDiff(key, target, regs.cl, regs.wl, tte, slow, header);
-    PartRecordsPrune();
     auto it = g_parts.find(key);
-    if (it != g_parts.end())
-        it->second.seenFrame = gs::FramesShown();
     std::uint64_t hash = 0;
     bool late = false;   // the hash is what the helper last found, not this frame's
     if (PartHashLate() && it != g_parts.end()) {
@@ -4169,7 +4138,6 @@ struct JobCopy {
         used += (std::uint32_t)n;
     }
 };
-std::atomic<std::uint32_t> g_levelLoads{0};   // (LevelLoadNoted)
 struct PartJob {
     std::unique_ptr<std::uint32_t[]> words{new std::uint32_t[kJobWords]};
     std::uint32_t wordCount = 0;
@@ -4202,7 +4170,6 @@ struct PartJob {
     std::uint64_t keepSerial = 0;
     float keepMatrix[16];
     bool right = false;   // the run that gave the job its items left VIF1's registers as foretold
-    std::uint32_t trimEpoch = 0;   // the level's load its items' buffers were last let go at (g_levelLoads)
 };
 std::vector<std::shared_ptr<PartJob>> g_keepJobs;   // (the render thread's) this list's jobs whose parts are to be kept from them
 std::vector<PartJob*> g_jobFree;
@@ -4215,7 +4182,7 @@ std::uint64_t g_jobsMade, g_jobsShape, g_jobSerial, g_jobWordsCopied, g_jobsNotC
 bool g_listJobsLive, g_drainOwed;   // (the render thread's) a job of this list reads the game's memory; the list's jobs are yet to be seen done
 std::atomic<std::uint64_t> g_jobsAgain, g_jobsChecked, g_jobsDiffered;   // jobs run a second time by a thread that needed them
 std::atomic<std::uint64_t> g_jobsLost[3], g_jobLostNs[3];   // runs whose items were dropped (another thread ended the job first), by thread
-std::atomic<std::uint64_t> g_jobsAhead, g_prepsAhead;   // jobs run by a thread while the one it needed was another's, not ended
+std::atomic<std::uint64_t> g_jobsAhead;   // jobs run by a thread while the one it needed was another's, not ended
 std::uint64_t g_jobDrainWaitNs;
 std::uint64_t g_jobMakeNs[4];   // making a job: the shape's hash, the job taken, VU1 copied, queued
 
@@ -4425,19 +4392,6 @@ void PartJobNeed(PartJob& j, int who)
                     g_jobsAhead++;
                 continue;
             }
-            // (the GS thread with no job left to take: a part's prep the helper has not taken, which
-            // this thread would make itself when it comes to the part: useful work, where a second
-            // run of the job waited for is lost to the helper)
-            // (SLY1_PREPS_AHEAD=1: on; =ab: on and off in turn, 600 frames each; off by default: on the Mac
-            // with the helper set aside it moved work, the helper's runs lost the more)
-            static const char* const prepsEnv = std::getenv("SLY1_PREPS_AHEAD");
-            const bool preps = prepsEnv && (prepsEnv[0] == 'a' ? gs::FramesShown() / 600 % 2 == 0 : prepsEnv[0] != '0');
-            if (who == 2 && preps)
-                if (std::shared_ptr<PrepTask> p = PrepTake()) {
-                    PrepRun(*p, 1);
-                    g_prepsAhead++;
-                    continue;
-                }
         }
         const std::uint64_t now = NowNs();
         if (beat) {
@@ -4714,7 +4668,6 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
         it = g_parts.emplace(g_callKey, PartRecord()).first;
         it->second.slow = slow;
     }
-    it->second.seenFrame = gs::FramesShown();
     PartRecord& r = it->second;
     // The registers a part is met with, but for those it does not read (as PartDecide's sameRegs:
     // the mask, when its packet unpacks through none before setting one; for a part drawn the
@@ -4839,7 +4792,6 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
         }
     }
     if (!job) {
-        g_partJobsMade++;
         job.reset(new PartJob, back);
         job->gen.fetch_add(1, std::memory_order_seq_cst);
     }
@@ -4862,23 +4814,6 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
     job->before = g_callRegs;
     job->after = jobAfter;
     job->out.used = 0;
-    {   // Its items' buffers, as many and as large as any run of it gave (a run's are swapped in
-        // from the thread that ran it): all let go the first time the job is made anew after a
-        // level's load. Kept for good, the 800 jobs' buffers grew with each level met, 100 to
-        // 300 MB at each change of level, until the Switch's heap ran out (Ryujinx's tour of the
-        // levels, at the 39th). Let go at each making past a limit, as first done, the Switch's
-        // allocator cost each job 100 us more and the render thread 2.7 ms a frame (run 18: 48% of
-        // the windows in 3D at 60 against 86 to 92%). SLY1_JOB_TRIM=0: never.
-        static const bool trim = !(std::getenv("SLY1_JOB_TRIM") && std::getenv("SLY1_JOB_TRIM")[0] == '0');
-        const std::uint32_t epoch = g_levelLoads.load(std::memory_order_relaxed);
-        if (trim && job->trimEpoch != epoch) {
-            job->trimEpoch = epoch;
-            Collect none, noRef;
-            std::swap(job->out, none);
-            std::swap(job->ref, noRef);
-            g_jobsTrimmed++;
-        }
-    }
     job->given.store(false, std::memory_order_release);
     job->begunAt = 0;
     job->state.store(0, std::memory_order_release);
@@ -5205,11 +5140,6 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
         g_partWords -= std::min<std::uint64_t>(g_partWords, r->words);
         r->words = 0;
         r->keys = 0;   // the renderer never saw them
-        // (nor is anything drawn from them: let go. Held, they were in no count and no record let go
-        // for room ever reached them, words being 0: 100 to 450 MB more at each level change, and
-        // Ryujinx's tour of the levels out of memory at the 39th.)
-        g_partGrave.push_back(std::move(r->kept));
-        r->kept.reset();
         r->lockout = std::min<std::uint32_t>(std::max<std::uint32_t>(r->lockout * 2, 30), 960);
         r->notBefore = gs::FramesShown() + r->lockout;   // not tried again at once
     }
@@ -5542,7 +5472,7 @@ void RunDmaChain(std::uint32_t regs, std::uint32_t tadr)
         if (regs == kVif1 && g_interruptScan.Count(item.words.data(), item.words.size()) != 0 && !copyAll) {
             {
                 std::lock_guard<std::mutex> lk(g_renderLock);
-                if (g_renderSpare.size() < 64 && item.words.capacity() <= kRenderSpareMostWords)
+                if (g_renderSpare.size() < 64)
                     g_renderSpare.push_back(std::move(item.words));
             }
             item.words = {};
@@ -5623,11 +5553,8 @@ void GsThreadMain()
             // (A frame has a thousand items and more where much is in sight. With a stock of 256 the
             // render thread ran out each frame and allocated the rest: a third of its work, walking
             // through A Stealthy Approach on the Switch, the allocator's lock among it.)
-            // (a buffer far larger than a stock one is let go: a GIF chain's copy, a texture's upload
-            // of hundreds of kilobytes, came back here and stayed, each level adding its own, 175 MB
-            // over eight levels in Ryujinx, and was then handed out for an item of a few words)
             for (auto& v : emptied)
-                if (g_gsSpare.size() < kGsSpareMost && v.capacity() <= 4 * kGsSpareWords)
+                if (g_gsSpare.size() < kGsSpareMost)
                     g_gsSpare.push_back(std::move(v));
             emptied.clear();
             g_gsBusy = false;
@@ -5816,14 +5743,6 @@ void GsThreadMain()
                                              (unsigned long long)(ji[2] - jw[2]), (ji[3] - jw[3]) / 1e6, (unsigned long long)(ji[4] - jw[4]), (ji[5] - jw[5]) / 1e6, (ji[6] - jw[6]) / 1e6);
                             std::memcpy(jw, ji, sizeof jw);
                         }
-                        {   // (SLY1_VU1_PROFILE) latevu1: the render thread's programs' time in the same frames
-                            static const bool vu1Profile = std::getenv("SLY1_VU1_PROFILE") != nullptr;
-                            static std::uint64_t vw;
-                            const std::uint64_t vi = vu1Profile ? vu1::RenderHandlerNs() : 0;
-                            if (vu1Profile && dt > 20.0 && dt < 200.0 && said <= 8)
-                                std::fprintf(stderr, "latevu1: frame %llu: the render thread's programs %.1f ms\n", (unsigned long long)gs::FramesShown(), (vi - vw) / 1e6);
-                            vw = vi;
-                        }
                         std::memcpy(pathWas, pathIs, sizeof pathWas);
                         at = now;
                         std::memcpy(was, is, sizeof was);
@@ -5867,101 +5786,6 @@ void GsThreadMain()
             }
             std::uint64_t t0 = NowNs();
             Bump(g_replayNs[3], t0 - prepFrom);
-            // The renderer's list of the part's commands (gpu.cpp's PartBegin), when nothing of it is
-            // made anew each frame (no lit, swaying or skinned batch, nothing the helper made): what
-            // its commands go by is in the key (the alpha's scale, the viewport's depths, the TEX0
-            // writes put right, its batches' keeps); its numbers each frame go to PartParams.
-            int listMode = 0;
-            if (gs::PartsTaken()) {
-                bool dynamic = false;
-                // (SLY1_PART_KEY_WHY: the parts not offered, by why: prepared, lit, swayed, skinned, projected, fading)
-                static const bool whyNot = std::getenv("SLY1_PART_KEY_WHY") != nullptr;
-                static std::uint64_t notBy[7], offeredAll;
-                int notWhy = dynamic ? 0 : -1;
-                std::uint64_t key = 0x9E3779B97F4A7C15ull ^ (std::uint64_t)part.size();
-                auto mix = [&](std::uint64_t v) {
-                    key = (key ^ v) * 0x100000001B3ull;
-                    key ^= key >> 31;
-                };
-                // (what the helper made of it this frame: each batch's vertices moved, colours lit; the
-                // list draws them from its own data, written each frame: which batches have them is the key's)
-                if (prep)
-                    for (std::size_t i = 0; i < part.size(); i++)
-                        mix((i < prep->quads.size() && !prep->quads[i].empty() ? 1u : 0u) | (i < prep->colours.size() && !prep->colours[i].empty() ? 2u : 0u) |
-                            (i < prep->moved.size() ? (std::uint32_t)prep->moved[i] << 2 : 0u));
-                bool alphaUsed = false;   // (a batch of it takes the alpha's scale: only then is the alpha its commands')
-                for (std::size_t i = 0; i < part.size() && !dynamic; i++) {
-                    if (part[i].path != 4)
-                        continue;
-                    const char* head = reinterpret_cast<const char*>(part[i].data + 1);
-                    std::uint32_t lit, sway, skin;
-                    std::uint64_t keep;
-                    bool projected, deferred;
-                    std::memcpy(&deferred, head + offsetof(gs::Batch, alphaDeferred), 1);
-                    alphaUsed = alphaUsed || deferred;
-                    std::memcpy(&lit, head + offsetof(gs::Batch, litWords), 4);
-                    std::memcpy(&sway, head + offsetof(gs::Batch, swayWords), 4);
-                    std::memcpy(&skin, head + offsetof(gs::Batch, skinWords), 4);
-                    std::memcpy(&keep, head + offsetof(gs::Batch, keep), 8);
-                    std::memcpy(&projected, head + offsetof(gs::Batch, projected), 1);
-                    // (a projected batch's projection is among its numbers: offered)
-                    (void)projected;
-                    // (lit, swayed or skinned anew each frame without the helper's: made here, BatchNow, not offered)
-                    dynamic = !prep && (lit != 0 || sway != 0 || skin != 0);
-                    if (dynamic && notWhy < 0)
-                        notWhy = lit ? 1 : sway ? 2 : 3;
-                    mix(keep);
-                }
-                const std::uint64_t sig = key;   // (the part's batches: their keeps)
-                // (a part whose batches take the alpha's scale: recorded with no alpha test decided by
-                // its vertices' alpha, flag 1, so that its list holds for any scale: a fading part too)
-                if (whyNot) {
-                    offeredAll++;
-                    if (notWhy >= 0)
-                        notBy[notWhy]++;
-                    if (offeredAll % 30000 == 0)
-                        std::fprintf(stderr, "partnot: %llu parts drawn again: not offered as prepared %llu, lit %llu, swayed %llu, skinned %llu, projected %llu, fading %llu\n",
-                                     (unsigned long long)offeredAll, (unsigned long long)notBy[0], (unsigned long long)notBy[1], (unsigned long long)notBy[2],
-                                     (unsigned long long)notBy[3], (unsigned long long)notBy[4], (unsigned long long)notBy[5]);
-                }
-                if (!dynamic && part.size() <= 256) {
-                    std::uint32_t a;
-                    std::memcpy(&a, &alphaNow, 4);
-                    std::uint32_t z[2];
-                    std::memcpy(&z[0], &viewport[2], 4);
-                    std::memcpy(&z[1], &viewport[6], 4);
-                    mix(z[0]);
-                    mix(z[1]);
-                    std::uint64_t fixHash = 0;
-                    for (std::size_t k = layout.fix; k < item.words.size(); k++) {
-                        mix(item.words[k]);
-                        fixHash = fixHash * 31 + item.words[k];
-                    }
-                    {   // SLY1_PART_KEY_WHY=1: which of the item's numbers changed from the part's last time, counted
-                        static const bool why = std::getenv("SLY1_PART_KEY_WHY") != nullptr;
-                        if (why) {
-                            struct Last { std::uint32_t a, z0, z1; std::uint64_t fix; };
-                            static std::unordered_map<const void*, Last> last;
-                            static std::uint64_t n, alpha, zs, fixes, seen;
-                            auto it = last.find(item.part.get());
-                            const Last now = {a, z[0], z[1], fixHash};
-                            if (it != last.end()) {
-                                seen++;
-                                alpha += it->second.a != a;
-                                zs += it->second.z0 != z[0] || it->second.z1 != z[1];
-                                fixes += it->second.fix != fixHash;
-                                it->second = now;
-                            } else {
-                                last.emplace(item.part.get(), now);
-                            }
-                            if (++n % 20000 == 0)
-                                std::fprintf(stderr, "partkey: %llu parts seen again: alpha other %llu, viewport's depths other %llu, TEX0 put right otherwise %llu\n",
-                                             (unsigned long long)seen, (unsigned long long)alpha, (unsigned long long)zs, (unsigned long long)fixes);
-                        }
-                    }
-                    listMode = gs::PartBegin(item.part.get(), sig, key, (std::uint32_t)part.size(), alphaUsed ? 1u : 0u);
-                }
-            }
             for (std::size_t i = 0; i < part.size(); i++) {
                 const PartKept& kept = part[i];
                 if (i + 2 < part.size()) {
@@ -6044,15 +5868,6 @@ void GsThreadMain()
                         std::memcpy(b.projLimits, pj + 20, 16);
                     }
                     b.quads = w + head;
-                    if (listMode == 2 && !prep) {   // the renderer gives the part from its list: this batch's numbers alone
-                        gs::PartReplayBatch(w[0], b, (std::uint32_t)i);
-                        const std::uint64_t t1 = NowNs();
-                        Bump(g_replayNs[0], t1 - t0);
-                        t0 = t1;
-                        continue;
-                    }
-                    if (listMode == 1)
-                        gs::PartBatch((std::uint32_t)i);
                     if (prep) {
                         if (!prep->quads[i].empty()) {
                             b.quads = prep->quads[i].data();
@@ -6065,13 +5880,6 @@ void GsThreadMain()
                     } else {
                         static thread_local BatchScratch scratch;
                         BatchNow(item.words.data(), layout, &part, w, b, scratch);
-                    }
-                    if (listMode == 2) {   // (a part the helper made something of: its numbers and this frame's vertices and colours)
-                        gs::PartReplayBatch(w[0], b, (std::uint32_t)i);
-                        const std::uint64_t t1 = NowNs();
-                        Bump(g_replayNs[0], t1 - t0);
-                        t0 = t1;
-                        continue;
                     }
                     if (!gs::DrawBatch(w[0], b))
                         g_batchesRefused++;
@@ -6101,8 +5909,6 @@ void GsThreadMain()
                     t0 = t1;
                 }
             }
-            if (listMode != 0)
-                gs::PartEnd();
         } else if (item.path == 4) {   // a batch (QueueBatch)
             gs::Batch b;
             const std::size_t head = 1 + (sizeof(gs::Batch) + 3) / 4;
@@ -6140,7 +5946,6 @@ void GsThreadMain()
 void RenderThreadMain()
 {
     ProfileThisThread("render");   // (SLY1_PROFILE=render)
-    vu1::MarkRenderThread();
     g_renderStarted.store(true, std::memory_order_release);
     for (;;) {
         RenderItem item;
@@ -6388,17 +6193,12 @@ void RenderThreadMain()
                                          (g_partsWaited - waitedWas) / f, (g_gsSpareHad.load() - spareWas[0]) / f, (g_gsSpareNone.load() - spareWas[1]) / f, (g_gsSpareGrown.load() - spareWas[2]) / f, (unsigned long long)g_jobStaleCodes.load(), (unsigned long long)g_jobsNotCopied, (g_jobWordsCopied - copiedWas) / f);
                         copiedWas = g_jobWordsCopied;
                         {   // the runs lost (another thread ended the job first) and the jobs run ahead while waiting
-                            static std::uint64_t lostWas[3], lostNsWas[3], aheadWas, prepsAheadWas;
+                            static std::uint64_t lostWas[3], lostNsWas[3], aheadWas;
                             if (since)
-                                std::fprintf(stderr, "perflost: to %llu, a frame: runs lost by the helper %.2f (%.3f ms), the render thread %.2f (%.3f ms), the GS thread %.2f (%.3f ms); jobs run ahead while waiting %.2f, preps %.2f\n",
+                                std::fprintf(stderr, "perflost: to %llu, a frame: runs lost by the helper %.2f (%.3f ms), the render thread %.2f (%.3f ms), the GS thread %.2f (%.3f ms); jobs run ahead while waiting %.2f\n",
                                              (unsigned long long)shown, (g_jobsLost[0].load() - lostWas[0]) / f, (g_jobLostNs[0].load() - lostNsWas[0]) / f / 1e6,
                                              (g_jobsLost[1].load() - lostWas[1]) / f, (g_jobLostNs[1].load() - lostNsWas[1]) / f / 1e6,
-                                             (g_jobsLost[2].load() - lostWas[2]) / f, (g_jobLostNs[2].load() - lostNsWas[2]) / f / 1e6, (g_jobsAhead.load() - aheadWas) / f,
-                                             (g_prepsAhead.load() - prepsAheadWas) / f);
-                            prepsAheadWas = g_prepsAhead.load();
-                            static const bool vu1Profile = std::getenv("SLY1_VU1_PROFILE") != nullptr;
-                            if (vu1Profile)
-                                vu1::RenderProfileLine(shown, f);
+                                             (g_jobsLost[2].load() - lostWas[2]) / f, (g_jobLostNs[2].load() - lostNsWas[2]) / f / 1e6, (g_jobsAhead.load() - aheadWas) / f);
                             for (int k = 0; k < 3; k++) {
                                 lostWas[k] = g_jobsLost[k].load();
                                 lostNsWas[k] = g_jobLostNs[k].load();
@@ -6480,7 +6280,7 @@ void RenderThreadMain()
         g_renderItems[kind < 3 ? kind : 0]++;
         if (item.words.capacity()) {
             std::lock_guard<std::mutex> lk(g_renderLock);
-            if (g_renderSpare.size() < 64 && item.words.capacity() <= kRenderSpareMostWords)
+            if (g_renderSpare.size() < 64)
                 g_renderSpare.push_back(std::move(item.words));
         }
     }
@@ -6555,45 +6355,4 @@ void DmacDump()
     }
 }
 
-// A level's load has begun (kernel.cpp): what grew with the last level is let go as it is next used.
-void LevelLoadNoted()
-{
-    g_levelLoads.fetch_add(1, std::memory_order_relaxed);
-}
-
-// What the tables that live from level to level hold (--verify-levels prints it after each level;
-// sizes read without their locks: for a diagnosis).
-void MemoryReport(int level)
-{
-    std::size_t itemsWords = 0, keptParts = 0;
-    for (const auto& kv : g_parts)
-        if (kv.second.kept)
-            keptParts++;
-    (void)itemsWords;
-    std::size_t prepWords = 0, prepFree = 0, jobWords = 0, jobFree = 0;
-    {
-        std::lock_guard<std::mutex> lk(g_prepFreeLock);
-        prepFree = g_prepFree.size();
-        for (const PrepTask* t : g_prepFree) {
-            prepWords += t->words.capacity() + t->all3.capacity() + t->moved.capacity() / 4 + t->sc.skinned.capacity() + t->sc.litSkinned.capacity() + t->sc.moved.capacity();
-            for (const auto& v : t->quads)
-                prepWords += v.capacity();
-            for (const auto& v : t->colours)
-                prepWords += v.capacity();
-        }
-    }
-    {
-        std::lock_guard<std::mutex> lk(g_jobFreeLock);
-        jobFree = g_jobFree.size();
-        for (const PartJob* j : g_jobFree)
-            for (const GsItem& it : j->out.items)
-                jobWords += it.words.capacity();
-    }
-    std::fprintf(stderr, "memreport: level %d: a part's record %zu bytes, %llu records forgotten\n", level, sizeof(PartRecord), (unsigned long long)g_partRecordsPruned);
-    std::fprintf(stderr, "memreport: level %d: free preps %zu hold %.1f MB, free jobs %zu hold %.1f MB in their items\n", level, prepFree, prepWords / 262144.0, jobFree, jobWords / 262144.0);
-    gs::BackendMemoryReport(level);
-    std::fprintf(stderr, "memreport: level %d: part records %zu (%zu kept), shapes %zu, jobs made %llu (free %zu), preps made %llu (free %zu), grave %zu+%zu, diff seen %zu, jobs' buffers let go %llu\n", level,
-                 g_parts.size(), keptParts, g_shapeRegs.size(), (unsigned long long)g_partJobsMade.load(), g_jobFree.size(), (unsigned long long)g_prepTasksMade.load(),
-                 g_prepFree.size(), g_partGrave.size(), g_partGraveItems.size(), g_diffSeen.size(), (unsigned long long)g_jobsTrimmed.load());
-}
 }  // namespace port
