@@ -42,6 +42,10 @@ void RaiseInterrupt(int cause);
 void Spin();
 // The kernel's threads and handlers, printed, for a diagnosis.
 void KernelDump();
+// The Options page's "Picture: Vivid" (bit 0x20000 of the save's option flags): the factor the
+// renderer moves each colour away from its grey by, 1 for Normal. SLY1_VIVID=N: N hundredths
+// whatever the setting (100: never).
+float VividFactor();
 
 }  // namespace port
 

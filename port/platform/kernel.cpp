@@ -369,6 +369,21 @@ int WideX(int x)
 // the next point where a game thread lets others in.
 std::atomic<void (*)()> g_gameThreadCall{nullptr};
 void LevelLoadNoted();   // (dmac.cpp)
+// The picture's setting (port/include/port/system.h): the save's option flags, bit 0x20000 (the
+// Options page's "Picture: Normal" or "Picture: Vivid", tools/patches.py), read from the game's
+// progress block as the renderer presents a frame. Vivid is 1.35: chosen against PS3 screenshots of
+// "At the Dog Track" (docs/PS3_PARITY.md).
+float VividFactor()
+{
+    static const char* const env = std::getenv("SLY1_VIVID");
+    if (env)
+        return (float)std::atoi(env) / 100.0f;
+    const std::uint32_t save = *(const std::uint32_t*)Native(0x002623C0);
+    if (save == 0)
+        return 1.0f;
+    return (*(const std::uint32_t*)Native(save + 0x19EC) & 0x20000u) ? 1.35f : 1.0f;
+}
+
 // SLY1_VAN_LOG=1: a driven path follower's numbers, every 30th call (tools/patches.py, world.cpp's
 // ControlPathFollower).
 void VanLog(float stick, float top, float target, float vx, float vy, float vz, float pace, float zone, int kind, int boosts, int checksum)

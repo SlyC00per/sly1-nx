@@ -40,6 +40,8 @@
 #include "gs_layers_fsh_dksh.h"
 #include "gs_fx_fsh_dksh.h"
 #include "batch_vsh_dksh.h"
+#include "present_vsh_dksh.h"
+#include "present_fsh_dksh.h"
 
 namespace port {
 namespace gpu {
@@ -327,6 +329,7 @@ private:
     DkImage fxImage_;
     Texture fxTexture_;
     DkShader fxShader_, layersShader_;
+    DkShader presentVertex_, presentFragment_;   // the frame put on the screen by a draw (Present: the Vivid picture)
     bool fxReady_ = false, fxOpen_ = false, inComposite_ = false, depthBound_ = false;
     // The effects' picture at half the frame's size as drawn (its dynamic scale), not half the whole
     // image's: the splashes of A Stealthy Approach's waterfall, ten screens of them, were 5.5 ms of
@@ -350,6 +353,7 @@ private:
     int frameBound_ = -1;          // the frame buffer bound as the test's texture in this command list
     std::uint64_t dateBarriers_ = 0;
     std::uint64_t frameTextured_ = 0, targetTextured_ = 0;
+    std::uint64_t vividFrames_ = 0;   // frames put on the screen by the Vivid picture's draw
     std::uint32_t otherSerial_[512] = {};   // the uploads so far when a buffer this renderer does not draw into was last drawn into; 0: never
     std::uint64_t retired_ = 0;
     BatchParams lastBatch_;
@@ -605,6 +609,14 @@ bool Renderer::Create()
     std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(codeMem_) + layersAt, gs_layers_fsh_dksh, gs_layers_fsh_dksh_size);
     dkShaderMakerDefaults(&shaderMaker, codeMem_, layersAt);
     dkShaderInitialize(&layersShader_, &shaderMaker);
+    std::uint32_t presentVAt = Align(layersAt + (std::uint32_t)gs_layers_fsh_dksh_size, DK_SHADER_CODE_ALIGNMENT);
+    std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(codeMem_) + presentVAt, present_vsh_dksh, present_vsh_dksh_size);
+    dkShaderMakerDefaults(&shaderMaker, codeMem_, presentVAt);
+    dkShaderInitialize(&presentVertex_, &shaderMaker);
+    std::uint32_t presentFAt = Align(presentVAt + (std::uint32_t)present_vsh_dksh_size, DK_SHADER_CODE_ALIGNMENT);
+    std::memcpy((std::uint8_t*)dkMemBlockGetCpuAddr(codeMem_) + presentFAt, present_fsh_dksh, present_fsh_dksh_size);
+    dkShaderMakerDefaults(&shaderMaker, codeMem_, presentFAt);
+    dkShaderInitialize(&presentFragment_, &shaderMaker);
     if (std::getenv("SLY1_GPU_CULL_FLIP"))
         cullFront_ = 0.0f;
 
@@ -2986,7 +2998,41 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
     float black[4] = {0, 0, 0, 1};
     dkCmdBufClearColor(cmd_, 0, DkColorMask_RGBA, black);
     DkImageRect src = {0, 0, 0, renderWidth_[target], renderHeight_[target], 1}, dst = {(kScreenWidth - kWidth) / 2, 0, 0, kWidth, kHeight, 1};
-    dkCmdBufBlitImage(cmd_, &from, &src, &screen, &dst, renderWidth_[target] != kWidth ? DkBlitFlag_FilterLinear : 0, 0);
+    // The Options page's "Picture: Vivid" (port::VividFactor, kernel.cpp): the frame put on the screen
+    // by a draw that moves each colour away from its grey (present_fsh.glsl), in the blit's place.
+    // Everything it binds is bound anew by the next frame's first draw (BeginCommands, below).
+    const float vivid = VividFactor();
+    if (vivid != 1.0f) {
+        const std::uint32_t id = kMaxTextures - 2 + (std::uint32_t)target;   // (the frame's place among the textures, as DATE's)
+        DkImageDescriptor d;
+        dkImageDescriptorInitialize(&d, &from, false, false);
+        dkCmdBufPushData(cmd_, dkMemBlockGetGpuAddr(dataMem_) + imageSet_ + id * sizeof d, &d, sizeof d);
+        DkResHandle handle = dkMakeTextureHandle(id, 3);   // (bilinear, clamped)
+        dkCmdBufBindTextures(cmd_, DkStage_Fragment, 1, &handle, 1);
+        const DkShader* shaders[2] = {&presentVertex_, &presentFragment_};
+        dkCmdBufBindShaders(cmd_, DkStageFlag_GraphicsMask, shaders, 2);
+        dkCmdBufBindVtxAttribState(cmd_, nullptr, 0);
+        const float params[4] = {vivid, (float)renderWidth_[target] / (float)kWidth, (float)renderHeight_[target] / (float)kHeight, 0.0f};
+        dkCmdBufPushConstants(cmd_, dkMemBlockGetGpuAddr(dataMem_) + fragmentUbo_, sizeof(FragmentParams), 0, sizeof params, params);
+        DkColorState colour;
+        dkColorStateDefaults(&colour);
+        dkCmdBufBindColorState(cmd_, &colour);
+        DkColorWriteState write;
+        dkColorWriteStateDefaults(&write);
+        dkCmdBufBindColorWriteState(cmd_, &write);
+        DkDepthStencilState ds;
+        dkDepthStencilStateDefaults(&ds);
+        ds.depthTestEnable = ds.depthWriteEnable = 0;
+        dkCmdBufBindDepthStencilState(cmd_, &ds);
+        DkViewport viewport = {(float)dst.x, 0.0f, (float)kWidth, (float)kHeight, 0.0f, 1.0f};
+        dkCmdBufSetViewports(cmd_, 0, &viewport, 1);
+        DkScissor part = {dst.x, 0, kWidth, kHeight};
+        dkCmdBufSetScissors(cmd_, 0, &part, 1);
+        dkCmdBufDraw(cmd_, DkPrimitive_Triangles, 3, 1, 0, 0);
+        vividFrames_++;
+    } else {
+        dkCmdBufBlitImage(cmd_, &from, &src, &screen, &dst, renderWidth_[target] != kWidth ? DkBlitFlag_FilterLinear : 0, 0);
+    }
     {   // The size of the frame drawn next, into the other buffer: as large as the GPU draws in a
         // frame's time. The GPU's time over a frame is taken as a fixed part and a part that goes
         // with the pixels; the size is brought down at once when a frame at the present size took

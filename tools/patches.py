@@ -440,6 +440,28 @@ PATCHES = [
      "    case 31:\n        switch (sel) {\n        case 27: {\n            g_saveData->u19EC ^= 0x10000;\n            s32 keep = self->cursor;\n            BuildPauseMenuPage(self);\n            self->cursor = keep;\n            return;\n        }\n        case 0x18: {",
      "choosing the Camera setting turns it over"),
 
+    # "Picture: Normal" or "Picture: Vivid" on the Options page, before Back (the user, 2026-11-24):
+    # item 28, bit 0x20000 of the save's option flags, which the renderer reads as it presents a
+    # frame (port::VividFactor: Vivid moves each colour away from its grey, an approximation of the
+    # PS3 release's more saturated picture; Normal is the PS2's). As the Camera setting: a label
+    # of the port's, no set of alternative labels, and choosing it turns it over.
+    ("src/main/pause_menu.cpp",
+     "char* GetMenuChoiceLabel(s32 index)\n{\n    if (index == 27) {",
+     "char* GetMenuChoiceLabel(s32 index)\n{\n    if (index == 28) {\n        static char port_plain[] = \"Picture: Normal\", port_vivid[] = \"Picture: Vivid\";\n        return (g_saveData->optionFlags & 0x20000) ? port_vivid : port_plain;\n    }\n    if (index == 27) {",
+     "the Picture setting's label"),
+    ("src/main/pause_menu.cpp",
+     "ChoiceLabels* cl = row->items[i] == 27 ? &port_none : &g_choiceTextSets[row->items[i]];",
+     "ChoiceLabels* cl = (row->items[i] == 27 || row->items[i] == 28) ? &port_none : &g_choiceTextSets[row->items[i]];",
+     "the Picture setting has no set of labels of the game's"),
+    ("src/main/pause_menu.cpp",
+     "            if (show != 0) {\n                row->items[row->count++] = item;\n            }\n        }\n        break;\n    }\n    for (s32 i = 0; i < 27; i++) {",
+     "            if (show != 0) {\n                row->items[row->count++] = item;\n            }\n        }\n        if (row->count >= 1) {\n            row->items[row->count] = row->items[row->count - 1];\n            row->items[row->count - 1] = 28;\n            row->count++;\n        }\n        break;\n    }\n    for (s32 i = 0; i < 27; i++) {",
+     "the Options page with the Picture setting before Back"),
+    ("src/main/pause_menu.cpp",
+     "        case 14:\n            SetPauseMenuLayerPage(self, 0, 0x18);\n            return;\n        case 23:\n            SetPauseMenuLayerPage(self, 0, 0x1F);\n            return;",
+     "        case 28: {\n            g_saveData->u19EC ^= 0x20000;\n            s32 keep = self->cursor;\n            BuildPauseMenuPage(self);\n            self->cursor = keep;\n            return;\n        }\n        case 14:\n            SetPauseMenuLayerPage(self, 0, 0x18);\n            return;\n        case 23:\n            SetPauseMenuLayerPage(self, 0, 0x1F);\n            return;",
+     "choosing the Picture setting turns it over"),
+
     # The Options page without "Center Screen...": the PS2's picture could be moved on a television
     # that showed it off centre; the Switch's screen and its dock's picture are where they are
     # (the user, 2026-11-24). The item is left out of the page as it is built; the game's own
