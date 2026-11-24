@@ -3,7 +3,7 @@
 """The frame rate measured without a player: the same levels, the same stops and the same camera
 turn each run, so that two builds can be compared.
 
-    python3 tools/bench.py run NAME [--nro build-switch/sly1.nro] [--levels 4,5,20,4] [--frames 150]
+    python3 tools/bench.py run NAME [--nro build-switch/sly1.nro] [--levels 4,5,20,4] [--frames 150] [--env NAME=VALUE ...]
     python3 tools/bench.py show LOG [LOG ...]
 
 run: sends the .nro to the Switch through nxlink (the homebrew menu waiting, Y) with --levels, the
@@ -65,11 +65,13 @@ def summary(path):
             % (os.path.basename(path), n, 100.0 * at60 / n, a[0], a[1], a[2], a[3], a[4], 1000 * a[6] / max(a[5], 1e-9), lates, 100.0 * lates / n, ended))
 
 
-def run(name, nro, levels, frames):
+def run(name, nro, levels, frames, envs):
     os.makedirs(os.path.join(ROOT, "bench"), exist_ok=True)
     log = os.path.join(ROOT, "bench", name + ".log")
     args = ("--levels %s --env SLY1_LEVEL_FRAMES=120 --env SLY1_TOUR=arrivals:%d --env SLY1_PAD_TURN=300 --env SLY1_PERF_LOG=1"
             % (levels, frames))
+    for e in envs:
+        args += " --env " + e
     address = os.environ.get("SLY1_SWITCH", "192.168.86.35")
     pid, fd = pty.fork()   # (through a pseudo-terminal: a pipe's output is kept back until nxlink exits)
     if pid == 0:
@@ -113,7 +115,8 @@ def main():
         return
     if len(a) >= 2 and a[0] == "run":
         opt = lambda flag, default: a[a.index(flag) + 1] if flag in a else default
-        run(a[1], opt("--nro", os.path.join(ROOT, "build-switch", "sly1.nro")), opt("--levels", "4,5,20,4,5"), int(opt("--frames", "150")))
+        run(a[1], opt("--nro", os.path.join(ROOT, "build-switch", "sly1.nro")), opt("--levels", "4,5,20,4,5"), int(opt("--frames", "150")),
+            [a[k + 1] for k, x in enumerate(a[:-1]) if x == "--env"])
         return
     sys.exit(__doc__)
 

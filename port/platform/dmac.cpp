@@ -4170,6 +4170,7 @@ struct JobCopy {
     }
 };
 std::atomic<std::uint32_t> g_levelLoads{0};   // (LevelLoadNoted)
+std::size_t g_jobsHeldWords;   // (the render thread's) what the jobs' items' buffers hold, as last measured
 struct PartJob {
     std::unique_ptr<std::uint32_t[]> words{new std::uint32_t[kJobWords]};
     std::uint32_t wordCount = 0;
@@ -4203,6 +4204,7 @@ struct PartJob {
     float keepMatrix[16];
     bool right = false;   // the run that gave the job its items left VIF1's registers as foretold
     std::uint32_t trimEpoch = 0;   // the level's load its items' buffers were last let go at (g_levelLoads)
+    std::size_t heldWords = 0;     // what its items' buffers held when it was last made anew (g_jobsHeldWords)
 };
 std::vector<std::shared_ptr<PartJob>> g_keepJobs;   // (the render thread's) this list's jobs whose parts are to be kept from them
 std::vector<PartJob*> g_jobFree;
@@ -4856,14 +4858,44 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
         // levels, at the 39th). Let go at each making past a limit, as first done, the Switch's
         // allocator cost each job 100 us more and the render thread 2.7 ms a frame (run 18: 48% of
         // the windows in 3D at 60 against 86 to 92%). SLY1_JOB_TRIM=0: never.
+        // And only while the jobs hold more than 768 MB between them (SLY1_JOB_HELD_MB), then what
+        // a job holds past 64 KB (SLY1_JOB_TRIM_KB): so that a load lets go what has grown since the
+        // last, not everything. Let go at every load, the jobs grew their buffers again in the eight
+        // seconds after it: a helper's job 442 us there against 370 with all let go, 424 with 64 KB
+        // kept, 390 with none let go (tools/bench.py, 2026-11-24). Never let go, the 816 jobs' buffers
+        // go on growing (a megabyte each after five levels, 1,265 MB after ten on the Mac, each
+        // buffer in time as large as the largest item met); with the limit they stay at 760 to
+        // 890 MB over the same ten, 30 to 300 jobs let go at a load.
         static const bool trim = !(std::getenv("SLY1_JOB_TRIM") && std::getenv("SLY1_JOB_TRIM")[0] == '0');
+        static const std::size_t keep = (std::getenv("SLY1_JOB_TRIM_KB") ? (std::size_t)std::atol(std::getenv("SLY1_JOB_TRIM_KB")) : 64) * 256;
+        static const std::size_t budget = (std::getenv("SLY1_JOB_HELD_MB") ? (std::size_t)std::atol(std::getenv("SLY1_JOB_HELD_MB")) : 768) << 18;
+        const auto held = [&] {
+            std::size_t words = 0;
+            for (const Collect* c : {&job->out, &job->ref})
+                for (const GsItem& it : c->items)
+                    words += it.words.capacity();
+            return words;
+        };
+        // (measured once a job a load, not at each making: 200 makings a frame, each going through
+        // the job's items, cost the render thread 0.4 ms a frame on the Switch)
         const std::uint32_t epoch = g_levelLoads.load(std::memory_order_relaxed);
         if (trim && job->trimEpoch != epoch) {
             job->trimEpoch = epoch;
-            Collect none, noRef;
-            std::swap(job->out, none);
-            std::swap(job->ref, noRef);
-            g_jobsTrimmed++;
+            std::size_t now = held();
+            if (g_jobsHeldWords + now - job->heldWords > budget) {
+                for (Collect* c : {&job->out, &job->ref}) {
+                    std::size_t words = 0;
+                    for (GsItem& it : c->items) {
+                        words += it.words.capacity();
+                        if (words > keep && it.words.capacity() != 0)
+                            std::vector<std::uint32_t>().swap(it.words);
+                    }
+                }
+                now = held();
+                g_jobsTrimmed++;
+            }
+            g_jobsHeldWords += now - job->heldWords;   // (the render thread's alone; unsigned, so the sum holds)
+            job->heldWords = now;
         }
     }
     job->given.store(false, std::memory_order_release);
@@ -6450,6 +6482,7 @@ void MemoryReport(int level)
                 jobWords += it.words.capacity();
     }
     std::fprintf(stderr, "memreport: level %d: a part's record %zu bytes, %llu records forgotten\n", level, sizeof(PartRecord), (unsigned long long)g_partRecordsPruned);
+    std::fprintf(stderr, "memreport: level %d: the jobs' buffers hold %.1f MB as last measured\n", level, g_jobsHeldWords / 262144.0);
     std::fprintf(stderr, "memreport: level %d: free preps %zu hold %.1f MB, free jobs %zu hold %.1f MB in their items\n", level, prepFree, prepWords / 262144.0, jobFree, jobWords / 262144.0);
     std::fprintf(stderr, "memreport: level %d: part records %zu (%zu kept), shapes %zu, jobs made %llu (free %zu), preps made %llu (free %zu), grave %zu+%zu, diff seen %zu, jobs' buffers let go %llu\n", level,
                  g_parts.size(), keptParts, g_shapeRegs.size(), (unsigned long long)g_partJobsMade.load(), g_jobFree.size(), (unsigned long long)g_prepTasksMade.load(),
