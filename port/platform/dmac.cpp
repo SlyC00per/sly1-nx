@@ -4169,6 +4169,7 @@ struct JobCopy {
         used += (std::uint32_t)n;
     }
 };
+std::atomic<std::uint32_t> g_levelLoads{0};   // (LevelLoadNoted)
 struct PartJob {
     std::unique_ptr<std::uint32_t[]> words{new std::uint32_t[kJobWords]};
     std::uint32_t wordCount = 0;
@@ -4201,6 +4202,7 @@ struct PartJob {
     std::uint64_t keepSerial = 0;
     float keepMatrix[16];
     bool right = false;   // the run that gave the job its items left VIF1's registers as foretold
+    std::uint32_t trimEpoch = 0;   // the level's load its items' buffers were last let go at (g_levelLoads)
 };
 std::vector<std::shared_ptr<PartJob>> g_keepJobs;   // (the render thread's) this list's jobs whose parts are to be kept from them
 std::vector<PartJob*> g_jobFree;
@@ -4861,23 +4863,20 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
     job->after = jobAfter;
     job->out.used = 0;
     {   // Its items' buffers, as many and as large as any run of it gave (a run's are swapped in
-        // from the thread that ran it): those past 128 KB in all let go. Kept whole, the 800 jobs'
-        // buffers grew with each level met, 100 to 300 MB at each change of level, until the
-        // Switch's heap ran out (Ryujinx's tour of the levels, at the 39th).
-        // SLY1_JOB_TRIM_KB: the limit (0: none).
-        static const std::size_t limit = std::getenv("SLY1_JOB_TRIM_KB") ? (std::size_t)std::atol(std::getenv("SLY1_JOB_TRIM_KB")) * 256 : (32u << 10);
-        if (limit != 0) {
-            std::size_t words = 0;
-            bool trimmed = false;
-            for (GsItem& it : job->out.items) {
-                words += it.words.capacity();
-                if (words > limit && it.words.capacity() != 0) {
-                    std::vector<std::uint32_t>().swap(it.words);
-                    trimmed = true;
-                }
-            }
-            if (trimmed)
-                g_jobsTrimmed++;
+        // from the thread that ran it): all let go the first time the job is made anew after a
+        // level's load. Kept for good, the 800 jobs' buffers grew with each level met, 100 to
+        // 300 MB at each change of level, until the Switch's heap ran out (Ryujinx's tour of the
+        // levels, at the 39th). Let go at each making past a limit, as first done, the Switch's
+        // allocator cost each job 100 us more and the render thread 2.7 ms a frame (run 18: 48% of
+        // the windows in 3D at 60 against 86 to 92%). SLY1_JOB_TRIM=0: never.
+        static const bool trim = !(std::getenv("SLY1_JOB_TRIM") && std::getenv("SLY1_JOB_TRIM")[0] == '0');
+        const std::uint32_t epoch = g_levelLoads.load(std::memory_order_relaxed);
+        if (trim && job->trimEpoch != epoch) {
+            job->trimEpoch = epoch;
+            Collect none, noRef;
+            std::swap(job->out, none);
+            std::swap(job->ref, noRef);
+            g_jobsTrimmed++;
         }
     }
     job->given.store(false, std::memory_order_release);
@@ -6554,6 +6553,12 @@ void DmacDump()
         for (auto& kv : g_survey.programSize)
             std::fprintf(stderr, "survey: program %08X: %u instructions\n", kv.first, kv.second);
     }
+}
+
+// A level's load has begun (kernel.cpp): what grew with the last level is let go as it is next used.
+void LevelLoadNoted()
+{
+    g_levelLoads.fetch_add(1, std::memory_order_relaxed);
 }
 
 // What the tables that live from level to level hold (--verify-levels prints it after each level;

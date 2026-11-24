@@ -28,7 +28,9 @@ namespace port { inline void CheckDevTable(const char*) {} }
 #include <cstring>
 namespace port {
 void MemoryReport(int level);   // (dmac.cpp)
+#if defined(__SWITCH__)
 __attribute__((weak)) void HeapProfileReport(int level);   // (switch/heap_profile.cpp, SLY1_HEAP_PROFILE)
+#endif
 }
 #if defined(__SWITCH__)
 #include <malloc.h>
@@ -507,8 +509,10 @@ void VerifyLevels()
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "verify: level %2d loaded and ran 60 frames (%.1f s)\n", i + 1, s);
         port::MemoryReport(i + 1);
+#if defined(__SWITCH__)
         if (port::HeapProfileReport)
             port::HeapProfileReport(i + 1);
+#endif
 #if defined(__SWITCH__)
         {   // (the heap in use after each level: what grows from level to level)
             const struct mallinfo mi = mallinfo();
