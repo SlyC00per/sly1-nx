@@ -471,6 +471,19 @@ PATCHES = [
      "            case 8:\n                show = g_elementStack.resumeState != 1;\n                break;\n            case 14:\n                show = 0;\n                break;\n            }",
      "the Options page without Center Screen"),
 
+    # The Options page without "Vibration: ..." and "Speakers: ..." either (the user, 2026-11-24).
+    # What they set stays as it works here with nothing to choose: the sound is stereo (the port's
+    # mixer does not act on the IOP's speaker option), and the vibration is on whatever a save
+    # holds, for a console that has motors (a save with it off could not turn it on again).
+    ("src/main/pause_menu.cpp",
+     "            case 14:\n                show = 0;\n                break;\n            }",
+     "            case 13:\n            case 14:\n            case 16:\n                show = 0;\n                break;\n            }",
+     "the Options page without Vibration and Speakers"),
+    ("src/main/pair_controller.cpp",
+     "s32 IsPadPatternEnabled(GameProgress* ctx)\n{\n    s32 v = g_padPatternSetting;",
+     "s32 IsPadPatternEnabled(GameProgress* ctx)\n{\n    return 1;   /* port: no Vibration setting to choose, on (tools/patches.py) */\n    s32 v = g_padPatternSetting;",
+     "the vibration on, with no setting for it"),
+
     # Frame layout: g++ 2.95 put t right after arr[32] in the frame, and the cleanup walks back from
     # &t; a modern compiler places locals as it likes.
     ("src/main/pose_source.cpp",
