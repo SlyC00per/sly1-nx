@@ -5786,6 +5786,83 @@ void GsThreadMain()
             }
             std::uint64_t t0 = NowNs();
             Bump(g_replayNs[3], t0 - prepFrom);
+            // The renderer's list of the part's commands (gpu.cpp's PartBegin), when nothing of it is
+            // made anew each frame (no lit, swaying or skinned batch, nothing the helper made): what
+            // its commands go by is in the key (the alpha's scale, the viewport's depths, the TEX0
+            // writes put right, its batches' keeps); its numbers each frame go to PartParams.
+            int listMode = 0;
+            {
+                bool dynamic = false;
+                if (prep)
+                    for (std::size_t i = 0; i < part.size() && !dynamic; i++)
+                        dynamic = (i < prep->quads.size() && !prep->quads[i].empty()) || (i < prep->colours.size() && !prep->colours[i].empty());
+                std::uint64_t key = 0x9E3779B97F4A7C15ull ^ (std::uint64_t)part.size();
+                auto mix = [&](std::uint64_t v) {
+                    key = (key ^ v) * 0x100000001B3ull;
+                    key ^= key >> 31;
+                };
+                bool alphaUsed = false;   // (a batch of it takes the alpha's scale: only then is the alpha its commands')
+                for (std::size_t i = 0; i < part.size() && !dynamic; i++) {
+                    if (part[i].path != 4)
+                        continue;
+                    const char* head = reinterpret_cast<const char*>(part[i].data + 1);
+                    std::uint32_t lit, sway, skin;
+                    std::uint64_t keep;
+                    bool projected, deferred;
+                    std::memcpy(&deferred, head + offsetof(gs::Batch, alphaDeferred), 1);
+                    alphaUsed = alphaUsed || deferred;
+                    std::memcpy(&lit, head + offsetof(gs::Batch, litWords), 4);
+                    std::memcpy(&sway, head + offsetof(gs::Batch, swayWords), 4);
+                    std::memcpy(&skin, head + offsetof(gs::Batch, skinWords), 4);
+                    std::memcpy(&keep, head + offsetof(gs::Batch, keep), 8);
+                    std::memcpy(&projected, head + offsetof(gs::Batch, projected), 1);
+                    dynamic = lit != 0 || sway != 0 || skin != 0 || projected;
+                    mix(keep);
+                }
+                const std::uint64_t sig = key;   // (the part's batches: their keeps)
+                // (a part fading, its alpha's scale not 1: drawn as ever, not kept again each frame)
+                if (alphaUsed && alphaNow != 1.0f)
+                    dynamic = true;
+                if (!dynamic && part.size() <= 256) {
+                    std::uint32_t a;
+                    std::memcpy(&a, &alphaNow, 4);
+                    if (alphaUsed)
+                        mix(a);
+                    std::uint32_t z[2];
+                    std::memcpy(&z[0], &viewport[2], 4);
+                    std::memcpy(&z[1], &viewport[6], 4);
+                    mix(z[0]);
+                    mix(z[1]);
+                    std::uint64_t fixHash = 0;
+                    for (std::size_t k = layout.fix; k < item.words.size(); k++) {
+                        mix(item.words[k]);
+                        fixHash = fixHash * 31 + item.words[k];
+                    }
+                    {   // SLY1_PART_KEY_WHY=1: which of the item's numbers changed from the part's last time, counted
+                        static const bool why = std::getenv("SLY1_PART_KEY_WHY") != nullptr;
+                        if (why) {
+                            struct Last { std::uint32_t a, z0, z1; std::uint64_t fix; };
+                            static std::unordered_map<const void*, Last> last;
+                            static std::uint64_t n, alpha, zs, fixes, seen;
+                            auto it = last.find(item.part.get());
+                            const Last now = {a, z[0], z[1], fixHash};
+                            if (it != last.end()) {
+                                seen++;
+                                alpha += it->second.a != a;
+                                zs += it->second.z0 != z[0] || it->second.z1 != z[1];
+                                fixes += it->second.fix != fixHash;
+                                it->second = now;
+                            } else {
+                                last.emplace(item.part.get(), now);
+                            }
+                            if (++n % 20000 == 0)
+                                std::fprintf(stderr, "partkey: %llu parts seen again: alpha other %llu, viewport's depths other %llu, TEX0 put right otherwise %llu\n",
+                                             (unsigned long long)seen, (unsigned long long)alpha, (unsigned long long)zs, (unsigned long long)fixes);
+                        }
+                    }
+                    listMode = gs::PartBegin(item.part.get(), sig, key, (std::uint32_t)part.size());
+                }
+            }
             for (std::size_t i = 0; i < part.size(); i++) {
                 const PartKept& kept = part[i];
                 if (i + 2 < part.size()) {
@@ -5868,6 +5945,15 @@ void GsThreadMain()
                         std::memcpy(b.projLimits, pj + 20, 16);
                     }
                     b.quads = w + head;
+                    if (listMode == 2) {   // the renderer gives the part from its list: this batch's numbers alone
+                        gs::PartReplayBatch(w[0], b, (std::uint32_t)i);
+                        const std::uint64_t t1 = NowNs();
+                        Bump(g_replayNs[0], t1 - t0);
+                        t0 = t1;
+                        continue;
+                    }
+                    if (listMode == 1)
+                        gs::PartBatch((std::uint32_t)i);
                     if (prep) {
                         if (!prep->quads[i].empty()) {
                             b.quads = prep->quads[i].data();
@@ -5909,6 +5995,8 @@ void GsThreadMain()
                     t0 = t1;
                 }
             }
+            if (listMode != 0)
+                gs::PartEnd();
         } else if (item.path == 4) {   // a batch (QueueBatch)
             gs::Batch b;
             const std::size_t head = 1 + (sizeof(gs::Batch) + 3) / 4;

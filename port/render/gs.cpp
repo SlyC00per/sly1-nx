@@ -959,8 +959,11 @@ const Draw& RunState(std::uint64_t prim, std::uint32_t type)
     return d;
 }
 
+std::uint64_t g_gathered;   // primitives gathered so far (PartEnd: anything drawn inside a part)
+
 void Gather(std::uint64_t prim, std::uint32_t type)
 {
+    g_gathered++;
     const Draw& d = RunState(prim, type);
     int ofx = d.ofx, ofy = d.ofy & ~15;   // the odd field's half line dropped
     float sw = 1.0f / (16.0f * d.tex.tw), sh = 1.0f / (16.0f * d.tex.th);
@@ -1527,10 +1530,17 @@ void ImageRun(const std::uint32_t* q, std::uint32_t count)
 static std::uint64_t g_lastClutTex = ~0ull, g_lastClutTexclut;
 static std::uint32_t g_lastClutUploads;
 
+namespace {
+bool g_partWatch;                  // a kept part's writes before its first batch being noted (PartBegin)
+std::uint64_t g_partWritten[2];    // which registers (TEX2's not: it writes a part of TEX0)
+}
+
 void Write(std::uint32_t reg, std::uint64_t value)
 {
     // the caller holds the GS (gs::Hold)
     Regs& r = g_regs;
+    if (g_partWatch && reg < 128 && reg != 0x16 && reg != 0x17)
+        g_partWritten[reg >> 6] |= 1ull << (reg & 63);
     // A register written with the value it has changes nothing: the run goes on. (The game's
     // particle packets write TEX0 before each sprite, the same each time, and each write loaded
     // the palette and began the run's state anew: a tenth of the GS thread's work in slow frames
@@ -2197,6 +2207,117 @@ bool DrawBatch(std::uint32_t tagWord1, Batch& batch)
 
 namespace {
 bool (*g_batchSink)(std::uint32_t, const Batch&);
+std::uint64_t g_partGathered;
+std::uint32_t g_partUploads;
+bool g_partOpenNow;
+
+// The registers a part's draws go by, as one number: all of them but what goes with the vertices
+// (RGBAQ, ST, UV, FOG), the transfers' and XYOFFSET (taken by each batch as numbers of its own),
+// and those the part itself writes before its first batch (written: a bit for each register's
+// address), whose values as the part comes are never seen by its draws.
+std::uint64_t StateKey(const std::uint64_t written[2])
+{
+    std::uint64_t h = 0x84222325CBF29CE4ull;
+    auto mix = [&](std::uint32_t reg, std::uint64_t v) {
+        if ((written[reg >> 6] >> (reg & 63)) & 1)
+            v = 0x5EEDull;
+        h = (h ^ v ^ reg) * 0x100000001B3ull;
+        h ^= h >> 29;
+    };
+    const Regs& r = g_regs;
+    mix(0x00, r.prim); mix(0x1B, r.prmode); mix(0x1A, r.prmodecont); mix(0x1C, r.texclut); mix(0x22, r.scanmsk); mix(0x3B, r.texa);
+    mix(0x3D, r.fogcol); mix(0x44, r.dimx); mix(0x45, r.dthe); mix(0x46, r.colclamp); mix(0x49, r.pabe);
+    for (std::uint32_t i = 0; i < 2; i++) {
+        const Context& c = r.ctx[i];
+        mix(0x06 + i, c.tex0); mix(0x08 + i, c.clamp); mix(0x14 + i, c.tex1); mix(0x7E, c.tex2); mix(0x40 + i, c.scissor);
+        mix(0x42 + i, c.alpha); mix(0x47 + i, c.test); mix(0x4A + i, c.fba); mix(0x4C + i, c.frame); mix(0x4E + i, c.zbuf);
+        mix(0x34 + i, c.miptbp1); mix(0x36 + i, c.miptbp2);
+    }
+    return h;
+}
+// Each kept part's writes before its first batch, as last noted, with the part's signature (its
+// address may be another part's later).
+struct PartWrites {
+    std::uint64_t sig = 0, written[2] = {0, 0};
+};
+std::unordered_map<const void*, PartWrites> g_partWrites;
+const void* g_partWatched;
+std::uint64_t g_partWatchedSig;
+
+void PartWatchEnd()
+{
+    if (!g_partWatch)
+        return;
+    g_partWatch = false;
+    PartWrites& w = g_partWrites[g_partWatched];
+    w.sig = g_partWatchedSig;
+    w.written[0] = g_partWritten[0];
+    w.written[1] = g_partWritten[1];
+}
+}
+
+int PartBegin(const void* part, std::uint64_t sig, std::uint64_t key, std::uint32_t batches)
+{
+    Guard lk;
+    g_partOpenNow = false;
+    g_partWatch = false;
+    if (!g_backend || g_rasterise || Surveying() || SoftBatches() || !g_backend->TakesParts())
+        return 0;
+    FlushRun();
+    g_partGathered = g_gathered;
+    g_partUploads = UploadSerial();
+    g_partOpenNow = true;
+    // (SLY1_PART_KEY=item: the item's key alone; =state: the registers' alone: which of them changes, for diagnosis)
+    static const char* const which = std::getenv("SLY1_PART_KEY");
+    // (the registers the part writes before its first batch, as last noted, are left out; noted again now)
+    static const std::uint64_t none[2] = {0, 0};
+    auto known = g_partWrites.find(part);
+    const std::uint64_t* written = known != g_partWrites.end() && known->second.sig == sig ? known->second.written : none;
+    const std::uint64_t state = StateKey(written) * 0x9E3779B97F4A7C15ull;
+    if (g_partWrites.size() > 50000)
+        g_partWrites.clear();
+    g_partWatch = true;
+    g_partWritten[0] = g_partWritten[1] = 0;
+    g_partWatched = part;
+    g_partWatchedSig = sig;
+    return g_backend->PartBegin(part, which && which[0] == 'i' ? key : which && which[0] == 's' ? state : key ^ state, batches);
+}
+
+void PartBatch(std::uint32_t index)
+{
+    PartWatchEnd();
+    if (g_backend && g_partOpenNow)
+        g_backend->PartBatch(index);
+}
+
+bool PartReplayBatch(std::uint32_t tagWord1, Batch& batch, std::uint32_t index)
+{
+    Guard lk;
+    PartWatchEnd();
+    if (!g_backend)
+        return false;
+    if ((tagWord1 >> 14) & 1)   // PRE: the tag sets PRIM
+        Write(0x00, (tagWord1 >> 15) & 0x7FF);
+    if ((g_regs.prim & 7) != 4)
+        return false;
+    const Draw d = DrawOf(g_regs.prim);
+    if (!d.iip || d.fst)
+        return false;
+    batch.ofx = d.ofx;
+    batch.ofy = d.ofy & ~15;
+    g_queued = 0;
+    g_backend->PartParams(index, batch);
+    return true;
+}
+
+void PartEnd()
+{
+    Guard lk;
+    g_partWatch = false;
+    if (!g_backend || !g_partOpenNow)
+        return;
+    g_partOpenNow = false;
+    g_backend->PartEnd(g_gathered == g_partGathered && UploadSerial() == g_partUploads);
 }
 void SetBatchSink(bool (*sink)(std::uint32_t, const Batch&)) { g_batchSink = sink; }
 void KeptAhead(std::uint64_t keep)

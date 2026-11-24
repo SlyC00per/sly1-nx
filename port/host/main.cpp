@@ -29,6 +29,7 @@ namespace port { inline void CheckDevTable(const char*) {} }
 #include <string>
 #include <thread>
 #include <set>
+#include <unordered_map>
 #include <vector>
 
 #include <pthread.h>
@@ -884,6 +885,42 @@ int main(int argc, char** argv)
                     hash = (hash ^ b[k]) * 1099511628211ull;
             }
             bool TakesBatches() const override { static const bool on = std::getenv("SLY1_GS_COUNT_BATCHES") != nullptr; return on; }
+            // SLY1_GS_COUNT_PARTS=1: kept parts taken as the Switch's renderer takes them into lists
+            // (gpu.cpp's PartBegin), counted: given again when a part comes with a key it came with
+            // before, kept otherwise; how many parts and batches a frame each way
+            struct PartKeys {
+                std::uint64_t key[2] = {0, 0};
+                int next = 0;
+            };
+            std::unordered_map<const void*, PartKeys> partKeys;
+            std::uint64_t partsFirst = 0, partsGiven = 0, partsRecorded = 0, partsUnclean = 0, partBatchesGiven = 0, partsOffered = 0;
+            int partMode = 0;
+            const void* partNow = nullptr;
+            bool TakesParts() const override { static const bool on = std::getenv("SLY1_GS_COUNT_PARTS") != nullptr; return on; }
+            int PartBegin(const void* part, std::uint64_t key, std::uint32_t) override
+            {
+                partsOffered++;
+                PartKeys& k = partKeys[part];
+                partNow = part;
+                if (key != 0 && (k.key[0] == key || k.key[1] == key)) {
+                    partsGiven++;
+                    return partMode = 2;
+                }
+                partsFirst += k.key[0] == 0 && k.key[1] == 0;
+                k.key[k.next] = key;
+                k.next ^= 1;
+                partsRecorded++;
+                return partMode = 1;
+            }
+            void PartParams(std::uint32_t, const port::gs::Batch&) override { partBatchesGiven++; }
+            void PartEnd(bool clean) override
+            {
+                if (!clean) {
+                    partsUnclean++;
+                    partKeys.erase(partNow);
+                }
+                partMode = 0;
+            }
             // SLY1_GS_LIST=N: frame N's runs and batches, with their depth test and depths
             long listAt = std::getenv("SLY1_GS_LIST") ? std::atol(std::getenv("SLY1_GS_LIST")) : -1;
             void List(const char* what, const port::gs::DrawState& s, std::size_t n, double zmin, double zmax)
@@ -1107,6 +1144,14 @@ int main(int argc, char** argv)
                     std::fprintf(stderr, "gs count: %llu frames, %llu runs, %llu vertices, %llu indices, all drawn hashed %016llX\n",
                                  (unsigned long long)frames, (unsigned long long)runs, (unsigned long long)vertices,
                                  (unsigned long long)indices, (unsigned long long)hash);
+                if (TakesParts() && (frames % 120) == 0) {   // SLY1_GS_COUNT_PARTS: a line each 120 frames
+                    static std::uint64_t was[6];
+                    const std::uint64_t is[6] = {partsOffered, partsGiven, partsRecorded, partsUnclean, partBatchesGiven, partsFirst};
+                    std::fprintf(stderr, "partlists: to %llu, a frame: parts offered %.1f, given again %.1f (%.0f batches), kept anew %.1f (first seen %.1f), not clean %.2f\n",
+                                 (unsigned long long)frames, (is[0] - was[0]) / 120.0, (is[1] - was[1]) / 120.0, (is[4] - was[4]) / 120.0, (is[2] - was[2]) / 120.0,
+                                 (is[5] - was[5]) / 120.0, (is[3] - was[3]) / 120.0);
+                    std::memcpy(was, is, sizeof was);
+                }
             }
         };
         static Counting counting;

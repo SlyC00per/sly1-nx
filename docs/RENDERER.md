@@ -1782,3 +1782,55 @@ Run 16, every part hashed (`SLY1_HASH_SKIP=0`), the rest as default, the same st
 264 windows in 3D at 60 against run 15's 92% of 80 with both on, 94 late frames per 100 windows
 against 85, the helper's job 340 against 333 us. Two runs on routes that differ: the skipping of
 hashes stays on, with no more than a small gain seen.
+
+## A kept part's commands kept (2026-11-24)
+
+The first step of drawing model parts natively (the decision of 2026-11-21: a native draw path for
+the parts, measured against the translation). In the Switch's late frames held up by the GS
+thread, drawing kept parts again was 9.5 to 11 ms of its 17.5: each batch of each part went through
+the GS's run state (`RunState`, `Begin`, the texture's lookup), then the renderer's (`DrawBatch`,
+`Layer`, `Submit`: blend, tests, fog, scissor, the texture's binding, the batch's numbers, the
+streams, one or two draws), the same every frame but for the part's numbers.
+
+Now (`SLY1_GPU_PART_LISTS=1`, or `=ab` on and off in turn; off by default until measured on the
+Switch) a kept part's commands are kept as a deko3d command list of its own:
+
+- **Recording.** The first time a part comes with a key (below), its batches are drawn as ever,
+  but into a command buffer of its own (`listCmd_`), from a state where nothing is taken as bound
+  (`ResetTracking`), and each batch's numbers are bound from a slot of their own (256 bytes each in
+  `paramMem_`) instead of being pushed into the one buffer. At its end the slots are filled for this
+  frame (`dkCmdBufPushConstants`, in order with the draws) and the list is called from the frame's
+  list (`dkCmdBufCallList`). A recording that met anything a list cannot hold (a run of the GS's,
+  vertices or colours of this frame, a small target, the effects' picture, DATE, a texture decoded,
+  commands sent, more than 256 slots, anything else drawn or uploaded meanwhile) is called this
+  once and not kept; the part is tried again after 240 frames, then less often.
+- **Giving again.** While the key is the same and the list's textures are what they were (looked
+  at again only when anything has been uploaded since: their pages' generation, decoded again in
+  place where it changed, the same texture with the same alpha range), the part's batches do not go
+  through the GS's run state nor the renderer's: `gs::PartReplayBatch` takes each batch's tag (PRIM)
+  and XYOFFSET as `DrawBatch` would, the renderer makes the batch's numbers (`MakeBatchParams`, the
+  arithmetic `BindSource` had), pushes them into the slots and calls the list. The part's register
+  writes are made as ever (the GS's state, its palettes, are what they would be).
+- **The key** is the item's (the part's batches' keeps, the TEX0 writes put right, the viewport's
+  depths, the alpha's scale where a batch takes it), the registers' as the part comes (but those
+  the part writes before its first batch, noted the first time: their values as it comes are never
+  seen), the image's size (dynamic resolution) and the faces dropped. A part keeps two lists, one
+  for each frame buffer (FRAME differs). Every list is forgotten when the textures' cache, the kept
+  batches' memory or the lists' own memory (24 MB, a reserve of 4) is made anew.
+- **What is never offered**: a part with a lit, swaying, skinned or projected batch, one the helper
+  made anything of this frame, one fading (an alpha's scale other than 1).
+
+Measured on the Mac with a stand-in for the renderer (`SLY1_GS_COUNT_PARTS=1`: kept when a key is
+new, given again when it is not), A Stealthy Approach's tour: of the 180 to 190 parts drawn again a
+frame, 93 to 148 offered, 84 to 138 given again (700 to 1,200 batches a frame that no longer go
+through the GS's and the renderer's state), 4 to 13 kept anew (2 to 4 of them parts never seen).
+The alpha's scale in every key made 10% of the parts' frames new keys (`SLY1_PART_KEY_WHY=1`).
+
+Not yet run on a GPU. Ryujinx shows no frame of the current build in two minutes, with the lists
+on and with them off alike (the program starts, the level's load never ends): the emulator cannot
+check it, the Switch must. For that, `SLY1_GPU_PART_LISTS=check`: every part that could be given
+from its list is recorded again instead, and the two recordings' signatures compared: everything
+the commands are made from, draw by draw (each draw's state, its streams' places, the decisions
+taken for it, its textures' places and alpha ranges, its depths, the image's size). `perflists:`
+counts them ("checked the same", "otherwise"), and `partcheck:` names the first parts drawn
+otherwise. The same means a list given would have drawn exactly what the batches drew.
