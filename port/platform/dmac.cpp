@@ -414,6 +414,7 @@ struct PrepTask {
     std::uint64_t begunAt = 0;
 };
 std::vector<PrepTask*> g_prepFree;
+std::atomic<std::uint64_t> g_prepTasksMade, g_partJobsMade, g_jobsTrimmed;   // (MemoryReport)
 std::mutex g_prepFreeLock;
 constexpr std::uint32_t kListPreps = 2048;
 std::shared_ptr<PrepTask> g_preps[kListPreps];
@@ -444,6 +445,7 @@ std::shared_ptr<PrepTask> PrepNew()
     }
     if (!t)
         t = new PrepTask;
+        g_prepTasksMade++;
     t->state.store(0, std::memory_order_relaxed);
     t->begunAt = 0;
     return std::shared_ptr<PrepTask>(t, [](PrepTask* x) {
@@ -4805,6 +4807,7 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
         }
     }
     if (!job) {
+        g_partJobsMade++;
         job.reset(new PartJob, back);
         job->gen.fetch_add(1, std::memory_order_seq_cst);
     }
@@ -4827,6 +4830,26 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
     job->before = g_callRegs;
     job->after = jobAfter;
     job->out.used = 0;
+    {   // Its items' buffers, as many and as large as any run of it gave (a run's are swapped in
+        // from the thread that ran it): those past 128 KB in all let go. Kept whole, the 800 jobs'
+        // buffers grew with each level met, 100 to 300 MB at each change of level, until the
+        // Switch's heap ran out (Ryujinx's tour of the levels, at the 39th).
+        // SLY1_JOB_TRIM_KB: the limit (0: none).
+        static const std::size_t limit = std::getenv("SLY1_JOB_TRIM_KB") ? (std::size_t)std::atol(std::getenv("SLY1_JOB_TRIM_KB")) * 256 : (32u << 10);
+        if (limit != 0) {
+            std::size_t words = 0;
+            bool trimmed = false;
+            for (GsItem& it : job->out.items) {
+                words += it.words.capacity();
+                if (words > limit && it.words.capacity() != 0) {
+                    std::vector<std::uint32_t>().swap(it.words);
+                    trimmed = true;
+                }
+            }
+            if (trimmed)
+                g_jobsTrimmed++;
+        }
+    }
     job->given.store(false, std::memory_order_release);
     job->begunAt = 0;
     job->state.store(0, std::memory_order_release);
@@ -5153,6 +5176,11 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
         g_partWords -= std::min<std::uint64_t>(g_partWords, r->words);
         r->words = 0;
         r->keys = 0;   // the renderer never saw them
+        // (nor is anything drawn from them: let go. Held, they were in no count and no record let go
+        // for room ever reached them, words being 0: 100 to 450 MB more at each level change, and
+        // Ryujinx's tour of the levels out of memory at the 39th.)
+        g_partGrave.push_back(std::move(r->kept));
+        r->kept.reset();
         r->lockout = std::min<std::uint32_t>(std::max<std::uint32_t>(r->lockout * 2, 30), 960);
         r->notBefore = gs::FramesShown() + r->lockout;   // not tried again at once
     }
@@ -6495,4 +6523,17 @@ void DmacDump()
     }
 }
 
+// What the tables that live from level to level hold (--verify-levels prints it after each level;
+// sizes read without their locks: for a diagnosis).
+void MemoryReport(int level)
+{
+    std::size_t itemsWords = 0, keptParts = 0;
+    for (const auto& kv : g_parts)
+        if (kv.second.kept)
+            keptParts++;
+    (void)itemsWords;
+    std::fprintf(stderr, "memreport: level %d: part records %zu (%zu kept), shapes %zu, jobs made %llu (free %zu), preps made %llu (free %zu), grave %zu+%zu, diff seen %zu, jobs' buffers let go %llu\n", level,
+                 g_parts.size(), keptParts, g_shapeRegs.size(), (unsigned long long)g_partJobsMade.load(), g_jobFree.size(), (unsigned long long)g_prepTasksMade.load(),
+                 g_prepFree.size(), g_partGrave.size(), g_partGraveItems.size(), g_diffSeen.size(), (unsigned long long)g_jobsTrimmed.load());
+}
 }  // namespace port
