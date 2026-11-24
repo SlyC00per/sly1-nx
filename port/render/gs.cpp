@@ -2256,6 +2256,12 @@ void PartWatchEnd()
 }
 }
 
+void BackendMemoryReport(int level)
+{
+    if (g_backend)
+        g_backend->MemoryReport(level);
+}
+
 bool PartsTaken()
 {
     return g_backend && !g_rasterise && g_backend->TakesParts();

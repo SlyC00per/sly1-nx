@@ -357,6 +357,7 @@ public:
     virtual void PartBatch(std::uint32_t) {}
     virtual void PartParams(std::uint32_t, const Batch&) {}
     virtual void PartEnd(bool) {}
+    virtual void MemoryReport(int) {}   // (--verify-levels: what the renderer's tables hold)
 };
 
 // The renderer the GS draws through, or none (the reference drawing, when --dump-fb asks).
@@ -374,6 +375,7 @@ bool DrawBatch(std::uint32_t tagWord1, Batch& batch);
 // 2: a batch's tag taken as DrawBatch takes it (PRIM), its XYOFFSET put in, and the batch given to
 // the renderer's PartParams; false where DrawBatch would draw nothing. PartEnd tells the renderer
 // whether the GS drew anything else meanwhile or had anything uploaded.
+void BackendMemoryReport(int level);
 bool PartsTaken();   // whether the renderer takes kept parts at all now (PartBegin is worth asking)
 int PartBegin(const void* part, std::uint64_t sig, std::uint64_t key, std::uint32_t batches, std::uint32_t flags);
 void PartBatch(std::uint32_t index);

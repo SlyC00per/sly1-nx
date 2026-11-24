@@ -458,6 +458,18 @@ private:
     // this frame's numbers are pushed into its slots and the list is called. SLY1_GPU_PART_LISTS=0:
     // never; =ab: in turn with never, 600 frames each.
     bool TakesParts() const override { return PartListsOn(); }
+    void MemoryReport(int level) override
+    {
+        std::size_t vectors = 0;
+        for (const auto& kv : partLists_)
+            for (const PartList& v : kv.second.variant)
+                vectors += v.slots.capacity() * sizeof(PartSlot) + v.textures.capacity() * sizeof(PartTexture) + v.data.capacity() * sizeof(PartData) + v.keeps.capacity() * 8;
+        std::size_t textureBytes = 0;
+        for (const auto& kv : textures_)
+            textureBytes += sizeof kv.second;
+        std::fprintf(stderr, "gpumem: level %d: part lists %zu (%.1f MB in their vectors), textures %zu, kept batches %zu of %zu slots, kept blocks free %zu, staging %.1f MB\n", level,
+                     partLists_.size(), vectors / 1048576.0, textures_.size(), kept_.used, kept_.slots.size(), keepFree_.size(), staging_.capacity() * 4 / 1048576.0);
+    }
     int PartBegin(const void* part, std::uint64_t key, std::uint32_t batches, std::uint32_t flags) override;
     void PartBatch(std::uint32_t index) override { partBatch_ = index; }
     void PartParams(std::uint32_t index, const gs::Batch& b) override;
