@@ -1878,3 +1878,33 @@ renderer makes of them is the Switch's check (`SLY1_GPU_PART_LISTS=check`).
 instead and the two signatures compared, as the check mode does for every one; a list found other
 than its part's drawing turns the lists off for the rest of the run (`perflists: ... the lists are
 off`), so that a fault the Mac could not show costs a moment, not a run.
+
+## Memory from level to level (2026-11-24)
+
+Ryujinx's tour of all the levels (`--verify-levels`, 600 frames a level, the camera turning, the
+arrival points) ran out of memory: at the 39th, then, as each cause was taken away, at the 28th and
+the 26th (the heap's growth had been hiding behind each other cause). `--verify-levels` now prints,
+after each level, the heap in use and taken (mallinfo on the Switch, malloc_zone_statistics on the
+Mac) and `memreport:` / `gpumem:` (the tables that live from level to level). Four causes, all older
+than the part lists:
+
+- **A part whose keeping was refused kept its items** in its record, in no count and out of reach of
+  the letting go for room. Let go now.
+- **The part jobs' items' buffers only grew** (a run's are swapped in from the thread that ran it).
+  When a job is made anew, those past 128 KB in all are let go (`SLY1_JOB_TRIM_KB`). On the Mac,
+  0.15 ms a frame more on the GS thread and the helper.
+- **The parts' records were never let go**: about 4,000 more a level, 1,472 bytes each. Every 600
+  frames, past 8,000, those not met for 30 s and holding nothing are forgotten.
+- **The spare buffers' stocks kept buffers of any size.** A GIF chain's copy (a texture's upload, half
+  a megabyte) went to the GS thread's stock once drawn, and stayed: 175 MB over eight levels, and
+  newlib's heap in pieces (2 GB taken for 1 GB in use). The stocks take back only buffers of about
+  their own size now.
+
+Found with `cmake -DSLY1_HEAP_PROFILE=ON` (port/switch/heap_profile.cpp: the global new and delete
+replaced, the bytes held counted by the four return addresses above new; build with
+`-fno-omit-frame-pointer` in the release flags for the addresses to be right).
+
+After them, in Ryujinx: 43 levels in the run's 50 minutes, the heap 607 MB at the first and 1,823 MB
+in use (2,041 MB taken) at the 43rd, still growing about 28 MB a level. Left to look at: the stocks
+filling to their limits (the render thread's may hold 64 buffers of up to 4 MB), the kept batches'
+vectors (QueueBatch), the items VU1's kicks give (KickPath1).
