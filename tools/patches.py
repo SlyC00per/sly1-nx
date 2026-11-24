@@ -115,6 +115,31 @@ PATCHES = [
      "        if (n == 0 && crc != 0) {\n            g_checksumMismatch[0] = 1;\n            TriggerScriptEvent(self, 2, 0, 0);\n        }",
      "        /* port: the genuine copy's outcome, no mismatch and no script event (tools/patches.py) */",
      "the placed code checksum covers retail's machine code, which the port does not have"),
+    # SLY1_VAN_LOG=1 (diagnosis): what a driven path follower (the van of the races) is given and
+    # does, twice a second: the stick's magnitude, its top and target speeds, its speed, its pace,
+    # its zone's limit (port::VanLog, kernel.cpp).
+    ("src/main/world.cpp",
+     "        self->targetSpeed = self->maxSpeed * pad->stickMagnitude;\n        if (g_movieChecksumFailed != 0) {",
+     "        self->targetSpeed = self->maxSpeed * pad->stickMagnitude;\n        port::VanLog(pad->stickMagnitude, self->maxSpeed, self->targetSpeed, self->v150.x, self->v150.y, self->v150.z, self->pace, self->activeZone ? self->activeZone->maxSpeed : -1.0f, self->kind, self->lapsLeft, g_movieChecksumFailed);\n        if (g_movieChecksumFailed != 0) {",
+     "the driven path follower's numbers, for SLY1_VAN_LOG"),
+    # The movie player's record, at retail's address among the other globals, was 12 bytes longer
+    # here than retail's 0x148: its stream's sink is a C++ class with virtual methods, whose hidden
+    # pointer is 8 bytes and aligned to 8 on a 64-bit machine (4 on the PS2), so everything after
+    # it lay 12 further on and the record's last fields lay over the globals after it: `cur` over
+    # g_movieChecksumFailed, `remain` over g_keyedMovieWatched. From the first movie on the
+    # checksum's flag held a pointer: the races' van at four tenths of its speed whatever the
+    # checksum's result ("Burning Rubber", the user, 2026-11-24; SLY1_VAN_LOG showed 1,200 of
+    # 3,000 and the flag 0x248D78). The 20 bytes of padding after the two packets, which nothing
+    # reads, are 8 here: the fields after them and the record's size are retail's again (gen.py's
+    # list of records that differ keeps the two packets, which only this file's code names).
+    ("include/movie_player.h",
+     "    u8 pad11C[0x14];",
+     "    u8 pad11C[0x14 - 0xC];   /* port: the sink before it is 12 bytes longer here (tools/patches.py) */\n    static void port_layout_check();",
+     "the movie player's record at retail's size: its tail off the globals after it"),
+    ("src/main/movie_player.cpp",
+     "void AdvanceCodeChecksum(MoviePlayer* self)\n{",
+     "void MoviePlayer::port_layout_check()\n{\n    static_assert(sizeof(MoviePlayer) == 0x148 && __builtin_offsetof(MoviePlayer, frameSemaphore) == 0x130 && __builtin_offsetof(MoviePlayer, cur) == 0x13C, \"the movie player's record must end where retail's does\");\n}\n\nvoid AdvanceCodeChecksum(MoviePlayer* self)\n{",
+     "the build fails if the movie player's record is not retail's size"),
     # The handler of interrupt cause 5 is retail's address 0x15E6A8, written as an offset from a
     # stripped function's leftover (func_0015E678 + 0x30): the function that begins there.
     ("src/main/render_frame.cpp",

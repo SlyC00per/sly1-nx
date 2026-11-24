@@ -369,6 +369,18 @@ int WideX(int x)
 // the next point where a game thread lets others in.
 std::atomic<void (*)()> g_gameThreadCall{nullptr};
 void LevelLoadNoted();   // (dmac.cpp)
+// SLY1_VAN_LOG=1: a driven path follower's numbers, every 30th call (tools/patches.py, world.cpp's
+// ControlPathFollower).
+void VanLog(float stick, float top, float target, float vx, float vy, float vz, float pace, float zone, int kind, int boosts, int checksum)
+{
+    static const bool on = std::getenv("SLY1_VAN_LOG") != nullptr;
+    static unsigned calls;
+    if (!on || calls++ % 30 != 0)
+        return;
+    std::fprintf(stderr, "van: stick %.3f, top speed %.0f, target %.0f, speed %.0f (%.0f %.0f %.0f), pace %.2f, zone limit %.0f, kind %d, boosts left %d, checksum flag %d\n",
+                 (double)stick, (double)top, (double)target, std::sqrt((double)vx * vx + (double)vy * vy + (double)vz * vz), (double)vx, (double)vy, (double)vz, (double)pace,
+                 (double)zone, kind, boosts, checksum);
+}
 void NoteWorldLoad(int arrivalA, int arrivalB, int flags)
 {
     std::fprintf(stderr, "world: a level load, arrival keys %d %d, flags 0x%X\n", arrivalA, arrivalB, (unsigned)flags);
