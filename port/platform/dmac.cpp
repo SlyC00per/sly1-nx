@@ -1989,6 +1989,7 @@ std::mutex g_renderLock;
 std::condition_variable g_renderWake, g_renderIdle;
 std::deque<RenderItem> g_renderQueue;
 std::vector<std::vector<std::uint32_t>> g_renderSpare;   // emptied items' buffers, for reuse
+constexpr std::size_t kRenderSpareMostWords = 1u << 20;   // (4 MB: a larger one is let go)
 bool g_renderBusy, g_renderWaiting;
 std::atomic<bool> g_renderStarted;
 std::atomic<std::uint64_t> g_renderQueuedWords, g_renderMaxQueued;
@@ -5542,7 +5543,7 @@ void RunDmaChain(std::uint32_t regs, std::uint32_t tadr)
         if (regs == kVif1 && g_interruptScan.Count(item.words.data(), item.words.size()) != 0 && !copyAll) {
             {
                 std::lock_guard<std::mutex> lk(g_renderLock);
-                if (g_renderSpare.size() < 64)
+                if (g_renderSpare.size() < 64 && item.words.capacity() <= kRenderSpareMostWords)
                     g_renderSpare.push_back(std::move(item.words));
             }
             item.words = {};
@@ -5623,8 +5624,11 @@ void GsThreadMain()
             // (A frame has a thousand items and more where much is in sight. With a stock of 256 the
             // render thread ran out each frame and allocated the rest: a third of its work, walking
             // through A Stealthy Approach on the Switch, the allocator's lock among it.)
+            // (a buffer far larger than a stock one is let go: a GIF chain's copy, a texture's upload
+            // of hundreds of kilobytes, came back here and stayed, each level adding its own, 175 MB
+            // over eight levels in Ryujinx, and was then handed out for an item of a few words)
             for (auto& v : emptied)
-                if (g_gsSpare.size() < kGsSpareMost)
+                if (g_gsSpare.size() < kGsSpareMost && v.capacity() <= 4 * kGsSpareWords)
                     g_gsSpare.push_back(std::move(v));
             emptied.clear();
             g_gsBusy = false;
@@ -6477,7 +6481,7 @@ void RenderThreadMain()
         g_renderItems[kind < 3 ? kind : 0]++;
         if (item.words.capacity()) {
             std::lock_guard<std::mutex> lk(g_renderLock);
-            if (g_renderSpare.size() < 64)
+            if (g_renderSpare.size() < 64 && item.words.capacity() <= kRenderSpareMostWords)
                 g_renderSpare.push_back(std::move(item.words));
         }
     }
