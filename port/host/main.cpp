@@ -76,6 +76,7 @@ struct IdentityKey;
 void func_001F0428(IdentityKey*, std::int32_t, std::int32_t);   // the game's StartObjectFade (SLY1_FADE_TO)
 std::int32_t func_001602A0();                 // the game's ComputeCompletionMask (SLY1_COMPLETION)
 std::int32_t func_00160B28(GameProgress*);    // and ComputeCompletionPercent
+std::int32_t func_00160650(GameProgress*);    // ChecksumGameProgress (SLY1_COMPLETION=FILE)
 struct WarpPage;
 void func_001F1590(WarpPage*, int, int);   // the game's SetWarpCursor (SLY1_MAP)
 #include "port/system.h"
@@ -385,8 +386,25 @@ void VerifyLevels()
             waitFor([&] { return word(kFrames) - from >= more; }, 60 + more / 10);
         }
         if (std::getenv("SLY1_COMPLETION")) {
-            // SLY1_COMPLETION=1: the game's own completion mask and percentage for the save as it is
+            // SLY1_COMPLETION=1: the game's own completion mask and percentage for the save as it is;
+            // =FILE: for that save file (0x1A00 bytes), put in the game's progress block first, with
+            // its checksum as ChecksumGameProgress makes it
+            static std::vector<unsigned char> saveFile;
+            if (const char* path = std::getenv("SLY1_COMPLETION"))
+                if (std::FILE* f = std::fopen(path, "rb")) {
+                    saveFile.resize(0x1A00);
+                    if (std::fread(saveFile.data(), 1, 0x1A00, f) != 0x1A00)
+                        saveFile.clear();
+                    std::fclose(f);
+                }
             port::CallOnGameThread([] {
+                if (!saveFile.empty()) {
+                    ::GameProgress* g = (::GameProgress*)port::Native(*(std::uint32_t*)port::Native(0x002623C0));
+                    std::memcpy((void*)g, saveFile.data(), 0x1A00);
+                    std::int32_t stored;
+                    std::memcpy(&stored, saveFile.data() + 8, 4);
+                    std::fprintf(stderr, "completion: the file's checksum %d, the game's %d\n", (int)stored, (int)::func_00160650(g));
+                }
                 std::fprintf(stderr, "completion: mask 0x%X, %d%%\n", (unsigned)::func_001602A0(),
                              (int)::func_00160B28((::GameProgress*)port::Native(*(std::uint32_t*)port::Native(0x002623C0))));
             });
@@ -798,6 +816,15 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "sly1: needs the NTSC-U disc image (--iso)\n");
         return 2;
     }
+#if defined(SLY1_INSTALL_SAVE_SLOT)
+    {   // (cmake -DSLY1_INSTALL_SAVE=FILE [-DSLY1_INSTALL_SLOT=n]: a build that puts that save in the slot
+        // when it starts, the one there backed up first; the file is in the build alone, never the repository)
+        static const unsigned char kInstallSave[] = {
+#include "install_save.inc"
+        };
+        port::InstallSave(SLY1_INSTALL_SAVE_SLOT, kInstallSave, sizeof kInstallSave);
+    }
+#endif
     if (!port::LoadRetailImage()) {
         std::fprintf(stderr, "sly1: the executable does not fit in main memory\n");
         return 1;

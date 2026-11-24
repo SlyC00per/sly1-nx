@@ -167,6 +167,45 @@ void SetSaveFolder(const std::string& path)
     g_root = path;
 }
 
+// A save file put in a slot of the game's (1 to 3) before the game starts: the file there is
+// copied to the backups first (save_backup.cpp), as before any write of the game's. Only into a
+// save folder the game has made (its directory and its other files are left as they are), and
+// only a file of the game's size and type. Written beside and moved into place.
+bool InstallSave(int slot, const unsigned char* data, std::size_t size)
+{
+    std::lock_guard<std::mutex> lk(g_card);
+    const std::string dir = g_root + "/BASCUS-97198YAOTWTD!";
+    const std::string name = "save" + std::to_string(slot);
+    const std::string path = dir + "/" + name, beside = path + ".new";
+    struct stat st;
+    if (slot < 1 || slot > 3 || size != 0x1A00 || data[0] != 0x12 || data[4] != 0x00 || data[5] != 0x1A) {
+        std::fprintf(stderr, "card: install: not a save of the game's (slot %d, %zu bytes)\n", slot, size);
+        return false;
+    }
+    if (stat(dir.c_str(), &st) != 0) {
+        std::fprintf(stderr, "card: install: the game's save folder is not there yet (%s): start the game once first\n", dir.c_str());
+        return false;
+    }
+    const bool copied = BackUpSave(g_root, path, "/BASCUS-97198YAOTWTD!/" + name);
+    std::FILE* f = std::fopen(beside.c_str(), "wb");
+    if (!f || std::fwrite(data, 1, size, f) != size) {
+        if (f)
+            std::fclose(f);
+        std::remove(beside.c_str());
+        std::fprintf(stderr, "card: install: %s could not be written\n", beside.c_str());
+        return false;
+    }
+    std::fclose(f);
+    std::remove(path.c_str());   // (the Switch's FAT does not rename over a file)
+    if (std::rename(beside.c_str(), path.c_str()) != 0) {
+        std::fprintf(stderr, "card: install: %s could not be put in place\n", path.c_str());
+        return false;
+    }
+    std::fprintf(stderr, "card: install: slot %d written (%zu bytes); the save that was there %s\n", slot, size,
+                 copied ? "is in the backups" : "was not copied (none, or the same as the last copy)");
+    return true;
+}
+
 }  // namespace port
 
 using namespace port;

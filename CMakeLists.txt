@@ -67,6 +67,24 @@ target_compile_options(sly1_unit PRIVATE -Wall -Wextra)
 # section 3), into the build folder. The submodule is never changed. Needs Python with the libclang
 # package (venv/ at the root, or the system's); CI builds without it for now (SLY1_BUILD_GAME=OFF).
 option(SLY1_BUILD_GAME "Build the game (needs Python with libclang)" ON)
+# A build that installs a save (-DSLY1_INSTALL_SAVE=FILE, a save file of the game's, 0x1A00 bytes;
+# -DSLY1_INSTALL_SLOT=1..3, 3 when not given): the file's bytes go into the program, which puts
+# them in that slot when it starts (port::InstallSave: the save there is backed up first). For
+# getting a save onto the Switch, whose card nothing else reaches; turn it off again after
+# (-DSLY1_INSTALL_SAVE=). The file never goes into the repository.
+set(SLY1_INSTALL_SAVE "" CACHE FILEPATH "a save file the build installs when it starts")
+set(SLY1_INSTALL_SLOT "3" CACHE STRING "the slot it goes to")
+function(sly1_install_save target)
+    if(SLY1_INSTALL_SAVE)
+        file(READ "${SLY1_INSTALL_SAVE}" hex HEX)
+        string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${hex}")
+        file(WRITE "${CMAKE_BINARY_DIR}/install_save/install_save.inc" "${bytes}\n")
+        target_include_directories(${target} PRIVATE "${CMAKE_BINARY_DIR}/install_save")
+        target_compile_definitions(${target} PRIVATE SLY1_INSTALL_SAVE_SLOT=${SLY1_INSTALL_SLOT})
+        message(STATUS "sly1-nx: this build installs ${SLY1_INSTALL_SAVE} in slot ${SLY1_INSTALL_SLOT}")
+    endif()
+endfunction()
+
 if(SLY1_BUILD_GAME)
 set(SLY1_DECOMP ${CMAKE_SOURCE_DIR}/sly1-decomp)
 set(GEN_DIR ${CMAKE_BINARY_DIR}/gen)
@@ -208,6 +226,7 @@ if(PLATFORM STREQUAL "SWITCH")
     target_link_libraries(port_gpu PRIVATE port_shaders deko3d)
     add_executable(sly1 port/host/main.cpp $<TARGET_OBJECTS:sly1_game>)
     target_include_directories(sly1 PRIVATE port/include)
+    sly1_install_save(sly1)
     target_link_libraries(sly1 PRIVATE port_game_asm port_platform port_gpu port_render port_libm port_core)
     # (diagnosis of the start-up fault: who takes a device out of newlib's table, port/platform/thread.cpp)
     target_link_options(sly1 PRIVATE -Wl,--wrap=RemoveDevice)
@@ -217,6 +236,7 @@ else()
     find_package(Threads REQUIRED)
     add_executable(sly1_headless port/host/main.cpp port/switch/gpu.cpp $<TARGET_OBJECTS:sly1_game>)
     target_include_directories(sly1_headless PRIVATE port/include)
+    sly1_install_save(sly1_headless)
     target_link_libraries(sly1_headless PRIVATE port_game_asm port_platform port_render port_libm port_core Threads::Threads)
 endif()
 endif()  # SLY1_BUILD_GAME
