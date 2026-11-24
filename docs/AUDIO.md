@@ -52,9 +52,16 @@ The game sends commands to two services of the IOP (`port/platform/iop.cpp`):
     sound is played as: 72 would put all of them an octave up (`SLY1_SFX_OCTAVE=1`). Read
     before as a 16-bit rate (17,066 Hz) and as a scale with 22,050 Hz for the commonest value;
   - the kinds themselves (1, 25, 26, 21, 22), read from the sequences the records are made of;
-  - a wait's unit, 1/240 s: with it a record of 0.03 s clicks 10 apart is a rattle, and a
-    one-second creak comes back every 7 to 11 seconds; at 1/60 s the same would be four times
-    as slow;
+  - a wait's unit, 1/120 s (`SLY1_SND_TICK=n`: n a second). It was read as 1/240 s; then the
+    dog of the title world (bank 871394's record 25: a bark of 0.95 s chosen at random, a wait of
+    225 to 245, again) barked back to back, twice in the 1.45 s the game lets it sound, where
+    retail barks once. At 1/120 s the game stops it before a second; 1/60 s would do as well,
+    so the unit is still a reading;
+  - a sample's envelope (+0x12 and +0x14, the SPU's two words), played as the music's are
+    (`Envelope`): 1,306 of the global banks' sample tones have 80FF/9FC0 (no envelope to speak
+    of), the others slow attacks, falling sustains and releases of up to several seconds. A
+    voice the game stops (0x15) goes into its notes' release, as a key let go; before, every
+    sound was cut in a hundredth of a second. `SLY1_SND_ENVELOPE=0`: as before;
   - kind 5, another record of the same bank started (the record at +0x14, a volume of 127 at
     +8; read from all ten in the global banks, each naming a record of its bank). It is how the
     ambient programs are made: bank 871394's record 26 starts a bed (7), a round that starts one
@@ -114,7 +121,14 @@ release was played, linearly, and every note held at full volume until its key w
 Prowling the Grounds several instruments' sustain falls (second words `CE6C`, `CE4C`, `CEED`: an
 exponential fall of about 0.8 s) and their release is exponential, so their notes hung where the
 game has them fade out. A sequence that is stopped still fades its notes in a twentieth of a
-second. `SLY1_SND_ENVELOPE=0`: the release alone, as before; `SLY1_SND_ENV=1` prints each tone's
+second. A note still held when its sequence ends is let go by the next sequence's end of the
+same key (a note over the joint between two sequences: Prowling the Grounds' music has them);
+one still held when that next sequence ends too goes into its release. Before, such notes were
+never let go, and in Prowling the Grounds, Down Home Cooking, A Stealthy Approach and The Unseen
+Foe a looping instrument sounded on and on, more of them the longer a level was played.
+`SLY1_SND_LOG` counts the music's notes and those of no playing sequence; `SLY1_SND_AUDIT=1`
+reports, for each bank loaded, its envelopes, its programs' kinds and any control message of
+its sequences not read (none, over all 46 levels). `SLY1_SND_ENVELOPE=0`: the release alone, as before; `SLY1_SND_ENV=1` prints each tone's
 envelope the first time it sounds.
 
 **Sequences.** The third chunk: a count at +0x17, an offset each from +0x20 (from +0x10), and

@@ -276,6 +276,8 @@ struct Note {
     bool last = false, over = false;
     double phase = 1.0;
     std::int16_t prev = 0, next = 0;
+    Envelope env;            // (a bank's voice's) its tone's envelope
+    bool enveloped = false;
 
     bool Sample(std::int16_t* out)
     {
@@ -326,6 +328,16 @@ struct Voice {
     // stopped with it
     std::vector<std::shared_ptr<Voice>> children;
     float childVolume = 1.0f;   // (a child's) the volume its parent's tone gave it
+    bool keyedOff = false;      // stopped by the game: its notes in their release, its program no further
+
+    void KeyOff()
+    {
+        keyedOff = true;
+        for (Note& n : notes)
+            n.env.KeyOff();
+        for (auto& c : children)
+            c->KeyOff();
+    }
 
     void Mix(std::int32_t* out, int frames, float master)
     {
@@ -335,8 +347,9 @@ struct Voice {
             wait--;
             return;
         }
-        Step(frames);
-        program = pc < tones;
+        if (!keyedOff)
+            Step(frames);
+        program = !keyedOff && pc < tones;
         bool any = program;
         for (Note& n : notes) {
             if (n.over)
@@ -355,7 +368,15 @@ struct Voice {
                 }
                 if (n.over)
                     break;
-                const float v = ((float)n.prev + (float)(n.next - n.prev) * (float)n.phase) * g;
+                float e = 1.0f;
+                if (n.enveloped) {
+                    e = n.env.Next();
+                    if (n.env.phase == Envelope::Off || (n.env.phase == Envelope::Sustain && n.env.level == 0)) {
+                        n.over = true;
+                        break;
+                    }
+                }
+                const float v = ((float)n.prev + (float)(n.next - n.prev) * (float)n.phase) * g * e;
                 out[k * 2] += (std::int32_t)(v * l);
                 out[k * 2 + 1] += (std::int32_t)(v * r);
                 n.phase += step;
@@ -417,6 +438,7 @@ struct Song {
         bool released = false;
         Envelope env;      // the tone's envelope (SLY1_SND_ENVELOPE=0: only its release, linear, as before)
         bool stopped = false;   // its sequence stopped: a twentieth of a second's fade over the envelope
+        bool leftOver = false;  // held when its sequence ended (the next one's end of the key may let it go)
     };
     struct Track {     // a sequence being played
         int index = 0;
@@ -713,10 +735,20 @@ struct Song {
         return 48000.0f * std::pow(2.0f, ((float)key - centre + bend * range) / 12.0f);
     }
 
+    // (a note left by a sequence that has ended, its own end not reached: a sequence goes on with
+    // the next on the same channels, and the next one's end of the key lets it go, as if one)
+    bool Orphan(const Playing& n) const
+    {
+        for (const Track& t : tracks)
+            if (t.id == n.track && !t.done)
+                return false;
+        return true;
+    }
+
     void NoteOff(Track& t, int channel, int key)
     {
         for (Playing& n : notes)
-            if (n.track == t.id && n.channel == channel && n.key == key && !n.released) {
+            if ((n.track == t.id || Orphan(n)) && n.channel == channel && n.key == key && !n.released) {
                 n.env.KeyOff();
                 // the release from the tone's second envelope word: its low five bits a rate, a
                 // step of 8 of 32,768 each 2^(rate - 11) samples (the SPU's linear release)
@@ -802,6 +834,21 @@ struct Song {
             }
         }
         if (t.done) {
+            // Its notes still held: the next sequence's end of the same key lets them go (a note
+            // over the joint); those already left over from a sequence before, which the next did
+            // not let go, go into their release now (they held for ever: a looping instrument
+            // sounded on and on in Down Home Cooking, A Stealthy Approach, The Unseen Foe)
+            for (Playing& n : notes)
+                if (!n.released && n.leftOver) {
+                    n.released = true;
+                    n.env.KeyOff();
+                    const int rate = n.tone[0x0C] & 0x1F;
+                    const float frames = 4096.0f * std::pow(2.0f, (float)(rate - 11));
+                    n.release = 1.0f / (frames < 96.0f ? 96.0f : frames > kRate * 4.0f ? kRate * 4.0f : frames);
+                }
+            for (Playing& n : notes)
+                if (n.track == t.id && !n.released)
+                    n.leftOver = true;
             if (t.next >= 0)
                 starts.push_back(t.next);
             else if (t.ended)
@@ -886,6 +933,107 @@ struct Song {
 };
 
 std::map<std::uint32_t, std::shared_ptr<Song>> g_songs;
+
+// SLY1_SND_AUDIT=1: what each bank holds that the engine might not play as the driver does, a few
+// lines a bank when it is loaded: its tones' envelopes, its programs' kinds, and (a level's bank)
+// every control message of its sequences that the engine cannot read.
+void AuditBank(const std::shared_ptr<Bank>& bank)
+{
+    auto le = [](const std::uint8_t* p) { return (std::int32_t)((std::uint32_t)p[0] | (std::uint32_t)p[1] << 8 | (std::uint32_t)p[2] << 16 | (std::uint32_t)p[3] << 24); };
+    const std::vector<std::uint8_t>& b = bank->block;
+    std::map<std::pair<unsigned, unsigned>, int> envs;
+    std::map<int, int> kinds;
+    if (bank->global) {
+        for (std::uint32_t i = 0; i < bank->tones && bank->toneAt + (std::size_t)(i + 1) * 0x28 <= b.size(); i++) {
+            const std::uint8_t* t = b.data() + bank->toneAt + (std::size_t)i * 0x28;
+            const int kind = le(t);
+            kinds[kind]++;
+            if (kind == 1)
+                envs[{(unsigned)(t[0x12] | t[0x13] << 8), (unsigned)(t[0x14] | t[0x15] << 8)}]++;
+        }
+    } else if (bank->level) {
+        for (std::uint32_t r = 0; r < bank->records && bank->recordAt + (std::size_t)(r + 1) * 8 <= b.size(); r++) {
+            const std::uint8_t* rec = b.data() + bank->recordAt + (std::size_t)r * 8;
+            const std::size_t first = (std::size_t)le(rec + 4);
+            for (int k = 0; k < rec[0] && first + (std::size_t)(k + 1) * 24 <= b.size(); k++) {
+                const std::uint8_t* t = b.data() + first + (std::size_t)k * 24;
+                envs[{(unsigned)(t[0x0A] | t[0x0B] << 8), (unsigned)(t[0x0C] | t[0x0D] << 8)}]++;
+            }
+        }
+    }
+    std::fprintf(stderr, "sndaudit: bank at sector %u (%s): envelopes", bank->sector, bank->global ? "global" : bank->level ? "level" : "other");
+    for (auto& e : envs)
+        std::fprintf(stderr, " %04X/%04X x%d", e.first.first, e.first.second, e.second);
+    if (bank->global) {
+        std::fprintf(stderr, "; kinds");
+        for (auto& k : kinds)
+            std::fprintf(stderr, " %d x%d", k.first, k.second);
+    }
+    std::fprintf(stderr, "\n");
+    if (!bank->level)
+        return;
+    // every sequence's control messages, read and not done (a statement not understood is said)
+    Song song;
+    song.bank = bank;
+    const std::vector<std::uint8_t>& q = bank->sequences;
+    const int count = q.size() > 0x17 ? q[0x17] : 0;
+    int messages = 0, unread = 0;
+    for (int i = 0; i < count; i++) {
+        std::size_t at, end;
+        std::uint32_t tempo, perBeat;
+        if (!song.Sequence(i, &at, &end, &tempo, &perBeat))
+            continue;
+        std::uint8_t status = 0;
+        while (at < end) {
+            while (at < end && (q[at++] & 0x80)) {}   // the delta
+            if (at >= end)
+                break;
+            const std::uint8_t c = q[at];
+            if (c == 0xF0) {
+                std::size_t stop = at + 1;
+                while (stop < end && q[stop] != 0xF7)
+                    stop++;
+                if (at + 2 <= stop && q[at + 1] == 0x75) {
+                    messages++;
+                    const std::uint8_t* p = &q[at + 2];
+                    const std::uint8_t* e = &q[stop];
+                    while (p && p < e) {
+                        if (i == 0 && (*p == 0x0B || *p == 0x0F))   // (the first sequence's blocks and groups)
+                            break;
+                        const std::uint8_t* was = p;
+                        p = song.Statement(p, e, false, nullptr, 0);
+                        if (!p) {
+                            unread++;
+                            std::fprintf(stderr, "sndaudit:   sector %u sequence %d: a statement not read at op %02X (message", bank->sector, i, *was);
+                            for (const std::uint8_t* m = &q[at + 2]; m < e && m < &q[at + 2] + 24; m++)
+                                std::fprintf(stderr, " %02X", *m);
+                            std::fprintf(stderr, ")\n");
+                        }
+                    }
+                }
+                at = stop + 1;
+                continue;
+            }
+            if (c == 0xFF) {
+                if (at + 3 > end)
+                    break;
+                at += 3 + (std::size_t)q[at + 2];
+                continue;
+            }
+            if (c >= 0x80) {
+                status = c;
+                at++;
+            }
+            const int kind = status >> 4;
+            if (kind < 8) {
+                std::fprintf(stderr, "sndaudit:   sector %u sequence %d: an event not read (%02X)\n", bank->sector, i, c);
+                break;
+            }
+            at += kind == 0xC || kind == 0xD ? 1 : 2;
+        }
+    }
+    std::fprintf(stderr, "sndaudit: sector %u: %d sequences, %d control messages, %d statements not read\n", bank->sector, count, messages, unread);
+}
 
 // ---------------------------------------------------------------------------------------------
 // A movie's sound (docs/VIDEO.md). The game asks the driver for a ring buffer in the IOP's
@@ -1011,16 +1159,28 @@ void MixChunk(std::int16_t* out)
             else
                 sounding++;
             // stopped by the game (it asks no more about it), or over and not asked about for five seconds
-            if (v.over && (v.gainStep != 0.0f || v.overFor > 500))
+            if (v.over && (v.gainStep != 0.0f || v.keyedOff || v.overFor > 500))
                 it = g_voices.erase(it);
             else
                 ++it;
         }
         static const bool log = std::getenv("SLY1_SND_LOG") != nullptr;
         static int chunks;
-        if (log && ++chunks % 500 == 0)
-            std::fprintf(stderr, "sndlog: %d voices sounding of %zu held, %zu streams; %llu started so far\n", sounding, g_voices.size(), g_streams.size(),
-                         (unsigned long long)g_voicesStarted);
+        if (log && ++chunks % 500 == 0) {
+            std::size_t notes = 0, orphans = 0, tracks = 0;   // the music's notes, and those of no playing sequence
+            for (auto& kv : g_songs) {
+                tracks += kv.second->tracks.size();
+                for (auto& n : kv.second->notes) {
+                    notes++;
+                    bool mine = false;
+                    for (auto& t : kv.second->tracks)
+                        mine = mine || t.id == n.track;
+                    orphans += mine ? 0 : 1;
+                }
+            }
+            std::fprintf(stderr, "sndlog: %d voices sounding of %zu held, %zu streams; %llu started so far; music: %zu sequences, %zu notes, %zu of no sequence\n", sounding, g_voices.size(), g_streams.size(),
+                         (unsigned long long)g_voicesStarted, tracks, notes, orphans);
+        }
     }
     for (int k = 0; k < kChunk * 2; k++)
         out[k] = (std::int16_t)(sum[k] < -32768 ? -32768 : sum[k] > 32767 ? 32767 : sum[k]);
@@ -1177,6 +1337,8 @@ std::uint32_t LoadBank(std::uint32_t sector)
     std::lock_guard<std::mutex> lk(g_lock);
     const std::uint32_t handle = g_nextBank++;
     g_banks[handle] = bank;
+    if (std::getenv("SLY1_SND_AUDIT"))
+        AuditBank(bank);
     if (std::getenv("SLY1_SND_KINDS") && bank->global) {   // every record's program, a line each (reading the tones' kinds)
         auto le = [](const std::uint8_t* p) { return (std::int32_t)((std::uint32_t)p[0] | (std::uint32_t)p[1] << 8 | (std::uint32_t)p[2] << 16 | (std::uint32_t)p[3] << 24); };
         for (std::uint32_t r = 0; r < bank->records && bank->recordAt + (r + 1) * 12 <= bank->block.size(); r++) {
@@ -1267,7 +1429,22 @@ void Voice::Play(const std::uint8_t* tone)
     note.at = (std::uint32_t)tone[0x18] | (std::uint32_t)tone[0x19] << 8 | (std::uint32_t)tone[0x1A] << 16 | (std::uint32_t)tone[0x1B] << 24;
     note.volume = recordVolume * (tone[9] > 127 ? 1.0f : (float)tone[9] / 127.0f);
     note.rate = ToneRate(tone);
+    {   // its envelope (+0x12 and +0x14, the SPU's two words; SLY1_SND_ENVELOPE=0: none)
+        static const bool off = std::getenv("SLY1_SND_ENVELOPE") && std::getenv("SLY1_SND_ENVELOPE")[0] == '0';
+        note.enveloped = !off;
+        note.env.Start((std::uint16_t)(tone[0x12] | tone[0x13] << 8), (std::uint16_t)(tone[0x14] | tone[0x15] << 8));
+    }
     notes.push_back(note);
+}
+
+// A wait's unit (kind 26): 120ths of a second. Read as 240ths before, a dog's barks (bank 871394's
+// record 25: a bark of 0.95 s chosen at random, a wait of 225 to 245, again) came back to back,
+// two in the 1.45 s the game lets it sound, where retail barks once; at 120ths the game stops it
+// before a second. Not measured: 60ths would do as well for the dog. SLY1_SND_TICK=n: n a second.
+int WaitTicksPerSecond()
+{
+    static const int n = std::getenv("SLY1_SND_TICK") && std::atoi(std::getenv("SLY1_SND_TICK")) > 0 ? std::atoi(std::getenv("SLY1_SND_TICK")) : 120;
+    return n;
 }
 
 void Voice::Step(int frames)
@@ -1309,7 +1486,7 @@ void Voice::Step(int frames)
         } else if (kind == 26) {
             const std::int32_t base = word(t + 8), more = word(t + 4);
             const std::int32_t ticks = (base > 0 ? base : 0) + (more > 0 ? (std::int32_t)random((std::uint32_t)more + 1) : 0);
-            waitFrames += (std::int32_t)((std::int64_t)ticks * kRate / 240);
+            waitFrames += (std::int32_t)((std::int64_t)ticks * kRate / WaitTicksPerSecond());
         } else if (kind == 25) {   // one of the next n: a sample, or a record started
             const std::uint32_t n = t[8] | t[9] << 8;
             if (n >= 1 && pc + n <= tones) {
@@ -1328,7 +1505,7 @@ void Voice::Step(int frames)
             if (loopPc >= 0) {
                 pc = (std::uint32_t)loopPc;
                 if (waitFrames <= 0)
-                    waitFrames = kRate / 240;   // (a round with no wait in it)
+                    waitFrames = kRate / WaitTicksPerSecond();   // (a round with no wait in it)
             }
         }
     }
@@ -1466,8 +1643,8 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
                                     break;
                                 }
                             }
-                            std::fprintf(stderr, " [1 note %d fine %u %.0f Hz at %u: %u frames, %u loop starts (%d..%u), end %X]", -(std::int8_t)t[10], t[11], (double)ToneRate(t), at, frames, starts,
-                                         firstStart == ~0u ? -1 : (int)firstStart, lastStart, endFlags);
+                            std::fprintf(stderr, " [1 note %d fine %u %.0f Hz at %u: %u frames, %u loop starts (%d..%u), end %X, envelope %04X/%04X]", -(std::int8_t)t[10], t[11], (double)ToneRate(t), at, frames, starts,
+                                         firstStart == ~0u ? -1 : (int)firstStart, lastStart, endFlags, (unsigned)(t[0x12] | t[0x13] << 8), (unsigned)(t[0x14] | t[0x15] << 8));
                         }
                         else {
                             std::fprintf(stderr, " [%d:", kind);
@@ -1538,11 +1715,17 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
         if (g_songs.count(a))
             g_songs[a]->paused = false;
         return 0;
-    case 0x15:   // a voice stopped: a bank's over a hundredth of a second, with no click
+    case 0x15:   // a voice stopped: a bank's notes go into their envelopes' release (the key let go);
+                 // SLY1_SND_ENVELOPE=0: over a hundredth of a second, with no click
         g_streams.erase(a);
         g_songs.erase(a);
-        if (g_voices.count(a))
-            g_voices[a]->gainStep = 1.0f / (kRate * 0.01f);
+        if (g_voices.count(a)) {
+            static const bool off = std::getenv("SLY1_SND_ENVELOPE") && std::getenv("SLY1_SND_ENVELOPE")[0] == '0';
+            if (off)
+                g_voices[a]->gainStep = 1.0f / (kRate * 0.01f);
+            else
+                g_voices[a]->KeyOff();
+        }
         return 0;
     case 0x16:   // voices suspended by mask, and resumed: all of them
         for (auto& kv : g_streams)
