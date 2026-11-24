@@ -97,6 +97,15 @@ PATCHES = [
      "        D_00275C34 = 1;",
      "        /* port: the genuine copy's outcome, the flag stays 0 (tools/patches.py) */",
      "the memory checksum covers retail's code and data addresses, which the port does not have"),
+    # The third of them: a CRC over the code from 0x100010, advanced four bytes at a time while a
+    # movie plays (AdvanceCodeChecksum). It began to run when the port's movies did (2026-11-19) and
+    # failed at the end of its range: with its flag set the van of the races drives at four tenths
+    # of its speed (ControlPathFollower, world.cpp: "Burning Rubber", the user, 2026-11-24) and a
+    # turret's aim is refused (tint_blend_collider.cpp).
+    ("src/main/movie_player.cpp",
+     "            g_movieChecksumFailed = 1;",
+     "            /* port: the genuine copy's outcome, the flag stays 0 (tools/patches.py) */",
+     "the movie-time code checksum covers retail's machine code, which the port does not have"),
     # The handler of interrupt cause 5 is retail's address 0x15E6A8, written as an offset from a
     # stripped function's leftover (func_0015E678 + 0x30): the function that begins there.
     ("src/main/render_frame.cpp",
