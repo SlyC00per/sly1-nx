@@ -1845,3 +1845,13 @@ the commands are made from, draw by draw (each draw's state, its streams' places
 taken for it, its textures' places and alpha ranges, its depths, the image's size). `perflists:`
 counts them ("checked the same", "otherwise"), and `partcheck:` names the first parts drawn
 otherwise. The same means a list given would have drawn exactly what the batches drew.
+
+**Memory.** Lists are recorded into twelve chunks of command memory, each a command buffer of its
+own; a chunk is cleared once every list in it is let go and the GPU has done with them (three frames:
+the sets of the frame's memory), and with none to clear, the chunk with the fewest lists alive has
+them let go (their parts are recorded again as they come). A list's slots and its data are blocks
+taken from their memory and given back when the list is let go, free again three frames after.
+A list is let go when it is found stale, when its part is recorded anew, and when a kept batch of
+its is let go (each list notes its batches' keeps and finds them still kept before it is given).
+`perflists` gives the lists alive, those let go, the chunks emptied, the recordings with no room, and
+the slots' and data's memory free.

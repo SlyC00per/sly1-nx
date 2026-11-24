@@ -481,10 +481,102 @@ private:
         std::uint8_t alphaMin, alphaMax;
         gs::DrawState s;
     };
+    // Blocks of a memory block given out and taken back: first fit; a block given back is free again
+    // once the GPU has done with the frames that may have read it (Settle, kSets frames after).
+    struct Blocks {
+        struct Free {
+            std::uint32_t at, size;
+        };
+        struct Late {
+            std::uint32_t at, size;
+            std::uint64_t frame;
+        };
+        std::vector<Free> free;   // (in order of their places)
+        std::deque<Late> late;
+        void Init(std::uint32_t total)
+        {
+            free.assign(1, Free{0, total});
+            late.clear();
+        }
+        bool Take(std::uint32_t size, std::uint32_t align, std::uint32_t* at)
+        {
+            for (std::size_t i = 0; i < free.size(); i++) {
+                Free& f = free[i];
+                const std::uint32_t a = (f.at + align - 1) / align * align, end = f.at + f.size;
+                if (a + size > end)
+                    continue;
+                const std::uint32_t before = a - f.at, after = end - (a + size);
+                if (before && after) {
+                    f.size = before;
+                    free.insert(free.begin() + (std::ptrdiff_t)i + 1, Free{a + size, after});
+                } else if (before) {
+                    f.size = before;
+                } else if (after) {
+                    f.at = a + size;
+                    f.size = after;
+                } else {
+                    free.erase(free.begin() + (std::ptrdiff_t)i);
+                }
+                *at = a;
+                return true;
+            }
+            return false;
+        }
+        void Give(std::uint32_t at, std::uint32_t size, std::uint64_t frame)
+        {
+            if (size)
+                late.push_back(Late{at, size, frame});
+        }
+        void Settle(std::uint64_t now)
+        {
+            while (!late.empty() && late.front().frame + kSets <= now) {
+                Insert(late.front().at, late.front().size);
+                late.pop_front();
+            }
+        }
+        void Insert(std::uint32_t at, std::uint32_t size)
+        {
+            std::size_t i = 0;
+            while (i < free.size() && free[i].at < at)
+                i++;
+            free.insert(free.begin() + (std::ptrdiff_t)i, Free{at, size});
+            if (i + 1 < free.size() && free[i].at + free[i].size == free[i + 1].at) {   // (joined with the next)
+                free[i].size += free[i + 1].size;
+                free.erase(free.begin() + (std::ptrdiff_t)i + 1);
+            }
+            if (i > 0 && free[i - 1].at + free[i - 1].size == free[i].at) {   // (and with the one before)
+                free[i - 1].size += free[i].size;
+                free.erase(free.begin() + (std::ptrdiff_t)i);
+            }
+        }
+    };
+    Blocks paramBlocks_, dataBlocks_;
+    // The lists' command memory in chunks, each a command buffer of its own: lists are recorded into
+    // the chunk in hand until it is near full; a chunk is cleared once every list in it is let go and
+    // the GPU has done with them. With none free, the one with the fewest lists alive has them let go
+    // (their parts are recorded again when they come).
+    static constexpr int kChunks = 12;
+    static constexpr std::uint32_t kChunkReserve = 192u << 10;
+    struct Chunk {
+        DkCmdBuf cmd = nullptr;
+        std::uint32_t at = 0, size = 0, estimate = 0;
+        int live = 0;
+        std::uint64_t lastUse = 0;
+        bool over = false;   // (it went into its reserve)
+        Renderer* owner = nullptr;
+    };
+    Chunk chunks_[kChunks];
+    int chunk_ = 0;
+    bool ChunkFor(std::uint32_t estimate);
+    struct PartList;
+    void KillList(PartList& l);
+    std::uint64_t partKills_ = 0, partChunkRetires_ = 0, partNoRoom_ = 0;
     struct PartList {
         std::uint64_t key = 0, epoch = 0, used = 0;   // used: the frame it was last given
         DkCmdList list = 0;
-        std::uint32_t paramAt = 0;
+        int chunk = -1;
+        std::uint32_t paramAt = 0, paramSize = 0;
+        std::vector<std::uint64_t> keeps;   // its kept batches (Batch::keep): all still kept, or the list is stale
         std::vector<PartSlot> slots;
         std::vector<PartTexture> textures;
         std::uint32_t uploads = 0;   // gs::UploadSerial() when its textures were last found the same
@@ -782,22 +874,35 @@ bool Renderer::Create()
         listMem_ = Block(kListMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
         paramMem_ = Block(kParamMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
         listData_ = Block(kListData, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
-        if (listMem_ && paramMem_) {
-            DkCmdBufMaker listMaker;
-            dkCmdBufMakerDefaults(&listMaker, device_);
-            listMaker.userData = this;
-            // (out of room: the reserve given, so that the list in hand can be ended; all of them made
-            // anew at the next present)
-            listMaker.cbAddMem = [](void* user, DkCmdBuf cmdbuf, std::size_t) {
-                Renderer* r = static_cast<Renderer*>(user);
-                if (!r->listFull_) {
-                    r->listFull_ = true;
-                    dkCmdBufAddMemory(cmdbuf, r->listMem_, kListMemory - kListReserve, kListReserve);
+        paramBlocks_.Init(kParamMemory);
+        dataBlocks_.Init(kListData);
+        if (listMem_ && paramMem_ && listData_) {
+            bool all = true;
+            for (int i = 0; i < kChunks; i++) {
+                Chunk& c = chunks_[i];
+                c.owner = this;
+                c.size = (kListMemory / kChunks) & ~(DK_CMDMEM_ALIGNMENT * 64 - 1);
+                c.at = c.size * (std::uint32_t)i;
+                DkCmdBufMaker listMaker;
+                dkCmdBufMakerDefaults(&listMaker, device_);
+                listMaker.userData = &c;
+                // (out of room: the chunk's reserve given, so that the list in hand can be ended; no
+                // list is recorded into it again until it is cleared)
+                listMaker.cbAddMem = [](void* user, DkCmdBuf cmdbuf, std::size_t) {
+                    Chunk* c = static_cast<Chunk*>(user);
+                    if (!c->over) {
+                        c->over = true;
+                        dkCmdBufAddMemory(cmdbuf, c->owner->listMem_, c->at + c->size - kChunkReserve, kChunkReserve);
+                    }
+                };
+                c.cmd = dkCmdBufCreate(&listMaker);
+                if (!c.cmd) {
+                    all = false;
+                    break;
                 }
-            };
-            listCmd_ = dkCmdBufCreate(&listMaker);
-            if (listCmd_)
-                dkCmdBufAddMemory(listCmd_, listMem_, 0, kListMemory - kListReserve);
+                dkCmdBufAddMemory(c.cmd, listMem_, c.at, c.size - kChunkReserve);
+            }
+            listCmd_ = all ? chunks_[0].cmd : nullptr;   // (lists are recorded at all)
         }
     }
     if (!queue_ || !swapchain_ || !imageMem_ || !dataMem_ || !textureMem_ || !frameMem_ || !commandMem_ || !cmd_)
@@ -1866,13 +1971,26 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
             src.doubled = &it->doubled;
             // (a part being recorded: this frame's vertices and colours in the list's own data, which a
             // list given again has written anew: PartEnd)
-            const bool toList = partMode_ == 1 && listData_ && dataUsed_ + b.count * 48 + 64 <= kListData;
+            std::uint32_t vertexAt = 0, colourAt = 0;
+            const bool moved = b.swayMoved || b.skinMoved;
+            bool toList = false;
+            if (partMode_ == 1 && listData_ && (moved || litColours)) {
+                const bool vertexOk = !moved || dataBlocks_.Take(b.count * 32, 64, &vertexAt);
+                const bool colourOk = !litColours || dataBlocks_.Take(b.count * 16, 64, &colourAt);
+                toList = vertexOk && colourOk;
+                if (!toList && moved && vertexOk)   // (the one had and not the other: given back)
+                    dataBlocks_.Give(vertexAt, b.count * 32, 0);
+                if (!toList && litColours && colourOk)
+                    dataBlocks_.Give(colourAt, b.count * 16, 0);
+            }
+            if (partMode_ == 1)
+                partList_->keeps.push_back(b.keep);
             if (partMode_ == 1 && !toList && (b.swayMoved || b.skinMoved || litColours) && !partBad_) {
                 partBad_ = true;
                 partWhy_ = "lists' data full";
             }
-            if (toList && (b.swayMoved || b.skinMoved)) {
-                const std::uint32_t at = Align(dataUsed_, 64);
+            if (toList && moved) {
+                const std::uint32_t at = vertexAt;
                 std::uint8_t* out = static_cast<std::uint8_t*>(dkMemBlockGetCpuAddr(listData_)) + at;
                 const std::uint32_t step = b.stride * 4;
                 for (std::uint32_t v = 0; v < b.count; v++, out += 32) {
@@ -1883,7 +2001,6 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
                 src.vertexAt = at;
                 src.vertexBase = dkMemBlockGetGpuAddr(listData_);
                 partList_->data.push_back({partBatch_, 0, at, b.count});
-                dataUsed_ = at + b.count * 32;
             } else if (b.swayMoved || b.skinMoved) {   // its vertices moved (sway, skinning) this frame: positions and STQ in the frame's memory
                 const std::uint32_t bytes = b.count * 32;
                 if (frameUsed_ + bytes + 64 > kFrameMemory)
@@ -1902,12 +2019,11 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
                 copiedBytes_ += bytes;
             }
             if (toList && litColours) {
-                const std::uint32_t at = Align(dataUsed_, 64);
+                const std::uint32_t at = colourAt;
                 std::memcpy(static_cast<std::uint8_t*>(dkMemBlockGetCpuAddr(listData_)) + at, litColours, b.count * 16);
                 src.colourAt = at;
                 src.colourBase = dkMemBlockGetGpuAddr(listData_);
                 partList_->data.push_back({partBatch_, 1, at, b.count});
-                dataUsed_ = at + b.count * 16;
             } else if (litColours) {   // its colours in the frame's memory, as a batch not kept has them
                 const std::uint32_t bytes = b.count * 16;
                 if (frameUsed_ + bytes + 64 > kFrameMemory)
@@ -2270,14 +2386,75 @@ bool Renderer::DataFree(int set, std::uint64_t frame)
 // Every list forgotten and their memory used again (the GPU has done with them).
 void Renderer::PartListsReset()
 {
-    dkCmdBufClear(listCmd_);
-    dkCmdBufAddMemory(listCmd_, listMem_, 0, kListMemory - kListReserve);
+    for (Chunk& c : chunks_)
+        if (c.cmd) {
+            dkCmdBufClear(c.cmd);
+            dkCmdBufAddMemory(c.cmd, listMem_, c.at, c.size - kChunkReserve);
+            c.estimate = 0;
+            c.live = 0;
+            c.over = false;
+        }
+    paramBlocks_.Init(kParamMemory);
+    dataBlocks_.Init(kListData);
     listFull_ = false;
-    paramUsed_ = 0;
-    dataUsed_ = 0;
     partLists_.clear();
     partEpoch_++;
     partResets_++;
+}
+
+// A list let go: its chunk has one alive fewer, its slots and data are given back (free once the
+// GPU has done with this frame).
+void Renderer::KillList(PartList& l)
+{
+    if (l.list && l.chunk >= 0)
+        chunks_[l.chunk].live--;
+    if (l.paramSize)
+        paramBlocks_.Give(l.paramAt, l.paramSize, frames_);
+    for (const PartData& d : l.data)
+        dataBlocks_.Give(d.at, d.count * (d.kind ? 16u : 32u), frames_);
+    if (l.list)
+        partKills_++;
+    l.list = 0;
+    l.chunk = -1;
+    l.paramSize = 0;
+    l.data.clear();
+    l.keeps.clear();
+}
+
+// A chunk with room for about estimate bytes of commands made the one in hand: the one in hand, or
+// one cleared whose lists are all let go and done with by the GPU. With none, the chunk with the
+// fewest lists alive has them let go, to be cleared in a few frames, and there is no room now.
+bool Renderer::ChunkFor(std::uint32_t estimate)
+{
+    {
+        const Chunk& c = chunks_[chunk_];
+        if (!c.over && c.estimate + estimate + kChunkReserve <= c.size)
+            return true;
+    }
+    for (int i = 0; i < kChunks; i++) {
+        Chunk& c = chunks_[i];
+        if (c.live == 0 && c.lastUse + kSets <= frames_ && (c.estimate > 0 || c.over || i != chunk_)) {
+            dkCmdBufClear(c.cmd);
+            dkCmdBufAddMemory(c.cmd, listMem_, c.at, c.size - kChunkReserve);
+            c.estimate = 0;
+            c.over = false;
+            chunk_ = i;
+            return estimate + kChunkReserve <= c.size;
+        }
+    }
+    int fewest = -1;
+    for (int i = 0; i < kChunks; i++)
+        if (i != chunk_ && chunks_[i].live > 0 && (fewest < 0 || chunks_[i].live < chunks_[fewest].live))
+            fewest = i;
+    if (fewest >= 0) {
+        for (auto& kv : partLists_)
+            for (PartList& v : kv.second.variant)
+                if (v.list && v.chunk == fewest)
+                    KillList(v);
+        chunks_[fewest].lastUse = frames_;
+        partChunkRetires_++;
+    }
+    return false;
 }
 
 void Renderer::PartNoteTexture(const Texture* texture, const gs::DrawState& s)
@@ -2326,8 +2503,10 @@ int Renderer::PartBegin(const void* part, std::uint64_t key, std::uint32_t batch
             if (same)
                 v.uploads = uploads;
         }
+        for (std::size_t k = 0; same && k < v.keeps.size(); k++)   // (its kept batches all still kept where they were)
+            same = kept_.find(v.keeps[k]) != nullptr;
         if (!same || v.epoch != partEpoch_) {
-            v.list = 0;
+            KillList(v);
             partStale_++;
             break;
         }
@@ -2346,8 +2525,7 @@ int Renderer::PartBegin(const void* part, std::uint64_t key, std::uint32_t batch
         v.used = frames_;
         return 2;
     }
-    if (listFull_ || (!partChecking_ && frames_ < lists.retryAt) || draws_ + 4 * batches + 64 > kMaxDraws || frameUsed_ > kFrameMemory / 2 ||
-        paramUsed_ + 2 * batches * kParamSlot > kParamMemory) {
+    if ((!partChecking_ && frames_ < lists.retryAt) || draws_ + 4 * batches + 64 > kMaxDraws || frameUsed_ > kFrameMemory / 2) {
         partChecking_ = false;
         return 0;
     }
@@ -2356,15 +2534,25 @@ int Renderer::PartBegin(const void* part, std::uint64_t key, std::uint32_t batch
     const bool live0 = lists.variant[0].list && lists.variant[0].epoch == partEpoch_, live1 = lists.variant[1].list && lists.variant[1].epoch == partEpoch_;
     if (live0)
         into = !live1 || lists.variant[1].used < lists.variant[0].used ? &lists.variant[1] : &lists.variant[0];
-    into->list = 0;
+    KillList(*into);
+    // room: command memory in a chunk, slots for twice its batches (a surface drawn apart from its shares takes two)
+    std::uint32_t paramAt = 0;
+    if (!ChunkFor(2 * batches * 2048) || !paramBlocks_.Take(2 * batches * kParamSlot, kParamSlot, &paramAt)) {
+        partChecking_ = false;
+        partNoRoom_++;
+        return 0;
+    }
     into->key = key;
     into->epoch = partEpoch_;
     into->slots.clear();
     into->textures.clear();
     into->data.clear();
+    into->keeps.clear();
     into->set = set_;
     into->frame = frames_;
-    into->paramAt = paramUsed_;
+    into->chunk = chunk_;
+    into->paramAt = paramAt;
+    into->paramSize = 2 * batches * kParamSlot;
     into->uploads = gs::UploadSerial();
     into->used = frames_;
     partMode_ = 1;
@@ -2380,7 +2568,7 @@ int Renderer::PartBegin(const void* part, std::uint64_t key, std::uint32_t batch
     partSig_ = 0xCBF29CE484222325ull;
     partAlphaFree_ = (flags & 1) != 0;
     mainCmd_ = cmd_;
-    cmd_ = listCmd_;
+    cmd_ = chunks_[chunk_].cmd;
     ResetTracking();   // (the list binds all it draws with)
     partRecords_++;
     return 1;
@@ -2402,8 +2590,10 @@ void Renderer::PartRecordEnd()
     if (partMode_ != 1)
         return;
     partMode_ = 0;
-    DkCmdList list = dkCmdBufFinishList(listCmd_);
+    Chunk& chunk = chunks_[partList_->chunk];
+    DkCmdList list = dkCmdBufFinishList(chunk.cmd);
     cmd_ = mainCmd_;
+    chunk.lastUse = frames_;
     PartList& l = *partList_;
     const std::uint32_t n = (std::uint32_t)l.slots.size();
     if (!partBad_ && decodes_ != partDecodes_) {
@@ -2438,15 +2628,18 @@ void Renderer::PartRecordEnd()
         }
     }
     l.sig = partSig_;
-    if (dataUsed_ + (1u << 20) > kListData || paramUsed_ + (256u << 10) > kParamMemory)
-        listFull_ = true;   // (made anew at the next present)
+    chunk.estimate += 2048 * std::max<std::uint32_t>(n, 1);
     if (!partBad_) {
         l.list = list;
-        paramUsed_ += n * kParamSlot;
+        chunk.live++;
+        // (the slots it does not use, which the GPU never reads: free at once)
+        paramBlocks_.Give(l.paramAt + n * kParamSlot, l.paramSize - n * kParamSlot, 0);
+        l.paramSize = n * kParamSlot;
         partRecordsKept_++;
         lists.fails = 0;
     } else {
-        l.list = 0;
+        l.list = 0;   // (called this once: its slots and data given back after this frame)
+        KillList(l);
         lists.fails++;
         lists.retryAt = frames_ + (120ull << std::min<std::uint32_t>(lists.fails, 6));
         partGiveUps_[partWhy_ ? partWhy_ : "?"]++;
@@ -2523,9 +2716,11 @@ void Renderer::PartEnd(bool clean)
         partReplays_++;
         l.set = set_;
         l.frame = frames_;
+        if (l.chunk >= 0)
+            chunks_[l.chunk].lastUse = frames_;
     }
     if (!clean || !all) {   // (not to be given again: kept anew when the part next comes)
-        l.list = 0;
+        KillList(l);
         partStale_++;
     }
 }
@@ -2538,8 +2733,7 @@ void Renderer::ForgetKept(std::uint64_t first, std::uint64_t count)
             continue;
         keepFree_.push_back({it->at, it->bytes, frames_});
         kept_.erase(it);
-        keptForgotten_++;
-        partEpoch_++;   // (a kept part's list may draw from it)
+        keptForgotten_++;   // (a part's list drawing from it finds it gone: PartBegin)
     }
 }
 
@@ -3624,11 +3818,20 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
                 static std::uint64_t was[7];
                 const std::uint64_t is[7] = {partReplays_, partRecordsKept_, partRecords_ - partRecordsKept_, partStale_, partBatchesSkipped_, partChecksSame_, partChecksOther_};
                 const double f = (double)(frames_ - framesWas);
+                int live = 0;
+                for (const Chunk& c : chunks_)
+                    live += c.live;
+                std::uint64_t paramFree = 0, dataFree = 0;
+                for (const auto& b : paramBlocks_.free)
+                    paramFree += b.size;
+                for (const auto& b : dataBlocks_.free)
+                    dataFree += b.size;
                 std::fprintf(stderr, "perflists: to %llu, a frame: parts given from their lists %.1f (%.0f batches), recorded and kept %.2f, recorded and not %.2f, found stale %.2f; "
-                             "%zu parts with lists, slots %.1f of %u MB, lists made anew %llu times; checked the same %llu, otherwise %llu; data in use %llu%s\n", (unsigned long long)frames_, (is[0] - was[0]) / f, (is[4] - was[4]) / f,
-                             (is[1] - was[1]) / f, (is[2] - was[2]) / f, (is[3] - was[3]) / f, partLists_.size(), paramUsed_ / 1048576.0, kParamMemory >> 20,
-                             (unsigned long long)partResets_, (unsigned long long)partChecksSame_, (unsigned long long)partChecksOther_, (unsigned long long)partDataBusy_,
-                             PartListsOn() ? "" : " (off)");
+                             "%d lists alive in chunk %d, %llu let go, %llu chunks emptied, %llu with no room; slots free %.1f MB, data free %.1f MB; checked the same %llu, otherwise %llu; "
+                             "data in use %llu%s\n", (unsigned long long)frames_, (is[0] - was[0]) / f, (is[4] - was[4]) / f,
+                             (is[1] - was[1]) / f, (is[2] - was[2]) / f, (is[3] - was[3]) / f, live, chunk_, (unsigned long long)partKills_, (unsigned long long)partChunkRetires_,
+                             (unsigned long long)partNoRoom_, paramFree / 1048576.0, dataFree / 1048576.0, (unsigned long long)partChecksSame_, (unsigned long long)partChecksOther_,
+                             (unsigned long long)partDataBusy_, PartListsOn() ? "" : " (off)");
                 if (!partGiveUps_.empty()) {
                     std::fprintf(stderr, "perflists: not kept so far:");
                     for (const auto& w : partGiveUps_)
@@ -3667,10 +3870,18 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
         keepResets_++;
         partEpoch_++;
     }
-    if (listFull_) {   // the kept parts' lists' memory used up: all of them made anew as they come
+    if (listFull_) {   // (all the lists made anew as they come)
         dkQueueWaitIdle(queue_);
         PartListsReset();
     }
+    paramBlocks_.Settle(frames_);   // (blocks given back free once the GPU has done with their frames)
+    dataBlocks_.Settle(frames_);
+    if (frames_ % 600 == 0 && partLists_.size() > 4096)   // (the parts with no list alive forgotten)
+        for (auto it = partLists_.begin(); it != partLists_.end();)
+            if (!it->second.variant[0].list && !it->second.variant[1].list && it->second.fails == 0)
+                it = partLists_.erase(it);
+            else
+                ++it;
     BeginCommands();
     presentNs_ += NowNs() - t0;
 }
