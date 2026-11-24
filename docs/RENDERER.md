@@ -1862,3 +1862,8 @@ batch, with their layout, keeps, kicks and what of them is this frame's, compare
 kept with): all 46 levels, 300 frames each with the camera turning, 2,721,001 parts checked, none
 drawn by other states. With the key the same, the GS hands the renderer the same draws; what the
 renderer makes of them is the Switch's check (`SLY1_GPU_PART_LISTS=check`).
+
+**A safety net.** In any run with the lists on, one list in 64 that could be given is recorded again
+instead and the two signatures compared, as the check mode does for every one; a list found other
+than its part's drawing turns the lists off for the rest of the run (`perflists: ... the lists are
+off`), so that a fault the Mac could not show costs a moment, not a run.

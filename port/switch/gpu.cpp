@@ -624,6 +624,8 @@ private:
     // again instead, and the two signatures compared (perflists: the same or other).
     std::uint64_t partSig_ = 0;
     bool partChecking_ = false;
+    bool partListsBroken_ = false;   // a check found a list other than its part's drawing: no lists more
+    std::uint32_t partCheckTick_ = 0;
     bool partAlphaFree_ = false;   // (recording) the part's alpha's scale changes: no alpha test decided by its vertices' alpha
     std::uint64_t partCheckSig_ = 0, partChecksSame_ = 0, partChecksOther_ = 0;
     int partCheckSaid_ = 0;
@@ -2364,7 +2366,7 @@ bool Renderer::PartListsOn() const
 {
     // (off until measured on the Switch: SLY1_GPU_PART_LISTS=1 on, =ab on and off in turn, 600 frames each)
     static const char* const e = std::getenv("SLY1_GPU_PART_LISTS");
-    if (!e || e[0] == '0' || !listCmd_ || abOn_ || vary_ >= 0 || varyRuns_ > 0 || view_ != 0 || listAt_ >= 0 || recording_ || replaying_)
+    if (!e || e[0] == '0' || !listCmd_ || partListsBroken_ || abOn_ || vary_ >= 0 || varyRuns_ > 0 || view_ != 0 || listAt_ >= 0 || recording_ || replaying_)
         return false;
     return e[0] == 'a' ? frames_ / 600 % 2 == 0 : true;   // (=check: on, every list checked, none given)
 }
@@ -2511,7 +2513,9 @@ int Renderer::PartBegin(const void* part, std::uint64_t key, std::uint32_t batch
             break;
         }
         static const bool check = std::getenv("SLY1_GPU_PART_LISTS")[0] == 'c';
-        if (check) {   // recorded again, and what it is made from compared with the list's
+        // (one in 64 checked so in any case: a list found other than its part's drawing turns the lists
+        // off for the run, partListsBroken_)
+        if (check || (++partCheckTick_ & 63) == 0) {   // recorded again, and what it is made from compared with the list's
             partChecking_ = true;
             partCheckSig_ = v.sig;
             break;
@@ -2622,6 +2626,12 @@ void Renderer::PartRecordEnd()
         if (!partBad_) {
             const bool same = partSig_ == partCheckSig_;
             (same ? partChecksSame_ : partChecksOther_)++;
+            static const bool checkMode = std::getenv("SLY1_GPU_PART_LISTS") && std::getenv("SLY1_GPU_PART_LISTS")[0] == 'c';
+            if (!same && !checkMode && !partListsBroken_) {
+                partListsBroken_ = true;
+                std::fprintf(stderr, "perflists: frame %llu: a list was found other than its part's drawing: the lists are off for the rest of the run\n",
+                             (unsigned long long)frames_);
+            }
             if (!same && partCheckSaid_++ < 12)
                 std::fprintf(stderr, "partcheck: frame %llu: part %p of %u batches: %u slots, %zu textures: drawn otherwise than its list\n", (unsigned long long)frames_, partNow_,
                              partBatches_, n, l.textures.size());
