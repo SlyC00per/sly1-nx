@@ -1855,3 +1855,10 @@ A list is let go when it is found stale, when its part is recorded anew, and whe
 its is let go (each list notes its batches' keeps and finds them still kept before it is given).
 `perflists` gives the lists alive, those let go, the chunks emptied, the recordings with no room, and
 the slots' and data's memory free.
+
+**The key checked on the Mac** (`SLY1_GS_COUNT_PARTS=check`: a part that comes with a key it came
+with before is drawn as ever by the stand-in, and the states its batches are drawn by, batch by
+batch, with their layout, keeps, kicks and what of them is this frame's, compared with those it was
+kept with): all 46 levels, 300 frames each with the camera turning, 2,721,001 parts checked, none
+drawn by other states. With the key the same, the GS hands the renderer the same draws; what the
+renderer makes of them is the Switch's check (`SLY1_GPU_PART_LISTS=check`).
