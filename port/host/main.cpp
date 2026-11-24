@@ -350,6 +350,9 @@ void VerifyLevels()
             word(kRequest + 0x0C) = b;
             word(kRequest + 0x10) = fl;
         }
+        // (a call still waiting for the game's thread, a tour's last stop, is not made during the
+        // load: the player it names is gone by then)
+        port::CallOnGameThread(nullptr);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         word(kRequest) = 1;
         // (SLY1_LOAD_WAIT=seconds: longer, for a run under lockstep with the software rasteriser)
@@ -459,8 +462,9 @@ void VerifyLevels()
                 if (std::sscanf(at, "%f,%f,%f", &pos[0], &pos[1], &pos[2]) != 3)
                     break;
                 pos[3] = 1.0f;
-                port::CallOnGameThread([] {
-                    ::func_00178008((::Player*)port::Native(*(std::uint32_t*)port::Native(0x00262E10)), (::Vec4*)pos);
+                port::CallOnGameThread([] {   // (not once a load is asked for, nor with no player)
+                    if (*(std::uint32_t*)port::Native(0x00275AF0) == 0 && *(std::uint32_t*)port::Native(0x00262E10) != 0)
+                        ::func_00178008((::Player*)port::Native(*(std::uint32_t*)port::Native(0x00262E10)), (::Vec4*)pos);
                 });
                 std::fprintf(stderr, "tour: stop %d at %.0f %.0f %.0f, frame %llu shown\n", stop++, (double)pos[0], (double)pos[1], (double)pos[2],
                              (unsigned long long)port::gs::FramesShown());
