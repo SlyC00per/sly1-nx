@@ -5791,16 +5791,23 @@ void GsThreadMain()
             // its commands go by is in the key (the alpha's scale, the viewport's depths, the TEX0
             // writes put right, its batches' keeps); its numbers each frame go to PartParams.
             int listMode = 0;
-            {
+            if (gs::PartsTaken()) {
                 bool dynamic = false;
-                if (prep)
-                    for (std::size_t i = 0; i < part.size() && !dynamic; i++)
-                        dynamic = (i < prep->quads.size() && !prep->quads[i].empty()) || (i < prep->colours.size() && !prep->colours[i].empty());
+                // (SLY1_PART_KEY_WHY: the parts not offered, by why: prepared, lit, swayed, skinned, projected, fading)
+                static const bool whyNot = std::getenv("SLY1_PART_KEY_WHY") != nullptr;
+                static std::uint64_t notBy[7], offeredAll;
+                int notWhy = dynamic ? 0 : -1;
                 std::uint64_t key = 0x9E3779B97F4A7C15ull ^ (std::uint64_t)part.size();
                 auto mix = [&](std::uint64_t v) {
                     key = (key ^ v) * 0x100000001B3ull;
                     key ^= key >> 31;
                 };
+                // (what the helper made of it this frame: each batch's vertices moved, colours lit; the
+                // list draws them from its own data, written each frame: which batches have them is the key's)
+                if (prep)
+                    for (std::size_t i = 0; i < part.size(); i++)
+                        mix((i < prep->quads.size() && !prep->quads[i].empty() ? 1u : 0u) | (i < prep->colours.size() && !prep->colours[i].empty() ? 2u : 0u) |
+                            (i < prep->moved.size() ? (std::uint32_t)prep->moved[i] << 2 : 0u));
                 bool alphaUsed = false;   // (a batch of it takes the alpha's scale: only then is the alpha its commands')
                 for (std::size_t i = 0; i < part.size() && !dynamic; i++) {
                     if (part[i].path != 4)
@@ -5816,18 +5823,29 @@ void GsThreadMain()
                     std::memcpy(&skin, head + offsetof(gs::Batch, skinWords), 4);
                     std::memcpy(&keep, head + offsetof(gs::Batch, keep), 8);
                     std::memcpy(&projected, head + offsetof(gs::Batch, projected), 1);
-                    dynamic = lit != 0 || sway != 0 || skin != 0 || projected;
+                    // (a projected batch's projection is among its numbers: offered)
+                    (void)projected;
+                    // (lit, swayed or skinned anew each frame without the helper's: made here, BatchNow, not offered)
+                    dynamic = !prep && (lit != 0 || sway != 0 || skin != 0);
+                    if (dynamic && notWhy < 0)
+                        notWhy = lit ? 1 : sway ? 2 : 3;
                     mix(keep);
                 }
                 const std::uint64_t sig = key;   // (the part's batches: their keeps)
-                // (a part fading, its alpha's scale not 1: drawn as ever, not kept again each frame)
-                if (alphaUsed && alphaNow != 1.0f)
-                    dynamic = true;
+                // (a part whose batches take the alpha's scale: recorded with no alpha test decided by
+                // its vertices' alpha, flag 1, so that its list holds for any scale: a fading part too)
+                if (whyNot) {
+                    offeredAll++;
+                    if (notWhy >= 0)
+                        notBy[notWhy]++;
+                    if (offeredAll % 30000 == 0)
+                        std::fprintf(stderr, "partnot: %llu parts drawn again: not offered as prepared %llu, lit %llu, swayed %llu, skinned %llu, projected %llu, fading %llu\n",
+                                     (unsigned long long)offeredAll, (unsigned long long)notBy[0], (unsigned long long)notBy[1], (unsigned long long)notBy[2],
+                                     (unsigned long long)notBy[3], (unsigned long long)notBy[4], (unsigned long long)notBy[5]);
+                }
                 if (!dynamic && part.size() <= 256) {
                     std::uint32_t a;
                     std::memcpy(&a, &alphaNow, 4);
-                    if (alphaUsed)
-                        mix(a);
                     std::uint32_t z[2];
                     std::memcpy(&z[0], &viewport[2], 4);
                     std::memcpy(&z[1], &viewport[6], 4);
@@ -5860,7 +5878,7 @@ void GsThreadMain()
                                              (unsigned long long)seen, (unsigned long long)alpha, (unsigned long long)zs, (unsigned long long)fixes);
                         }
                     }
-                    listMode = gs::PartBegin(item.part.get(), sig, key, (std::uint32_t)part.size());
+                    listMode = gs::PartBegin(item.part.get(), sig, key, (std::uint32_t)part.size(), alphaUsed ? 1u : 0u);
                 }
             }
             for (std::size_t i = 0; i < part.size(); i++) {
@@ -5945,7 +5963,7 @@ void GsThreadMain()
                         std::memcpy(b.projLimits, pj + 20, 16);
                     }
                     b.quads = w + head;
-                    if (listMode == 2) {   // the renderer gives the part from its list: this batch's numbers alone
+                    if (listMode == 2 && !prep) {   // the renderer gives the part from its list: this batch's numbers alone
                         gs::PartReplayBatch(w[0], b, (std::uint32_t)i);
                         const std::uint64_t t1 = NowNs();
                         Bump(g_replayNs[0], t1 - t0);
@@ -5966,6 +5984,13 @@ void GsThreadMain()
                     } else {
                         static thread_local BatchScratch scratch;
                         BatchNow(item.words.data(), layout, &part, w, b, scratch);
+                    }
+                    if (listMode == 2) {   // (a part the helper made something of: its numbers and this frame's vertices and colours)
+                        gs::PartReplayBatch(w[0], b, (std::uint32_t)i);
+                        const std::uint64_t t1 = NowNs();
+                        Bump(g_replayNs[0], t1 - t0);
+                        t0 = t1;
+                        continue;
                     }
                     if (!gs::DrawBatch(w[0], b))
                         g_batchesRefused++;

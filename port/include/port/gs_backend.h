@@ -351,7 +351,9 @@ public:
     // numbers instead. PartEnd after the part's last batch; clean is false when anything but its
     // batches was drawn in the meantime (the commands kept are then not to be used).
     virtual bool TakesParts() const { return false; }
-    virtual int PartBegin(const void*, std::uint64_t, std::uint32_t) { return 0; }
+    // (flags: 1 the part's alpha's scale changes from frame to frame: its alpha tests are not to be
+    // decided by its vertices' alpha, so that its commands do not depend on it)
+    virtual int PartBegin(const void*, std::uint64_t, std::uint32_t, std::uint32_t) { return 0; }
     virtual void PartBatch(std::uint32_t) {}
     virtual void PartParams(std::uint32_t, const Batch&) {}
     virtual void PartEnd(bool) {}
@@ -372,7 +374,8 @@ bool DrawBatch(std::uint32_t tagWord1, Batch& batch);
 // 2: a batch's tag taken as DrawBatch takes it (PRIM), its XYOFFSET put in, and the batch given to
 // the renderer's PartParams; false where DrawBatch would draw nothing. PartEnd tells the renderer
 // whether the GS drew anything else meanwhile or had anything uploaded.
-int PartBegin(const void* part, std::uint64_t sig, std::uint64_t key, std::uint32_t batches);
+bool PartsTaken();   // whether the renderer takes kept parts at all now (PartBegin is worth asking)
+int PartBegin(const void* part, std::uint64_t sig, std::uint64_t key, std::uint32_t batches, std::uint32_t flags);
 void PartBatch(std::uint32_t index);
 bool PartReplayBatch(std::uint32_t tagWord1, Batch& batch, std::uint32_t index);
 void PartEnd();

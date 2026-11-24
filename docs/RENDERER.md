@@ -1817,14 +1817,26 @@ Switch) a kept part's commands are kept as a deko3d command list of its own:
   seen), the image's size (dynamic resolution) and the faces dropped. A part keeps two lists, one
   for each frame buffer (FRAME differs). Every list is forgotten when the textures' cache, the kept
   batches' memory or the lists' own memory (24 MB, a reserve of 4) is made anew.
-- **What is never offered**: a part with a lit, swaying, skinned or projected batch, one the helper
-  made anything of this frame, one fading (an alpha's scale other than 1).
+- **This frame's vertices and colours** (a part the helper prepared: lit, swayed, skinned): the
+  recording puts them in the list's own data (`listData_`: two blocks, one for each set of the
+  frame's memory, the same places in both) instead of the frame's memory, and a list given again
+  has this frame's copied there first (`PartEnd`). Such a list is given only in frames of the set it
+  was recorded in (the frame buffers pair with the sets: its variant's), so that what it reads is
+  written only once the GPU has done with that set's last frame. Which of its batches have them is in
+  the key. While recording, a share that adds this frame's colours is drawn even when they are all
+  black (left out otherwise): adding black changes nothing, and the list holds for any frame's.
+- **The alpha's scale**: a part whose batches take it is recorded with no alpha test decided by its
+  vertices' alpha (two draws where one would do, the same picture), so that its list holds for any
+  scale; a fading part is given from its list too.
+- **What is never offered**: a part lit, swayed or skinned anew each frame without the helper
+  (`BatchNow` on the GS thread; none in the tour).
 
 Measured on the Mac with a stand-in for the renderer (`SLY1_GS_COUNT_PARTS=1`: kept when a key is
-new, given again when it is not), A Stealthy Approach's tour: of the 180 to 190 parts drawn again a
-frame, 93 to 148 offered, 84 to 138 given again (700 to 1,200 batches a frame that no longer go
-through the GS's and the renderer's state), 4 to 13 kept anew (2 to 4 of them parts never seen).
-The alpha's scale in every key made 10% of the parts' frames new keys (`SLY1_PART_KEY_WHY=1`).
+new, given again when it is not). All 46 levels, 300 frames each with the camera turning: of 207
+parts offered a frame, 195.6 given again (94.5%, 1,359 batches a frame that no longer go through
+the GS's and the renderer's state), 11.3 kept anew. The alpha's scale in every key had made 10% of
+the parts' frames new keys (`SLY1_PART_KEY_WHY=1` says which of the item's numbers changed, and why
+a part was not offered).
 
 Not yet run on a GPU. Ryujinx shows no frame of the current build in two minutes, with the lists
 on and with them off alike (the program starts, the level's load never ends): the emulator cannot

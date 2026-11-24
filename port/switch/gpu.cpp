@@ -128,6 +128,9 @@ struct Source {
     DkGpuAddr layerColours[2] = {0, 0};
     bool sharesOnly = false;   // the shares alone, after their surface (Renderer::FlushHeld)
     const struct Texture* shareTextures[2] = {nullptr, nullptr};   // each share's texture (the surface's texels with a palette of its own)
+    // (a kept part being recorded) its batch's vertices or colours of this frame in the list's own data
+    // (Renderer::listData_), not the frame's memory: the place of that data's start (0: not)
+    DkGpuAddr vertexBase = 0, colourBase = 0;
 };
 
 struct FragmentParams {
@@ -455,7 +458,7 @@ private:
     // this frame's numbers are pushed into its slots and the list is called. SLY1_GPU_PART_LISTS=0:
     // never; =ab: in turn with never, 600 frames each.
     bool TakesParts() const override { return PartListsOn(); }
-    int PartBegin(const void* part, std::uint64_t key, std::uint32_t batches) override;
+    int PartBegin(const void* part, std::uint64_t key, std::uint32_t batches, std::uint32_t flags) override;
     void PartBatch(std::uint32_t index) override { partBatch_ = index; }
     void PartParams(std::uint32_t index, const gs::Batch& b) override;
     void PartEnd(bool clean) override;
@@ -468,6 +471,9 @@ private:
     struct PartSlot {
         std::uint32_t batch;
         std::uint8_t layers;
+    };
+    struct PartData {   // (a list's) a batch's vertices (kind 0) or colours (1) of each frame, at its place in listData_
+        std::uint32_t batch, kind, at, count;
     };
     struct PartTexture {
         const Texture* texture;
@@ -483,6 +489,8 @@ private:
         std::vector<PartTexture> textures;
         std::uint32_t uploads = 0;   // gs::UploadSerial() when its textures were last found the same
         std::uint64_t sig = 0;       // what its commands were made from (partSig_)
+        std::vector<PartData> data;  // its batches' vertices and colours of each frame
+        int set = -1;                // the set of the frame's memory it was recorded in (with data: given only then)
     };
     struct PartLists {
         PartList variant[2];         // (the frame buffers in turn: a part's state differs by FRAME)
@@ -492,6 +500,13 @@ private:
     std::unordered_map<const void*, PartLists> partLists_;
     static constexpr std::uint32_t kListMemory = 24u << 20, kListReserve = 4u << 20, kParamMemory = 8u << 20, kParamSlot = 256;
     DkMemBlock listMem_ = nullptr, paramMem_ = nullptr;
+    // A list's vertices and colours of each frame (a lit, swayed or skinned part's): two blocks, one
+    // for each set of the frame's memory, the same places in both; a list draws from the one of the
+    // set it was recorded in, and is given again only in that set's frames, so that the block is
+    // written when the GPU has done with it (the set's fence)
+    static constexpr std::uint32_t kListData = 12u << 20;
+    DkMemBlock listData_[2] = {nullptr, nullptr};
+    std::uint32_t dataUsed_ = 0;
     DkCmdBuf listCmd_ = nullptr, mainCmd_ = nullptr;
     std::uint32_t paramUsed_ = 0, listBytes_ = 0;
     bool uboAtSlot_ = false;               // the vertex shader's numbers bound are a part's slot's
@@ -515,6 +530,7 @@ private:
     // again instead, and the two signatures compared (perflists: the same or other).
     std::uint64_t partSig_ = 0;
     bool partChecking_ = false;
+    bool partAlphaFree_ = false;   // (recording) the part's alpha's scale changes: no alpha test decided by its vertices' alpha
     std::uint64_t partCheckSig_ = 0, partChecksSame_ = 0, partChecksOther_ = 0;
     int partCheckSaid_ = 0;
     void PartSig(std::uint64_t v)
@@ -763,6 +779,8 @@ bool Renderer::Create()
     {   // the kept parts' lists, and their batches' slots (Renderer::PartBegin)
         listMem_ = Block(kListMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
         paramMem_ = Block(kParamMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
+        for (DkMemBlock& d : listData_)
+            d = Block(kListData, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
         if (listMem_ && paramMem_) {
             DkCmdBufMaker listMaker;
             dkCmdBufMakerDefaults(&listMaker, device_);
@@ -1542,7 +1560,7 @@ void Renderer::Layer(const gs::DrawState& s, const Source& src, const gs::Batch&
             surface_.src.shareTextures[surface_.src.layers] = texture_;
             if (partMode_ == 1 && texture_ && s.tme)
                 PartNoteTexture(texture_, s);
-            surface_.src.layerColours[surface_.src.layers++] = dkMemBlockGetGpuAddr(src.kept && !src.colourFrame ? keepMem_ : frameMem_) + src.colourAt;
+            surface_.src.layerColours[surface_.src.layers++] = (src.colourBase ? src.colourBase : dkMemBlockGetGpuAddr(src.kept && !src.colourFrame ? keepMem_ : frameMem_)) + src.colourAt;
             layersMerged_++;
             return;
         }
@@ -1671,7 +1689,8 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
     {
         static const bool off = std::getenv("SLY1_GPU_NO_BLACK_SKIP") != nullptr;
         const std::uint32_t test = (std::uint32_t)s.test;
-        if (!off && vary_ != 1 && s.abe && (s.alpha & 0xFF) == 0x48 && (test & 1) && ((test >> 1) & 7) == 0 && ((test >> 12) & 3) == 3 &&
+        // (a part being recorded with this frame's colours: drawn black or not, as a list must hold for any frame's)
+        if (!off && vary_ != 1 && !(partMode_ == 1 && litColours) && s.abe && (s.alpha & 0xFF) == 0x48 && (test & 1) && ((test >> 1) & 7) == 0 && ((test >> 12) & 3) == 3 &&
             (!s.fge || (s.fogcol & 0xFFFFFF) == 0) && (!s.tme || ((s.tex0 >> 35) & 3) == 0) && b.count) {
             const std::uint32_t* c = litColours ? litColours : b.quads + b.colourAt * 4;
             const std::uint32_t step = litColours ? 4 : b.stride * 4;
@@ -1844,7 +1863,27 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
             src.colourAt = k.colourAt;
             src.indexAt = k.indexAt;
             src.doubled = &it->doubled;
-            if (b.swayMoved || b.skinMoved) {   // its vertices moved (sway, skinning) this frame: positions and STQ in the frame's memory
+            // (a part being recorded: this frame's vertices and colours in the list's own data, which a
+            // list given again has written anew: PartEnd)
+            const bool toList = partMode_ == 1 && listData_[0] && listData_[1] && dataUsed_ + b.count * 48 + 64 <= kListData;
+            if (partMode_ == 1 && !toList && (b.swayMoved || b.skinMoved || litColours) && !partBad_) {
+                partBad_ = true;
+                partWhy_ = "lists' data full";
+            }
+            if (toList && (b.swayMoved || b.skinMoved)) {
+                const std::uint32_t at = Align(dataUsed_, 64);
+                std::uint8_t* out = static_cast<std::uint8_t*>(dkMemBlockGetCpuAddr(listData_[set_ & 1])) + at;
+                const std::uint32_t step = b.stride * 4;
+                for (std::uint32_t v = 0; v < b.count; v++, out += 32) {
+                    const std::uint32_t* q = b.quads + v * step;
+                    std::memcpy(out, q + b.positionAt * 4, 16);
+                    std::memcpy(out + 16, q + b.stqAt * 4, 16);
+                }
+                src.vertexAt = at;
+                src.vertexBase = dkMemBlockGetGpuAddr(listData_[set_ & 1]);
+                partList_->data.push_back({partBatch_, 0, at, b.count});
+                dataUsed_ = at + b.count * 32;
+            } else if (b.swayMoved || b.skinMoved) {   // its vertices moved (sway, skinning) this frame: positions and STQ in the frame's memory
                 const std::uint32_t bytes = b.count * 32;
                 if (frameUsed_ + bytes + 64 > kFrameMemory)
                     Send(true);
@@ -1861,7 +1900,14 @@ bool Renderer::DrawBatch(const gs::DrawState& s, const gs::Batch& b)
                 frameUsed_ += bytes;
                 copiedBytes_ += bytes;
             }
-            if (litColours) {   // its colours in the frame's memory, as a batch not kept has them
+            if (toList && litColours) {
+                const std::uint32_t at = Align(dataUsed_, 64);
+                std::memcpy(static_cast<std::uint8_t*>(dkMemBlockGetCpuAddr(listData_[set_ & 1])) + at, litColours, b.count * 16);
+                src.colourAt = at;
+                src.colourBase = dkMemBlockGetGpuAddr(listData_[set_ & 1]);
+                partList_->data.push_back({partBatch_, 1, at, b.count});
+                dataUsed_ = at + b.count * 16;
+            } else if (litColours) {   // its colours in the frame's memory, as a batch not kept has them
                 const std::uint32_t bytes = b.count * 16;
                 if (frameUsed_ + bytes + 64 > kFrameMemory)
                     Send(true);
@@ -1990,7 +2036,10 @@ int Renderer::AlphaDecided(const gs::DrawState& s, const Source& src, const Text
         return 1;
     static const bool noRange = std::getenv("SLY1_GPU_NO_ALPHA_RANGE") != nullptr;
     int decided = 0;
-    if (!noRange && ab_ != 2 && ab_ != 3 && !smallTexture && atst != 0 && atst != 4 && atst != 7) {
+    // (a kept part recorded whose alpha's scale changes from frame to frame: its batches' tests not decided
+    // by their vertices' alpha, so that the list's commands hold for any scale; two draws, the same picture)
+    const bool alphaFree = partMode_ == 1 && partAlphaFree_ && src.batch && src.batch->alphaDeferred;
+    if (!noRange && !alphaFree && ab_ != 2 && ab_ != 3 && !smallTexture && atst != 0 && atst != 4 && atst != 7) {
         float lo = src.alphaMin, hi = src.alphaMax;   // the vertices' alone, unless the texture's comes in
         if (!src.batch && src.vertices && src.vertexSize == sizeof(gs::DrawVertex)) {   // the GS's vertices: looked at here
             const gs::DrawVertex* v = static_cast<const gs::DrawVertex*>(src.vertices);
@@ -2210,6 +2259,7 @@ void Renderer::PartListsReset()
     dkCmdBufAddMemory(listCmd_, listMem_, 0, kListMemory - kListReserve);
     listFull_ = false;
     paramUsed_ = 0;
+    dataUsed_ = 0;
     partLists_.clear();
     partEpoch_++;
     partResets_++;
@@ -2223,7 +2273,7 @@ void Renderer::PartNoteTexture(const Texture* texture, const gs::DrawState& s)
     partList_->textures.push_back({texture, texture->generation, texture->alphaMin, texture->alphaMax, s});
 }
 
-int Renderer::PartBegin(const void* part, std::uint64_t key, std::uint32_t batches)
+int Renderer::PartBegin(const void* part, std::uint64_t key, std::uint32_t batches, std::uint32_t flags)
 {
     partMode_ = 0;
     if (batches == 0 || batches > 256 || !PartListsOn())
@@ -2237,7 +2287,7 @@ int Renderer::PartBegin(const void* part, std::uint64_t key, std::uint32_t batch
            ((std::uint64_t)(cullFront_ != 0.0f) << 63);
     PartLists& lists = partLists_[part];
     for (PartList& v : lists.variant) {
-        if (!v.list || v.key != key || v.epoch != partEpoch_)
+        if (!v.list || v.key != key || v.epoch != partEpoch_ || (!v.data.empty() && v.set != (set_ & 1)))
             continue;
         // its textures as they were: looked at again only when anything has been uploaded since, and
         // decoded again in place where their pages have changed (as a draw would have them)
@@ -2292,6 +2342,8 @@ int Renderer::PartBegin(const void* part, std::uint64_t key, std::uint32_t batch
     into->epoch = partEpoch_;
     into->slots.clear();
     into->textures.clear();
+    into->data.clear();
+    into->set = set_ & 1;
     into->paramAt = paramUsed_;
     into->uploads = gs::UploadSerial();
     into->used = frames_;
@@ -2306,6 +2358,7 @@ int Renderer::PartBegin(const void* part, std::uint64_t key, std::uint32_t batch
     partSends_ = sends_;
     partParams_.clear();
     partSig_ = 0xCBF29CE484222325ull;
+    partAlphaFree_ = (flags & 1) != 0;
     mainCmd_ = cmd_;
     cmd_ = listCmd_;
     ResetTracking();   // (the list binds all it draws with)
@@ -2365,6 +2418,8 @@ void Renderer::PartRecordEnd()
         }
     }
     l.sig = partSig_;
+    if (dataUsed_ + (1u << 20) > kListData || paramUsed_ + (256u << 10) > kParamMemory)
+        listFull_ = true;   // (made anew at the next present)
     if (!partBad_) {
         l.list = list;
         paramUsed_ += n * kParamSlot;
@@ -2408,6 +2463,38 @@ void Renderer::PartEnd(bool clean)
         float near, far;
         MakeBatchParams(partNowBatches_[slot.batch], slot.layers, false, kFieldWidth, kFieldHeight, bp, near, far);
         std::memcpy(partPush_.data() + (std::size_t)k * kParamSlot, &bp, sizeof bp);
+    }
+    // this frame's vertices and colours where the list draws them from (its set's block: the GPU has
+    // done with that set's last frame)
+    for (std::size_t k = 0; k < l.data.size() && all; k++) {
+        const PartData& d = l.data[k];
+        if (d.batch >= partBatches_ || !partHave_[d.batch]) {
+            all = false;
+            break;
+        }
+        const gs::Batch& b = partNowBatches_[d.batch];
+        std::uint8_t* out = static_cast<std::uint8_t*>(dkMemBlockGetCpuAddr(listData_[l.set])) + d.at;
+        if (d.kind == 0) {
+            if (!(b.swayMoved || b.skinMoved) || b.count != d.count) {
+                all = false;
+                break;
+            }
+            staging_.resize((std::size_t)b.count * 8);
+            std::uint8_t* st = reinterpret_cast<std::uint8_t*>(staging_.data());
+            const std::uint32_t step = b.stride * 4;
+            for (std::uint32_t v = 0; v < b.count; v++, st += 32) {
+                const std::uint32_t* q = b.quads + v * step;
+                std::memcpy(st, q + b.positionAt * 4, 16);
+                std::memcpy(st + 16, q + b.stqAt * 4, 16);
+            }
+            std::memcpy(out, staging_.data(), (std::size_t)b.count * 32);
+        } else {
+            if (!b.coloursNow || b.count != d.count) {
+                all = false;
+                break;
+            }
+            std::memcpy(out, b.coloursNow, (std::size_t)b.count * 16);
+        }
     }
     if (all) {
         dkCmdBufPushConstants(cmd_, dkMemBlockGetGpuAddr(paramMem_) + l.paramAt, n * kParamSlot, 0, n * kParamSlot, partPush_.data());
@@ -2645,11 +2732,17 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         PartSig(s.kind); PartSig(s.tme); PartSig(s.fge); PartSig(s.abe); PartSig(s.fba);
         PartSig(s.tex0); PartSig(s.tex1); PartSig(s.clamp); PartSig(s.alpha); PartSig(s.test); PartSig(s.frame);
         PartSig(s.zbuf); PartSig(s.scissor); PartSig(s.texa); PartSig(s.fogcol);
-        PartSig((std::uint64_t)target); PartSig(src.indices); PartSig(src.vertexAt); PartSig(src.colourAt); PartSig(src.indexAt);
+        PartSig((std::uint64_t)target); PartSig(src.indices); PartSig(src.vertexBase ? 0xDA7A0 : src.vertexAt); PartSig(src.colourBase ? 0xDA7A1 : src.colourAt); PartSig(src.indexAt);
         PartSig((std::uint64_t)src.placed | (std::uint64_t)src.kept << 1 | (std::uint64_t)src.allCullable << 2 | (std::uint64_t)src.sharesOnly << 3 |
-                (std::uint64_t)src.alphaMin << 8 | (std::uint64_t)src.alphaMax << 16 | (std::uint64_t)src.layers << 24 |
+                (partAlphaFree_ && src.batch && src.batch->alphaDeferred ? 0 : (std::uint64_t)src.alphaMin << 8 | (std::uint64_t)src.alphaMax << 16) | (std::uint64_t)src.layers << 24 |
                 (std::uint64_t)(src.doubled ? (std::uint8_t)*src.doubled : 0xEE) << 32);
-        PartSig(src.layerColours[0]); PartSig(src.layerColours[1]);
+        for (int k = 0; k < 2; k++) {   // (a place in a list's data: which one is the recording's own)
+            const DkGpuAddr a = src.layerColours[k];
+            bool inData = false;
+            for (DkMemBlock d : listData_)
+                inData = inData || (d && a >= dkMemBlockGetGpuAddr(d) && a < dkMemBlockGetGpuAddr(d) + kListData);
+            PartSig(inData ? 0xDA7A2 : a);
+        }
         PartSig(src.batch ? src.batch->count | (std::uint64_t)src.batch->cull << 32 : 0);
         PartSig(texture ? texture->id | (std::uint64_t)texture->alphaMin << 32 | (std::uint64_t)texture->alphaMax << 40 : 0xFFFF);
         for (int k = 0; k < 2; k++)
@@ -2919,9 +3012,9 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
     }
     if (src.placed) {   // the batch's two streams where DrawBatch put them
         DkGpuAddr base = dkMemBlockGetGpuAddr(src.kept ? keepMem_ : frameMem_);
-        const DkGpuAddr vertexBase = src.vertexFrame ? dkMemBlockGetGpuAddr(frameMem_) : base;
+        const DkGpuAddr vertexBase = src.vertexBase ? src.vertexBase : src.vertexFrame ? dkMemBlockGetGpuAddr(frameMem_) : base;
         const std::uint32_t count = src.batch->count;   // the streams' sizes exactly (an emulator tracks what is bound)
-        const DkGpuAddr own = (src.colourFrame ? dkMemBlockGetGpuAddr(frameMem_) : base) + src.colourAt;
+        const DkGpuAddr own = (src.colourBase ? src.colourBase : src.colourFrame ? dkMemBlockGetGpuAddr(frameMem_) : base) + src.colourAt;
         DkBufExtents streams[4] = {{vertexBase + src.vertexAt, count * 32}, {own, count * 16}, {src.layers >= 1 ? src.layerColours[0] : own, count * 16},
                                    {src.layers >= 2 ? src.layerColours[1] : own, count * 16}};
         dkCmdBufBindVtxBuffers(cmd_, 0, streams, 4);

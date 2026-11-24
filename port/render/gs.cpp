@@ -2256,7 +2256,12 @@ void PartWatchEnd()
 }
 }
 
-int PartBegin(const void* part, std::uint64_t sig, std::uint64_t key, std::uint32_t batches)
+bool PartsTaken()
+{
+    return g_backend && !g_rasterise && g_backend->TakesParts();
+}
+
+int PartBegin(const void* part, std::uint64_t sig, std::uint64_t key, std::uint32_t batches, std::uint32_t flags)
 {
     Guard lk;
     g_partOpenNow = false;
@@ -2280,7 +2285,7 @@ int PartBegin(const void* part, std::uint64_t sig, std::uint64_t key, std::uint3
     g_partWritten[0] = g_partWritten[1] = 0;
     g_partWatched = part;
     g_partWatchedSig = sig;
-    return g_backend->PartBegin(part, which && which[0] == 'i' ? key : which && which[0] == 's' ? state : key ^ state, batches);
+    return g_backend->PartBegin(part, which && which[0] == 'i' ? key : which && which[0] == 's' ? state : key ^ state, batches, flags);
 }
 
 void PartBatch(std::uint32_t index)
@@ -2300,11 +2305,13 @@ bool PartReplayBatch(std::uint32_t tagWord1, Batch& batch, std::uint32_t index)
         Write(0x00, (tagWord1 >> 15) & 0x7FF);
     if ((g_regs.prim & 7) != 4)
         return false;
-    const Draw d = DrawOf(g_regs.prim);
-    if (!d.iip || d.fst)
+    // (DrawOf's: the attributes from PRIM or PRMODE, their context's XYOFFSET)
+    const std::uint64_t attrs = Bits(g_regs.prmodecont, 0, 1) ? g_regs.prim : g_regs.prmode;
+    if (!Bits(attrs, 3, 1) || Bits(attrs, 8, 1))   // IIP, FST: as DrawBatch refuses
         return false;
-    batch.ofx = d.ofx;
-    batch.ofy = d.ofy & ~15;
+    const Context& c = g_regs.ctx[Bits(attrs, 9, 1)];
+    batch.ofx = (int)Bits(c.xyoffset, 0, 16);
+    batch.ofy = (int)Bits(c.xyoffset, 32, 16) & ~15;
     g_queued = 0;
     g_backend->PartParams(index, batch);
     return true;

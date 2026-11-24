@@ -897,7 +897,7 @@ int main(int argc, char** argv)
             int partMode = 0;
             const void* partNow = nullptr;
             bool TakesParts() const override { static const bool on = std::getenv("SLY1_GS_COUNT_PARTS") != nullptr; return on; }
-            int PartBegin(const void* part, std::uint64_t key, std::uint32_t) override
+            int PartBegin(const void* part, std::uint64_t key, std::uint32_t, std::uint32_t) override
             {
                 partsOffered++;
                 PartKeys& k = partKeys[part];
