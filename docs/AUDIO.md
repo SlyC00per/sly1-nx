@@ -98,9 +98,15 @@ tones; a MIDI program number is a record. A tone (24 bytes) is a sample over a r
 volume +1, note +2 and fine +3 (as the global banks' tones: 48,000 Hz where the key equals
 them), pan +4 (degrees, signed), the lowest and highest key +6 and +7, the bend's range down and
 up in semitones +8 and +9, the SPU's two envelope words +0xA and +0xC, the sample's place
-+0x10. Every envelope read has an instant attack and a full sustain, so only the release is
-played: the low five bits of the second word, as the SPU's linear release (8 of 32,768 each
-2^(rate - 11) samples).
++0x10. The two envelope words are played as the SPU plays them (`Envelope`, from the public
+description of the PlayStation SPU: attack, an exponential decay to the sustain level, a sustain
+that rises or falls until the key is let go, a release, each a shift and a step). Before, only the
+release was played, linearly, and every note held at full volume until its key was let go: in
+Prowling the Grounds several instruments' sustain falls (second words `CE6C`, `CE4C`, `CEED`: an
+exponential fall of about 0.8 s) and their release is exponential, so their notes hung where the
+game has them fade out. A sequence that is stopped still fades its notes in a twentieth of a
+second. `SLY1_SND_ENVELOPE=0`: the release alone, as before; `SLY1_SND_ENV=1` prints each tone's
+envelope the first time it sounds.
 
 **Sequences.** The third chunk: a count at +0x17, an offset each from +0x20 (from +0x10), and
 each sequence a 0xDC-byte header (the tempo in microseconds a beat at +0x20, 480 ticks a beat at

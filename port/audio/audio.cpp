@@ -20,6 +20,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <thread>
 #include <vector>
 
@@ -35,6 +36,85 @@ namespace {
 
 constexpr int kRate = 48000;
 constexpr int kChunk = 480;   // frames mixed at a time: 10 ms
+
+// The SPU's volume envelope, from its two envelope words, as the public description of the PlayStation
+// SPU gives it (the PS2's SPU2 runs it the same way, at 48,000 Hz): a level of 0 to 0x7FFF that
+// rises in the attack, falls exponentially to the sustain level in the decay, rises or falls in
+// the sustain until the key is let go, and falls to 0 in the release. Each phase has a shift and
+// a step: the level moves by step << max(0, 11 - shift) each 1 << max(0, shift - 11) samples, an
+// exponential rise four times slower above 0x6000, an exponential fall scaled by the level.
+// word 1: attack exponential (15), shift (14-10), step 7 - (9-8); decay shift (7-4), step -8;
+//         sustain level (3-0), (n + 1) * 0x800
+// word 2: sustain exponential (15), falling (14), shift (12-8), step 7 - (7-6) rising or
+//         -8 + (7-6) falling; release exponential (5), shift (4-0), step -8
+struct Envelope {
+    enum Phase { Attack, Decay, Sustain, Release, Off };
+    std::uint16_t adsr1 = 0x80FF, adsr2 = 0x9FC0;
+    int level = 0, phase = Attack, wait = 0;
+
+    void Start(std::uint16_t a1, std::uint16_t a2)
+    {
+        adsr1 = a1;
+        adsr2 = a2;
+        level = 0;
+        phase = Attack;
+        wait = 0;
+    }
+    void KeyOff()
+    {
+        if (phase != Off)
+            phase = Release, wait = 0;
+    }
+    // One sample's step; the level as a factor of 0 to 1.
+    float Next()
+    {
+        if (phase == Off)
+            return 0.0f;
+        int shift, step;
+        bool exponential, falling;
+        const int sustainLevel = ((adsr1 & 0xF) + 1) * 0x800;
+        switch (phase) {
+        case Attack:
+            exponential = (adsr1 & 0x8000) != 0, falling = false, shift = (adsr1 >> 10) & 0x1F, step = 7 - ((adsr1 >> 8) & 3);
+            break;
+        case Decay:
+            if (level <= sustainLevel) {
+                phase = Sustain;
+                return Next();
+            }
+            exponential = true, falling = true, shift = (adsr1 >> 4) & 0xF, step = -8;
+            break;
+        case Sustain:
+            exponential = (adsr2 & 0x8000) != 0, falling = (adsr2 & 0x4000) != 0, shift = (adsr2 >> 8) & 0x1F;
+            step = falling ? -8 + ((adsr2 >> 6) & 3) : 7 - ((adsr2 >> 6) & 3);
+            break;
+        default:   // Release
+            exponential = (adsr2 & 0x20) != 0, falling = true, shift = adsr2 & 0x1F, step = -8;
+            break;
+        }
+        if (wait > 0) {
+            wait--;
+        } else {
+            int cycles = 1 << (shift > 11 ? shift - 11 : 0);
+            int by = step * (1 << (shift < 11 ? 11 - shift : 0));
+            if (exponential && !falling && level > 0x6000)
+                cycles *= 4;
+            if (exponential && falling)   // (by is negative: rounded down, as an arithmetic shift does, so it reaches 0)
+                by = -((-by * level + 0x7FFF) >> 15);
+            level += by;
+            if (level > 0x7FFF)
+                level = 0x7FFF;
+            if (level < 0)
+                level = 0;
+            wait = cycles - 1;
+            if (phase == Attack && level >= 0x7FFF)
+                phase = Decay, wait = 0;
+            else if (phase == Release && level == 0)
+                phase = Off;
+        }
+        return (float)level / 32767.0f;
+    }
+};
 
 // The SPU's ADPCM: a 16-byte frame is a shift and filter byte, a flags byte and 28 four-bit
 // samples; each sample is the nibble shifted, plus the filter's two taps on the two before.
@@ -315,6 +395,8 @@ struct Song {
         const std::uint8_t* tone = nullptr;
         float left = 0.0f, right = 0.0f, gain = 1.0f, release = 0.0f;
         bool released = false;
+        Envelope env;      // the tone's envelope (SLY1_SND_ENVELOPE=0: only its release, linear, as before)
+        bool stopped = false;   // its sequence stopped: a twentieth of a second's fade over the envelope
     };
     struct Track {     // a sequence being played
         int index = 0;
@@ -384,10 +466,17 @@ struct Song {
     void ReleaseTrack(int id)
     {
         for (Playing& n : notes)
-            if (n.track == id && !n.released) {
-                n.released = true;
+            if (n.track == id && !n.stopped) {
+                n.released = n.stopped = true;
                 n.release = 1.0f / (kRate * 0.05f);
+                n.env.KeyOff();
             }
+    }
+
+    static bool EnvelopeOn()
+    {
+        static const bool off = std::getenv("SLY1_SND_ENVELOPE") && std::getenv("SLY1_SND_ENVELOPE")[0] == '0';
+        return !off;
     }
 
     void StopSequence(int index)
@@ -569,6 +658,14 @@ struct Song {
             const std::uint8_t* tone = &b[o];
             if (key < tone[6] || key > tone[7])
                 continue;
+            {   // SLY1_SND_ENV=1: each program's tone envelopes the first time it sounds
+                static const bool envLog = std::getenv("SLY1_SND_ENV") != nullptr;
+                static std::set<std::pair<const void*, std::uint32_t>> seen;
+                if (envLog && seen.insert({bank.get(), (std::uint32_t)(o)}).second)
+                    std::fprintf(stderr, "sndenv: sequence %d channel %d program %u key %d velocity %d: tone at 0x%zX keys %u-%u note %d fine %u vol %u adsr1 %04X adsr2 %04X\n", t.index, channel,
+                                 program, key, velocity, o, tone[6], tone[7], -(std::int8_t)tone[2], tone[3], tone[1], (unsigned)(tone[0x0A] | tone[0x0B] << 8),
+                                 (unsigned)(tone[0x0C] | tone[0x0D] << 8));
+            }
             Playing n;
             n.track = t.id;
             n.channel = channel;
@@ -581,6 +678,7 @@ struct Song {
             const float sine = std::sin((float)(std::int16_t)(tone[4] | tone[5] << 8) * 3.14159265f / 180.0f);
             n.left = level * std::sqrt(0.5f * (1.0f - sine));
             n.right = level * std::sqrt(0.5f * (1.0f + sine));
+            n.env.Start((std::uint16_t)(tone[0x0A] | tone[0x0B] << 8), (std::uint16_t)(tone[0x0C] | tone[0x0D] << 8));
             notes.push_back(n);
         }
     }
@@ -599,6 +697,7 @@ struct Song {
     {
         for (Playing& n : notes)
             if (n.track == t.id && n.channel == channel && n.key == key && !n.released) {
+                n.env.KeyOff();
                 // the release from the tone's second envelope word: its low five bits a rate, a
                 // step of 8 of 32,768 each 2^(rate - 11) samples (the SPU's linear release)
                 const int rate = n.tone[0x0C] & 0x1F;
@@ -729,11 +828,19 @@ struct Song {
                     }
                     if (note.over)
                         break;
-                    const float v = ((float)note.prev + (float)(note.next - note.prev) * (float)note.phase) * p.gain * g;
+                    float envelope = 1.0f;
+                    if (EnvelopeOn()) {   // the tone's envelope; a stopped sequence's notes also fade in a twentieth of a second
+                        envelope = p.env.Next();
+                        if (p.env.phase == Envelope::Off || (p.env.phase == Envelope::Sustain && p.env.level == 0)) {
+                            note.over = true;   // (fallen to nothing while held: silent until let go, so over)
+                            break;
+                        }
+                    }
+                    const float v = ((float)note.prev + (float)(note.next - note.prev) * (float)note.phase) * p.gain * envelope * g;
                     out[(from + k) * 2] += (std::int32_t)(v * p.left);
                     out[(from + k) * 2 + 1] += (std::int32_t)(v * p.right);
                     note.phase += step;
-                    if (p.released) {
+                    if (p.released && (!EnvelopeOn() || p.stopped)) {
                         p.gain -= p.release;
                         if (p.gain <= 0.0f) {
                             note.over = true;
@@ -1269,9 +1376,43 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
         {   // SLY1_SND_LOG: each sound started, with when (for naming a sound heard at a known moment)
             static const bool log = std::getenv("SLY1_SND_LOG") != nullptr;
             static const auto t0 = std::chrono::steady_clock::now();
-            if (log)
-                std::fprintf(stderr, "sndlog: %.1f s: sound %u of bank %u (sector %u) started, volume %d\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), b, a,
-                             bank == g_banks.end() ? 0 : bank->second->sector, (int)c);
+            if (log) {
+                std::fprintf(stderr, "sndlog: %.1f s: sound %u of bank %u (sector %u) started, volume %d, pitch %d; tones:", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), b, a,
+                             bank == g_banks.end() ? 0 : bank->second->sector, (int)c, (int)(std::int32_t)Word(data, size, 4));
+                if (v->bank)   // each tone's kind, and a sample's note, fine part, rate and place
+                    for (std::uint32_t k = 0; k < v->tones && k < 12; k++) {
+                        const std::uint8_t* t = v->bank->block.data() + v->toneAt + (std::size_t)k * 0x28;
+                        const std::int32_t kind = (std::int32_t)(t[0] | t[1] << 8 | t[2] << 16 | t[3] << 24);
+                        if (kind == 1) {
+                            const std::uint32_t at = (unsigned)(t[0x18] | t[0x19] << 8 | t[0x1A] << 16);
+                            // the sample's frames: how many, those marked a loop's start, and how it ends
+                            unsigned frames = 0, starts = 0, firstStart = ~0u, lastStart = 0, endFlags = 0;
+                            for (std::uint32_t f = at; f + 16 <= v->bank->samples.size() && frames < 200000; f += 16) {
+                                const std::uint8_t fl = v->bank->samples[f + 1];
+                                if (fl & 4) {
+                                    starts++;
+                                    if (firstStart == ~0u)
+                                        firstStart = frames;
+                                    lastStart = frames;
+                                }
+                                frames++;
+                                if (fl & 1) {
+                                    endFlags = fl;
+                                    break;
+                                }
+                            }
+                            std::fprintf(stderr, " [1 note %d fine %u %.0f Hz at %u: %u frames, %u loop starts (%d..%u), end %X]", -(std::int8_t)t[10], t[11], (double)ToneRate(t), at, frames, starts,
+                                         firstStart == ~0u ? -1 : (int)firstStart, lastStart, endFlags);
+                        }
+                        else {
+                            std::fprintf(stderr, " [%d:", kind);
+                            for (int w = 1; w < 6; w++)
+                                std::fprintf(stderr, " %d", (int)(std::int32_t)(t[w * 4] | t[w * 4 + 1] << 8 | t[w * 4 + 2] << 16 | t[w * 4 + 3] << 24));
+                            std::fprintf(stderr, "]");
+                        }
+                    }
+                std::fprintf(stderr, "\n");
+            }
         }
         const std::uint32_t handle = g_nextHandle++;
         g_voicesStarted++;
