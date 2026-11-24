@@ -20,6 +20,15 @@ asks.
 
 ## Status
 
+- **The Binoc-u-com in widescreen** (2026-11-23). As the PS3 release has it, the lens and its blue
+  frame are stretched across the 16:9 picture, while the dialogue text and the two portraits keep
+  their shape. The caption box (screen element 1) is as wide as the screen, so `port::Wide2D`
+  leaves it stretched and narrows only what it draws after the lens (the text, its box, the button
+  glyph). Each portrait's character is a model placed where its box shows it, and the box's black
+  and scissor are drawn by requests queued for later; all three are now narrowed as the box is
+  (`port::WideAt`, `port::WideScope`). Before, the frame left the black it borders, and the
+  characters stood out of their boxes over a black wider than them. `SLY1_WIDE_LOG=1` lists the
+  elements drawn, with their places and widths.
 - **Saving** (2026-11-15). The port answers the memory card library's requests from a folder of
   the player's (port/platform/memory_card.cpp; `--save FOLDER` on the host): an 8 MB card in
   port 0 that is always there and formatted, so the "no card", "unformatted" and "card full"

@@ -336,8 +336,39 @@ PATCHES = [
      "a 2D vertex's x for the 16:9 picture (port::WideX)"),
     ("src/main/object_pool.cpp",
      "        if (p->mode != 0) {\n            p->vt->m09(p);\n        }",
-     "        if (p->mode != 0) {\n            port::Wide2D(p->shownX + p->w * 0.5f);\n            p->vt->m09(p);\n            port::Wide2D(-1.0f);\n        }",
+     "        if (p->mode != 0) {\n            port::Wide2D(p->shownX + p->w * 0.5f, i, p->w);\n            p->vt->m09(p);\n            port::Wide2D(-1.0f);\n        }",
      "each screen element drawn about the side of the screen it rests at"),
+    # The caption box (element 1) is as wide as the screen: its lens and the lens's frame (the
+    # Binoc-u-com) are stretched with the picture, as the PS3 release has them, so that the frame
+    # stays on the black it borders (port::Wide2D leaves a full-width element as it is). What it
+    # draws after them, the text, the box behind it and the button's glyph, is narrowed about the
+    # middle as before.
+    ("src/main/text_panel.cpp",
+     "    f32 scale = 1.0f;\n    if (self->state == 4) {\n        scale = 0.8f;\n    }",
+     "    port::Wide2D(320.0f, 1, 280.0f);\n    f32 scale = 1.0f;\n    if (self->state == 4) {\n        scale = 0.8f;\n    }",
+     "the caption box's text narrowed, its lens stretched"),
+    # The Binoc-u-com's portraits (the arc elements): the box is narrowed about its side of the
+    # screen by its draw (slot 9), but the character is a model placed in the world where the box
+    # shows it, and the box's black and its scissor are drawn in requests queued for later, out of
+    # the element's draw: all three at the box's 4:3 place, so the character stood out of the
+    # narrowed box, over a black wider than it. The character's place and both requests are
+    # narrowed as the box is.
+    ("src/main/arc_element.cpp",
+     "        f32 sx = ((1.0f - held->u) * self->x + held->u * (self->x + self->w)) * 0.003125f - 1.0f;",
+     "        f32 sx = port::WideAt((1.0f - held->u) * self->x + held->u * (self->x + self->w), self->shownX + self->w * 0.5f) * 0.003125f - 1.0f;",
+     "the portrait's character where the narrowed box shows it"),
+    ("src/main/arc_element.cpp",
+     "    PushBackMemoryMark();\n    InitGifPacket(&buf);\n    AllocateTempPacketBuffer(&buf, 0x100);",
+     "    port::WideScope wideScope(self->shownX + self->w * 0.5f, self->index, self->w);\n    PushBackMemoryMark();\n    InitGifPacket(&buf);\n    AllocateTempPacketBuffer(&buf, 0x100);",
+     "the portrait's black and outline narrowed as its box"),
+    ("src/main/arc_element.cpp",
+     "    s32 px = (s32)x0;\n    s32 pw = (s32)x1 - 1;",
+     "    s32 px = (s32)port::WideAt(x0, self->shownX + self->w * 0.5f);\n    s32 pw = (s32)port::WideAt(x1, self->shownX + self->w * 0.5f) - 1;",
+     "the portrait's scissor narrowed as its box"),
+    ("src/main/arc_element.cpp",
+     "    PushBackMemoryMark();\n    InitGifPacket(&buf);\n    AllocateTempPacketBuffer(&buf, 0x200);",
+     "    port::WideScope wideScope(self->shownX + self->w * 0.5f, self->index, self->w);\n    PushBackMemoryMark();\n    InitGifPacket(&buf);\n    AllocateTempPacketBuffer(&buf, 0x200);",
+     "the portrait's ticks narrowed as its box"),
 
     # The camera's turn by the right stick, and a setting for it (as the PS Vita release has under
     # Controls: "Camera: Normal" or "Camera: Inverted"). Measured against retail on a PS2 by the

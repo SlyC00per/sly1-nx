@@ -158,8 +158,18 @@ void NotePropertyRead(int property, int object, int cls, const int* descriptor, 
 // left edge, the middle or the right edge of the screen, by the third the middle is in);
 // Wide2D(-1): no element. WideX: a vertex's x (12.4, with the game's offset of 1,728) as the
 // element's place makes it; one at the screen's very edge stays.
-void Wide2D(float middle);
+void Wide2D(float middle, int element = -1, float width = 0.0f);
 int WideX(int x);
+// An x of the 640 as an element whose middle rests at that x is narrowed (one at the very edge
+// stays), for what the element places outside its draw (the portraits' characters, scissors).
+float WideAt(float x, float middle);
+// Wide2D for a scope: for what an element draws outside its own draw (a request queued for later).
+struct WideScope {
+    WideScope(float middle, int element, float width) { Wide2D(middle, element, width); }
+    ~WideScope() { Wide2D(-1.0f); }
+    WideScope(const WideScope&) = delete;
+    WideScope& operator=(const WideScope&) = delete;
+};
 // fn called once on a game thread, at its next point of letting others in (the host's diagnosis).
 void CallOnGameThread(void (*fn)());
 #ifdef PORT_SENTINEL

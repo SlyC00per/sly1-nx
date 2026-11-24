@@ -332,12 +332,28 @@ float WideFactor()
 namespace {
 float g_wideAnchor = -1.0f;   // the x the element being drawn is narrowed about, or none
 }
-void Wide2D(float middle)
+void Wide2D(float middle, int element, float width)
 {
-    if (middle < 0.0f || WideFactor() == 1.0f)
+    {   // SLY1_WIDE_LOG=1: each element drawn, every 60th frame (which element is which)
+        static const bool log = std::getenv("SLY1_WIDE_LOG") != nullptr;
+        if (log && middle >= 0.0f && gs::FramesShown() % 60 == 0)
+            std::fprintf(stderr, "wide: frame %llu: element %d, middle %.1f, width %.1f\n", (unsigned long long)gs::FramesShown(), element, (double)middle, (double)width);
+    }
+    // (an element as wide as the screen is laid over the whole picture, as the Binoc-u-com's lens
+    // and its frame are: stretched with the picture, as the PS3 release has it, not narrowed;
+    // narrowed, its frame left the black it borders. SLY1_WIDE_FULL=0: narrowed.)
+    static const bool fullStretched = !std::getenv("SLY1_WIDE_FULL") || std::getenv("SLY1_WIDE_FULL")[0] != '0';
+    if (middle < 0.0f || WideFactor() == 1.0f || (fullStretched && width >= 640.0f))
         g_wideAnchor = -1.0f;
     else
         g_wideAnchor = middle < 640.0f / 3 ? 0.0f : middle > 640.0f * 2 / 3 ? 640.0f : 320.0f;
+}
+float WideAt(float x, float middle)
+{
+    if (WideFactor() == 1.0f || x <= 0.5f || x >= 639.5f)
+        return x;
+    const float anchor = middle < 640.0f / 3 ? 0.0f : middle > 640.0f * 2 / 3 ? 640.0f : 320.0f;
+    return anchor + (x - anchor) / WideFactor();
 }
 int WideX(int x)
 {
