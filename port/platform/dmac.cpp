@@ -412,6 +412,42 @@ struct PrepTask {
     std::vector<std::uint32_t> all3;
     BatchScratch sc;
     std::uint64_t begunAt = 0;
+    std::size_t items = 0;   // the part's items these buffers hold: their vectors only ever grow in number
+};
+// The memory of the shared pointers' own records (of a job or a prep: one each, 36 a frame), used
+// again: the allocator of std::shared_ptr's control blocks, in blocks of one size.
+std::mutex g_blockLock;
+std::vector<void*> g_blockFree;
+constexpr std::size_t kBlockBytes = 64;
+template <class T> struct BlockAlloc {
+    using value_type = T;
+    BlockAlloc() = default;
+    template <class U> BlockAlloc(const BlockAlloc<U>&) {}
+    T* allocate(std::size_t n)
+    {
+        if (n == 1 && sizeof(T) <= kBlockBytes) {
+            std::lock_guard<std::mutex> lk(g_blockLock);
+            if (!g_blockFree.empty()) {
+                void* p = g_blockFree.back();
+                g_blockFree.pop_back();
+                return static_cast<T*>(p);
+            }
+        }
+        return static_cast<T*>(::operator new(std::max(n * sizeof(T), kBlockBytes)));
+    }
+    void deallocate(T* p, std::size_t n)
+    {
+        if (n == 1 && sizeof(T) <= kBlockBytes) {
+            std::lock_guard<std::mutex> lk(g_blockLock);
+            if (g_blockFree.size() < 4096) {
+                g_blockFree.push_back(p);
+                return;
+            }
+        }
+        ::operator delete(p);
+    }
+    template <class U> bool operator==(const BlockAlloc<U>&) const { return true; }
+    template <class U> bool operator!=(const BlockAlloc<U>&) const { return false; }
 };
 std::vector<PrepTask*> g_prepFree;
 std::atomic<std::uint64_t> g_prepTasksMade, g_partJobsMade, g_jobsTrimmed;   // (MemoryReport)
@@ -453,7 +489,7 @@ std::shared_ptr<PrepTask> PrepNew()
         x->part.reset();
         std::lock_guard<std::mutex> lk(g_prepFreeLock);
         g_prepFree.push_back(x);
-    });
+    }, BlockAlloc<PrepTask>());
 }
 // The work, on this thread (who: 0 the helper, 1 the GS thread): true when this thread made it.
 bool PrepRun(PrepTask& t, int who)
@@ -470,8 +506,13 @@ bool PrepRun(PrepTask& t, int who)
     const std::vector<PartKept>& part = *t.part;
     const ReplayLayout L(t.words.data());
     const std::size_t head = 1 + (sizeof(gs::Batch) + 3) / 4;
-    t.quads.resize(part.size());
-    t.colours.resize(part.size());
+    // (never made fewer: resized down, each item's buffer was freed and got again at the next larger
+    // part, 45 allocations a frame between the helper and the GS thread)
+    if (t.quads.size() < part.size()) {
+        t.quads.resize(part.size());
+        t.colours.resize(part.size());
+    }
+    t.items = part.size();
     t.moved.assign(part.size(), 0);
     std::uint32_t lastId = 0, lastCount = 0;
     for (std::size_t i = 0; i < part.size(); i++) {
@@ -4964,12 +5005,12 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
                 continue;
             }
             g_jobFree.erase(g_jobFree.begin() + (std::ptrdiff_t)k);
-            job.reset(j, back);
+            job.reset(j, back, BlockAlloc<PartJob>());
         }
     }
     if (!job) {
         g_partJobsMade++;
-        job.reset(new PartJob, back);
+        job.reset(new PartJob, back, BlockAlloc<PartJob>());
         job->gen.fetch_add(1, std::memory_order_seq_cst);
     }
     job->keepKey = 0;
@@ -6094,7 +6135,7 @@ void GsThreadMain()
                         std::this_thread::yield();
                     g_prepWaitNs += NowNs() - w0;
                 }
-                if (t.state.load(std::memory_order_acquire) == 2 && t.quads.size() == part.size())
+                if (t.state.load(std::memory_order_acquire) == 2 && t.items == part.size())
                     prep = &t;
                 else
                     g_prepsMade[2]++;
