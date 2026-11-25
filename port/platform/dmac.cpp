@@ -4514,9 +4514,39 @@ bool PartJobsDrainStep()
 // (the render thread, every job of the list done) The parts to be kept from their jobs: what each
 // job gave, copied (the job's buffers are another part's next), with a key for each batch, and
 // then judged as the render thread's own recording is.
+// Buffers for what a part's items are while it is being kept, used again each time (the render
+// thread's): the items end in one block (PartKeepFinish), and until then each had two to four
+// pieces of memory of its own, got and given back at once: 54 for a part kept, most of the render
+// thread's allocations. SLY1_KEEP_SCRATCH=0: as before; =ab: in turn, 600 frames each, off first.
+struct KeepScratch {
+    std::vector<std::vector<std::uint32_t>> buffers;
+    std::size_t used = 0;
+    std::vector<std::uint32_t>& Next()
+    {
+        if (used == buffers.size())
+            buffers.emplace_back();
+        return buffers[used++];
+    }
+};
+KeepScratch g_keepWords, g_keepFlat;
+bool KeepScratchOn()
+{
+    static const char* const e = std::getenv("SLY1_KEEP_SCRATCH");
+    return !e ? true : e[0] == 'a' ? gs::FramesShown() / 600 % 2 == 1 : e[0] != '0';
+}
+// The time of the keeping from jobs, and the parts so kept (perfkeepms:).
+std::uint64_t g_jobsKeepNs, g_jobsKeepParts;
+
 void PartJobsKeep()
 {
+    const bool scratch = KeepScratchOn();
+    struct Timer {
+        const std::uint64_t t0 = NowNs();
+        ~Timer() { g_jobsKeepNs += NowNs() - t0; }
+    } timer;
+    g_jobsKeepParts += g_keepJobs.size();
     for (std::shared_ptr<PartJob>& jp : g_keepJobs) {
+        g_keepWords.used = 0;
         PartJob& j = *jp;
         auto it = g_parts.find(j.keepKey);
         if (it == g_parts.end() || it->second.serial != j.keepSerial || !it->second.pending)
@@ -4538,7 +4568,9 @@ void PartJobsKeep()
                 ok = false;
                 break;
             }
-            std::vector<std::uint32_t> words = item.words;
+            std::vector<std::uint32_t> own;
+            std::vector<std::uint32_t>& words = scratch ? g_keepWords.Next() : own;
+            words.assign(item.words.begin(), item.words.end());
             if (item.path == 4) {
                 gs::Batch b;
                 std::memcpy(&b, &words[1], sizeof b);
@@ -4547,7 +4579,10 @@ void PartJobsKeep()
             }
             r.words += words.size();
             g_partWords += words.size();
-            r.items.push_back({item.path, std::make_shared<const std::vector<std::uint32_t>>(std::move(words))});
+            if (scratch)
+                r.items.push_back({item.path, nullptr, words.data(), (std::uint32_t)words.size()});
+            else
+                r.items.push_back({item.path, std::make_shared<const std::vector<std::uint32_t>>(std::move(words))});
         }
         Vif::Regs after = j.after;
         PartKeepFinish(&r, ok, j.keepMatrix, after, !done ? "its job did not give a part's items" : "an item not a part's");
@@ -5002,8 +5037,19 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
     for (const MaskAt& m : r->boneAt)
         boneStrict = boneStrict || m.p == nullptr;
     std::uint64_t stUsed = 0, swayUsed = 0;
+    // an item's words: its own, or a scratch buffer's (PartJobsKeep's, or the writes made below)
+    struct View {
+        const std::uint32_t* at;
+        std::size_t n;
+        explicit View(const PartKept& i) : at(i.words ? i.words->data() : i.data), n(i.words ? i.words->size() : i.size) {}
+        std::size_t size() const { return n; }
+        const std::uint32_t* data() const { return at; }
+        const std::uint32_t& operator[](std::size_t k) const { return at[k]; }
+    };
+    const bool scratch = KeepScratchOn();
+    g_keepFlat.used = 0;
     for (std::size_t k = 0; ok && k < r->items.size(); k++) {
-        const std::vector<std::uint32_t>& w = *r->items[k].words;
+        const View w(r->items[k]);
         if (r->items[k].path == 4) {
             gs::Batch b;
             std::memcpy(&b, &w[1], sizeof b);
@@ -5085,7 +5131,9 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
             // Kept as the writes themselves (path 7: a register, its value's two halves; a tag's
             // PRIM first where it sets one), for the GS thread to make without the GIF's reading
             // of tags and quadwords (a fifth of its time was the registers' way in).
-            std::vector<std::uint32_t> flat;
+            std::vector<std::uint32_t> ownFlat;
+            std::vector<std::uint32_t>& flat = scratch ? g_keepFlat.Next() : ownFlat;
+            flat.clear();
             flat.reserve(w.size());
             for (std::size_t q = 0; ok && q + 4 <= w.size();) {
                 std::uint32_t nloop = w[q] & 0x7FFF, flg = (w[q + 1] >> 26) & 3, nreg = (w[q + 1] >> 28) & 0xF;
@@ -5134,7 +5182,10 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
                 const std::size_t was = w.size();
                 r->words = r->words + flat.size() - std::min<std::uint64_t>(r->words, was);
                 g_partWords = g_partWords + flat.size() - std::min<std::uint64_t>(g_partWords, was);
-                r->items[k] = {7, std::make_shared<const std::vector<std::uint32_t>>(std::move(flat))};
+                if (scratch)
+                    r->items[k] = {7, nullptr, flat.data(), (std::uint32_t)flat.size()};
+                else
+                    r->items[k] = {7, std::make_shared<const std::vector<std::uint32_t>>(std::move(flat))};
             } else if (asWrites) {
                 // (texFix's places were the writes': a packet refused is not kept, so they are not used)
             } else {
@@ -5171,7 +5222,7 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
                 if (kk.path != 4)
                     continue;
                 gs::Batch b;
-                std::memcpy(&b, &(*kk.words)[1], sizeof b);
+                std::memcpy(&b, View(kk).data() + 1, sizeof b);
                 lit += b.stride == 4;
                 if (b.skinWords) {
                     skinned++;
@@ -5197,22 +5248,25 @@ void PartKeepFinish(PartRecord* r, bool ok, const float* matrix, const Vif::Regs
         if (pack) {
             std::size_t total = 0;
             for (const PartKept& k : r->items)
-                total += (k.words->size() + 15) & ~std::size_t(15);   // (each at 64 bytes)
+                total += (View(k).size() + 15) & ~std::size_t(15);   // (each at 64 bytes)
             auto block = std::make_shared<std::vector<std::uint32_t>>(total + 16);
             std::uint32_t* base = block->data();
             base += (16 - ((reinterpret_cast<std::uintptr_t>(base) / 4) & 15)) & 15;
             std::size_t at = 0;
             for (PartKept& k : r->items) {
-                std::memcpy(base + at, k.words->data(), k.words->size() * 4);
+                const View w(k);
+                std::memcpy(base + at, w.data(), w.size() * 4);
                 k.data = base + at;
-                k.size = (std::uint32_t)k.words->size();
-                at += (k.words->size() + 15) & ~std::size_t(15);
+                k.size = (std::uint32_t)w.size();
+                at += (w.size() + 15) & ~std::size_t(15);
             }
             const std::shared_ptr<const std::vector<std::uint32_t>> held = block;
             for (PartKept& k : r->items)
                 k.words = held;   // (each item's own words let go: the block holds them)
         } else {
             for (PartKept& k : r->items) {
+                if (!k.words)   // (a scratch buffer's)
+                    k.words = std::make_shared<const std::vector<std::uint32_t>>(k.data, k.data + k.size);
                 k.data = k.words->data();
                 k.size = (std::uint32_t)k.words->size();
             }
@@ -6296,6 +6350,11 @@ void RenderThreadMain()
                                      "%llu parts made jobs at first sight by their shape, %llu when their shape turned; %llu parts kept from their jobs, %llu not (the job's run was not a part's)\n", (unsigned long long)shown,
                                      (unsigned long long)g_partsLetGo, (unsigned long long)g_partsLetGoRecent, (unsigned long long)g_partsKeepPutOff, (unsigned long long)g_jobsByShape,
                                      (unsigned long long)g_jobsShapeTurned, (unsigned long long)g_keptByJob, (unsigned long long)g_keptByJobRefused);
+                        static std::uint64_t jobsKeepNsWas, jobsKeepPartsWas;
+                        std::fprintf(stderr, "perfkeepms: to %llu, a frame: %.2f parts kept from jobs in %.3f ms (scratch %s)\n", (unsigned long long)gs::FramesShown(),
+                                     (g_jobsKeepParts - jobsKeepPartsWas) / (double)f, (g_jobsKeepNs - jobsKeepNsWas) / 1e6 / (double)f, KeepScratchOn() ? "on" : "off");
+                        jobsKeepNsWas = g_jobsKeepNs;
+                        jobsKeepPartsWas = g_jobsKeepParts;
                         std::memcpy(keepWas, g_keepWhy, sizeof keepWas);
                         std::memcpy(watchWas, g_watchWhy, sizeof watchWas);
                     }
