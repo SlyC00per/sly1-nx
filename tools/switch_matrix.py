@@ -15,6 +15,7 @@ It stops by itself when the receiver is gone, or a run does not end as it should
 """
 import os
 import re
+import shutil
 import statistics as st
 import sys
 import time
@@ -52,7 +53,9 @@ def main():
         variants.append((label, [e for e in envs.split(",") if e]))
     rounds, frames, levels = int(opts["--rounds"]), int(opts["--frames"]), opts["--levels"]
     common = [e for e in opts["--common"].split(",") if e]   # (settings every run has: K=V,K=V)
-    nro = os.path.join(ROOT, "build-switch", "sly1.nro")
+    nro = os.path.join(ROOT, "bench", name + ".nro")   # (a copy: a build made while this runs does not change it)
+    os.makedirs(os.path.join(ROOT, "bench"), exist_ok=True)
+    shutil.copy(os.path.join(ROOT, "build-switch", "sly1.nro"), nro)
     got = {label: [] for label, _ in variants}
     for r in range(rounds):
         for label, envs in variants:

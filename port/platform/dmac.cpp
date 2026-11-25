@@ -2163,6 +2163,7 @@ struct PartRecord {
     bool slow = false, headerSet = false;
     std::uint32_t headerAt = 0;
     std::uint32_t verdictList = 0;   // the list in which the helper's last good hash of it came
+    const void* nextRec = nullptr;       // the record that came after it in the last list (PartPrefetch): only ever prefetched
     // The TEX0 writes left out of the hash: where they are in the packet, what they were when the
     // part was kept, and where each is in the kept packets (item, word, which write). texStrict:
     // a kept TEX0 that is none of them, or too many: the values must be what they were.
@@ -2226,6 +2227,25 @@ struct PartRecord {
     Vif::Regs jobBefore, jobAfter;
 };
 std::unordered_map<std::uint32_t, PartRecord> g_parts;
+// The part that came before in the list being walked, and the records of the parts that come after a
+// part, as the last list had them, loaded while that one is worked on: a record is 1.4 KB and cold,
+// and the parts come in nearly the same order each frame. SLY1_PART_PREFETCH=lines (off unless set;
+// 16 is the one to try), or =ab:lines: on in every other 600 frames.
+PartRecord* g_prevRec;
+void PartPrefetch(PartRecord& r)
+{
+    static const char* const e = std::getenv("SLY1_PART_PREFETCH");
+    static const bool ab = e && e[0] == 'a';
+    static const int lines = e ? std::max(0, std::atoi(ab ? (std::strchr(e, ':') ? std::strchr(e, ':') + 1 : "16") : e)) : 0;
+    if (lines == 0 || (ab && gs::FramesShown() / 600 % 2 == 0))
+        return;
+    if (g_prevRec)
+        g_prevRec->nextRec = &r;
+    g_prevRec = &r;
+    if (const char* p = static_cast<const char*>(r.nextRec))
+        for (int k = 0; k < lines; k++)
+            __builtin_prefetch(p - 16 + k * 64);
+}
 // The records of parts not met for 1,800 frames (30 s), holding nothing (not kept, no job keeping
 // them, neither recorded nor watched now), forgotten: one is made anew when the part comes again.
 // Each level met added about 4,000 that were never let go (95,000 by the 25th in Ryujinx's tour,
@@ -3533,8 +3553,10 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
         PartDiff(key, target, regs.cl, regs.wl, tte, slow, header);
     PartRecordsPrune();
     auto it = g_parts.find(key);
-    if (it != g_parts.end())
+    if (it != g_parts.end()) {
         it->second.seenFrame = gs::FramesShown();
+        PartPrefetch(it->second);
+    }
     std::uint64_t hash = 0;
     bool late = false;   // the hash is what the helper last found, not this frame's
     if (PartHashLate() && it != g_parts.end()) {
@@ -6452,6 +6474,7 @@ void RenderThreadMain()
                 hold.emplace();
             {
                 g_partTurns.clear();
+                g_prevRec = nullptr;
                 g_listsBegun.store(++g_listSerial, std::memory_order_release);
                 PartJobsBegin();
                 if (PartJobsOn()) {
