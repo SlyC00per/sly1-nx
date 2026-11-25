@@ -342,7 +342,16 @@ void* Clock(void*)
             auto waiting = [] { return *(const volatile std::int32_t*)port::Native(0x002BE46C) != 0; };   // g_vblankWaiting
             const bool was = waitedLast;
             waitedLast = g_started && waiting();
-            if (slack > 0 && g_started && was && !waitedLast) {
+            // SLY1_VBLANK_GRID=1: the blanks after a held one stay where they were, so a frame that
+            // came late is followed by a short one that catches up (the GS thread, a frame behind,
+            // evens it out at the display), and a blank is lost only when the lateness passes the
+            // slack. Without it every frame of a heavy stretch is shown after 18 ms: 55 a second.
+            // SLY1_VBLANK_AB=1|2: the slack on in every other 600 frames (2: the other ones), for
+            // comparing within one run.
+            static const bool grid = std::getenv("SLY1_VBLANK_GRID") != nullptr;
+            static const int ab = std::getenv("SLY1_VBLANK_AB") ? std::atoi(std::getenv("SLY1_VBLANK_AB")) : 0;
+            const bool phaseOn = ab == 0 || (int)(port::gs::FramesShown() / 600 % 2) == ab - 1;
+            if (slack > 0 && phaseOn && g_started && (was || grid) && !waitedLast) {
                 const auto until = next + std::chrono::microseconds(slack);
                 while (!waiting() && std::chrono::steady_clock::now() < until)
                     std::this_thread::sleep_for(std::chrono::microseconds(150));
@@ -350,7 +359,8 @@ void* Clock(void*)
                     waitedLast = true;
                     heldUs += (std::uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - next).count();
                     held++;
-                    next = std::chrono::steady_clock::now();
+                    if (!grid)
+                        next = std::chrono::steady_clock::now();
                 }
             }
             if (slack > 0 && ++blanks % 600 == 0 && std::getenv("SLY1_PERF_LOG")) {
