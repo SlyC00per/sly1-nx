@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """A comparison of settings on the Switch, through the receiver (docs/RECEIVER.md), interleaved.
 
-    python3 tools/switch_matrix.py NAME [--rounds N] [--frames N] [--levels 4,5,20] VARIANT ...
+    python3 tools/switch_matrix.py NAME [--rounds N] [--frames N] [--levels 4,5,20] [--common K=V,K=V] VARIANT ...
 
 Each VARIANT is "label" or "label:K=V,K=V" (environment settings passed to the game; a first
 variant with none is the one compared against). They are run in turn, round after round (A B C A B
@@ -40,8 +40,9 @@ def main():
     if not a:
         sys.exit(__doc__)
     name = a.pop(0)
-    opts = {"--rounds": 3, "--frames": 150, "--levels": "4,5,20,4,5"}
+    opts = {"--rounds": 3, "--frames": 150, "--levels": "4,5,20,4,5", "--common": ""}
     variants = []
+    common = []
     while a:
         x = a.pop(0)
         if x in opts:
@@ -50,13 +51,14 @@ def main():
         label, _, envs = x.partition(":")
         variants.append((label, [e for e in envs.split(",") if e]))
     rounds, frames, levels = int(opts["--rounds"]), int(opts["--frames"]), opts["--levels"]
+    common = [e for e in opts["--common"].split(",") if e]   # (settings every run has: K=V,K=V)
     nro = os.path.join(ROOT, "build-switch", "sly1.nro")
     got = {label: [] for label, _ in variants}
     for r in range(rounds):
         for label, envs in variants:
             log = "%s-%s-%d" % (name, label, r)
             print("== %s" % log, flush=True)
-            status = bench.run(log, nro, levels, frames, envs, receiver=True)
+            status = bench.run(log, nro, levels, frames, common + envs, receiver=True)
             m = measures(os.path.join(ROOT, "bench", log + ".log"))
             if status:
                 print("stopped: that run did not end as it should (status %d)" % status)

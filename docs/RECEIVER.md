@@ -73,3 +73,19 @@ made on purpose (`SLY1_FAULT_AFTER`), a normal run after each, and the five-leve
 (57.0% at 60; render thread 9.30 ms, GS thread 9.50 ms, a helper's job 378 us: as through
 nxlink the same night, 57.1%, 9.30, 9.44 and 376, so the wrapped waits cost nothing that
 shows). After the last fix every run ended "13 of 13 threads ended, 0 stopped" with no fault.
+
+## When a run left the process unusable
+
+A run that ends without giving the GPU back leaves it, and other memory, in the process that the
+next run starts in. One started with the GPU would fault, or bring the whole system down (2026-11-25);
+a run refuses to start in a process marked so (`ProcessTainted`, `sdmc:/switch/sly1/tainted.txt`) and
+the way out is to close the receiver from HOME and start it again. A run with the GPU never opened
+works in it all the same and measures the CPU side on the Switch's own cores:
+
+    SLY1_NO_GPU=1 SLY1_GS_COUNT=1 SLY1_GS_COUNT_BATCHES=1
+
+(`switch_matrix.py --common` takes them). No picture, and no GPU time: the frame's own limit in
+such a run is the vertical blank and the threads. The program's heap starts at the largest clean
+stretch of the loader's (`__libnx_initheap`), so a piece of it a run before left lent out is never
+handed to it: the fault on that memory is what made the first attempts fail.
+

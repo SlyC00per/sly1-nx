@@ -132,6 +132,66 @@ void CloseLink()
 #endif
 
 #if defined(__SWITCH__)
+// The program's heap: the largest stretch of the one the loader gives that is plain memory. libnx
+// takes all of it, and newlib grows through it from the start; where a run before this one in the
+// process (the receiver's) was stopped with pieces of it lent out -- a thread's stack, a transfer
+// memory -- the first allocation that reached one faulted (2026-11-25). At a clean start the one
+// piece is the loader's copy of this program, and the stretch after it is the same but for 5 MB.
+extern "C" {
+extern char* fake_heap_start;
+extern char* fake_heap_end;
+void __libnx_initheap(void)
+{
+    u64 addr = 0, size = 0;
+    if (envHasHeapOverride()) {
+        addr = (u64)envGetHeapOverrideAddr();
+        size = envGetHeapOverrideSize();
+    } else {
+        u64 total = 0, used = 0;
+        svcGetInfo(&total, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&used, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
+        if (total > used + 0x200000)
+            size = (total - used - 0x200000) & ~0x1FFFFFull;
+        if (size == 0)
+            size = 0x2000000 * 16;
+        void* at = nullptr;
+        if (R_FAILED(svcSetHeapSize(&at, size)))
+            svcBreak(BreakReason_Panic, 0, 0);
+        addr = (u64)at;
+    }
+    u64 best = addr, bestSize = 0, at = addr;
+    u64 run = 0, runAt = addr;
+    const u64 end = addr + size;
+    while (at < end) {
+        MemoryInfo info;
+        u32 page = 0;
+        if (R_FAILED(svcQueryMemory(&info, &page, at)) || info.size == 0)
+            break;
+        const u64 stop = std::min(info.addr + info.size, end);
+        if (info.perm == Perm_Rw && info.attr == 0) {
+            if (run == 0)
+                runAt = at;
+            run += stop - at;
+            if (run > bestSize) {
+                bestSize = run;
+                best = runAt;
+            }
+        } else {
+            run = 0;
+        }
+        at = stop;
+    }
+    if (bestSize == 0) {   // (nothing plain: as libnx)
+        best = addr;
+        bestSize = size;
+    }
+    fake_heap_start = (char*)best;
+    fake_heap_end = (char*)(best + bestSize);
+}
+}
+#endif
+
+#if defined(__SWITCH__)
 // The end of a run that another program follows in this process (SLY1_NEXT: the receiver,
 // port/switch/receiver.cpp, which waits for the next build, for runs with nobody at the Switch).
 // The loader gives the next program this process and its heap, so everything this one holds of
