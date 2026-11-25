@@ -150,7 +150,7 @@ are used:
 | `12 n` | sequence n started beside this one |
 | `03 n` | sequence n stopped |
 | `0B n ...` | (first sequence) the rest of the part kept as block n; `0C n` does it |
-| `0F g m (c lo hi)...` | (first sequence) group g: channels and the sound levels each sounds between; `10 g` switches a sequence's channels by it |
+| `0F g m (c lo hi)...` | (first sequence) group g: channels and the sound levels each sounds between; `10 g` gives a sequence the group, which then switches its channels whenever the sound level changes ("Sneaking", below) |
 | `14 n`, `0E n` | not understood: passed over |
 
 The first sequence is messages only, in parts ended by `F7`: it sets registers, keeps blocks
@@ -215,3 +215,33 @@ a frame, not 1/60 s (tools/patches.py): on a 60.00 Hz screen every frame is a li
 and the clamp made the clock gain 0.4%. A register the music sets is told to the game 50 ms later
 on the Switch (`SLY1_AUDIO_DELAY_MS`), for the sound's way to the speaker; that figure is not
 measured.
+
+## Sneaking: the plucked steps and the music under them (2026-11-25)
+
+The player's report: on a PS2 each step of a sneak along a ledge is a plucked note, and the
+port seemed to have none. What the game does (sly1-decomp, `PlayPhaseCrossingSound`,
+`PlaySoundWithWanderingPitch`, `UpdateSoundEmitters`): entering a ledge pushes a sound level of
+-20; the level steps down one every three frames and is sent, plus 20, as command 0x27; while
+it is under 0 each step also starts sound 0x77 (record 119 of the first global bank) at half
+volume, a semitone or so from the last one's pitch.
+
+The port did all of that: on the host, with the player put beside a ledge and circle tapped
+(`SLY1_TOUR=ledges`), the level went to -20 and record 119 was started at every step, at about
+the level of a footstep. Alone it measures 140 to 260 Hz and under a fifth of a second: a low
+note, which a Switch's own speakers give little of. What was wrong was the music over it.
+"Prowling the Grounds" has a group whose channels 15, 0 and 11 sound at levels 0 to 19 and
+the others at 20 and over: a quiet arrangement for sneaking. The port switched a sequence's
+channels only when the sequence came to its `10 g` statement, once a loop, so the music stayed
+full through a sneak. Now the group a sequence was given goes on deciding: when the level
+changes its channels change at once, and a channel switched off lets its notes go
+(`Song::TakeGroup`, `Song::LevelChanged`). `SLY1_SND_GROUPS=0`: at the statement only, as before.
+
+Measured on the host, the music alone, with the level set to 0 for eight seconds
+(`SLY1_SND_LEVEL=22,0,30,20`): it falls from some 2,300 to some 1,100 (RMS over two seconds)
+and comes back. **A reading, to be put right by ear:** that retail switches at once and not at
+the statement was not measured on a PS2; and whether the pluck is then as loud against the
+music as retail's is the player's to say.
+
+`SLY1_SND_LOG` now also prints each change of the sound level, each group, and a sound's
+record and tone volumes.
+

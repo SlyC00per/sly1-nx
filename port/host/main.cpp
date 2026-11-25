@@ -74,6 +74,8 @@ void func_001BED48();   // the game's PauseStagedBankVoice (SLY1_RETRY_TEST)
 void func_00178008(Player*, Vec4*);   // the game's SetPlayerPosition (SLY1_WARP)
 struct World;
 std::int32_t func_0015A4F0(World* world, std::uint32_t flags, std::int32_t id, void* scope, std::int32_t max, void* found);   // GatherObjectsById (SLY1_TOUR=arrivals)
+struct TargetCurve;
+void func_00169E20(TargetCurve* self, Vec4* out, float* angleOut, float t);   // PlaceOnTargetCurve (SLY1_TOUR=ledges)
 struct BaseObject;
 void func_001F3BD8(BaseObject* self, Vec4* out);   // GetObjectWorldPosition
 struct GameProgress;
@@ -673,6 +675,43 @@ void VerifyLevels()
             // which lie along the way through it: the same tour for any level, without a played route
             // (the user's idea, 2026-11-22). With --verify-levels: every level's.
             static std::string arrivals;
+            // SLY1_TOUR=ledges[:frames]: the stops are the level's target curves the player is held beside
+            // (class 0x6F with mode 0 or 1: the ledges it sidles along), a little way along each.
+            if (std::strncmp(tour, "ledges", 6) == 0) {
+                frames = 240;
+                if (tour[6] == ':')
+                    frames = std::max(1, std::atoi(tour + 7));
+                static std::uint32_t found[64 + 4];
+                static float places[64][4] __attribute__((aligned(16)));
+                static std::int32_t count;
+                static std::atomic<bool> gathered;
+                count = 0;
+                gathered = false;
+                if (word(0x00275710) != 0 && word(0x00262E10) != 0) {
+                    port::CallOnGameThread([] {
+                        count = ::func_0015A4F0((::World*)port::Native(*(std::uint32_t*)port::Native(0x00275710)), 0x205, 0x6F, nullptr, 64, found);
+                        for (std::int32_t k = 0; k < count && k < 64; k++)
+                            if (found[k] != 0)
+                                ::func_00169E20((::TargetCurve*)port::Native(found[k]), (::Vec4*)places[k], nullptr, 60.0f);
+                        gathered = true;
+                    });
+                    waitFor([&] { return gathered.load(); }, 30);
+                }
+                arrivals = ":";
+                int kept = 0;
+                for (std::int32_t k = 0; k < count && k < 64; k++) {
+                    if (found[k] == 0)
+                        continue;
+                    const std::int32_t mode = *(const std::int32_t*)port::Native(found[k] + 0x40);
+                    std::fprintf(stderr, "tour: curve %d, mode %d, at %.0f %.0f %.0f\n", (int)k, (int)mode, (double)places[k][0], (double)places[k][1], (double)places[k][2]);
+                    if (mode != 0 && mode != 1)
+                        continue;
+                    char one[96];
+                    std::snprintf(one, sizeof one, "%s%.1f,%.1f,%.1f", kept++ ? ";" : "", (double)places[k][0], (double)places[k][1], (double)places[k][2] + 60.0);
+                    arrivals += one;
+                }
+                at = kept > 0 ? arrivals.c_str() : nullptr;
+            }
             if (std::strncmp(tour, "arrivals", 8) == 0) {
                 frames = 240;
                 if (tour[8] == ':')

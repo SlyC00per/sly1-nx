@@ -492,6 +492,7 @@ struct Song {
         bool ended = false;            // it reached its end (it was not stopped)
         int id = 0;
         int next = -1;                 // the sequence its messages chose to go on with
+        int group = -1;                // the group its channels go by (statement 10), or none
     };
     std::shared_ptr<Bank> bank;
     std::vector<Track> tracks;
@@ -586,6 +587,42 @@ struct Song {
                 n.release = 1.0f / (kRate * 0.05f);
                 n.env.KeyOff();
             }
+    }
+
+    // A sequence's channels as its group has them at the sound level now: each sounds between two
+    // levels. The group goes on deciding after the statement that names it: when the level changes
+    // (LevelChanged, command 0x27) the channels change at once, and a channel switched off lets its
+    // notes go. So a level's music thins to its quiet channels the moment the player starts to
+    // sneak (the level goes under 20), where the statement alone left it full until the sequence
+    // came round to it again. SLY1_SND_GROUPS=0: at the statement only, as before.
+    void TakeGroup(Track& t)
+    {
+        auto g = groups.find(t.group);
+        if (g == groups.end())
+            return;
+        for (std::size_t k = 0; k + 3 <= g->second.size(); k += 3) {
+            const std::uint8_t* c = &g->second[k];
+            if (c[0] >= 16)
+                continue;
+            const bool was = t.on[c[0]];
+            t.on[c[0]] = g_soundLevel >= c[1] && g_soundLevel <= c[2];
+            if (was && !t.on[c[0]])
+                for (Playing& n : notes)
+                    if (n.track == t.id && n.channel == c[0] && !n.stopped) {
+                        n.released = n.stopped = true;
+                        n.release = 1.0f / (kRate * 0.05f);
+                        n.env.KeyOff();
+                    }
+        }
+    }
+    void LevelChanged()
+    {
+        static const bool off = std::getenv("SLY1_SND_GROUPS") && std::getenv("SLY1_SND_GROUPS")[0] == '0';
+        if (off)
+            return;
+        for (Track& t : tracks)
+            if (!t.done && t.group >= 0)
+                TakeGroup(t);
     }
 
     static bool EnvelopeOn()
@@ -691,13 +728,8 @@ struct Song {
             if (!need(1))
                 return nullptr;
             if (run && track) {
-                auto g = groups.find(p[0]);
-                if (g != groups.end())
-                    for (std::size_t k = 0; k + 3 <= g->second.size(); k += 3) {
-                        const std::uint8_t* c = &g->second[k];
-                        if (c[0] < 16)
-                            track->on[c[0]] = g_soundLevel >= c[1] && g_soundLevel <= c[2];
-                    }
+                track->group = p[0];
+                TakeGroup(*track);
             }
             return p + 1;
         case 0x14:   // not understood, one byte each
@@ -742,6 +774,12 @@ struct Song {
                 }
                 if (*s == 0x0F && s + 3 <= e) {
                     groups[s[1]].assign(s + 3, e);
+                    if (std::getenv("SLY1_SND_LOG")) {   // the group's channels and the sound levels each sounds between
+                        std::fprintf(stderr, "sndlog: music: group %d (%d):", s[1], s[2]);
+                        for (const std::uint8_t* q = s + 3; q + 3 <= e; q += 3)
+                            std::fprintf(stderr, " channel %d from %d to %d,", q[0], q[1], q[2]);
+                        std::fprintf(stderr, "\n");
+                    }
                     break;
                 }
                 s = Statement(s, e, true, nullptr, 0);
@@ -1261,8 +1299,11 @@ void MixChunk(std::int16_t* out)
                     if (p)
                         p++;
                 }
-                if (value >= 0)
+                if (value >= 0 && g_soundLevel != value) {
                     g_soundLevel = value;
+                    for (auto& kv : g_songs)
+                        kv.second->LevelChanged();
+                }
             }
         }
         g_movieRing.Mix(sum, kChunk, Channel(2));
@@ -1746,7 +1787,13 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
             g_movieRing.played = g_movieRing.Frames();   // (no mixer: it is taken as fast as it comes)
         return g_movieRing.Position();
     case 0x27:   // the sound level: what the level's music goes by
-        g_soundLevel = (std::int32_t)a;
+        if (g_soundLevel != (std::int32_t)a && std::getenv("SLY1_SND_LOG"))
+            std::fprintf(stderr, "sndlog: the sound level %d\n", (int)(std::int32_t)a);
+        if (g_soundLevel != (std::int32_t)a) {
+            g_soundLevel = (std::int32_t)a;
+            for (auto& kv : g_songs)
+                kv.second->LevelChanged();
+        }
         return 0;
     case 0x09:   // a volume channel's value, 0x400 is 1
                 {
@@ -1782,6 +1829,7 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
             if (log) {
                 std::fprintf(stderr, "sndlog: %.1f s: sound %u of bank %u (sector %u) started, volume %d, pitch %d; tones:", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), b, a,
                              bank == g_banks.end() ? 0 : bank->second->sector, (int)c, (int)(std::int32_t)Word(data, size, 4));
+                std::fprintf(stderr, " (record's volume %.2f, channel %d)", (double)v->recordVolume, v->channel);
                 if (v->bank)   // each tone's kind, and a sample's note, fine part, rate and place
                     for (std::uint32_t k = 0; k < v->tones && k < 12; k++) {
                         const std::uint8_t* t = v->bank->block.data() + v->toneAt + (std::size_t)k * 0x28;
@@ -1804,7 +1852,7 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
                                     break;
                                 }
                             }
-                            std::fprintf(stderr, " [1 note %d fine %u %.0f Hz at %u: %u frames, %u loop starts (%d..%u), end %X, envelope %04X/%04X]", -(std::int8_t)t[10], t[11], (double)ToneRate(t), at, frames, starts,
+                            std::fprintf(stderr, " [1 volume %u note %d fine %u %.0f Hz at %u: %u frames, %u loop starts (%d..%u), end %X, envelope %04X/%04X]", t[9], -(std::int8_t)t[10], t[11], (double)ToneRate(t), at, frames, starts,
                                          firstStart == ~0u ? -1 : (int)firstStart, lastStart, endFlags, (unsigned)(t[0x12] | t[0x13] << 8), (unsigned)(t[0x14] | t[0x15] << 8));
                         }
                         else {
