@@ -1782,3 +1782,42 @@ Run 16, every part hashed (`SLY1_HASH_SKIP=0`), the rest as default, the same st
 264 windows in 3D at 60 against run 15's 92% of 80 with both on, 94 late frames per 100 windows
 against 85, the helper's job 340 against 333 us. Two runs on routes that differ: the skipping of
 hashes stays on, with no more than a small gain seen.
+
+## A night of measuring (2026-11-25)
+
+Every figure is from the Switch unless it says the host; the tour reads 57% at 60 (docs of
+`tools/bench.py`: 6 points between runs of one build), so what is compared is thread time, in one
+run. Four switches were measured, one was refused.
+
+- **The render thread hashed parts the helper should have** (on, `SLY1_HASH_RENEW`). A long-way
+  part whose hash the helper had not made for four lists was hashed here, and, its verdict never
+  made new, in every list after: 19 a frame of the 27 drawn again. 0.346 ms a frame off,
+  0.041 ms on. `perfhash:` under `SLY1_PERF_LOG` counts the render thread's own hashes by why.
+- **A part kept from its job cost 162 us, now 80** (on, `SLY1_KEEP_SCRATCH`). Its items went through
+  two to four pieces of memory each before the block that is kept; the pieces are buffers used
+  again.
+- **The kept batches' memory is not a limit** (`SLY1_PART_KEEP_MB`, `SLY1_GPU_KEEP_MB`). 49 MB of the
+  64 used; 160 and 224 MB: 58.1% against 57.0%, within the noise.
+- **The late blank kept on its grid is not shown to help** (`SLY1_VBLANK_GRID`, off). Two runs with
+  the phases swapped said +9.7 and -2.0 points; 0 to 7 of 600 blanks were held, the late frames are
+  mostly over 30 ms.
+- **A second helper on the GS thread's core** (taken out) hung a run. The GS thread wakes every few
+  tens of microseconds during a list, so a thread below it on its core is set aside in the middle
+  of every job: 0.5 jobs a frame for 6.1 ms of its time, and one set aside between giving a job's
+  items and saying so left the others running that job again for ever. The rule that came of it
+  (a job given but not said is waited for) is in PartJobNeed.
+
+Not measured on the Switch (the process there had been left unusable by that hang; nothing was
+sent to it): branch `overnight-2026-11-25`.
+
+- `SLY1_PART_KEEP_TWICE=new`: a part kept at first sight unless it changed before. On the host: jobs
+  55,824 to 37,650 (level 4), 108,484 to 97,951 (20), 28,860 to 22,777 (5).
+- `SLY1_GIF_LIVE=1`: a frame's upload of 272 KB (before its list) read where it lies by the render
+  thread, not copied by the game's. The timeline has 0.4 ms of that copy before the list is
+  queued. On the host 16,648 uploads over the 46 levels read later than queued were what they were
+  when queued, 0 differing, with the render thread slowed by 25 and 60 ms a list too.
+- `SLY1_JOB_HASH_COPY` (on in that branch): a job's copy and its part's shape in one walk. On the
+  host 50,000 shapes the same as PartHash's; 0.55 to 0.49 s of job making.
+- One job of some 12,800 on level 14 is "wrong" (`SLY1_PART_JOBS_CHECK`) in half the default runs and in
+  all of =new's. It was there before; a wrong job is not kept.
+

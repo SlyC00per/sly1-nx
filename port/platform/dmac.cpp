@@ -1979,7 +1979,7 @@ void RunFromSprChain(std::uint32_t regs)
 // the buffer swap go through the queue too. SLY1_RENDER_SYNC runs everything on the game's
 // thread, as before.
 struct RenderItem {
-    enum Kind : std::uint8_t { Vif1, Gif, Call, Vif1Live } kind = Vif1;
+    enum Kind : std::uint8_t { Vif1, Gif, Call, Vif1Live, GifLive } kind = Vif1;
     std::uint32_t regs = 0, tadr = 0;   // Vif1Live: the chain, walked where it is
     std::vector<std::uint32_t> words;
     void (*fn)(std::uint64_t, std::uint64_t) = nullptr;
@@ -5553,6 +5553,8 @@ struct InterruptScan {
 };
 InterruptScan g_interruptScan;
 std::atomic<std::uint64_t> g_liveLists, g_copiedLists;
+std::atomic<std::uint64_t> g_gifLive;   // (GIF uploads read where they lie by the render thread)
+constexpr std::size_t kLiveGifWords = 8192;   // (32 KB; a smaller one is copied as before)
 
 // (Quadwords that follow each other in memory are copied in one piece: a quadword at a time was
 // half of what the game's own render thread did on the Switch, before the port's could start.)
@@ -5588,7 +5590,7 @@ struct CaptureSink {
 // A chain walked as the DMAC walks it, its data handed to sink: OnVif(words, n) for VIF0 and VIF1
 // (the tags' upper halves with TTE, then each quadword), OnGif(quadword) for the GIF channel.
 template <class Sink>
-void WalkChain(std::uint32_t regs, std::uint32_t tadr, Sink& sink)
+void WalkChain(std::uint32_t regs, std::uint32_t tadr, Sink& sink, bool finish = true)   // (finish: the channel's registers left as a transfer that is over leaves them)
 {
     volatile std::uint32_t* r = static_cast<volatile std::uint32_t*>(Native(regs));
     Vif* vif = regs == kVif0 ? &g_vif0 : regs == kVif1 ? &g_vif1 : nullptr;
@@ -5677,6 +5679,8 @@ void WalkChain(std::uint32_t regs, std::uint32_t tadr, Sink& sink)
         std::fprintf(stderr, "dmac: chain on 0x%08X from 0x%08X%s: %u tags, %u FINISH, VIF %s\n", regs, start,
                      tte ? " (TTE)" : "", g_counts.tags - tagsBefore, g_counts.finishes - finishesBefore,
                      vif && sink.Direct() ? vif->State().c_str() : "-");
+    if (!finish)
+        return;
     r[0x30 / 4] = tadr;
     if (toSpr)
         r[0x80 / 4] = sadr;
@@ -5705,6 +5709,33 @@ void RunDmaChain(std::uint32_t regs, std::uint32_t tadr)
                 item.regs = regs;
                 item.tadr = tadr;
                 g_liveLists++;
+                Enqueue(std::move(item));
+                g_counts.dmaNanoseconds += NowNs() - t0;
+                return;
+            }
+        }
+        // A long upload of the GIF's channel (a frame's 272 KB: 0.4 ms of the game's thread to copy,
+        // in front of the frame's list) is copied by the render thread, which is idle then: the
+        // game's thread only counts it, which leaves the channel's registers as a finished
+        // transfer's, and goes on. It stays in order before the list, and the chain is of a packet
+        // the game does not write again until the frame's FINISH. SLY1_GIF_LIVE=0: copied by the
+        // game's thread; =ab: in turn, 600 frames each, off first; =check: copied by both and compared.
+        static const char* const gifEnv = std::getenv("SLY1_GIF_LIVE");
+        static const bool gifAb = gifEnv && gifEnv[0] == 'a', gifCheck = gifEnv && gifEnv[0] == 'c';
+        const bool gifLive = !gifEnv ? false : gifAb ? gs::FramesShown() / 600 % 2 == 1 : gifEnv[0] != '0';
+        if (regs == kGif && gifLive && !copyAll) {
+            CountSink count;
+            WalkChain(regs, tadr, count);
+            if (count.words >= kLiveGifWords) {
+                item.kind = RenderItem::GifLive;
+                item.regs = regs;
+                item.tadr = tadr;
+                if (gifCheck) {
+                    item.words = SpareBuffer();
+                    CaptureSink sink{item.words};
+                    WalkChain(regs, tadr, sink, false);
+                }
+                g_gifLive++;
                 Enqueue(std::move(item));
                 g_counts.dmaNanoseconds += NowNs() - t0;
                 return;
@@ -6272,6 +6303,37 @@ void RenderThreadMain()
             g_renderQueue.pop_front();
             g_renderQueuedWords -= item.words.size();
             g_renderBusy = true;
+        }
+        if (item.kind == RenderItem::GifLive) {
+            std::vector<std::uint32_t> words = SpareBuffer();
+            {
+                CaptureSink sink{words};
+                WalkChain(item.regs, item.tadr, sink, false);
+            }
+            static const bool check = std::getenv("SLY1_GIF_LIVE") && std::getenv("SLY1_GIF_LIVE")[0] == 'c';
+            if (check) {
+                static std::uint64_t n, wrong, bytes;
+                n++;
+                bytes += words.size() * 4;
+                if (item.words != words) {
+                    wrong++;
+                    if (wrong < 20) {
+                        std::size_t k = 0;
+                        while (k < std::min(words.size(), item.words.size()) && words[k] == item.words[k])
+                            k++;
+                        std::fprintf(stderr, "giflive: upload %llu differs from its copy at queueing: word %zu of %zu and %zu\n", (unsigned long long)n, k, words.size(), item.words.size());
+                    }
+                }
+                if ((n & (n - 1)) == 0 || n % 500 == 0)
+                    std::fprintf(stderr, "giflive: %llu uploads of %llu KB, %llu other than at their queueing\n", (unsigned long long)n, (unsigned long long)(bytes >> 10), (unsigned long long)wrong);
+                {
+                    std::lock_guard<std::mutex> lk(g_renderLock);
+                    if (g_renderSpare.size() < 64 && item.words.capacity() <= kRenderSpareMostWords)
+                        g_renderSpare.push_back(std::move(item.words));
+                }
+            }
+            item.words = std::move(words);
+            item.kind = RenderItem::Gif;
         }
         const bool gsThread = GsAsync();
         const std::uint64_t started = NowNs();
