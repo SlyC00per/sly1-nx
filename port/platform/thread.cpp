@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Threads on stacks in game memory (port/thread.h).
 #include "port/thread.h"
+#include "port/crashlog.h"
 
 #include <cstdint>
 #include <algorithm>
@@ -600,6 +601,63 @@ void PlaceThread(ThreadRole role, bool sampled)
         svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2B);   // above the game's (libnx gives 0x2C to main)
     else
         svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2C);
+}
+
+// Where every other thread is, for a report of a hang or a fault (port/crashlog.h): each is paused
+// for the moment its registers are read, and a frame record is followed only where the memory can
+// be read. No heap is used.
+namespace {
+bool Readable(std::uintptr_t at)
+{
+    MemoryInfo info = {};
+    u32 page = 0;
+    return at % 8 == 0 && R_SUCCEEDED(svcQueryMemory(&info, &page, at)) && (info.perm & Perm_R) && at + 16 <= info.addr + info.size;
+}
+}
+void DescribeThreads(void (*line)(const char*))
+{
+    const Handle self = threadGetCurHandle();
+    const std::uintptr_t base = ImageBase(), size = ImageSize();
+    for (int k = 0; k < kThreadsMost; k++) {
+        if (!g_threads[k].load() || g_threadHandle[k] == self || Ended(k))
+            continue;
+        const Handle h = g_threadHandle[k];
+        ThreadContext ctx = {};
+        const bool paused = R_SUCCEEDED(svcSetThreadActivity(h, ThreadActivity_Paused));
+        const Result got = svcGetThreadContext3(&ctx, h);
+        char text[512];
+        int n = std::snprintf(text, sizeof text, "thread %d (first function +0x%llX):", k, (unsigned long long)(g_threadEntry[k] - base));
+        if (R_FAILED(got)) {
+            std::snprintf(text + n, sizeof text - n, " its registers could not be read (0x%X)", got);
+        } else {
+            auto place = [&](const char* what, std::uintptr_t at) {
+                if (at - base < size)
+                    n += std::snprintf(text + n, sizeof text - n, " %s +0x%llX", what, (unsigned long long)(at - base));
+                else
+                    n += std::snprintf(text + n, sizeof text - n, " %s 0x%llX (not the program's)", what, (unsigned long long)at);
+            };
+            place("at", ctx.pc.x);
+            place("lr", ctx.lr);
+            std::uintptr_t fp = ctx.fp;
+            for (int i = 0; i < 10 && fp && Readable(fp) && n < (int)sizeof text - 40; i++) {
+                const std::uintptr_t ret = reinterpret_cast<std::uintptr_t*>(fp)[1];
+                if (ret - base >= size)
+                    break;
+                n += std::snprintf(text + n, sizeof text - n, ", from +0x%llX", (unsigned long long)(ret - base));
+                fp = reinterpret_cast<std::uintptr_t*>(fp)[0];
+            }
+        }
+        if (paused)
+            svcSetThreadActivity(h, ThreadActivity_Runnable);
+        line(text);
+    }
+}
+void PauseOtherThreads(bool pause)
+{
+    const Handle self = threadGetCurHandle();
+    for (int k = 0; k < kThreadsMost; k++)
+        if (g_threads[k].load() && g_threadHandle[k] != self && !Ended(k))
+            svcSetThreadActivity(g_threadHandle[k], pause ? ThreadActivity_Paused : ThreadActivity_Runnable);
 }
 
 #else

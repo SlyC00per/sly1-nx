@@ -121,7 +121,9 @@ void WorkerMain();
 void HelperMain();
 }  // namespace movie
 // A level load's request, written to the log (tools/patches.py).
-void NoteWorldLoad(int arrivalA, int arrivalB, int flags);
+void NoteWorldLoad(int arrivalA, int arrivalB, int flags, unsigned level);
+// The record (a game address in the level table) of the level last loaded, or 0.
+unsigned LastLevelLoaded();
 // A fade that is to load a level: where StartScreenFade was called from (bytes from its own start;
 // -1 for the completion fade, whose two values are then its kind and the completion mask).
 void NoteFade(long from, int kind, int value, int count, int mode);

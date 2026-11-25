@@ -363,10 +363,10 @@ PATCHES = [
 
     # A line in the log for each level load: the two arrival keys and the flags of the request
     # (what the level it was asked from gave), for reproducing a way into a level on the host
-    # (SLY1_ARRIVAL).
+    # (SLY1_ARRIVAL); and the level's record, for a report of a fault (port/switch/crashlog.cpp).
     ("src/main/on_off_object.cpp",
      "    OwnedStream sub;\n    SetScreenOwner(2);\n    if (self->key != 0) {",
-     "    OwnedStream sub;\n    SetScreenOwner(2);\n    port::NoteWorldLoad(self->arrivalKeyA, self->arrivalKeyB, self->flags);\n    if (self->key != 0) {",
+     "    OwnedStream sub;\n    SetScreenOwner(2);\n    port::NoteWorldLoad(self->arrivalKeyA, self->arrivalKeyB, self->flags, (u32)(self->key));\n    if (self->key != 0) {",
      "each level load noted in the log"),
 
     # Widescreen (docs/PS3_PARITY.md): the camera's horizontal extent over the vertical is 4/3 wider

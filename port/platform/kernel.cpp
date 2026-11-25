@@ -448,9 +448,13 @@ void VanLog(float stick, float top, float target, float vx, float vy, float vz, 
                  (double)stick, (double)top, (double)target, std::sqrt((double)vx * vx + (double)vy * vy + (double)vz * vz), (double)vx, (double)vy, (double)vz, (double)pace,
                  (double)zone, kind, boosts, checksum);
 }
-void NoteWorldLoad(int arrivalA, int arrivalB, int flags)
+static std::atomic<unsigned> g_lastLevel{0};
+unsigned LastLevelLoaded() { return g_lastLevel.load(std::memory_order_relaxed); }
+void NoteWorldLoad(int arrivalA, int arrivalB, int flags, unsigned level)
 {
-    std::fprintf(stderr, "world: a level load, arrival keys %d %d, flags 0x%X\n", arrivalA, arrivalB, (unsigned)flags);
+    if (level)
+        g_lastLevel.store(level, std::memory_order_relaxed);
+    std::fprintf(stderr, "world: a level load, arrival keys %d %d, flags 0x%X, level record 0x%X\n", arrivalA, arrivalB, (unsigned)flags, level);
     LevelLoadNoted();   // (dmac.cpp)
 }
 

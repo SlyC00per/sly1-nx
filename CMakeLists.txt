@@ -15,6 +15,7 @@ if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_TOOLCHAIN_FILE)
     endif()
 endif()
 project(sly1_nx C CXX)
+set(SLY1_VERSION "0.9.0")
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -246,21 +247,26 @@ if(PLATFORM STREQUAL "SWITCH")
     target_include_directories(port_gpu PRIVATE port/include)
     target_compile_options(port_gpu PRIVATE -Wall -Wextra)
     target_link_libraries(port_gpu PRIVATE port_shaders deko3d)
-    add_executable(sly1 port/host/main.cpp port/switch/screen_text.cpp $<TARGET_OBJECTS:sly1_game>)
-    target_include_directories(sly1 PRIVATE port/include)
+    # The build's name in a report of a fault (docs/CRASHES.md): the commit, made again at each build.
+    add_custom_target(sly1_build_id BYPRODUCTS ${CMAKE_BINARY_DIR}/gen/build_id.h
+        COMMAND ${CMAKE_COMMAND} -DOUT=${CMAKE_BINARY_DIR}/gen/build_id.h -DSRC=${CMAKE_SOURCE_DIR} -DVERSION=${SLY1_VERSION}
+                -P ${CMAKE_SOURCE_DIR}/cmake/build_id.cmake)
+    add_executable(sly1 port/host/main.cpp port/switch/screen_text.cpp port/switch/crashlog.cpp $<TARGET_OBJECTS:sly1_game>)
+    add_dependencies(sly1 sly1_build_id)
+    target_include_directories(sly1 PRIVATE port/include ${CMAKE_BINARY_DIR}/gen)
     sly1_install_save(sly1)
     target_link_libraries(sly1 PRIVATE port_game_asm port_platform port_gpu port_render port_libm port_core)
     # (diagnosis of the start-up fault: who takes a device out of newlib's table, port/platform/thread.cpp)
     # (and every thread's handle kept, for stopping them at the end of a run the receiver follows)
     target_link_options(sly1 PRIVATE -Wl,--wrap=RemoveDevice -Wl,--wrap=threadCreate -Wl,--wrap=threadClose
         -Wl,--wrap=svcSleepThread -Wl,--wrap=svcWaitSynchronization -Wl,--wrap=condvarWaitTimeout)
-    nx_generate_nacp(sly1.nacp NAME "Sly Cooper" AUTHOR "sly1-nx" VERSION "0.9.0")
+    nx_generate_nacp(sly1.nacp NAME "Sly Cooper" AUTHOR "sly1-nx" VERSION "${SLY1_VERSION}")
     # (the homebrew menu's icon: the project's own mark, 256 by 256, branding/nro-icon.jpg)
     nx_create_nro(sly1 NACP sly1.nacp ICON ${CMAKE_SOURCE_DIR}/branding/nro-icon.jpg)
     # The receiver (port/switch/receiver.cpp): takes builds over the network and starts them, for
     # runs on a Switch nobody is at (tools/switch_run.py).
     add_executable(sly1_receiver port/switch/receiver.cpp)
-    nx_generate_nacp(sly1_receiver.nacp NAME "sly1-nx receiver" AUTHOR "sly1-nx" VERSION "0.9.0")
+    nx_generate_nacp(sly1_receiver.nacp NAME "sly1-nx receiver" AUTHOR "sly1-nx" VERSION "${SLY1_VERSION}")
     nx_create_nro(sly1_receiver NACP sly1_receiver.nacp)
 else()
     find_package(Threads REQUIRED)

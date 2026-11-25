@@ -67,6 +67,7 @@ namespace port { void ScreenText(const char* text); }   // (switch/screen_text.c
 #include "port/memory_card.h"
 #include "port/retail_data.h"
 #include "port/audio.h"
+#include "port/crashlog.h"
 struct Player;
 struct Vec4;
 void func_001BED48();   // the game's PauseStagedBankVoice (SLY1_RETRY_TEST)
@@ -878,11 +879,13 @@ extern "C" const void* devoptab_list[];
 void __libnx_exception_handler(ThreadExceptionDump* ctx)
 {
     char line[256];
+    port::crashlog::Begin("fault");
     std::uintptr_t base = port::g_imageBase;
     std::snprintf(line, sizeof line, "sly1: fault 0x%X at pc +0x%llX, lr +0x%llX, address 0x%llX, sp 0x%llX",
                   ctx->error_desc, (unsigned long long)(ctx->pc.x - base), (unsigned long long)(ctx->lr.x - base),
                   (unsigned long long)ctx->far.x, (unsigned long long)ctx->sp.x);
     svcOutputDebugString(line, std::strlen(line));
+    port::crashlog::Line(line);
     std::fprintf(stderr, "%s\n", line);   // to nxlink on hardware
     {   // (diagnosis of the start-up fault) newlib's device table as it is now, and as x1 points at it
         const void* const* seen = reinterpret_cast<const void* const*>(ctx->cpu_gprs[1].x);
@@ -900,6 +903,7 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
                 break;
             std::snprintf(line, sizeof line, "sly1:   called from +0x%llX", (unsigned long long)(ret - base));
             svcOutputDebugString(line, std::strlen(line));
+            port::crashlog::Line(line);
             std::fprintf(stderr, "%s\n", line);
             fp = reinterpret_cast<std::uintptr_t*>(fp)[0];
         }
@@ -909,13 +913,19 @@ void __libnx_exception_handler(ThreadExceptionDump* ctx)
         for (int k = i; k < i + 4 && k < 29; k++)
             n += std::snprintf(line + n, sizeof line - n, " x%d %llX", k, (unsigned long long)ctx->cpu_gprs[k].x);
         svcOutputDebugString(line, std::strlen(line));
+        port::crashlog::Line(line);
         std::fprintf(stderr, "%s\n", line);
     }
     std::snprintf(line, sizeof line, "sly1:   fp %llX lr %llX sp %llX", (unsigned long long)ctx->fp.x,
                   (unsigned long long)ctx->lr.x, (unsigned long long)ctx->sp.x);
     svcOutputDebugString(line, std::strlen(line));
+    port::crashlog::Line(line);
     std::fprintf(stderr, "%s\n", line);
     std::fflush(stderr);
+    port::crashlog::Line("");
+    port::crashlog::Line("every other thread:");
+    port::DescribeThreads(port::crashlog::Line);
+    port::crashlog::Write();
     Finish(3);
 }
 }
@@ -970,6 +980,7 @@ int Main(int argc, char** argv)
         g_nxlinkSocket = nxlinkStdio();
         g_socketsUp = true;
     }
+    port::crashlog::Start();   // (after the link: what is printed goes on to it)
     if (std::getenv("SLY1_HEAP_MAP") || __nxlink_host.s_addr != 0)   // (under nxlink or the receiver: what a run before left)
         port::HeapReport("at the start", std::getenv("SLY1_HEAP_MAP") != nullptr);
     // An exception nothing catches, or any other call of std::terminate, said with where it came
@@ -990,6 +1001,19 @@ int Main(int argc, char** argv)
                 if (const char* fault = std::getenv("SLY1_FAULT_AFTER"))
                     if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(std::atoi(fault)))
                         *(volatile int*)8 = 1;
+                // SLY1_STALL_AFTER=seconds: every other thread paused then, for 8 s (the hang report, tried)
+                if (const char* stall = std::getenv("SLY1_STALL_AFTER")) {
+                    static int state;
+                    const auto in = std::chrono::steady_clock::now() - t0;
+                    if (state == 0 && in > std::chrono::seconds(std::atoi(stall))) {
+                        state = 1;
+                        port::PauseOtherThreads(true);
+                    } else if (state == 1 && in > std::chrono::seconds(std::atoi(stall) + 8)) {
+                        state = 2;
+                        port::PauseOtherThreads(false);
+                    }
+                }
+                port::crashlog::Watch();
                 const char* limit = std::getenv("SLY1_DEADLINE");
                 if (limit && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(std::atoi(limit))) {
                     std::fprintf(stderr, "sly1: the run's deadline of %s s passed: ended\n", limit);
