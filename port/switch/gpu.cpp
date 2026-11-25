@@ -68,7 +68,14 @@ constexpr std::uint32_t kSmallScale = 1;               // an image's pixels to o
 constexpr std::uint32_t kTargetMemory = 8u << 20;
 // Memory for the batches that come again unchanged (gs::Batch::keep): their positions and STQ,
 // colours and indices, written once and drawn from each frame after.
-constexpr std::uint32_t kKeepMemory = 64u << 20;
+// The kept batches' memory: 64 MB, or SLY1_GPU_KEEP_MB (with SLY1_PART_KEEP_MB, the render
+// thread's own limit for what it keeps of parts: port/platform/dmac.cpp). Read when first asked
+// for: the arguments' --env are set by main, after the program's globals.
+std::uint32_t KeepMemory()
+{
+    static const std::uint32_t bytes = (std::uint32_t)(std::getenv("SLY1_GPU_KEEP_MB") ? std::min(1024, std::max(16, std::atoi(std::getenv("SLY1_GPU_KEEP_MB")))) : 64) << 20;
+    return bytes;
+}
 // The half-size picture of the translucent effects (Renderer::FxRun): its number as a target, and
 // its and the depth buffer's places among the textures' descriptors.
 constexpr int kFxTarget = 100;
@@ -711,7 +718,7 @@ bool Renderer::Create()
         }
     }
     if (!std::getenv("SLY1_GPU_NO_KEEP"))   // without it, a kept batch is copied each frame like any other
-        keepMem_ = Block(kKeepMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
+        keepMem_ = Block(KeepMemory(), DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
     for (int k = 0; k < kSets; k++) {
         frameMems_[k] = Block(kFrameMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
         commandMems_[k] = Block(kCommandMemory, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
@@ -2081,7 +2088,7 @@ bool Renderer::KeepRoom(std::uint32_t bytes, std::uint32_t* at, std::uint32_t* g
             return true;
         }
     }
-    if (keepUsed_ + bytes > kKeepMemory)
+    if (keepUsed_ + bytes > KeepMemory())
         return false;
     *at = keepUsed_;
     *got = bytes;
@@ -3211,7 +3218,7 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
                 const std::uint64_t us = gpuSumUs_, count = gpuCount_;
                 static std::uint64_t lateWas;
                 std::fprintf(stderr, "perfkept: to %llu: kept batches' memory %.1f of %u MB, %llu batches with no room so far, emptied %llu times\n", (unsigned long long)frames_,
-                             keepUsed_ / 1e6, kKeepMemory >> 20, (unsigned long long)keptNoRoom_, (unsigned long long)keepResets_);
+                             keepUsed_ / 1e6, KeepMemory() >> 20, (unsigned long long)keptNoRoom_, (unsigned long long)keepResets_);
                 std::fprintf(stderr, "perfscale: to %llu: the GPU was %.1f ms at a frame; frames drawn at %.0f hundredths of the width and height on average; %llu frames late\n", (unsigned long long)frames_,
                              count > countWas ? (us - usWas) / 1000.0 / (double)(count - countWas) : 0.0, (scaleSum_ - scaleWas) / (double)(frames_ - framesWas),
                              (unsigned long long)(gpuLate_ - lateWas));
@@ -3289,7 +3296,7 @@ void Renderer::Report()
                  (unsigned long long)held_[4], (unsigned long long)held_[5]);
     std::fprintf(stderr, "gpu: batches kept from frame to frame: %llu draws from %llu written once (%.1f MB), %llu let go, %llu with no room; %.1f MB of %u in use, "
                  "%zu blocks free, emptied %llu times\n", (unsigned long long)keptDraws_, (unsigned long long)keptPlaced_, keptBytes_ / 1e6, (unsigned long long)keptForgotten_,
-                 (unsigned long long)keptNoRoom_, keepUsed_ / 1e6, kKeepMemory >> 20, keepFree_.size(), (unsigned long long)keepResets_);
+                 (unsigned long long)keptNoRoom_, keepUsed_ / 1e6, KeepMemory() >> 20, keepFree_.size(), (unsigned long long)keepResets_);
     std::fprintf(stderr, "gpu: %llu runs whose alpha test was decided for the whole run (one draw), %llu drawn twice (what passes, what fails); "
                  "%llu batches culled by the rasteriser\n", (unsigned long long)onePassDraws_, (unsigned long long)twoPassDraws_, (unsigned long long)culledDraws_);
     std::fprintf(stderr, "gpu: %llu batches adding a light's share left out as all black, %llu drawn: %llu with their surface, %llu by themselves; %llu surfaces' shares drawn after them (%llu surfaces with a triangle twice)\n", (unsigned long long)blackBatches_,
