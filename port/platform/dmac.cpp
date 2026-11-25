@@ -3102,6 +3102,17 @@ bool KeepTwice()
     static const bool twice = !std::getenv("SLY1_PART_KEEP_TWICE") || std::getenv("SLY1_PART_KEEP_TWICE")[0] != '0';
     return twice;
 }
+// SLY1_PART_KEEP_TWICE=new: a part is kept at first sight unless it has been found changed since
+// it was kept before, or keeping it was refused (then, as ever, only when two lists running have
+// it the same). Keeping cost several times running it when the render thread ran the part itself
+// (6 ms a frame on the Switch); since parts are kept from their jobs it costs a fiftieth of a
+// millisecond or two.
+bool MustBeTwice(const PartRecord& r)
+{
+    static const char* const e = std::getenv("SLY1_PART_KEEP_TWICE");
+    static const bool fresh = e && e[0] == 'n';
+    return KeepTwice() && !(fresh && r.stale == 0 && r.lockout == 0);
+}
 bool g_headerNearAsked;   // (perfwait's count with SLY1_PART_HDR_EXACT: what the tolerance would have passed)
 bool PartHeaderSame(const std::uint32_t a[44], const std::uint32_t b[44], bool slow, bool alphaFree, bool litFree = false)
 {
@@ -3522,7 +3533,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     // had is run as ever without being hashed: it cannot be drawn again, and it is not kept until
     // two lists running have it the same (below). Hashing such parts here was a tenth of the render
     // thread's work walking on the Switch (the helper's hashes come a list late for them).
-    if (!late && it != g_parts.end() && !it->second.moving && KeepTwice()) {
+    if (!late && it != g_parts.end() && !it->second.moving && MustBeTwice(it->second)) {
         PartRecord& r = it->second;
         const bool asKept = r.ok && (ceiling || (sameRegs(r.before, !r.maskRead) && PartHeaderSame(r.header, header, slow, alphaFree(r), litFree(r))));
         const bool asSeen = r.seenList != 0 && r.seenList + 1 >= g_listSerial && (ceiling || (sameRegs(r.seenRegs, r.ok && !r.maskRead) && PartHeaderSame(r.seenHeader, header, slow, alphaFree(r), litFree(r))));
@@ -3978,7 +3989,7 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
     // was met, which costs several times running it: 4 to 5 parts a frame and 6 ms of the render
     // thread on the Switch, walking through A Stealthy Approach. SLY1_PART_KEEP_TWICE=0: at once.
     {
-        const bool twice = KeepTwice();
+        const bool twice = MustBeTwice(r);
         const bool asSeen = r.seenList != 0 && r.seenList + 1 >= g_listSerial && (ceiling || (r.seenHash == hash && sameRegs(r.seenRegs, r.ok && !r.maskRead) && PartHeaderSame(r.seenHeader, header, slow, alphaFree(r), litFree(r))));
         if (twice && !asSeen) {
             r.seenHash = hash;
