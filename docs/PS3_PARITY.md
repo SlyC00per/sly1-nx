@@ -11,7 +11,7 @@ is a port bug.
 | Aspect ratio | 4:3 | 16:9 widescreen (Hor+): projection and culling widened, 2D elements anchored without stretching |
 | Textures | PS2 textures | HD textures in place of the PS2 ones |
 | Saving | memory card, with its checks, slot selection and prompts | no memory card: progress saved to the console's save data, none of the card screens |
-| Resolution | 640×448 | HD output: 1280×720 handheld, 1920×1080 docked |
+| Resolution | 640×448 | HD output: 1280×720 handheld, 1920×1080 docked (not built yet: the picture is 1280×720 in both, and nothing has been run docked; parked 2026-11-25, no dockable Switch to test on) |
 | Frame rate | 60 Hz | locked 60 FPS |
 | Outlines | the characters' outlines one PS2 pixel wide | three times as wide in play (4.5 of the screen's pixels for 1.5), and 7.75 pixels in a cut scene, the width following its letterbox bars as they slide in and out (the maintainer's choice, 2026-11-24, for the higher resolution; not checked against the PS3 release) |
 | Touch screen | none | as the PS Vita release: the screen touched anywhere is L1 (the Binocucom), in handheld play |
