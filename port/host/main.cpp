@@ -69,6 +69,7 @@ namespace port { void ScreenText(const char* text); }   // (switch/screen_text.c
 #include "port/audio.h"
 struct Player;
 struct Vec4;
+void func_001BED48();   // the game's PauseStagedBankVoice (SLY1_RETRY_TEST)
 void func_00178008(Player*, Vec4*);   // the game's SetPlayerPosition (SLY1_WARP)
 struct World;
 std::int32_t func_0015A4F0(World* world, std::uint32_t flags, std::int32_t id, void* scope, std::int32_t max, void* found);   // GatherObjectsById (SLY1_TOUR=arrivals)
@@ -403,6 +404,33 @@ void VerifyLevels()
         static const int perLevel = std::getenv("SLY1_LEVEL_FRAMES") ? std::max(60, std::atoi(std::getenv("SLY1_LEVEL_FRAMES"))) : 60;
         if (!waitFor([&] { return word(kFrames) - frames >= perLevel; }, 60 + perLevel / 10))
             fail("60 frames did not run within 60 s of the load", i + 1);
+        if (const char* after = std::getenv("SLY1_RETRY_TEST")) {
+            // SLY1_RETRY_TEST=frames[,more[,0]]: after that many frames, what "Try again" does after a game
+            // over: the music's voice paused (the game-over page pauses it in the level 0x308) and the
+            // same level loaded again with flags 0x10; more frames (1,800) run after (,0: without the pause)
+            int first = 600, more = 1800;
+            static int pause;
+            pause = 1;
+            std::sscanf(after, "%d,%d,%d", &first, &more, &pause);
+            std::int32_t from = word(kFrames);
+            waitFor([&] { return word(kFrames) - from >= first; }, 120 + first / 30);
+            port::CallOnGameThread([] {
+                if (pause)
+                    ::func_001BED48();
+                auto w = [](std::uint32_t a) -> std::int32_t& { return *(std::int32_t*)port::Native(a); };
+                constexpr std::uint32_t kLoad = 0x00275AF0;
+                if (w(kLoad) == 0) {
+                    w(kLoad + 0x04) = (std::int32_t)(kLoad + 0x14);
+                    w(kLoad + 0x08) = -1;
+                    w(kLoad + 0x0C) = -1;
+                    w(kLoad + 0x10) = 0x10;
+                    w(kLoad) = 1;
+                }
+            });
+            std::fprintf(stderr, "retry test: the voice paused and the level asked for again\n");
+            from = word(kFrames);
+            waitFor([&] { return word(kFrames) - from >= more; }, 120 + more / 30);
+        }
         if (const char* to = std::getenv("SLY1_FADE_TO")) {
             // SLY1_FADE_TO=n[,style[,frames]]: from this level, the game's own fade to level n (as its map
             // page asks for it: StartObjectFade, style 2), and frames more (1,800) run there

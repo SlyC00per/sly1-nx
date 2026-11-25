@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,6 +37,42 @@ namespace {
 
 constexpr int kRate = 48000;
 constexpr int kChunk = 480;   // frames mixed at a time: 10 ms
+
+// SLY1_SND_BEAT=1: when the music's registers change and when the game is told, to the millisecond
+// (the third world's boss starts its beat clock when register 1 is the section it asked for:
+// sly1-decomp's UpdateWorld3Boss), for measuring the one against the other.
+// From a sound's mixing to its reaching the speaker: on the Switch three buffers of 20 ms wait
+// ahead of the one being mixed, which is itself 20 ms long: 60 to 80 ms, and the output's own delay
+// after that, which is not known; against that, the picture is itself two or three frames behind
+// the game: 50 ms taken, not measured. On the host what is mixed is not played: none.
+// SLY1_AUDIO_DELAY_MS: another value.
+std::uint64_t HeardDelayNs()
+{
+#if defined(__SWITCH__)
+    static const std::uint64_t ms = std::getenv("SLY1_AUDIO_DELAY_MS") ? (std::uint64_t)std::atoi(std::getenv("SLY1_AUDIO_DELAY_MS")) : 50;
+#else
+    static const std::uint64_t ms = std::getenv("SLY1_AUDIO_DELAY_MS") ? (std::uint64_t)std::atoi(std::getenv("SLY1_AUDIO_DELAY_MS")) : 0;
+#endif
+    return ms * 1000000ull;
+}
+std::uint64_t SteadyNs()
+{
+    return (std::uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+void BeatLog(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+void BeatLog(const char* fmt, ...)
+{
+    static const bool on = std::getenv("SLY1_SND_BEAT") != nullptr;
+    if (!on)
+        return;
+    static const auto t0 = std::chrono::steady_clock::now();
+    char line[160];
+    va_list va;
+    va_start(va, fmt);
+    std::vsnprintf(line, sizeof line, fmt, va);
+    va_end(va);
+    std::fprintf(stderr, "sndbeat: %9.3f s: %s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), line);
+}
 
 // The SPU's volume envelope, from its two envelope words, as the public description of the PlayStation
 // SPU gives it (the PS2's SPU2 runs it the same way, at 48,000 Hz): a level of 0 to 0x7FFF that
@@ -462,6 +499,41 @@ struct Song {
     std::map<int, std::vector<std::uint8_t>> blocks;
     std::map<int, std::vector<std::uint8_t>> groups;   // triples: a channel and the levels it sounds between
     std::int32_t reg[8] = {};
+    // The registers as the game is told them (command 0x28): a value the music sets is the game's
+    // only once its sound has reached the speaker (HeardDelayNs), as on the PS2, where the driver's
+    // answer and the sound are a few milliseconds apart. The third world's boss starts its beat
+    // clock on register 1's answer (sly1-decomp's UpdateWorld3Boss).
+    std::int32_t told[8] = {};
+    struct Due {
+        std::uint64_t at;
+        std::uint8_t reg;
+        std::int32_t value;
+    };
+    std::vector<Due> due;
+    void MusicSet(int r, std::int32_t v)   // (the music's own program sets a register, as it is mixed)
+    {
+        reg[r] = v;
+        const std::uint64_t delay = HeardDelayNs();
+        if (delay == 0) {
+            told[r] = v;
+            return;
+        }
+        if (due.size() < 64)
+            due.push_back({SteadyNs() + delay, (std::uint8_t)r, v});
+    }
+    std::int32_t Told(int r)   // (the game asks: what was set long enough ago to be heard)
+    {
+        const std::uint64_t now = SteadyNs();
+        std::size_t kept = 0;
+        for (std::size_t k = 0; k < due.size(); k++) {
+            if (due[k].at <= now)
+                told[due[k].reg] = due[k].value;
+            else
+                due[kept++] = due[k];
+        }
+        due.resize(kept);
+        return told[r];
+    }
     float volume = 1.0f, fade = 1.0f, fadeStep = 0.0f;
     bool paused = false, over = false;
     int nextId = 1;
@@ -568,8 +640,11 @@ struct Song {
         case 0x13:   // a register set
             if (!need(2))
                 return nullptr;
-            if (run && p[0] < 8)
-                reg[p[0]] = p[1];
+            if (run && p[0] < 8) {
+                if (reg[p[0]] != p[1])
+                    BeatLog("the music set register %d to %d (it was %d)", (int)p[0], (int)p[1], (int)reg[p[0]]);
+                MusicSet(p[0], p[1]);
+            }
             return p + 2;
         case 0x11:   // the sequence to go on with, in this one's place
         case 0x0D:   // the same, the one a register names (kept as the sequence's number and one)
@@ -682,6 +757,22 @@ struct Song {
         now.swap(starts);
         for (int index : now)
             StartTrack(index);
+    }
+
+    // The steps a song has at its very start, run as it starts and not at the mixer's next pass:
+    // they set the registers to their first values, and the game sets the section it wants right
+    // after it starts the song (a level loaded again: within the same frame), which those steps
+    // must not undo. Retail's driver takes its commands in order, so the game's value is the later.
+    void RunOpening()
+    {
+        for (int pass = 0; pass < 8; pass++) {
+            for (std::size_t k = 0; k < tracks.size(); k++)
+                if (!tracks[k].done)
+                    Run(tracks[k], 0.0);
+            if (starts.empty())
+                break;
+            Starts();
+        }
     }
 
     void NoteOn(Track& t, int channel, int key, int velocity)
@@ -861,6 +952,26 @@ struct Song {
         }
     }
 
+    // A sequence's ticks a second, as retail's driver counts them, which is not quite the tempo the
+    // sequence names: the driver steps 240 times a second, by a whole number of hundredths of a
+    // tick, from a whole number of microseconds a tick: (4167 * 100 / (tempo / ticks a beat)) / 100.
+    // So a beat of 750,000 us in 480 ticks goes 2.66 ticks a step and lasts 0.7519 s, and one of
+    // 428,571 us lasts 0.4283 s; 500,000 and 1,000,000 are exact. Measured from a recording of
+    // the PS2 (the level 0x308's music: 0.75190, 0.42830, 0.30909 for 309,278, 0.50002 and
+    // 1.00006 s a beat), which the rule gives within the measure's 0.01%. The game counts its
+    // beats by the tempo named, so in retail the music falls behind them or runs ahead within a
+    // section (the boss of the level 0x308: 120 ms by the end of the 80-a-minute part). That is a
+    // flaw of retail's driver, and the port plays the tempo named, so the beats stay with the
+    // music (the user's decision, 2026-11-24: docs/PS3_PARITY.md). SLY1_SND_TEMPO=ps2: retail's.
+    static double TicksPerSecond(std::uint32_t tempo, std::uint32_t perBeat)
+    {
+        static const bool exact = !(std::getenv("SLY1_SND_TEMPO") && std::getenv("SLY1_SND_TEMPO")[0] == 'p');
+        const std::uint32_t tick = perBeat ? tempo / perBeat : 0;   // microseconds a tick, whole
+        if (exact || tick == 0 || tick > 416700)
+            return 1e6 / (double)tempo * (double)perBeat;
+        return (double)(416700 / tick) / 100.0 * 240.0;
+    }
+
     void Mix(std::int32_t* out, int frames, float master)
     {
         if (paused || over)
@@ -871,7 +982,7 @@ struct Song {
             for (std::size_t k = 0; k < tracks.size(); k++) {
                 Track& t = tracks[k];
                 if (!t.done)
-                    Run(t, (double)n / kRate * 1e6 / (double)t.tempo * (double)t.perBeat);
+                    Run(t, (double)n / kRate * TicksPerSecond(t.tempo, t.perBeat));
             }
             Starts();
             for (std::size_t k = 0; k < tracks.size();)
@@ -984,6 +1095,11 @@ void AuditBank(const std::shared_ptr<Bank>& bank)
         std::uint32_t tempo, perBeat;
         if (!song.Sequence(i, &at, &end, &tempo, &perBeat))
             continue;
+        std::fprintf(stderr, "sndaudit:   sector %u sequence %d: a beat %u us in %u ticks", bank->sector, i, tempo, perBeat);
+        for (std::size_t m = at; m + 6 <= end; m++)   // (and the tempos set on the way)
+            if (q[m] == 0xFF && q[m + 1] == 0x51 && q[m + 2] == 3)
+                std::fprintf(stderr, ", then %u", (unsigned)(q[m + 3] << 16 | q[m + 4] << 8 | q[m + 5]));
+        std::fprintf(stderr, "\n");
         std::uint8_t status = 0;
         while (at < end) {
             while (at < end && (q[at++] & 0x80)) {}   // the delta
@@ -1638,6 +1754,7 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
             if (c != 0)
                 song->volume = (float)(std::int32_t)c / 1024.0f;
             song->Begin();
+            song->RunOpening();
             g_songs.clear();   // one level's music at a time: the last level's ends where the next one's starts
             const std::uint32_t handle = g_nextHandle++;
             g_songs[handle] = song;
@@ -1819,8 +1936,18 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
             g_voices[a]->pitch = std::pow(2.0f, (float)(std::int32_t)b / 1524.0f);
         return 0;
     case 0x29:   // one of the music's eight registers set: the voice, the register, the value
-        if (g_songs.count(a) && b < 8)
+        if (g_songs.count(a) && b < 8) {
+            if (g_songs[a]->reg[b] != (std::int32_t)c)
+                BeatLog("the game set register %u to %d (it was %d)", b, (int)c, (int)g_songs[a]->reg[b]);
             g_songs[a]->reg[b] = (std::int32_t)c;
+            g_songs[a]->told[b] = (std::int32_t)c;   // (the game's own value: known to it at once)
+            auto& due = g_songs[a]->due;
+            for (std::size_t k = 0; k < due.size();)
+                if (due[k].reg == b)
+                    due.erase(due.begin() + (std::ptrdiff_t)k);
+                else
+                    k++;
+        }
         return 0;
     case 0x22:   // a voice faded out: over a fifth of a second until its time's unit is known
         if (Stream* s = Find(a))
@@ -1830,8 +1957,15 @@ std::uint32_t CommandInner(std::int32_t cmd, const std::uint8_t* data, std::int3
         if (g_songs.count(a))
             g_songs[a]->fadeStep = 1.0f / (kRate * 0.2f);
         return 0;
-    case 0x28:   // a register asked for
-        return g_songs.count(a) && b < 8 ? (std::uint32_t)g_songs[a]->reg[b] : 0;
+    case 0x28: {   // a register asked for
+        const std::uint32_t value = g_songs.count(a) && b < 8 ? (std::uint32_t)g_songs[a]->Told((int)b) : 0;
+        static std::uint32_t told[8] = {~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u, ~0u};
+        if (b < 8 && told[b] != value) {
+            BeatLog("the game was told register %u is %u", b, value);
+            told[b] = value;
+        }
+        return value;
+    }
     case 0x34:   // every sound stopped
         // (the level's music goes on: the game stops it by its voice, and after a restart of the
         // level it does not start it again)

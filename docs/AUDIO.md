@@ -192,3 +192,26 @@ two had been read the other way round, which is what made a dog (record 25: 225 
 bark twice in quick succession, and why 120ths had seemed right for a day.
 
 `SLY1_SND_KINDS=all` prints every bank's records with each sample's wait, volume and length.
+
+## The tempo retail's driver plays, and a song's first steps (2026-11-24)
+
+Measured from a recording of the PS2 in the level 0x308 (the onsets' repeat period, to 0.01%): a
+beat named 1,000,000 or 500,000 us is exact, but 750,000 us lasts 0.75190 s, 428,571 us lasts
+0.42830 s and 309,278 us lasts 0.30909 s. One rule gives all five: the driver steps 240 times a
+second by a whole number of hundredths of a tick, `(4167 * 100 / (tempo / ticks a beat)) / 100`,
+both divisions whole. The game counts the boss's beats by the tempo named, so on the PS2 the music
+falls 120 ms behind them by the end of the 80-a-minute section. The port plays the tempo named
+(the maintainer's decision); `SLY1_SND_TEMPO=ps2` plays the rule's.
+
+A song's steps at its very start (they set its registers) are run as the song starts
+(`Song::RunOpening`), not at the mixer's next pass: a level loaded again starts its music and sets
+the section it wants within one frame, and the opening steps run later undid that, after which the
+music waited for the game and the game for the music (no music and no cut scenes after "Try
+again"). `SLY1_RETRY_TEST=frames[,more[,0]]` on the host does such a reload without a player.
+
+The boss's beat clock: `SLY1_SND_BEAT=1` prints the registers' changes, what the game is told and
+each eighth beat's real time against the game's. The game's clock is clamped from below at 0.015 s
+a frame, not 1/60 s (tools/patches.py): on a 60.00 Hz screen every frame is a little under 1/60 s
+and the clamp made the clock gain 0.4%. A register the music sets is told to the game 50 ms later
+on the Switch (`SLY1_AUDIO_DELAY_MS`), for the sound's way to the speaker; that figure is not
+measured.

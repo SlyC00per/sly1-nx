@@ -166,6 +166,8 @@ float WideAt(float x, float middle);
 // Wide2D for a scope: for what an element draws outside its own draw (a request queued for later).
 // The letterbox bars drawn (kernel.cpp; tools/patches.py, DrawLetterboxElement)
 void LetterboxNoted(float blend);
+// SLY1_SND_BEAT (kernel.cpp): the third world's boss's beat clock, restarted (kind 0) or a beat on (1)
+void BossBeat(int kind, float gameTime, float beatLength, int beat);
 // SLY1_VAN_LOG (kernel.cpp)
 void VanLog(float stick, float top, float target, float vx, float vy, float vz, float pace, float zone, int kind, int boosts, int checksum);
 

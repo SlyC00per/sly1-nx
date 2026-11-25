@@ -121,6 +121,29 @@ PATCHES = [
      "void DrawLetterboxElement(LetterboxElement* self)\n{\n    f32 x = self->blend * 66.40001f;",
      "void DrawLetterboxElement(LetterboxElement* self)\n{\n    port::LetterboxNoted(self->blend);\n    f32 x = self->blend * 66.40001f;",
      "the letterbox bars' blend, for the port to know a cut scene"),
+    # The game's clock on a 60 Hz screen. The clock's step is the frame's measured time, held between
+    # a sixtieth and a thirtieth of a second. An NTSC PS2 shows 59.94 frames a second, so its frames
+    # measure a little over a sixtieth and the lower limit never acts: the clock is real time. The
+    # Switch shows 60.00: its frames measure a sixtieth give or take the timing's jitter, about half
+    # fall under the limit and are raised to it, and the clock gains. Measured in "A Deadly Dance"
+    # (SLY1_SND_BEAT, 2026-11-24): 146 ms in 40 s, 190 ms in 48 s, 162 ms in 36 s, about 0.4%, which
+    # put the boss's beats that far ahead of the music by a section's end. The lower limit is 15 ms
+    # here: a frame's step is its measured time, and the clock is real time as on the PS2. (The upper
+    # limit stays: a frame over a thirtieth still loses the rest, as retail's does.)
+    ("src/main/game_clock.cpp",
+     "    f32 dt = t * 0.0000000033908420f;\n    f32 lo = 0.016666668f;\n    f32 hi = 0.033333335f;",
+     "    f32 dt = t * 0.0000000033908420f;\n    f32 lo = 0.015f;   /* port: 60.00 Hz, not 59.94 (tools/patches.py) */\n    f32 hi = 0.033333335f;",
+     "the game's clock is real time on a 60 Hz screen"),
+    # SLY1_SND_BEAT=1 (diagnosis): the third world's boss's beat clock told to the port as it
+    # restarts and at each beat (port::BossBeat), for measuring it against the music and real time.
+    ("src/main/warp_menu.cpp",
+     "        self->beatInBar = 0;\n        self->beat = 0;\n        if (sub != 0) {",
+     "        self->beatInBar = 0;\n        self->beat = 0;\n        port::BossBeat(0, g_gameClock.time, self->beatLength, 0);\n        if (sub != 0) {",
+     "the boss's beat clock restarted, for SLY1_SND_BEAT"),
+    ("src/main/warp_menu.cpp",
+     "        self->lastBeatTime = self->nextBeatTime;\n        self->beat = a;\n        self->beatInBar = b;",
+     "        self->lastBeatTime = self->nextBeatTime;\n        self->beat = a;\n        self->beatInBar = b;\n        port::BossBeat(1, g_gameClock.time, self->beatLength, a);",
+     "the boss's beats, for SLY1_SND_BEAT"),
     # SLY1_VAN_LOG=1 (diagnosis): what a driven path follower (the van of the races) is given and
     # does, twice a second: the stick's magnitude, its top and target speeds, its speed, its pace,
     # its zone's limit (port::VanLog, kernel.cpp).

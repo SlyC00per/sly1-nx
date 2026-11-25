@@ -409,6 +409,33 @@ bool ShowFps()
     return save != 0 && (*(const std::uint32_t*)Native(save + 0x19EC) & 0x40000u) != 0;
 }
 
+// SLY1_SND_BEAT=1: the third world's boss's beat clock against real time (tools/patches.py,
+// UpdateWorld3Boss): when it restarts, and at each beat how far the game's clock has fallen behind
+// the real one since (the game's step is held to a thirtieth of a second: a longer frame loses the
+// rest, and the music does not wait). With port/audio's sndbeat lines, the music's side.
+void BossBeat(int kind, float gameTime, float beatLength, int beat)
+{
+    static const bool on = std::getenv("SLY1_SND_BEAT") != nullptr;
+    if (!on)
+        return;
+    static std::uint64_t realAt;
+    static float gameAt;
+    const std::uint64_t now = NowNs();
+    if (kind == 0) {
+        realAt = now;
+        gameAt = gameTime;
+        std::fprintf(stderr, "bossbeat: the beat clock restarted: a beat %.4f s (%.1f a minute), the game's clock %.3f\n", (double)beatLength, 60.0 / (double)beatLength, (double)gameTime);
+        return;
+    }
+    if (realAt == 0) {   // (beats before any restart: counted from the first seen)
+        realAt = now;
+        gameAt = gameTime;
+    }
+    const double real = (double)(now - realAt) / 1e9, game = (double)(gameTime - gameAt);
+    if (beat % 8 == 0)
+        std::fprintf(stderr, "bossbeat: beat %d: %.3f s of real time since the restart, %.3f of the game's: the game's clock %.0f ms behind\n", beat, real, game, (real - game) * 1000.0);
+}
+
 // SLY1_VAN_LOG=1: a driven path follower's numbers, every 30th call (tools/patches.py, world.cpp's
 // ControlPathFollower).
 void VanLog(float stick, float top, float target, float vx, float vy, float vz, float pace, float zone, int kind, int boosts, int checksum)
