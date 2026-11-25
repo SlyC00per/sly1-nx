@@ -1845,3 +1845,15 @@ looked at: one or two of two errors come by chance. No variant changed the frame
   these figures (the copy ran before that thread's timer began; put right after this run), so the
   unchanged render time says nothing.
 
+`SLY1_GIF_LIVE=1` again with its cost counted (seven rounds of two, paired by round): the game's
+threads -0.66 +- 0.06 ms, the render thread +0.62 +- 0.04, the frame -0.02 +- 0.05, % at 60
++1.0 +- 0.4 (t 2.2, not enough to say anything by). It moves the copy from one thread to the other.
+Off. On the host over moving tours (levels 4, 5, 20, 30, and 4 with the render thread slowed) 12,608
+uploads, 0 other than when queued.
+
+**Not to be tried again: the GS thread reading an upload where it lies.** 98.5% of an upload's words
+are one to three pieces from some 200 fixed addresses, and most are the same each time, which looks
+like textures that stay. With pieces of 4 KB and more left in place the first 256 uploads of level 4
+were unchanged when drawn; from about the 1,393rd, on the tour, every second one had hundreds of
+words changed by the time the GS thread read it, and the run deadlocked. Taken out.
+
