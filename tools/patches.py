@@ -115,6 +115,12 @@ PATCHES = [
      "        if (n == 0 && crc != 0) {\n            g_checksumMismatch[0] = 1;\n            TriggerScriptEvent(self, 2, 0, 0);\n        }",
      "        /* port: the genuine copy's outcome, no mismatch and no script event (tools/patches.py) */",
      "the placed code checksum covers retail's machine code, which the port does not have"),
+    # The letterbox bars told to the port as the game draws them: a cut scene is on (the renderer
+    # may draw the outlines' lines another width then, SLY1_LINE_WIDTH_CUT; perflines logs it).
+    ("src/main/screen_element.cpp",
+     "void DrawLetterboxElement(LetterboxElement* self)\n{\n    f32 x = self->blend * 66.40001f;",
+     "void DrawLetterboxElement(LetterboxElement* self)\n{\n    port::LetterboxNoted(self->blend);\n    f32 x = self->blend * 66.40001f;",
+     "the letterbox bars' blend, for the port to know a cut scene"),
     # SLY1_VAN_LOG=1 (diagnosis): what a driven path follower (the van of the races) is given and
     # does, twice a second: the stick's magnitude, its top and target speeds, its speed, its pace,
     # its zone's limit (port::VanLog, kernel.cpp).

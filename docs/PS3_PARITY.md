@@ -13,6 +13,7 @@ is a port bug.
 | Saving | memory card, with its checks, slot selection and prompts | no memory card: progress saved to the console's save data, none of the card screens |
 | Resolution | 640×448 | HD output: 1280×720 handheld, 1920×1080 docked |
 | Frame rate | 60 Hz | locked 60 FPS |
+| Outlines | the characters' outlines one PS2 pixel wide | three times as wide in play (4.5 of the screen's pixels for 1.5), and 10 pixels while a cut scene's letterbox bars are on the screen (the maintainer's choice, 2026-11-24, for the higher resolution; not checked against the PS3 release) |
 | Touch screen | none | as the PS Vita release: the screen touched anywhere is L1 (the Binocucom), in handheld play |
 | Options | "Vibration" and "Speakers" settings | neither: the sound is stereo, and the vibration is on for a console with motors (the maintainer's choice, 2026-11-24; not checked against the PS3 release) |
 | Options | "Center Screen..." moves the picture on the television | no such item: the screen's picture is where it is (the maintainer's choice, 2026-11-24; not checked against the PS3 release) |

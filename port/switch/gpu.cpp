@@ -354,6 +354,8 @@ private:
     std::uint64_t dateBarriers_ = 0;
     std::uint64_t frameTextured_ = 0, targetTextured_ = 0;
     std::uint64_t vividFrames_ = 0;   // frames put on the screen by the Vivid picture's draw
+    std::uint64_t lineDraws_ = 0, lineIndices_ = 0;   // runs of lines submitted, and their vertices (perflines)
+    double letterboxSum_ = 0;                         // the letterbox bars' blend at each frame's start, summed
     // The Options page's "Show FPS" (Present): frames presented since fpsSince_, and the number shown
     std::uint64_t fpsSince_ = 0;
     std::uint32_t fpsFrames_ = 0, fpsShown_ = 0;
@@ -740,7 +742,18 @@ void Renderer::BeginCommands()
     dkCmdBufBindVtxBuffers(cmd_, 0, &vertices, 1);
     dkCmdBufBindIdxBuffer(cmd_, DkIdxFormat_Uint32, dkMemBlockGetGpuAddr(frameMem_));
     indexKeep_ = false;
-    dkCmdBufSetLineWidth(cmd_, 1.5f);
+    {   // The lines' width, in the screen's pixels. The characters' outlines are the game's lines (some
+        // 600 edges a frame). A PS2 pixel's width at this size is 1.5, which the outlines had: thin
+        // for a screen of three times the PS2's lines, so they are three times that, 4.5 (the user,
+        // 2026-11-24), and 10 while the game's letterbox bars are on the screen: a cut scene's close
+        // views make a character many times larger than in play, and 4.5 was hardly seen there.
+        // SLY1_LINE_WIDTH=N and SLY1_LINE_WIDTH_CUT=N: N hundredths of a pixel (150: as the PS2's).
+        static const float width = std::getenv("SLY1_LINE_WIDTH") ? (float)std::atoi(std::getenv("SLY1_LINE_WIDTH")) / 100.0f : 4.5f;
+        static const float cut = std::getenv("SLY1_LINE_WIDTH_CUT") ? (float)std::atoi(std::getenv("SLY1_LINE_WIDTH_CUT")) / 100.0f : 10.0f;
+        const float bars = LetterboxBlend();
+        letterboxSum_ += bars;
+        dkCmdBufSetLineWidth(cmd_, bars > 0.5f ? cut : width);
+    }
     dkCmdBufSetPointSize(cmd_, 2.0f);
     // window pixels to clip space: x right, y up, the image's first row at the top
     VertexParams vp = {{2.0f / kFieldWidth, -2.0f / kFieldHeight, -1.0f, 1.0f}};
@@ -2059,6 +2072,10 @@ void Renderer::Submit(const gs::DrawState& s, const Source& src)
         std::uint64_t start = Tick();
         ~Timed() { total += Tick() - start; }
     } timed{drawNs_};
+    if (s.kind == 1) {   // (the game's lines: the outlines; perflines)
+        lineDraws_++;
+        lineIndices_ += indices;
+    }
     int target = TargetFor(s);
     if (target < 0) {
         otherTargets_++;
@@ -3175,6 +3192,14 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
                              "Submit %.2f, Begin %.2f\n", (unsigned long long)frames_, (is[0] - was[0]) / f, (is[1] - was[1]) / f, (is[2] - was[2]) / f, (is[3] - was[3]) / f,
                              (is[4] - was[4]) / f / 1e6, (is[5] - was[5]) / f / 1e6, (is[6] - was[6]) / f / 1e6, (is[7] - was[7]) / f / 1e6);
                 std::memcpy(was, is, sizeof was);
+                // the game's lines (the outlines) a frame, and how far in the letterbox bars were (a cut scene)
+                static std::uint64_t linesWas[2];
+                static double barsWas;
+                std::fprintf(stderr, "perflines: to %llu, a frame: %.1f runs of lines, %.0f line vertices; the letterbox bars %.2f in on average\n", (unsigned long long)frames_,
+                             (lineDraws_ - linesWas[0]) / f, (lineIndices_ - linesWas[1]) / f, (letterboxSum_ - barsWas) / f);
+                linesWas[0] = lineDraws_;
+                linesWas[1] = lineIndices_;
+                barsWas = letterboxSum_;
             }
             drainWas = drainNs_;
             acquireWas = acquireNs_;

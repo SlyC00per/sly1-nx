@@ -423,7 +423,7 @@ void VerifyLevels()
                 ::func_00178008((::Player*)port::Native(*(std::uint32_t*)port::Native(0x00262E10)), (::Vec4*)pos);
             });
             const std::int32_t from = word(kFrames);
-            waitFor([&] { return word(kFrames) - from >= more; }, 120);
+            waitFor([&] { return word(kFrames) - from >= more; }, 120 + more / 30);   // (as long as the frames asked for take, for playing on from there)
             const std::uint32_t player = (std::uint32_t)word(0x00262E10);
             float now[3];
             std::memcpy(now, port::Native(player + 0x100), sizeof now);

@@ -384,6 +384,21 @@ float VividFactor()
     return (*(const std::uint32_t*)Native(save + 0x19EC) & 0x20000u) ? 1.35f : 1.0f;
 }
 
+// The letterbox bars as the game last drew them (port/include/port/system.h): the blend, and when;
+// one not drawn again within a tenth of a second is gone.
+std::atomic<float> g_letterboxBlend{0.0f};
+std::atomic<std::uint64_t> g_letterboxAt{0};
+void LetterboxNoted(float blend)
+{
+    g_letterboxBlend.store(blend, std::memory_order_relaxed);
+    g_letterboxAt.store(NowNs(), std::memory_order_relaxed);
+}
+float LetterboxBlend()
+{
+    const std::uint64_t at = g_letterboxAt.load(std::memory_order_relaxed);
+    return at != 0 && NowNs() - at < 100000000ull ? g_letterboxBlend.load(std::memory_order_relaxed) : 0.0f;
+}
+
 // The frame counter's setting (port/include/port/system.h), read as VividFactor reads its own.
 bool ShowFps()
 {

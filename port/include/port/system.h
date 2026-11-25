@@ -48,6 +48,10 @@ void KernelDump();
 float VividFactor();
 // The Options page's "Show FPS" (bit 0x40000 of the save's option flags; SLY1_SHOW_FPS=1 or 0 whatever the setting).
 bool ShowFps();
+// The game's letterbox bars (a cut scene's): how far in they are, 0 to 1, as the game last drew
+// them (a named patch in DrawLetterboxElement tells LetterboxNoted); 0 when none was drawn lately.
+float LetterboxBlend();
+void LetterboxNoted(float blend);
 
 }  // namespace port
 
