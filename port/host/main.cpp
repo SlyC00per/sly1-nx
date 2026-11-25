@@ -53,6 +53,9 @@ __attribute__((weak)) void HeapProfileReport(int level);   // (switch/heap_profi
 #if defined(__SWITCH__)
 #include <arpa/inet.h>
 #include <switch.h>
+#include <cstdarg>
+#include <sys/stat.h>
+namespace port { void ScreenText(const char* text); }   // (switch/screen_text.cpp)
 #endif
 
 #include "port/dmac.h"
@@ -102,6 +105,31 @@ int g_seconds = 0;   // until the program is closed
 int g_seconds = 10;
 #endif
 
+#if defined(__SWITCH__)
+// The link to nxlink (main): its socket, on which the standard output and error are too.
+bool g_socketsUp;
+int g_nxlinkSocket = -1;
+
+// The link given back before the program returns to the homebrew menu, which goes on in this
+// process: left open, the menu faulted when it was itself closed (2026-11-24, after the
+// no-disc message). The standard output and error are taken off the socket first: what the
+// program still writes on its way out then fails as a write to a closed file, where a write to
+// a socket whose service is gone hung the program. Only where no other thread of the program runs.
+void CloseLink()
+{
+    if (!g_socketsUp)
+        return;
+    std::fflush(stdout);
+    std::fflush(stderr);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
+    if (g_nxlinkSocket >= 0)
+        close(g_nxlinkSocket);
+    socketExit();
+    g_socketsUp = false;
+}
+#endif
+
 // The end of a run: its status, in the line tools/run_ryujinx.py waits for.
 [[noreturn]] void Finish(int status)
 {
@@ -112,6 +140,9 @@ int g_seconds = 10;
     std::fflush(stderr);
 #if defined(__SWITCH__)
     svcOutputDebugString(line, std::strlen(line));
+    // (The link to nxlink is not given back here: socketExit before the end left the screen black
+    // and the program hung, 2026-11-24. The program still writes to its standard error on the way
+    // out, RemoveDevice's diagnosis among it, which is the link's.)
 #endif
     std::_Exit(status);
 }
@@ -721,8 +752,10 @@ int main(int argc, char** argv)
     CatchFatalSignals();
 #if defined(__SWITCH__)
     consoleDebugInit(debugDevice_SVC);
-    if (__nxlink_host.s_addr != 0 && R_SUCCEEDED(socketInitializeDefault()))
-        nxlinkStdio();
+    if (__nxlink_host.s_addr != 0 && R_SUCCEEDED(socketInitializeDefault())) {
+        g_nxlinkSocket = nxlinkStdio();
+        g_socketsUp = true;
+    }
     // An exception nothing catches, or any other call of std::terminate, said with where it came
     // from before the program ends: without this the first sign was a fault elsewhere, the SD
     // card having been unmounted by the exit while a game thread still read from it.
@@ -754,7 +787,7 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "sly1: memory: %llu MB for the program, %llu MB used at its start\n", (unsigned long long)(total >> 20), (unsigned long long)(used >> 20));
     }
 #endif
-    std::string iso = "sdmc:/switch/sly1/sly1.iso";
+    std::string iso;   // (found in the folder by what is in it, below, unless --iso names one)
     port::SetSaveFolder("sdmc:/switch/sly1/save");
 #else
     std::string iso;
@@ -812,10 +845,82 @@ int main(int argc, char** argv)
             return 2;
         }
     }
+#if defined(__SWITCH__)
+    {   // The player's disc image: any file of sdmc:/switch/sly1/ that is the NTSC-U disc, whatever
+        // its name (port::FindDisc: by its executable's SHA-1). With none, or one that cannot be
+        // opened, the screen says so and what to do, and the program ends when a button is pressed.
+        static const char* const kFolder = "sdmc:/switch/sly1";
+        std::vector<port::DiscCandidate> seen;
+        bool named = !iso.empty();
+        if (!named) {
+            mkdir("sdmc:/switch", 0777);
+            mkdir(kFolder, 0777);   // (a place to put it, if there was none)
+            iso = port::FindDisc(kFolder, &seen);
+        }
+        for (const port::DiscCandidate& c : seen)
+            std::fprintf(stderr, "sly1: disc: %s: %s%s%s\n", c.name.c_str(), port::DiscKindReason(c.kind), c.what.empty() ? "" : ", ", c.what.c_str());
+        if (iso.empty() || !port::OpenIso(iso)) {
+            std::fprintf(stderr, "sly1: no disc image to play from\n");
+            consoleInit(nullptr);
+            // (written to the screen's console itself: started through nxlink, the program's
+            // standard output is the link's, and the first try of this left the screen black)
+            const auto say = [&](const char* fmt, ...) __attribute__((format(printf, 2, 3))) {
+                char line[512];
+                va_list va;
+                va_start(va, fmt);
+                const int n = std::vsnprintf(line, sizeof line, fmt, va);
+                va_end(va);
+                if (n <= 0)
+                    return;
+                port::ScreenText(line);
+            };
+            say("\n  Sly Cooper\n\n");
+            if (named)
+                say("  The disc image could not be used:\n    %s\n\n", iso.c_str());
+            else if (seen.empty())
+                say("  No disc image was found.\n\n");
+            else
+                say("  No disc image that can be played was found.\n\n");
+            say("  Copy your own disc image of\n"
+                "  \"Sly Cooper and the Thievius Raccoonus\"\n"
+                "  (North American version, SCUS-97198) to this folder\n"
+                "  on the SD card. Any file name will do.\n\n"
+                "    %s/\n\n", kFolder);
+            if (!seen.empty()) {
+                say("  In that folder now:\n");
+                int shown = 0;
+                for (const port::DiscCandidate& c : seen) {
+                    if (shown++ == 6) {
+                        say("    ...\n");
+                        break;
+                    }
+                    say("    %.40s%s\n      %s\n", c.name.c_str(), c.name.size() > 40 ? "..." : "", port::DiscKindReason(c.kind));
+                }
+                say("\n");
+            }
+            say("  Press any button to exit.\n");
+            PadState pad;
+            padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+            padInitializeDefault(&pad);
+            while (appletMainLoop()) {
+                padUpdate(&pad);
+                if (padGetButtonsDown(&pad) != 0)
+                    break;
+                consoleUpdate(nullptr);
+            }
+            consoleExit(nullptr);
+            std::fprintf(stderr, "sly1: done, status 2\n");
+            CloseLink();
+            std::_Exit(2);   // (as the program ends at any other time: not by main's return, which runs every global's destructor)
+        }
+        std::fprintf(stderr, "sly1: disc: playing from %s\n", iso.c_str());
+    }
+#else
     if (iso.empty() || !port::OpenIso(iso)) {
-        std::fprintf(stderr, "sly1: needs the NTSC-U disc image (--iso)\n");
+        std::fprintf(stderr, "sly1: needs the NTSC-U disc image (--iso): SCUS_971.98, SHA-1 57dc305d...\n");
         return 2;
     }
+#endif
 #if defined(SLY1_INSTALL_SAVE_SLOT)
     {   // (cmake -DSLY1_INSTALL_SAVE=FILE [-DSLY1_INSTALL_SLOT=n]: a build that puts that save in the slot
         // when it starts, the one there backed up first; the file is in the build alone, never the repository)
