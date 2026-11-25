@@ -1891,3 +1891,17 @@ from inlining a function another file could replace and takes a global's address
 had been configured without `SLY1_ISO`, so its `vu1_programs.cpp` was the stub and VU1 was interpreted
 (133 ms a frame). **A build for a measurement needs `-DSLY1_ISO=...`**, and its `gen/vu1_programs.cpp`
 is some 670 KB. `-O3`'s four rounds in it repeat the figures above: 68.3 +- 0.7% at 60, 171 +- 5 late.
+
+### The same three with the GPU (2026-11-25, 09:49 to 10:37)
+
+Four interleaved rounds in a fresh receiver, every run ended clean. Paired by round:
+
+| Build | % at 60 | render ms | GS ms | game ms | job us | late per 100 windows |
+| --- | --- | --- | --- | --- | --- | --- |
+| `main` | 61.2 +- 0.7 | 8.90 | 9.44 | 7.33 | 371 | 274 +- 11 |
+| branch | 61.6 +- 0.7 | 8.85 | 9.27 | 7.49 | 373 | 260 +- 3 |
+| branch, `-O3` | 64.0 +- 1.1 | 8.44 | 9.04 | 7.17 | 293 | 213 +- 6 |
+
+`main` to branch: +0.45 +- 0.34 points at 60, late -14 +- 9: nothing to claim; the 1.9 points
+measured without the GPU are not there with it. Branch to `-O3`: +2.4 +- 0.8 (4 of 4 rounds), render
+-0.41 +- 0.08 ms, late -47 +- 8. **A gain measured without the GPU is not one until measured with it.**
