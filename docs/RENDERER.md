@@ -1911,3 +1911,17 @@ against `-O3` with `SLY1_PIE=ON`, paired: % at 60 +4.2 +- 0.8 (64.8 to 69.0, 4 o
 frame -0.50 +- 0.06 ms, late per 100 windows -50 +- 10; a helper's job +30 +- 2 us and the GS thread
 +0.37 +- 0.08 ms, the render thread -0.14 +- 0.09, the game's threads the same. Where the half
 millisecond comes from is not known: no thread's time accounts for it. Its picture is not checked.
+
+**`-fPIE` on the game's code faults; on the port's code alone it gains nothing (12:24).** The build
+measured above, started as a player starts it, faulted after the opening movie every time (three
+of three, no input): func_001C61E0 read `aimAnimPlayer` (null, address 0x44) just after
+`ReplaceAnimationPlayer`, which calls `CreateAnimationPlayerWithoutPresetTargets` through a pointer
+of another parameter order; `-O3` alone ran the same start. Likely the compiler, free under `-fPIE`
+to inline the game's functions, did so through that cast; not proved. The checks above did not see
+it: they begin inside a level. `SLY1_PIE` now leaves the game's code, its assembly functions and the
+math library `-fPIC`; that build runs the start, and against `-O3` over four rounds with the GPU
+gives +0.4 +- 1.1 points at 60 and the frame -0.02 +- 0.02 ms: nothing. So the 4 points were the
+game's code inlined, which cannot be had while such calls are in it. Off.
+
+**Where this stopped (2026-11-25, the user's decision).** With the GPU, `main` is at 60 for some 61%
+of the tour's windows and `-O3` (`SLY1_PORT_O3`, off) for some 64%. Locked 60 was not reached.

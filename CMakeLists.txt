@@ -33,7 +33,8 @@ message(STATUS "sly1-nx: platform ${PLATFORM}")
 add_compile_options(-fno-omit-frame-pointer)
 # (a trial: devkitPro's CMake compiles everything -fPIC, as for a library whose functions another may
 # replace; the .nro is a program, and -fPIE, which comes later and so counts, lets its own be inlined)
-# (not measured: the one trial build of it was without SLY1_ISO, docs/RENDERER.md)
+# (the port's own code only: the game's stays -fPIC, below. With the game's code -fPIE too the game
+# faulted after the opening movie, in func_001C61E0, every time: docs/RENDERER.md)
 option(SLY1_PIE "Switch: compile with -fPIE instead of -fPIC" OFF)
 if(SLY1_PIE AND PLATFORM STREQUAL "SWITCH")
     add_compile_options(-fPIE)
@@ -223,6 +224,12 @@ add_library(port_game_asm STATIC port/game_asm/game_asm.cpp)
 target_compile_options(port_game_asm PRIVATE ${GAME_FLAGS})
 target_include_directories(port_game_asm PRIVATE ${GAME_INCLUDES})
 add_dependencies(port_game_asm sly1_gen)
+if(SLY1_PIE AND PLATFORM STREQUAL "SWITCH")
+    # (later than -fPIE, so it counts: the decompiled code as it has always been compiled)
+    target_compile_options(sly1_game PRIVATE -fPIC)
+    target_compile_options(port_game_asm PRIVATE -fPIC)
+    target_compile_options(port_libm PRIVATE -fPIC)
+endif()
 
 if(PLATFORM STREQUAL "SWITCH")
     # The GPU renderer (port/switch/gpu.cpp) and its shaders, compiled by uam and embedded.
