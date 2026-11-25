@@ -1821,3 +1821,27 @@ sent to it): branch `overnight-2026-11-25`.
 - One job of some 12,800 on level 14 is "wrong" (`SLY1_PART_JOBS_CHECK`) in 4 of 9 default runs and in
   9 of 10 with =new. It was there before; a wrong job is not kept.
 
+### The CPU side of them on the Switch (2026-11-25)
+
+With the GPU never opened (docs/RECEIVER.md), three rounds of six variants in turn
+(`tools/switch_matrix.py`, 18 runs). Standard errors are of three runs, and 35 differences were
+looked at: one or two of two errors come by chance. No variant changed the frame rate.
+
+| Variant | jobs a frame | job ms, all threads | game ms | % at 60 | late per 100 windows |
+| --- | --- | --- | --- | --- | --- |
+| base | 26.8 | 10.09 | 6.80 +- 0.02 | 64.7 +- 0.7 | 201 +- 5 |
+| `SLY1_PART_KEEP_TWICE=new` | 19.3 | 9.07 | 6.71 +- 0.03 | 63.2 +- 1.1 | 190 +- 11 |
+| `SLY1_GIF_LIVE=1` | 26.3 | 9.74 | 6.16 +- 0.07 | 66.5 +- 0.2 | 183 +- 6 |
+| `SLY1_JOB_BOOST=1` | 26.8 | 8.41 | 7.03 +- 0.01 | 63.4 +- 0.5 | 216 +- 4 |
+| `SLY1_PART_PREFETCH=16` | 27.0 | 10.08 | 6.78 +- 0.02 | 64.2 +- 1.2 | 207 +- 5 |
+| the four together | 19.6 | 7.79 | 6.42 +- 0.01 | 63.1 +- 0.6 | 194 +- 2 |
+
+- Keeping at first sight does what it was made for (28% fewer jobs, 10% less job time, the three
+  rounds of each apart from each other) and the frame rate does not show it.
+- The boost makes a job 93 us shorter as measured, and is paid for by the game's threads (+0.23 ms);
+  more frames come late. Off, and not worth more.
+- The prefetch does nothing that shows. Off.
+- `SLY1_GIF_LIVE` takes 0.64 ms from the game's threads. Its cost on the render thread was NOT in
+  these figures (the copy ran before that thread's timer began; put right after this run), so the
+  unchanged render time says nothing.
+

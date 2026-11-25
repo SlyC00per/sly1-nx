@@ -6417,6 +6417,8 @@ void RenderThreadMain()
             g_renderQueuedWords -= item.words.size();
             g_renderBusy = true;
         }
+        const bool gsThread = GsAsync();
+        const std::uint64_t started = NowNs();   // (before an upload read in place is copied: that copy is this thread's time)
         if (item.kind == RenderItem::GifLive) {
             std::vector<std::uint32_t> words = SpareBuffer();
             {
@@ -6448,8 +6450,6 @@ void RenderThreadMain()
             item.words = std::move(words);
             item.kind = RenderItem::Gif;
         }
-        const bool gsThread = GsAsync();
-        const std::uint64_t started = NowNs();
         const int kind = (int)item.kind;
         TIMELINE("render starts %s", kind == 0 ? "VIF1 (copy)" : kind == 3 ? "VIF1 (in place)" : kind == 1 ? "GIF" : "a call");
         if ((kind == 0 || kind == 3) && g_drainOwed) {   // (a list begins with the last one's jobs done: PartJobsBegin)
