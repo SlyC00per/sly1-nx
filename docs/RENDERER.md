@@ -1818,6 +1818,6 @@ sent to it): branch `overnight-2026-11-25`.
   when queued, 0 differing, with the render thread slowed by 25 and 60 ms a list too.
 - `SLY1_JOB_HASH_COPY` (on in that branch): a job's copy and its part's shape in one walk. On the
   host 50,000 shapes the same as PartHash's; 0.55 to 0.49 s of job making.
-- One job of some 12,800 on level 14 is "wrong" (`SLY1_PART_JOBS_CHECK`) in half the default runs and in
-  all of =new's. It was there before; a wrong job is not kept.
+- One job of some 12,800 on level 14 is "wrong" (`SLY1_PART_JOBS_CHECK`) in 4 of 9 default runs and in
+  9 of 10 with =new. It was there before; a wrong job is not kept.
 
