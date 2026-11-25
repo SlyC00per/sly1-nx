@@ -1785,9 +1785,9 @@ hashes stays on, with no more than a small gain seen.
 
 ## A night of measuring (2026-11-25)
 
-Every figure is from the Switch unless it says the host; the tour reads 57% at 60 (docs of
+Every figure is from the Switch unless it says the host. The tour reads 57% at 60 (docs of
 `tools/bench.py`: 6 points between runs of one build), so what is compared is thread time, in one
-run. Four switches were measured, one was refused.
+run.
 
 - **The render thread hashed parts the helper should have** (on, `SLY1_HASH_RENEW`). A long-way
   part whose hash the helper had not made for four lists was hashed here, and, its verdict never
