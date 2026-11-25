@@ -52,6 +52,7 @@ void InitSwitchPad()
     padInitializeDefault(&g_pad);
     hidInitializeVibrationDevices(g_vibration[0], 2, HidNpadIdType_Handheld, HidNpadStyleTag_NpadHandheld);
     hidInitializeVibrationDevices(g_vibration[1], 2, HidNpadIdType_No1, HidNpadStyleTag_NpadFullKey);
+    hidInitializeTouchScreen();
     g_padReady = true;
 }
 
@@ -80,6 +81,20 @@ PadFrame ReadFrame()
     for (const auto& m : kMap)
         if (held & m.from)
             f.buttons |= m.to;
+    {   // The screen touched anywhere is L1, as the PS Vita release has it for the Binocucom (the
+        // user, 2026-11-24): held while a finger is on the screen, and for four reads at least, so
+        // that the shortest tap is a press the game sees. (No touch screen when docked: none read.)
+        static int held4;
+        HidTouchScreenState touch = {};
+        const bool touching = hidGetTouchScreenStates(&touch, 1) > 0 && touch.count > 0;
+        if (touching)
+            held4 = 4;
+        if (touching || held4 > 0) {
+            f.buttons |= kL1;
+            if (!touching)
+                held4--;
+        }
+    }
     HidAnalogStickState l = padGetStickPos(&g_pad, 0), r = padGetStickPos(&g_pad, 1);
     f.lx = StickByte(l.x);
     f.ly = StickByte(-l.y);

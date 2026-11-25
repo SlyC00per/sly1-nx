@@ -13,6 +13,7 @@ is a port bug.
 | Saving | memory card, with its checks, slot selection and prompts | no memory card: progress saved to the console's save data, none of the card screens |
 | Resolution | 640×448 | HD output: 1280×720 handheld, 1920×1080 docked |
 | Frame rate | 60 Hz | locked 60 FPS |
+| Touch screen | none | as the PS Vita release: the screen touched anywhere is L1 (the Binocucom), in handheld play |
 | Options | "Vibration" and "Speakers" settings | neither: the sound is stereo, and the vibration is on for a console with motors (the maintainer's choice, 2026-11-24; not checked against the PS3 release) |
 | Options | "Center Screen..." moves the picture on the television | no such item: the screen's picture is where it is (the maintainer's choice, 2026-11-24; not checked against the PS3 release) |
 | Colour | the PS2's picture | Options has "Picture: Normal" (the PS2's picture, the default) or "Picture: Vivid": each colour moved away from its grey by 1.35 as the frame goes to the screen. Measured on "At the Dog Track" against PS3 screenshots, the port's exact pixels match the PS3's sky and far road within a few units; near textured surfaces are more saturated on the PS3 (the near road 69% against 37%), which its HD textures may explain. Vivid is an approximation: over four regions it takes a quarter off the difference, and no single factor does better |
