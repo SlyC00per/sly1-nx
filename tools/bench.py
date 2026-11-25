@@ -65,7 +65,7 @@ def summary(path):
             % (os.path.basename(path), n, 100.0 * at60 / n, a[0], a[1], a[2], a[3], a[4], 1000 * a[6] / max(a[5], 1e-9), lates, 100.0 * lates / n, ended))
 
 
-def run(name, nro, levels, frames, envs):
+def run(name, nro, levels, frames, envs, receiver=False):
     os.makedirs(os.path.join(ROOT, "bench"), exist_ok=True)
     log = os.path.join(ROOT, "bench", name + ".log")
     args = ("--levels %s --env SLY1_LEVEL_FRAMES=120 --env SLY1_TOUR=arrivals:%d --env SLY1_PAD_TURN=300 --env SLY1_PERF_LOG=1"
@@ -73,6 +73,19 @@ def run(name, nro, levels, frames, envs):
     for e in envs:
         args += " --env " + e
     address = os.environ.get("SLY1_SWITCH", "192.168.86.35")
+    if receiver:   # (through the receiver, with nobody at the Switch: tools/switch_run.py)
+        import switch_run
+
+        def echo(data):
+            for line in data.decode("latin1").replace("\r", "").split("\n"):
+                if line.startswith(("verify: level", "verify: all", "verify: FAILED", "tour: over", "sly1: fault", "sly1: the run's deadline")):
+                    print(line[:110], flush=True)
+        status = switch_run.run(nro, log, 3600, args, address, echo)
+        if status:
+            print("bench: the run did not end as it should (status %d)" % status)
+        if status != 2:
+            print(summary(log))
+        return status
     pid, fd = pty.fork()   # (through a pseudo-terminal: a pipe's output is kept back until nxlink exits)
     if pid == 0:
         os.execv("/opt/devkitpro/tools/bin/nxlink", ["nxlink", "-a", address, "-s", nro, "--args", args])
@@ -116,7 +129,7 @@ def main():
     if len(a) >= 2 and a[0] == "run":
         opt = lambda flag, default: a[a.index(flag) + 1] if flag in a else default
         run(a[1], opt("--nro", os.path.join(ROOT, "build-switch", "sly1.nro")), opt("--levels", "4,5,20,4,5"), int(opt("--frames", "150")),
-            [a[k + 1] for k, x in enumerate(a[:-1]) if x == "--env"])
+            [a[k + 1] for k, x in enumerate(a[:-1]) if x == "--env"], "--receiver" in a)
         return
     sys.exit(__doc__)
 

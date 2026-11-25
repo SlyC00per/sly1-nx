@@ -26,6 +26,8 @@ void MovieRingWrite(std::uint32_t iopAddress, const std::uint8_t* from, std::uin
 // the mixer's thread, which the program starts (port/host/main.cpp) and which does not return.
 bool Wanted();
 void MixerMain();
+// Whether the mixer has ended and given the output back, waited for up to `ms` (after Finish).
+bool WaitEnded(int ms);
 
 // On the host: the WAV file's header written with what was mixed (at the program's end).
 void Finish();

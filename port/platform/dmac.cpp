@@ -5624,8 +5624,30 @@ void RenderFlush()
 }
 
 
+// The GS thread told to stop between two items and stay there (ParkGsThread): before the program
+// gives the GPU back at the end of a run another program follows (port/host/main.cpp's HandOver).
+std::atomic<bool> g_gsPark, g_gsParked;
+pthread_t g_gsThreadId;
+
+bool OnGsThread() { return g_gsStarted.load(std::memory_order_acquire) && pthread_equal(pthread_self(), g_gsThreadId); }
+
+bool ParkGsThread(int ms)
+{
+    if (!g_gsStarted.load(std::memory_order_acquire))
+        return false;
+    {
+        std::lock_guard<std::mutex> lk(g_gsLock);
+        g_gsPark.store(true);
+    }
+    g_gsWake.notify_all();
+    for (int k = 0; k < ms / 5 && !g_gsParked.load(); k++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    return g_gsParked.load();
+}
+
 void GsThreadMain()
 {
+    g_gsThreadId = pthread_self();
     ProfileThisThread("gs");   // (SLY1_PROFILE)
     gs::SetBatchSink(QueueBatch);
     g_gsStarted.store(true, std::memory_order_release);
@@ -5637,6 +5659,11 @@ void GsThreadMain()
     std::shared_ptr<PartJob> jobNow;   // the job whose items are being taken, and the next of them
     std::size_t jobAt = 0;
     for (;;) {
+        if (g_gsPark.load(std::memory_order_relaxed)) {   // (ParkGsThread: here for good)
+            g_gsParked.store(true);
+            for (;;)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
         if (!jobNow && takenAt == taken.size()) {
             std::unique_lock<std::mutex> lk(g_gsLock);
             // (A frame has a thousand items and more where much is in sight. With a stock of 256 the
@@ -5653,8 +5680,10 @@ void GsThreadMain()
             if (g_gsQueue.empty()) {
                 g_gsIdle.notify_all();
                 g_gsWaiting = true;
-                g_gsWake.wait(lk, [] { return !g_gsQueue.empty(); });
+                g_gsWake.wait(lk, [] { return !g_gsQueue.empty() || g_gsPark.load(); });
                 g_gsWaiting = false;
+                if (g_gsPark.load())
+                    continue;
             }
             taken.clear();
             takenAt = 0;

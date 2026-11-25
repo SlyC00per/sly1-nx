@@ -36,6 +36,10 @@ void PartCountsLine(const char* what);
 // The GS thread's body (the GS's packets and the display's calls, after the render thread's), on
 // a stack in game memory too (it raises the GS's interrupt).
 void GsThreadMain();
+// The GS thread stopped between two items for good, waited for up to `ms`: false when it did not
+// stop in that time or there is none. OnGsThread: whether the caller is that thread.
+bool ParkGsThread(int ms);
+bool OnGsThread();
 void RenderCall(void (*fn)(std::uint64_t, std::uint64_t), std::uint64_t a, std::uint64_t b);
 void RenderFlush();
 void TimelineEvent(const char* what);   // SLY1_TIMELINE (port/platform/dmac.cpp)

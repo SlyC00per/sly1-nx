@@ -160,6 +160,10 @@ public:
 
 private:
     DkMemBlock Block(std::uint32_t size, std::uint32_t flags);
+    std::vector<DkMemBlock> blocks_;   // every block made, for Destroy
+public:
+    void Destroy();
+private:
     void BeginCommands();
     void Send(bool wait);
     void BindTarget(int target);
@@ -534,7 +538,36 @@ DkMemBlock Renderer::Block(std::uint32_t size, std::uint32_t flags)
     DkMemBlockMaker maker;
     dkMemBlockMakerDefaults(&maker, device_, Align(size, DK_MEMBLOCK_ALIGNMENT));
     maker.flags = flags;
-    return dkMemBlockCreate(&maker);
+    const DkMemBlock block = dkMemBlockCreate(&maker);
+    if (block)
+        blocks_.push_back(block);
+    return block;
+}
+
+// Everything of deko3d's given back, in the order it asks for: the queue idle, then the command
+// buffer, the swapchain, the queue, every block of memory and the device, which closes the GPU's
+// services. Only with nothing drawing (the GS thread parked): at the end of a run another
+// program follows in this process (port/host/main.cpp's HandOver).
+void Renderer::Destroy()
+{
+    if (!device_)
+        return;
+    if (queue_)
+        dkQueueWaitIdle(queue_);
+    if (cmd_)
+        dkCmdBufDestroy(cmd_);
+    if (swapchain_)
+        dkSwapchainDestroy(swapchain_);
+    if (queue_)
+        dkQueueDestroy(queue_);
+    for (DkMemBlock block : blocks_)
+        dkMemBlockDestroy(block);
+    blocks_.clear();
+    dkDeviceDestroy(device_);
+    cmd_ = nullptr;
+    swapchain_ = nullptr;
+    queue_ = nullptr;
+    device_ = nullptr;
 }
 
 bool Renderer::Create()
@@ -3304,6 +3337,14 @@ void Report()
         g_renderer.Report();
 }
 
+void Shutdown()
+{
+    if (!g_started)
+        return;
+    g_renderer.Destroy();   // (the backend stays named: nothing calls it with the GS thread parked)
+    g_started = false;
+}
+
 }  // namespace gpu
 }  // namespace port
 
@@ -3313,6 +3354,7 @@ namespace port {
 namespace gpu {
 bool Start() { return false; }
 void Report() {}
+void Shutdown() {}
 }  // namespace gpu
 }  // namespace port
 

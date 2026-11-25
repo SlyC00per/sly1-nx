@@ -41,4 +41,16 @@ void SamplerReport();
 // millisecond long but for one frame in eighteen (docs/RENDERER.md).
 void SampleWindow(bool open);
 
+#if defined(__SWITCH__)
+// Every other thread of the program stopped for good and its stack given back, before the program
+// ends with another to follow in its process (port/platform/thread.cpp). Called by the first
+// thread. Returns how many.
+int StopOtherThreads();
+// The other threads told to end themselves where they next wait, and waited for up to `ms`: how
+// many of the `made` have ended (the rest are said, and are StopOtherThreads's).
+int EndOtherThreads(int ms, int* made);
+// The parts of the heap that are not plain memory of the program's own, said (port/platform/thread.cpp).
+int HeapReport(const char* when, bool each = true);
+#endif
+
 }  // namespace port

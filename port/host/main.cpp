@@ -131,9 +131,67 @@ void CloseLink()
 }
 #endif
 
+#if defined(__SWITCH__)
+// The end of a run that another program follows in this process (SLY1_NEXT: the receiver,
+// port/switch/receiver.cpp, which waits for the next build, for runs with nobody at the Switch).
+// The loader gives the next program this process and its heap, so everything this one holds of
+// the system is given back first, in order, by the first thread (the one the loader started and
+// that returns to it):
+//   the mixer ends and closes the audio output itself;
+//   the GS thread stops between two items, and the GPU's objects are destroyed (deko3d closes
+//   the GPU's services with its device);
+//   every other thread ends itself where it next waits (port/platform/thread.cpp's wrapped
+//   waits); one that does not is stopped for good; their stacks' mappings are given back;
+//   the link to nxlink is closed.
+// Found on hardware, 2026-11-24 and 25: with the threads left running the next program faulted at
+// once; with them stopped but the GPU still held, the second build started this way brought the
+// whole system down; the GPU's session closed from outside (nvExit) hung there.
+std::atomic<int> g_endStatus{-1};
+bool g_endByGsThread;
+pthread_t g_firstThread;
+
+[[noreturn]] void HandOver(int status, const char* next)
+{
+    const bool quiet = port::audio::WaitEnded(1000);
+    const bool parked = g_endByGsThread || port::ParkGsThread(3000);
+    std::fprintf(stderr, "sly1: %s comes next; the mixer %s, the GS thread %s\n", next, quiet ? "ended" : "DID NOT END",
+                 parked ? "stopped" : "DID NOT STOP (the GPU is not given back)");
+    std::fflush(stderr);
+    port::HeapReport("before the end", false);
+    if (parked) {
+        port::gpu::Shutdown();
+        std::fprintf(stderr, "sly1: the GPU given back\n");
+        std::fflush(stderr);
+        port::HeapReport("the GPU given back", false);
+    }
+    int made = 0;
+    const int ended = port::EndOtherThreads(3000, &made);
+    std::fprintf(stderr, "sly1: %d of %d threads ended\n", ended, made);
+    std::fflush(stderr);
+    const int stopped = port::StopOtherThreads();
+    std::fprintf(stderr, "sly1: %d threads stopped; closing the link\n", stopped);
+    std::fflush(stderr);
+    port::HeapReport("at the end", std::getenv("SLY1_HEAP_MAP") != nullptr);   // (as at the start, if all is given back)
+    CloseLink();
+    envSetNextLoad(next, next);
+    std::_Exit(status);
+}
+#endif
+
+// The deadline's thread (main): told to end and waited for before the program does. The program
+// that comes next (the homebrew menu, or SLY1_NEXT's) is loaded into this same process, and a
+// thread of this one that woke after that ran code no longer there: "the software closed because
+// an error occurred" a second after the first run through the receiver (2026-11-24).
+std::atomic<bool> g_ending;
+pthread_t g_deadlineThread;
+bool g_deadlineThreadUp;
+
 // The end of a run: its status, in the line tools/run_ryujinx.py waits for.
 [[noreturn]] void Finish(int status)
 {
+    g_ending.store(true);
+    if (g_deadlineThreadUp && !pthread_equal(pthread_self(), g_deadlineThread))
+        pthread_join(g_deadlineThread, nullptr);
     char line[64];
     std::snprintf(line, sizeof line, "sly1: done, status %d", status);
     port::audio::Finish();
@@ -144,6 +202,16 @@ void CloseLink()
     // (The link to nxlink is not given back here: socketExit before the end left the screen black
     // and the program hung, 2026-11-24. The program still writes to its standard error on the way
     // out, RemoveDevice's diagnosis among it, which is the link's.)
+    // SLY1_NEXT=path: the program to start when this one ends (HandOver)
+    if (const char* next = std::getenv("SLY1_NEXT"))
+        if (envHasNextLoad()) {
+            if (pthread_equal(pthread_self(), g_firstThread))
+                HandOver(status, next);
+            g_endByGsThread = port::OnGsThread();
+            g_endStatus.store(status);   // (the first thread does it, main's wait; this one stays here)
+            for (;;)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
 #endif
     std::_Exit(status);
 }
@@ -775,18 +843,59 @@ void ArgsFromFile(int& argc, char**& argv)
 }  // namespace
 #endif
 
+int Main(int argc, char** argv);
+
+// (A start that fails returns from Main: with another program to follow, that too ends by Finish,
+// or the receiver would not come back and a night's runs would stop there.)
 int main(int argc, char** argv)
+{
+    const int status = Main(argc, argv);
+#if defined(__SWITCH__)
+    if (std::getenv("SLY1_NEXT"))
+        Finish(status);
+#endif
+    return status;
+}
+
+int Main(int argc, char** argv)
 {
     CatchFatalSignals();
 #if defined(__SWITCH__)
+    g_firstThread = pthread_self();
     consoleDebugInit(debugDevice_SVC);
     if (__nxlink_host.s_addr != 0 && R_SUCCEEDED(socketInitializeDefault())) {
         g_nxlinkSocket = nxlinkStdio();
         g_socketsUp = true;
     }
+    if (std::getenv("SLY1_HEAP_MAP") || __nxlink_host.s_addr != 0)   // (under nxlink or the receiver: what a run before left)
+        port::HeapReport("at the start", std::getenv("SLY1_HEAP_MAP") != nullptr);
     // An exception nothing catches, or any other call of std::terminate, said with where it came
     // from before the program ends: without this the first sign was a fault elsewhere, the SD
     // card having been unmounted by the exit while a game thread still read from it.
+    // SLY1_DEADLINE=seconds (set by --env, so read by the thread once the arguments are): a run
+    // that has not ended by then is ended, status 4, so that one that hangs does not hold up the
+    // runs after it (with SLY1_NEXT).
+    {
+        g_deadlineThreadUp = pthread_create(&g_deadlineThread, nullptr, [](void*) -> void* {
+            const auto t0 = std::chrono::steady_clock::now();
+            while (!g_ending.load()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (g_ending.load())
+                    break;
+                // SLY1_FAULT_AFTER=seconds: a fault made on purpose then (the fault handler's end
+                // and the receiver's start after it, tried)
+                if (const char* fault = std::getenv("SLY1_FAULT_AFTER"))
+                    if (std::chrono::steady_clock::now() - t0 > std::chrono::seconds(std::atoi(fault)))
+                        *(volatile int*)8 = 1;
+                const char* limit = std::getenv("SLY1_DEADLINE");
+                if (limit && std::chrono::steady_clock::now() - t0 > std::chrono::seconds(std::atoi(limit))) {
+                    std::fprintf(stderr, "sly1: the run's deadline of %s s passed: ended\n", limit);
+                    Finish(4);
+                }
+            }
+            return nullptr;
+        }, nullptr) == 0;
+    }
     std::set_terminate([] {
         char line[240];
         const std::uint64_t base = (std::uint64_t)port::ImageBase();
@@ -1411,7 +1520,18 @@ int main(int argc, char** argv)
         std::fprintf(stderr, "sly1: cannot start the clock thread on its stack in game memory\n");
         return 1;
     }
+#if defined(__SWITCH__)
+    // (the clock's thread does not end; what this thread waits for is a run's end that another
+    // program follows, which it carries out itself: HandOver)
+    for (;;) {
+        const int status = g_endStatus.load();
+        if (status >= 0)
+            HandOver(status, std::getenv("SLY1_NEXT"));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+#else
     pthread_join(clock, nullptr);
     return 0;
+#endif
 }
 

@@ -1224,6 +1224,7 @@ float Channel(int channel)
 }
 std::atomic<bool> g_started, g_mixing;
 std::atomic<bool> g_quit;
+std::atomic<bool> g_mixerEnded;
 std::vector<std::int16_t> g_wav;   // the host's file, kept in memory until the end
 const char* g_wavPath;
 std::uint64_t g_commands, g_unknown;
@@ -1337,6 +1338,11 @@ void MixerMain()
         released->data_size = kFrames * 4;
         audoutAppendAudioOutBuffer(released);
     }
+    // (the output given back by the thread that used it, once told to end: the program that
+    // comes next in this process must not find it held, port/host/main.cpp's Finish)
+    audoutStopAudioOut();
+    audoutExit();
+    g_mixerEnded.store(true);
 #else
     auto next = std::chrono::steady_clock::now();
     std::int16_t out[kChunk * 2];
@@ -1383,6 +1389,14 @@ bool Wanted()
     g_wavPath = std::getenv("SLY1_AUDIO_WAV");
     return g_wavPath != nullptr;   // (the host makes sound only into a file)
 #endif
+}
+
+// Whether the mixer has ended and given the output back (after Finish), waited for up to `ms`.
+bool WaitEnded(int ms)
+{
+    for (int k = 0; k < ms / 5 && g_mixing.load() && !g_mixerEnded.load(); k++)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    return !g_mixing.load() || g_mixerEnded.load();
 }
 
 void Finish()

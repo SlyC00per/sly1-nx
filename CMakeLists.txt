@@ -231,10 +231,17 @@ if(PLATFORM STREQUAL "SWITCH")
     sly1_install_save(sly1)
     target_link_libraries(sly1 PRIVATE port_game_asm port_platform port_gpu port_render port_libm port_core)
     # (diagnosis of the start-up fault: who takes a device out of newlib's table, port/platform/thread.cpp)
-    target_link_options(sly1 PRIVATE -Wl,--wrap=RemoveDevice)
+    # (and every thread's handle kept, for stopping them at the end of a run the receiver follows)
+    target_link_options(sly1 PRIVATE -Wl,--wrap=RemoveDevice -Wl,--wrap=threadCreate -Wl,--wrap=threadClose
+        -Wl,--wrap=svcSleepThread -Wl,--wrap=svcWaitSynchronization -Wl,--wrap=condvarWaitTimeout)
     nx_generate_nacp(sly1.nacp NAME "Sly Cooper" AUTHOR "sly1-nx" VERSION "0.9.0")
     # (the homebrew menu's icon: the project's own mark, 256 by 256, branding/nro-icon.jpg)
     nx_create_nro(sly1 NACP sly1.nacp ICON ${CMAKE_SOURCE_DIR}/branding/nro-icon.jpg)
+    # The receiver (port/switch/receiver.cpp): takes builds over the network and starts them, for
+    # runs on a Switch nobody is at (tools/switch_run.py).
+    add_executable(sly1_receiver port/switch/receiver.cpp)
+    nx_generate_nacp(sly1_receiver.nacp NAME "sly1-nx receiver" AUTHOR "sly1-nx" VERSION "0.9.0")
+    nx_create_nro(sly1_receiver NACP sly1_receiver.nacp)
 else()
     find_package(Threads REQUIRED)
     add_executable(sly1_headless port/host/main.cpp port/switch/gpu.cpp $<TARGET_OBJECTS:sly1_game>)

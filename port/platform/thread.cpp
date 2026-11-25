@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <algorithm>
+#include <unistd.h>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -284,6 +285,276 @@ extern "C" int __wrap_RemoveDevice(const char* name)
     svcOutputDebugString(line, __builtin_strlen(line));
     std::fprintf(stderr, "%s\n", line);
     return __real_RemoveDevice(name);
+}
+
+// Every thread the program starts and has not closed (libnx's threadCreate and threadClose wrapped
+// at the link, -Wl,--wrap=...: pthread_create's threads and StartThread's alike), for
+// StopOtherThreads.
+extern "C" Result __real_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack, size_t stackSize, int prio, int cpu);
+extern "C" Result __real_threadClose(Thread* t);
+extern "C" Result __real_svcWaitSynchronization(s32* index, const Handle* handles, s32 count, u64 timeout);
+namespace {
+constexpr int kThreadsMost = 256;
+std::atomic<Thread*> g_threads[kThreadsMost];
+std::uintptr_t g_threadEntry[kThreadsMost];   // each one's first function and argument, for naming one that does not end
+std::uintptr_t g_threadArg[kThreadsMost];
+// Its handle and its stack's two places, copied when it is made: the Thread itself may be gone by
+// the end (a detached thread's is freed when it ends; read then, the end faulted, 2026-11-25).
+Handle g_threadHandle[kThreadsMost];
+void* g_threadMirror[kThreadsMost];
+void* g_threadStack[kThreadsMost];
+
+// Whether the thread of a slot has ended (a handle no longer one counts as ended).
+bool Ended(int k)
+{
+    s32 index = 0;
+    const Result rc = __real_svcWaitSynchronization(&index, &g_threadHandle[k], 1, 0);
+    return rc != 0xEA01;   // (anything but "timed out": it ended, or its handle is closed)
+}
+}
+extern "C" Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack, size_t stackSize, int prio, int cpu)
+{
+    const Result rc = __real_threadCreate(t, entry, arg, stack, stackSize, prio, cpu);
+    if (R_FAILED(rc)) {   // (the tenth run or so in one process could not start a thread, 2026-11-25: why, said)
+        std::fprintf(stderr, "sly1: a thread could not be made: answer 0x%X (module %u, description %u)\n", rc, R_MODULE(rc), R_DESCRIPTION(rc));
+    }
+    if (R_SUCCEEDED(rc))
+        for (int k = 0; k < kThreadsMost; k++) {
+            Thread* none = nullptr;
+            if (g_threads[k].compare_exchange_strong(none, t)) {
+                g_threadEntry[k] = (std::uintptr_t)entry;
+                g_threadArg[k] = (std::uintptr_t)arg;
+                g_threadHandle[k] = t->handle;
+                g_threadMirror[k] = t->stack_mirror;
+                g_threadStack[k] = t->stack_mem;
+                break;
+            }
+        }
+    return rc;
+}
+extern "C" Result __wrap_threadClose(Thread* t)
+{
+    for (auto& slot : g_threads) {
+        Thread* it = t;
+        if (slot.compare_exchange_strong(it, nullptr))
+            break;
+    }
+    return __real_threadClose(t);
+}
+
+// Threads that end themselves (EndOtherThreads). A thread cannot be ended from outside, and one
+// only stopped stays in the process: a dozen a run, and the tenth run through the receiver could
+// not make its threads (2026-11-25). So the three calls a thread waits in are wrapped at the link
+// (-Wl,--wrap=...): a sleep, a wait on a condition variable (every std::condition_variable and
+// semaphore) and a wait on the system's objects. Once the end is asked for, a thread that comes
+// to one of them, or wakes from one, ends there: long waits are cut into short ones, and the
+// condition variables anyone has waited on are signalled. Never the first thread, which carries
+// the end out. A thread ends holding whatever locks it held, but for the wait's own mutex, which
+// it gives up; one that then waits for such a lock for ever is stopped as before.
+extern "C" void __real_svcSleepThread(s64 nano);
+extern "C" Result __real_svcWaitSynchronization(s32* index, const Handle* handles, s32 count, u64 timeout);
+extern "C" Result __real_condvarWaitTimeout(CondVar* c, Mutex* m, u64 timeout);
+namespace {
+std::atomic<bool> g_threadsEnd;
+// The condition variables threads are waiting on now, one slot a waiting thread. Only these are
+// signalled at the end: the kernel writes to a condition variable it signals (0, when nobody
+// waits on it any more), and one that is gone -- a function's local -- is by then something
+// else's memory: signalling every one ever waited on zeroed half a pointer on the first
+// thread's stack, which faulted in each run's end (2026-11-25).
+constexpr int kWaitersMost = 64;
+std::atomic<CondVar*> g_waitingOn[kWaitersMost];
+
+inline bool EndHere()
+{
+    return g_threadsEnd.load(std::memory_order_relaxed) && threadGetCurHandle() != envGetMainThreadHandle();
+}
+
+// A slot taken for a wait on `c` (-1: none free, the wait is then not signalled at the end and
+// its thread is stopped instead).
+int NoteWait(CondVar* c)
+{
+    for (int k = 0; k < kWaitersMost; k++) {
+        CondVar* none = nullptr;
+        if (g_waitingOn[k].load(std::memory_order_relaxed) == nullptr && g_waitingOn[k].compare_exchange_strong(none, c))
+            return k;
+    }
+    return -1;
+}
+constexpr s64 kSliceNs = 50'000'000;
+}  // namespace
+
+extern "C" void __wrap_svcSleepThread(s64 nano)
+{
+    if (EndHere())
+        threadExit();
+    while (nano > kSliceNs) {   // (a yield, 0 and under, and a short sleep go as they are)
+        __real_svcSleepThread(kSliceNs);
+        nano -= kSliceNs;
+        if (EndHere())
+            threadExit();
+    }
+    __real_svcSleepThread(nano);
+    if (EndHere())
+        threadExit();
+}
+
+extern "C" Result __wrap_svcWaitSynchronization(s32* index, const Handle* handles, s32 count, u64 timeout)
+{
+    if (EndHere())
+        threadExit();
+    Result rc;
+    if (timeout <= (u64)kSliceNs) {
+        rc = __real_svcWaitSynchronization(index, handles, count, timeout);
+    } else {   // (in slices, so that the end is seen; the kernel's "timed out" until the whole time has passed)
+        const u64 start = armGetSystemTick();
+        for (;;) {
+            const u64 passed = armTicksToNs(armGetSystemTick() - start);
+            const u64 left = timeout == UINT64_MAX ? (u64)kSliceNs : passed >= timeout ? 0 : std::min<u64>(timeout - passed, (u64)kSliceNs);
+            rc = __real_svcWaitSynchronization(index, handles, count, left);
+            if (rc != 0xEA01 || (timeout != UINT64_MAX && passed + left >= timeout))
+                break;
+            if (EndHere())
+                threadExit();
+        }
+    }
+    if (EndHere())
+        threadExit();
+    return rc;
+}
+
+extern "C" Result __wrap_condvarWaitTimeout(CondVar* c, Mutex* m, u64 timeout)
+{
+    if (EndHere()) {
+        mutexUnlock(m);
+        threadExit();
+    }
+    const int slot = NoteWait(c);
+    const Result rc = __real_condvarWaitTimeout(c, m, timeout);
+    if (slot >= 0)
+        g_waitingOn[slot].store(nullptr, std::memory_order_release);
+    if (EndHere()) {
+        mutexUnlock(m);
+        threadExit();
+    }
+    return rc;
+}
+
+// The other threads told to end, and waited for up to `ms`: how many of those made have ended.
+// The ones that have not are said, by their first function (addr2line on sly1.elf) and argument.
+int EndOtherThreads(int ms, int* made)
+{
+    g_threadsEnd.store(true);
+    const Handle self = threadGetCurHandle();
+    int ended = 0, count = 0;
+    for (int round = 0; round <= ms / 5; round++) {
+        for (auto& waiting : g_waitingOn)
+            if (CondVar* c = waiting.load())
+                svcSignalProcessWideKey(c, -1);
+        ended = count = 0;
+        for (int k = 0; k < kThreadsMost; k++) {
+            if (!g_threads[k].load() || g_threadHandle[k] == self)
+                continue;
+            count++;
+            if (Ended(k))
+                ended++;
+        }
+        if (ended == count)
+            break;
+        __real_svcSleepThread(5'000'000);
+    }
+    if (ended != count)
+        for (int k = 0; k < kThreadsMost; k++) {
+            if (g_threads[k].load() && g_threadHandle[k] != self && !Ended(k))
+                std::fprintf(stderr, "sly1: a thread has not ended: its first function +0x%llX, argument 0x%llX\n",
+                             (unsigned long long)(g_threadEntry[k] - (std::uintptr_t)ImageBase()), (unsigned long long)g_threadArg[k]);
+        }
+    if (made)
+        *made = count;
+    return ended;
+}
+
+// Every other thread of the program stopped where it is, for good, and its stack's mapping and
+// handle given back: before the program ends with another to follow it (SLY1_NEXT). The next
+// program is loaded into this process: a thread of this one that went on ran code no longer
+// there, and a stack still mapped is memory of this program's image the loader cannot take back.
+// The allocator's lock and the two output streams' are taken before the threads are stopped and
+// kept, so that none is stopped holding one (the caller frees and closes after this). Called by the first
+// thread (main). Returns how many were stopped.
+extern "C" void __malloc_lock(struct _reent*);
+extern "C" void __malloc_unlock(struct _reent*);
+int StopOtherThreads()
+{
+    const Handle self = threadGetCurHandle();
+    int stopped = 0;
+    __malloc_lock(_REENT);
+    flockfile(stdout);
+    flockfile(stderr);
+    for (int k = 0; k < kThreadsMost; k++)
+        if (g_threads[k].load() && g_threadHandle[k] != self && !Ended(k) &&
+            R_SUCCEEDED(svcSetThreadActivity(g_threadHandle[k], ThreadActivity_Paused)))
+            stopped++;
+    // (The three locks are kept: given up, each would pass to a thread that waited for it, which is
+    // stopped now. They are this thread's as often as it asks, and the next program has its own.)
+    for (int k = 0; k < kThreadsMost; k++) {
+        if (!g_threads[k].exchange(nullptr) || g_threadHandle[k] == self)
+            continue;
+        // The stack's mapping taken away (its size asked of the kernel: libnx maps the stack with
+        // the thread's own data after it, more than stack_sz) and the handle closed; each one
+        // that does not go is said, with the kernel's answer. (One whose Thread was closed in
+        // the meantime has no mapping left: the kernel then names a region that is not a stack.)
+        MemoryInfo info{};
+        u32 page = 0;
+        Result rc = svcQueryMemory(&info, &page, (u64)g_threadMirror[k]);
+        if (R_SUCCEEDED(rc) && info.type == MemType_MappedMemory && info.addr == (u64)g_threadMirror[k]) {
+            rc = svcUnmapMemory(g_threadMirror[k], g_threadStack[k], info.size);
+            if (R_FAILED(rc)) {
+                char line[200];
+                std::snprintf(line, sizeof line, "sly1: a stack's mapping stays: answer 0x%X; mirror %p (%llu KB, attribute 0x%X), stack %p\n", rc,
+                              g_threadMirror[k], (unsigned long long)(info.size >> 10), info.attr, g_threadStack[k]);
+                write(STDERR_FILENO, line, __builtin_strlen(line));
+            }
+        }
+        svcCloseHandle(g_threadHandle[k]);
+    }
+    return stopped;
+}
+
+// The parts of the program's heap that are not plain memory of its own (not readable and
+// writable, or with an attribute: lent to a service, mapped as a thread's stack, locked for a
+// call), said in one line each. At the start of a run there should be none; one that a run before
+// it in this process left is what the next run faults on (a transfer memory still with its
+// service, 2026-11-25).
+int HeapReport(const char* when, bool each)
+{
+    u64 base = 0, size = 0;
+    if (envHasHeapOverride()) {
+        base = (u64)envGetHeapOverrideAddr();
+        size = envGetHeapOverrideSize();
+    } else {
+        svcGetInfo(&base, InfoType_HeapRegionAddress, CUR_PROCESS_HANDLE, 0);
+        svcGetInfo(&size, InfoType_HeapRegionSize, CUR_PROCESS_HANDLE, 0);
+    }
+    int odd = 0;
+    u64 at = base;
+    char line[200];
+    while (at < base + size) {
+        MemoryInfo info;
+        u32 page = 0;
+        if (R_FAILED(svcQueryMemory(&info, &page, at)) || info.size == 0)
+            break;
+        const u64 end = std::min<u64>(info.addr + info.size, base + size);
+        if ((info.perm != Perm_Rw || info.attr != 0) && odd++ < 24 && each) {
+            std::snprintf(line, sizeof line, "heapmap: %s: +0x%llX, %llu KB: type 0x%X, attribute 0x%X, permission %u, lent to devices %u, to calls %u\n", when,
+                          (unsigned long long)(at - base), (unsigned long long)((end - at) >> 10), info.type, info.attr, info.perm, info.device_refcount,
+                          info.ipc_refcount);
+            write(STDERR_FILENO, line, __builtin_strlen(line));
+        }
+        at = end;
+    }
+    std::snprintf(line, sizeof line, "heapmap: %s: %d parts of the heap (%llu MB at 0x%llX) not plain memory\n", when, odd, (unsigned long long)(size >> 20),
+                  (unsigned long long)base);
+    write(STDERR_FILENO, line, __builtin_strlen(line));
+    return odd;
 }
 
 void PlaceThread(ThreadRole role, bool sampled)
