@@ -4190,6 +4190,20 @@ struct JobCopy {
         used += (std::uint32_t)n;
     }
 };
+// A job's copy and its part's shape in one walk of the packet (SLY1_JOB_HASH_COPY): the shape's
+// hash reads the same words again, cold each time, so it is made of the copy as it is written.
+struct CopyAndShape {
+    JobCopy copy;
+    PartHasher hasher;
+    void Tag(const std::uint32_t* tag) { hasher.Mix(tag[0]); }
+    void Words(const std::uint32_t* p, int n)
+    {
+        const std::uint32_t at = copy.used;
+        copy.Words(p, n);
+        if (!copy.over)
+            hasher.Feed(copy.words + at, (std::size_t)n);   // (over: the walk's result is not used)
+    }
+};
 std::atomic<std::uint32_t> g_levelLoads{0};   // (LevelLoadNoted)
 std::size_t g_jobsHeldWords;   // (the render thread's) what the jobs' items' buffers hold, as last measured
 struct PartJob {
@@ -4276,6 +4290,8 @@ template <class Sink> bool WalkPart(std::uint32_t target, bool tte, Sink& vif)
         const std::uint32_t* tag = At(tadr & 0x7FFFFFFFu, tagSpr);
         const std::uint32_t qwc = tag[0] & 0xFFFF, id = (tag[0] >> 28) & 7, addr = tag[1] & 0x7FFFFFF0;
         const bool spr = (tag[1] >> 31) != 0;
+        if constexpr (std::is_same_v<Sink, CopyAndShape>)
+            vif.Tag(tag);
         if (tag[0] >> 31)
             return false;
         if (tte)
@@ -4859,8 +4875,45 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
             return false;
     }
     const std::uint64_t tCall = NowNs();
+    // the copy and the shape in one walk: 0 as before (the shape's walk, then the copy's); ab: in turn,
+    // 600 frames each, off first; check: both, and the two shapes compared
+    static const char* const hcEnv = std::getenv("SLY1_JOB_HASH_COPY");
+    static std::unique_ptr<std::uint32_t[]> hcScratch;
+    static std::uint32_t hcUsed;
+    static bool hcCopied;
+    const bool hashCopy = !hcEnv ? true : hcEnv[0] == 'a' ? gs::FramesShown() / 600 % 2 == 1 : hcEnv[0] != '0';
+    if (hashCopy) {
+        if (!hcScratch)
+            hcScratch.reset(new std::uint32_t[kJobWords]);
+        hcCopied = false;
+    }
     {
-        const std::uint64_t shapeNow = PartHash(target, false, g_callRegs.cl, g_callRegs.wl, g_callTte, slow, nullptr, true);
+        std::uint64_t shapeNow;
+        if (hashCopy) {
+            CopyAndShape sink{JobCopy{hcScratch.get()}, {}};
+            sink.hasher.shape = true;
+            sink.hasher.cl = g_callRegs.cl;
+            sink.hasher.wl = g_callRegs.wl;
+            if (slow && !(target & 0x80000000u))
+                sink.hasher.chain = At(target, false);
+            sink.hasher.stable = !slow;
+            const bool ok = WalkPart(target, g_callTte, sink);
+            hcUsed = sink.copy.used;
+            hcCopied = ok && !sink.copy.over;
+            shapeNow = ok && !sink.copy.over && sink.hasher.left == 0 && !sink.hasher.shapeBad ? (sink.hasher.h | 1) : 0;
+            if (!hcCopied && ok)   // (too long to copy: its shape the ordinary way)
+                shapeNow = PartHash(target, false, g_callRegs.cl, g_callRegs.wl, g_callTte, slow, nullptr, true);
+            if (hcEnv && hcEnv[0] == 'c') {
+                static std::uint64_t checked, wrong;
+                checked++;
+                if (shapeNow != PartHash(target, false, g_callRegs.cl, g_callRegs.wl, g_callTte, slow, nullptr, true))
+                    wrong++;
+                if ((checked & (checked - 1)) == 0 || (checked % 50000) == 0)
+                    std::fprintf(stderr, "hashcopy: %llu shapes, %llu other than PartHash's\n", (unsigned long long)checked, (unsigned long long)wrong);
+            }
+        } else {
+            shapeNow = PartHash(target, false, g_callRegs.cl, g_callRegs.wl, g_callTte, slow, nullptr, true);
+        }
         if (shapeNow != r.shape) {
             // Its shape is another than its record's: a job all the same by another part's registers
             // for the shape it has now, when they are known (a part that turns between a few shapes was
@@ -4983,7 +5036,12 @@ bool PartCallInner(std::uint32_t marker, std::uint32_t target, bool slow)
     {   // the packet copied for the job (SLY1_JOB_COPY=0: read where it lies, and the list's end waits for the jobs)
         static const bool copy = !std::getenv("SLY1_JOB_COPY") || std::getenv("SLY1_JOB_COPY")[0] != '0';
         job->copied = false;
-        if (copy) {
+        if (copy && hashCopy && hcCopied) {   // (walked above: its buffer given to the job for the job's own)
+            job->words.swap(hcScratch);
+            job->wordCount = hcUsed;
+            job->copied = true;
+            g_jobWordsCopied += hcUsed;
+        } else if (copy) {
             JobCopy c{job->words.get()};
             const bool ok = WalkPart(job->target, job->tte, c) && !c.over;
             job->wordCount = c.used;
