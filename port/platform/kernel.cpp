@@ -384,6 +384,16 @@ float VividFactor()
     return (*(const std::uint32_t*)Native(save + 0x19EC) & 0x20000u) ? 1.35f : 1.0f;
 }
 
+// The frame counter's setting (port/include/port/system.h), read as VividFactor reads its own.
+bool ShowFps()
+{
+    static const char* const env = std::getenv("SLY1_SHOW_FPS");
+    if (env)
+        return env[0] != '0';
+    const std::uint32_t save = *(const std::uint32_t*)Native(0x002623C0);
+    return save != 0 && (*(const std::uint32_t*)Native(save + 0x19EC) & 0x40000u) != 0;
+}
+
 // SLY1_VAN_LOG=1: a driven path follower's numbers, every 30th call (tools/patches.py, world.cpp's
 // ControlPathFollower).
 void VanLog(float stick, float top, float target, float vx, float vy, float vz, float pace, float zone, int kind, int boosts, int checksum)

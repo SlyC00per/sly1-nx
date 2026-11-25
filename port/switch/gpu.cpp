@@ -354,6 +354,10 @@ private:
     std::uint64_t dateBarriers_ = 0;
     std::uint64_t frameTextured_ = 0, targetTextured_ = 0;
     std::uint64_t vividFrames_ = 0;   // frames put on the screen by the Vivid picture's draw
+    // The Options page's "Show FPS" (Present): frames presented since fpsSince_, and the number shown
+    std::uint64_t fpsSince_ = 0;
+    std::uint32_t fpsFrames_ = 0, fpsShown_ = 0;
+    void DrawFps(std::uint64_t now);
     std::uint32_t otherSerial_[512] = {};   // the uploads so far when a buffer this renderer does not draw into was last drawn into; 0: never
     std::uint64_t retired_ = 0;
     BatchParams lastBatch_;
@@ -2817,6 +2821,50 @@ void Renderer::DumpDraw(long k)
     }
 }
 
+// The Options page's "Show FPS": the frames presented a second, counted over half a second, as two
+// or three seven-segment digits in the screen's bottom left corner. Each segment is a rectangle
+// cleared to a colour on the screen's image (a scissor and a clear: no draw, no shader, no
+// texture), over one dark rectangle: twenty small clears a frame at most, and nothing when the
+// setting is off. The scissor is set anew by the next frame's first draw.
+void Renderer::DrawFps(std::uint64_t now)
+{
+    fpsFrames_++;
+    if (fpsSince_ == 0)
+        fpsSince_ = now;
+    if (now - fpsSince_ >= 500000000ull) {
+        fpsShown_ = (std::uint32_t)(((std::uint64_t)fpsFrames_ * 1000000000ull + (now - fpsSince_) / 2) / (now - fpsSince_));
+        fpsFrames_ = 0;
+        fpsSince_ = now;
+    }
+    const std::uint32_t value = fpsShown_ > 999 ? 999 : fpsShown_;
+    const int digits = value >= 100 ? 3 : 2;
+    constexpr int kW = 8, kH = 14, kT = 2, kGap = 3, kPad = 3;   // a digit's size, its strokes, between digits, around them
+    const int x0 = (int)(kScreenWidth - kWidth) / 2 + 10, y0 = (int)kScreenHeight - 10 - kH - 2 * kPad;
+    const auto fill = [&](int x, int y, int w, int h, const float* colour) {
+        DkScissor sc = {(std::uint32_t)x, (std::uint32_t)y, (std::uint32_t)w, (std::uint32_t)h};
+        dkCmdBufSetScissors(cmd_, 0, &sc, 1);
+        dkCmdBufClearColor(cmd_, 0, DkColorMask_RGBA, colour);
+    };
+    static const float kBack[4] = {0.0f, 0.0f, 0.0f, 1.0f}, kLit[4] = {0.4f, 1.0f, 0.2f, 1.0f};
+    fill(x0, y0, digits * kW + (digits - 1) * kGap + 2 * kPad, kH + 2 * kPad, kBack);
+    // the segments a digit lights: bit 0 the top, 1 top right, 2 bottom right, 3 the bottom, 4 bottom left, 5 top left, 6 the middle
+    static const std::uint8_t kSegments[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
+    int place = 1;
+    for (int k = 1; k < digits; k++)
+        place *= 10;
+    for (int k = 0; k < digits; k++, place /= 10) {
+        const std::uint8_t s = kSegments[value / place % 10];
+        const int x = x0 + kPad + k * (kW + kGap), y = y0 + kPad, half = (kH - kT) / 2;
+        if (s & 0x01) fill(x, y, kW, kT, kLit);
+        if (s & 0x02) fill(x + kW - kT, y, kT, half + kT, kLit);
+        if (s & 0x04) fill(x + kW - kT, y + half, kT, kH - half, kLit);
+        if (s & 0x08) fill(x, y + kH - kT, kW, kT, kLit);
+        if (s & 0x10) fill(x, y + half, kT, kH - half, kLit);
+        if (s & 0x20) fill(x, y, kT, half + kT, kLit);
+        if (s & 0x40) fill(x, y + half, kW, kT, kLit);
+    }
+}
+
 void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
 {
     FlushPending();
@@ -3033,6 +3081,8 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
     } else {
         dkCmdBufBlitImage(cmd_, &from, &src, &screen, &dst, renderWidth_[target] != kWidth ? DkBlitFlag_FilterLinear : 0, 0);
     }
+    if (ShowFps())
+        DrawFps(t0);
     {   // The size of the frame drawn next, into the other buffer: as large as the GPU draws in a
         // frame's time. The GPU's time over a frame is taken as a fixed part and a part that goes
         // with the pixels; the size is brought down at once when a frame at the present size took

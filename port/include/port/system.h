@@ -46,6 +46,8 @@ void KernelDump();
 // renderer moves each colour away from its grey by, 1 for Normal. SLY1_VIVID=N: N hundredths
 // whatever the setting (100: never).
 float VividFactor();
+// The Options page's "Show FPS" (bit 0x40000 of the save's option flags; SLY1_SHOW_FPS=1 or 0 whatever the setting).
+bool ShowFps();
 
 }  // namespace port
 

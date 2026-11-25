@@ -462,6 +462,26 @@ PATCHES = [
      "        case 28: {\n            g_saveData->u19EC ^= 0x20000;\n            s32 keep = self->cursor;\n            BuildPauseMenuPage(self);\n            self->cursor = keep;\n            return;\n        }\n        case 14:\n            SetPauseMenuLayerPage(self, 0, 0x18);\n            return;\n        case 23:\n            SetPauseMenuLayerPage(self, 0, 0x1F);\n            return;",
      "choosing the Picture setting turns it over"),
 
+    # "Show FPS: Off" or "Show FPS: On" on the Options page, after Picture (the user, 2026-11-24):
+    # item 29, bit 0x40000 of the save's option flags; the renderer draws the frames a second in a
+    # corner as it presents a frame (port::ShowFps, gpu.cpp's DrawFps). As the Picture setting.
+    ("src/main/pause_menu.cpp",
+     "char* GetMenuChoiceLabel(s32 index)\n{\n    if (index == 28) {",
+     "char* GetMenuChoiceLabel(s32 index)\n{\n    if (index == 29) {\n        static char port_fps_off[] = \"Show FPS: Off\", port_fps_on[] = \"Show FPS: On\";\n        return (g_saveData->optionFlags & 0x40000) ? port_fps_on : port_fps_off;\n    }\n    if (index == 28) {",
+     "the Show FPS setting's label"),
+    ("src/main/pause_menu.cpp",
+     "ChoiceLabels* cl = (row->items[i] == 27 || row->items[i] == 28) ? &port_none",
+     "ChoiceLabels* cl = (row->items[i] >= 27 && row->items[i] <= 29) ? &port_none",
+     "the Show FPS setting has no set of labels of the game's"),
+    ("src/main/pause_menu.cpp",
+     "            row->items[row->count - 1] = 28;\n            row->count++;\n        }",
+     "            row->items[row->count - 1] = 28;\n            row->count++;\n            row->items[row->count] = row->items[row->count - 1];\n            row->items[row->count - 1] = 29;\n            row->count++;\n        }",
+     "the Options page with the Show FPS setting before Back"),
+    ("src/main/pause_menu.cpp",
+     "        case 28: {\n            g_saveData->u19EC ^= 0x20000;",
+     "        case 29: {\n            g_saveData->u19EC ^= 0x40000;\n            s32 keep = self->cursor;\n            BuildPauseMenuPage(self);\n            self->cursor = keep;\n            return;\n        }\n        case 28: {\n            g_saveData->u19EC ^= 0x20000;",
+     "choosing the Show FPS setting turns it over"),
+
     # The Options page without "Center Screen...": the PS2's picture could be moved on a television
     # that showed it off centre; the Switch's screen and its dock's picture are where they are
     # (the user, 2026-11-24). The item is left out of the page as it is built; the game's own
