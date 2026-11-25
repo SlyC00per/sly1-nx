@@ -5,7 +5,8 @@
     python3 tools/switch_matrix.py NAME [--rounds N] [--frames N] [--levels 4,5,20] [--common K=V,K=V] VARIANT ...
 
 Each VARIANT is "label" or "label:K=V,K=V" (environment settings passed to the game; a first
-variant with none is the one compared against). They are run in turn, round after round (A B C A B
+variant with none is the one compared against), or "label@FILE.nro" with another build (a copy of
+it is run), or both, "label@FILE.nro:K=V". They are run in turn, round after round (A B C A B
 C ...), because two runs of one build differ by about 6 points at 60: a single pair says nothing.
 A summary after the last round: each variant's % at 60, thread times and late frames, as mean and
 standard error over its rounds, and the difference from the first with its error. Logs:
@@ -43,6 +44,7 @@ def main():
     name = a.pop(0)
     opts = {"--rounds": 3, "--frames": 150, "--levels": "4,5,20,4,5", "--common": ""}
     variants = []
+    builds = {}
     common = []
     while a:
         x = a.pop(0)
@@ -50,18 +52,26 @@ def main():
             opts[x] = a.pop(0)
             continue
         label, _, envs = x.partition(":")
+        label, _, build = label.partition("@")
+        builds[label] = build
         variants.append((label, [e for e in envs.split(",") if e]))
     rounds, frames, levels = int(opts["--rounds"]), int(opts["--frames"]), opts["--levels"]
     common = [e for e in opts["--common"].split(",") if e]   # (settings every run has: K=V,K=V)
     nro = os.path.join(ROOT, "bench", name + ".nro")   # (a copy: a build made while this runs does not change it)
     os.makedirs(os.path.join(ROOT, "bench"), exist_ok=True)
     shutil.copy(os.path.join(ROOT, "build-switch", "sly1.nro"), nro)
+    nros = {}
+    for label, _ in variants:
+        nros[label] = nro
+        if builds[label]:
+            nros[label] = os.path.join(ROOT, "bench", "%s-%s.nro" % (name, label))
+            shutil.copy(builds[label], nros[label])
     got = {label: [] for label, _ in variants}
     for r in range(rounds):
         for label, envs in variants:
             log = "%s-%s-%d" % (name, label, r)
             print("== %s" % log, flush=True)
-            status = bench.run(log, nro, levels, frames, common + envs, receiver=True)
+            status = bench.run(log, nros[label], levels, frames, common + envs, receiver=True)
             m = measures(os.path.join(ROOT, "bench", log + ".log"))
             if status:
                 print("stopped: that run did not end as it should (status %d)" % status)

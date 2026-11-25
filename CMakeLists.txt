@@ -201,6 +201,12 @@ add_library(port_render STATIC port/render/vu1.cpp port/render/vu1_handlers.cpp 
 target_include_directories(port_render PRIVATE port/include port/render)
 # VU arithmetic rounds each operation (port/render/vu1_runner.h): never fused into one.
 target_compile_options(port_render PRIVATE -Wall -Wextra -Wno-unused-label -Wno-unused-variable -ffp-contract=off)
+# (a trial: the port's own code at -O3, the game's as ever; its floating point stays as it is written)
+option(SLY1_PORT_O3 "Compile the port's platform and render code with -O3" OFF)
+if(SLY1_PORT_O3)
+    target_compile_options(port_platform PRIVATE -O3)
+    target_compile_options(port_render PRIVATE -O3)
+endif()
 # The translated microcode, generated from the core the interpreter runs: optimised and without
 # the sanitizers' checks in every build (instrumented, its inlined instructions came to 290 MB).
 set_source_files_properties(${GEN_DIR}/vu1_programs.cpp PROPERTIES COMPILE_OPTIONS "-O2;-fno-sanitize=all;-ffp-contract=off")
