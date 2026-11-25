@@ -55,6 +55,10 @@ asks.
 
 ## Beyond the PS3 release
 
+- **Difficulty: Normal / Easy** on the Options page (the maintainer, 2026-11-25;
+  docs/DIFFICULTY.md). Normal, the default, is retail's game. Easy slows the enemies of four
+  levels (Treasure in the Depths, Piranha Lake, Down Home Cooking, Burning Rubber) and doubles
+  Piranha Lake's piranhas; no other level is changed.
 - **Camera: Normal / Inverted** on the Controls page of the pause menu, as the PS Vita release
   has (tools/patches.py; bit 0x10000 of the save's option flags, set for Inverted). Normal, the
   default, turns the camera by the right stick the way retail does on a PS2 (the user's

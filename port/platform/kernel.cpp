@@ -550,6 +550,40 @@ void NoteFreeze(int object, int flag)
 #endif
 }
 
+// The Difficulty setting (docs/DIFFICULTY.md): bit 0x80000 of the save's option flags (the Options
+// page's "Difficulty: Normal" or "Difficulty: Easy", tools/patches.py). Easy changes four levels,
+// known by the code the game keeps for the level being played (the world's number and the level's
+// within it), and nothing anywhere else. SLY1_EASY=1 or 0 sets it whatever the save says.
+namespace {
+int EasyLevel()
+{
+    static const char* const env = std::getenv("SLY1_EASY");
+    const std::uint32_t save = *(const std::uint32_t*)Native(0x002623C0);   // g_saveData
+    if (save == 0)
+        return 0;
+    const bool easy = env ? env[0] != '0' : (*(const std::uint32_t*)Native(save + 0x19EC) & 0x80000u) != 0;
+    if (!easy)
+        return 0;
+    return (*(const std::int32_t*)Native(save + 0x19D8) << 8) | *(const std::int32_t*)Native(save + 0x19DC);
+}
+}  // namespace
+
+float EnemyPace()
+{
+    switch (EasyLevel()) {
+    case 0x106: return 0.5f;   // Treasure in the Depths: the crabs
+    case 0x304: return 0.8f;   // Piranha Lake: the piranhas
+    case 0x307: return 0.5f;   // Down Home Cooking: the chickens
+    case 0x502: return 0.5f;   // Burning Rubber: the fire slugs
+    }
+    return 1.0f;
+}
+
+int ExtraEnemyClass()
+{
+    return EasyLevel() == 0x304 ? 0x0F : 0;   // Piranha Lake: a second piranha for each
+}
+
 void NoteCamera(const float* position, int areaMask)
 {
     static long from = -1, to = -1;

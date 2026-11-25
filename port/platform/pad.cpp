@@ -199,6 +199,31 @@ s32 ReadPadFrame(s32 port, s32 slot, u8* out)
         static const long startAt = std::getenv("SLY1_PAD_START") ? std::atol(std::getenv("SLY1_PAD_START")) : -1;
         if (startAt >= 0 && reads >= startAt && reads < startAt + 6)
             f.buttons |= 0x0800;
+        // SLY1_PAD_TAP=N: the cross button tapped every N reads (a level's opening talk passed, unattended)
+        static const long tapEvery = std::getenv("SLY1_PAD_TAP") ? std::atol(std::getenv("SLY1_PAD_TAP")) : 0;
+        if (tapEvery > 0 && reads % tapEvery < 4)
+            f.buttons |= kCross;
+        // SLY1_PAD_SCRIPT=N:MASK,N:MASK,...: the buttons of MASK (hexadecimal, the PS2's bits) held for
+        // the Nth read and the five after (a menu walked, unattended)
+        static const char* const script = std::getenv("SLY1_PAD_SCRIPT");
+        for (const char* at = script; at && *at;) {
+            char* end = nullptr;
+            const long n = std::strtol(at, &end, 10);
+            if (*end != ':')
+                break;
+            const unsigned long mask = std::strtoul(end + 1, &end, 16);
+            if (reads >= n && reads < n + 6)
+                f.buttons |= (std::uint16_t)mask;
+            at = *end == ',' ? end + 1 : end;
+            if (*end != ',')
+                break;
+        }
+        // SLY1_PAD_AIM=N: from the Nth read on, the right stick held fully up (a vehicle's gun fired)
+        static const long aimFrom = std::getenv("SLY1_PAD_AIM") ? std::atol(std::getenv("SLY1_PAD_AIM")) : -1;
+        if (aimFrom >= 0 && reads >= aimFrom && reads % 240 < 200) {
+            f.rx = 0x80;
+            f.ry = 0x00;
+        }
         if (turnFrom >= 0 && reads >= turnFrom) {
             f.rx = 0xC0;
             f.ry = 0x80;

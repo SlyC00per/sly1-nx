@@ -511,6 +511,61 @@ PATCHES = [
      "        case 29: {\n            g_saveData->u19EC ^= 0x40000;\n            s32 keep = self->cursor;\n            BuildPauseMenuPage(self);\n            self->cursor = keep;\n            return;\n        }\n        case 28: {\n            g_saveData->u19EC ^= 0x20000;",
      "choosing the Show FPS setting turns it over"),
 
+    # "Difficulty: Normal" or "Difficulty: Easy" on the Options page, after Show FPS (the user,
+    # 2026-11-25; docs/DIFFICULTY.md): item 30, bit 0x80000 of the save's option flags. As the
+    # Picture setting. Normal is retail's game. Easy changes four levels and no other
+    # (port::EnemyPace, port::ExtraEnemyClass, kernel.cpp): their enemies move slower, and Piranha
+    # Lake has twice its piranhas.
+    ("src/main/pause_menu.cpp",
+     "char* GetMenuChoiceLabel(s32 index)\n{\n    if (index == 29) {",
+     "char* GetMenuChoiceLabel(s32 index)\n{\n    if (index == 30) {\n        static char port_normal_game[] = \"Difficulty: Normal\", port_easy_game[] = \"Difficulty: Easy\";\n        return (g_saveData->optionFlags & 0x80000) ? port_easy_game : port_normal_game;\n    }\n    if (index == 29) {",
+     "the Difficulty setting's label"),
+    ("src/main/pause_menu.cpp",
+     "ChoiceLabels* cl = (row->items[i] >= 27 && row->items[i] <= 29) ? &port_none",
+     "ChoiceLabels* cl = (row->items[i] >= 27 && row->items[i] <= 30) ? &port_none",
+     "the Difficulty setting has no set of labels of the game's"),
+    ("src/main/pause_menu.cpp",
+     "            row->items[row->count - 1] = 29;\n            row->count++;\n        }",
+     "            row->items[row->count - 1] = 29;\n            row->count++;\n            row->items[row->count] = row->items[row->count - 1];\n            row->items[row->count - 1] = 30;\n            row->count++;\n        }",
+     "the Options page with the Difficulty setting before Back"),
+    ("src/main/pause_menu.cpp",
+     "        case 29: {\n            g_saveData->u19EC ^= 0x40000;",
+     "        case 30: {\n            g_saveData->u19EC ^= 0x80000;\n            s32 keep = self->cursor;\n            BuildPauseMenuPage(self);\n            self->cursor = keep;\n            return;\n        }\n        case 29: {\n            g_saveData->u19EC ^= 0x40000;",
+     "choosing the Difficulty setting turns it over"),
+    # Easy's slower enemies. An agent (class 8 and the classes made from it: the piranhas, the
+    # chickens, the fire slugs) moves at the velocity its state's animation gives, taken each frame
+    # in UpdateAgent and, while it follows the clip's own motion, in StepAgent: both are scaled.
+    ("src/main/agent.cpp",
+     "            Vu0::Q(self->headingVelocity) = Vu0::MulX(Vu0::Q(self->headingVelocity), neg);\n            Vu0::Q(push) = neg;",
+     "            Vu0::Q(self->headingVelocity) = Vu0::MulX(Vu0::Q(self->headingVelocity), neg);\n            Vu0::Q(push) = neg;\n            Vu0::Q(self->headingVelocity) = Vu0::MulX(Vu0::Q(self->headingVelocity), Vu0::FromFloat(port::EnemyPace()));",
+     "an agent's velocity, as the Difficulty setting makes it"),
+    ("src/main/agent.cpp",
+     "        (**(AgentMotionFn**)src)(src, self, 0, 0, &motion, ap->time, ap->speed);\n",
+     "        (**(AgentMotionFn**)src)(src, self, 0, 0, &motion, ap->time, ap->speed);\n        Vu0::Q(motion) = Vu0::MulX(Vu0::Q(motion), Vu0::FromFloat(port::EnemyPace()));\n",
+     "an agent's motion along its clip, as the Difficulty setting makes it"),
+    # The crabs of Treasure in the Depths are paired objects (class 0x42): they steer at up to
+    # their top speed, before they hold a chest and after.
+    ("src/main/pair_controller.cpp",
+     "        f32 speed = MinF(Vu0::ToFloatMoved(Vu0::Length(Vu0::Q(delta))) / g_gameClock[2], self->maxSpeed);",
+     "        f32 speed = MinF(Vu0::ToFloatMoved(Vu0::Length(Vu0::Q(delta))) / g_gameClock[2], self->maxSpeed * port::EnemyPace());",
+     "a crab's top speed, as the Difficulty setting makes it"),
+    # Easy's second piranha for each one of Piranha Lake: a copy of each object of the class
+    # port::ExtraEnemyClass names (none: 0), made as the level's load ends and before its objects
+    # are started, as SpawnListedObjectCopies makes the game's own copies.
+    ("src/main/world.cpp",
+     "    SpawnListedObjectCopies(self);\n    RunQueuedCalls(self);\n    for (BaseObject* o = (BaseObject*)self->list48.head; o != 0; o = o->next) {",
+     "    SpawnListedObjectCopies(self);\n"
+     "    if (s32 port_cls = port::ExtraEnemyClass()) {\n"
+     "        BaseObject* port_found[64];\n"
+     "        s32 port_n = 0;\n"
+     "        for (BaseObject* o = (BaseObject*)self->list48.head; o != 0 && port_n < 64; o = o->next) {\n"
+     "            if (o->desc->id == port_cls) port_found[port_n++] = o;\n"
+     "        }\n"
+     "        for (s32 k = 0; k < port_n; k++) CreateObjectCopy(port_found[k], self, port_found[k]->parent);\n"
+     "    }\n"
+     "    RunQueuedCalls(self);\n    for (BaseObject* o = (BaseObject*)self->list48.head; o != 0; o = o->next) {",
+     "the Difficulty setting's extra piranhas"),
+
     # The Options page without "Center Screen...": the PS2's picture could be moved on a television
     # that showed it off centre; the Switch's screen and its dock's picture are where they are
     # (the user, 2026-11-24). The item is left out of the page as it is built; the game's own

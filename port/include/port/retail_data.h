@@ -143,6 +143,11 @@ void NoteTick(int object, float timer, float step);
 // SLY1_EVENT_TRACE=N: a script event raised on object N (its key, the caller as an offset from
 // TriggerScriptEvent).
 void NoteScriptEvent(int object, int key, long from);
+// The Difficulty setting (docs/DIFFICULTY.md; kernel.cpp; tools/patches.py). EnemyPace: how fast the
+// level's enemies move against retail, 1 on Normal and in every level Easy leaves alone.
+// ExtraEnemyClass: the class whose objects a level's load makes a second copy of, or 0.
+float EnemyPace();
+int ExtraEnemyClass();
 // SLY1_FREEZE_TRACE=N: object N frozen (flag non-zero) or let go.
 void NoteFreeze(int object, int flag);
 // SLY1_CAMERA_TRACE=A,B: the camera's position and area mask, each world frame from shown frame A to B.
