@@ -2430,6 +2430,9 @@ std::uint64_t g_bonesMislaid;
 // and why one is run here and watched: 0 never run here cleanly, 1 no registers known for its
 // shape, 2 met with other registers than known)
 std::uint64_t g_keepWhy[6], g_watchWhy[3];
+// The render thread's own hashes of parts by why, cached and the long way (0 a part not met before, 1
+// kept and watched for now, 2 kept and the helper's not in time, 3 moving, 4 not kept): perfhash:.
+std::uint64_t g_hashWhyNs[2][5], g_hashWhyN[2][5];
 std::uint64_t g_partsLetGo, g_partsLetGoRecent;
 std::uint64_t g_fullNsBy[7], g_fullBy[7];
 std::uint64_t g_partsKeepPutOff;   // parts not kept in the list they could have been (no more than a few a list)
@@ -3576,8 +3579,26 @@ bool PartDecide(std::uint32_t marker, std::uint32_t target, bool slow)
             return false;
         }
     }
-    if (!late)
+    if (!late) {
+        // (why it is hashed here, for perfhash:)
+        const int why = it == g_parts.end() ? 0 : it->second.ok ? (gs::FramesShown() < it->second.watchUntil ? 1 : 2) : it->second.moving ? 3 : 4;
+        const std::uint64_t h0 = NowNs();
         hash = hashNow();
+        g_hashWhyNs[slow ? 1 : 0][why] += NowNs() - h0;
+        g_hashWhyN[slow ? 1 : 0][why]++;
+        // A part drawn the long way whose helper's hash was more than four lists old was hashed here,
+        // and, its verdict never made new, hashed here in every list after as well, and never asked
+        // of the helper again: 22 of the 27 long-way parts a frame that were drawn again, on the
+        // Switch (perfhash:'s "long helper late"). What was found here is the verdict: the next
+        // list asks the helper, as for any other. SLY1_HASH_RENEW=0: as before; =ab: in turn, 600
+        // frames each, off first.
+        static const char* const renewEnv = std::getenv("SLY1_HASH_RENEW");
+        const bool renew = !renewEnv ? true : renewEnv[0] == 'a' ? gs::FramesShown() / 600 % 2 == 1 : renewEnv[0] != '0';
+        if (renew && slow && it != g_parts.end() && (it->second.ok || it->second.moving)) {
+            it->second.verdictList = g_listSerial;
+            it->second.seen = hash;
+        }
+    }
     if (it != g_parts.end() && it->second.moving && it->second.hash == hash) {
         PartRecord& r = it->second;
         if (gs::FramesShown() < r.movingUntil) {
@@ -6353,6 +6374,19 @@ void RenderThreadMain()
                         static std::uint64_t jobsKeepNsWas, jobsKeepPartsWas;
                         std::fprintf(stderr, "perfkeepms: to %llu, a frame: %.2f parts kept from jobs in %.3f ms (scratch %s)\n", (unsigned long long)gs::FramesShown(),
                                      (g_jobsKeepParts - jobsKeepPartsWas) / (double)f, (g_jobsKeepNs - jobsKeepNsWas) / 1e6 / (double)f, KeepScratchOn() ? "on" : "off");
+                        {
+                            static std::uint64_t nsWas[2][5], nWas[2][5];
+                            static const char* const kWhy[5] = {"new", "watched", "helper late", "moving", "not kept"};
+                            std::fprintf(stderr, "perfhash: to %llu, a frame, parts hashed by the render thread:", (unsigned long long)gs::FramesShown());
+                            for (int w = 0; w < 2; w++)
+                                for (int k = 0; k < 5; k++) {
+                                    if (g_hashWhyN[w][k] != nWas[w][k])
+                                        std::fprintf(stderr, " %s%s %.1f (%.3f ms)", w ? "long " : "", kWhy[k], (g_hashWhyN[w][k] - nWas[w][k]) / (double)f, (g_hashWhyNs[w][k] - nsWas[w][k]) / 1e6 / (double)f);
+                                    nsWas[w][k] = g_hashWhyNs[w][k];
+                                    nWas[w][k] = g_hashWhyN[w][k];
+                                }
+                            std::fprintf(stderr, "\n");
+                        }
                         jobsKeepNsWas = g_jobsKeepNs;
                         jobsKeepPartsWas = g_jobsKeepParts;
                         std::memcpy(keepWas, g_keepWhy, sizeof keepWas);
