@@ -31,6 +31,13 @@ endif()
 message(STATUS "sly1-nx: platform ${PLATFORM}")
 # Frame records on every target, for the port's reports of where a fault came from.
 add_compile_options(-fno-omit-frame-pointer)
+# (a trial: devkitPro's CMake compiles everything -fPIC, as for a library whose functions another may
+# replace; the .nro is a program, and -fPIE, which comes later and so counts, lets its own be inlined)
+# (not measured: the one trial build of it was without SLY1_ISO, docs/RENDERER.md)
+option(SLY1_PIE "Switch: compile with -fPIE instead of -fPIC" OFF)
+if(SLY1_PIE AND PLATFORM STREQUAL "SWITCH")
+    add_compile_options(-fPIE)
+endif()
 
 if(PLATFORM STREQUAL "HOST_ASAN")
     # No stack-use-after-return detection: it moves locals to a heap of its own, and the game's

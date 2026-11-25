@@ -77,7 +77,7 @@ def main():
             status = bench.run(log, nros[label], levels, frames, common + envs, receiver=True)
             m = measures(os.path.join(ROOT, "bench", log + ".log"))
             whole = m is not None and "verify: all" in open(os.path.join(ROOT, "bench", log + ".log"), errors="replace").read()
-            if status:
+            if status or not whole:   # (a run ended at its deadline says it is done: its levels tell)
                 abnormal.append((log, status))
                 print("ABNORMAL END: %s (status %d), its levels %s" % (log, status, "all run" if whole else "NOT all run"), flush=True)
             if m and whole:

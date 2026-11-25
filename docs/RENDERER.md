@@ -1884,3 +1884,10 @@ Both steps are gains without the GPU; small ones. What `-O3` draws: 2,387 frames
 lockstep, none different from the branch's (one thread); and with the threads as a player has them,
 `SLY1_PART_JOBS_CHECK=1` on the Switch, 329,012 jobs against the same work done at once, 0 differed.
 Not shown by either: a picture from the GPU. Neither goes to `main` before a run with it.
+
+**`-fPIE`, not measured.** devkitPro's CMake compiles everything `-fPIC`, which keeps the compiler
+from inlining a function another file could replace and takes a global's address from a table;
+`SLY1_PIE=ON` (off) compiles with `-fPIE`. The one comparison made (four rounds) is void: that build
+had been configured without `SLY1_ISO`, so its `vu1_programs.cpp` was the stub and VU1 was interpreted
+(133 ms a frame). **A build for a measurement needs `-DSLY1_ISO=...`**, and its `gen/vu1_programs.cpp`
+is some 670 KB. `-O3`'s four rounds in it repeat the figures above: 68.3 +- 0.7% at 60, 171 +- 5 late.
