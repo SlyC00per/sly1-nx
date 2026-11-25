@@ -1857,3 +1857,30 @@ like textures that stay. With pieces of 4 KB and more left in place the first 25
 were unchanged when drawn; from about the 1,393rd, on the tour, every second one had hundreds of
 words changed by the time the GS thread read it, and the run deadlocked. Taken out.
 
+
+### `main`, the branch and `-O3` on the Switch (2026-11-25, 06:43 to 07:55)
+
+Six interleaved rounds of three builds, the five-level tour, **without the GPU**
+(`SLY1_NO_GPU=1 SLY1_GS_COUNT=1 SLY1_GS_COUNT_BATCHES=1`): what the GPU costs, and what waiting for
+it costs, is not in these figures. `main` is d193acf with the branch's heap setup added so that it
+can run so. All 18 runs ran their levels; one (`main`, round 0) lost the last lines of its log and
+counts. `-O3` is `SLY1_PORT_O3=ON`: the port's platform and render code, not the game's.
+
+| Build | % at 60 | frame ms | render ms | GS ms | game ms | job us | late per 100 windows |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `main` | 63.3 +- 0.4 | 18.02 | 8.46 | 9.42 | 6.80 | 370 | 235 +- 3 |
+| branch | 65.2 +- 0.3 | 17.91 | 8.30 | 9.18 | 6.76 | 375 | 198 +- 5 |
+| branch, `-O3` | 68.5 +- 0.4 | 17.88 | 7.98 | 9.08 | 6.63 | 286 | 176 +- 2 |
+
+Differences paired by round (mean +- standard error; how many of the six rounds have that sign):
+
+| Step | % at 60 | render ms | GS ms | game ms | late per 100 windows |
+| --- | --- | --- | --- | --- | --- |
+| `main` to branch | +1.9 +- 0.5 (6) | -0.16 +- 0.05 (6) | -0.24 +- 0.11 (5) | -0.04 +- 0.02 (3) | -37 +- 6 (6) |
+| branch to `-O3` | +3.3 +- 0.6 (6) | -0.33 +- 0.03 (6) | -0.10 +- 0.07 (5) | -0.13 +- 0.02 (6) | -23 +- 5 (5) |
+| `main` to `-O3` | +5.2 +- 0.7 (6) | -0.49 +- 0.04 (6) | -0.33 +- 0.07 (6) | -0.17 +- 0.01 (6) | -60 +- 4 (6) |
+
+Both steps are gains without the GPU; small ones. What `-O3` draws: 2,387 frames hashed under
+lockstep, none different from the branch's (one thread); and with the threads as a player has them,
+`SLY1_PART_JOBS_CHECK=1` on the Switch, 329,012 jobs against the same work done at once, 0 differed.
+Not shown by either: a picture from the GPU. Neither goes to `main` before a run with it.
