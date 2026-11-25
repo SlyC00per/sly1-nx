@@ -745,14 +745,18 @@ void Renderer::BeginCommands()
     {   // The lines' width, in the screen's pixels. The characters' outlines are the game's lines (some
         // 600 edges a frame). A PS2 pixel's width at this size is 1.5, which the outlines had: thin
         // for a screen of three times the PS2's lines, so they are three times that, 4.5 (the user,
-        // 2026-11-24), and 10 while the game's letterbox bars are on the screen: a cut scene's close
-        // views make a character many times larger than in play, and 4.5 was hardly seen there.
+        // 2026-11-24), and 7.75 while the game's letterbox bars are on the screen: a cut scene's close
+        // views make a character many times larger than in play, and 4.5 was hardly seen there. The
+        // width goes from the one to the other as the bars slide in and out (half a second), eased
+        // at both ends: changed at once when the bars were half in, the change was plain to see, and
+        // 10 was too much.
         // SLY1_LINE_WIDTH=N and SLY1_LINE_WIDTH_CUT=N: N hundredths of a pixel (150: as the PS2's).
         static const float width = std::getenv("SLY1_LINE_WIDTH") ? (float)std::atoi(std::getenv("SLY1_LINE_WIDTH")) / 100.0f : 4.5f;
-        static const float cut = std::getenv("SLY1_LINE_WIDTH_CUT") ? (float)std::atoi(std::getenv("SLY1_LINE_WIDTH_CUT")) / 100.0f : 10.0f;
+        static const float cut = std::getenv("SLY1_LINE_WIDTH_CUT") ? (float)std::atoi(std::getenv("SLY1_LINE_WIDTH_CUT")) / 100.0f : 7.75f;
         const float bars = LetterboxBlend();
         letterboxSum_ += bars;
-        dkCmdBufSetLineWidth(cmd_, bars > 0.5f ? cut : width);
+        const float in = bars < 0.0f ? 0.0f : bars > 1.0f ? 1.0f : bars;
+        dkCmdBufSetLineWidth(cmd_, width + (cut - width) * in * in * (3.0f - 2.0f * in));
     }
     dkCmdBufSetPointSize(cmd_, 2.0f);
     // window pixels to clip space: x right, y up, the image's first row at the top
