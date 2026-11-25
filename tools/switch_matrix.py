@@ -12,11 +12,13 @@ A summary after the last round: each variant's % at 60, thread times and late fr
 standard error over its rounds, and the difference from the first with its error. Logs:
 bench/NAME-<label>-<round>.log.
 
-It stops by itself when the receiver is gone, or a run does not end as it should (status not 0).
+It stops by itself when the receiver is gone. A run that did not say it had ended is named at the end
+(abnormal ends), and counts when all its levels ran.
 """
 import os
 import re
 import shutil
+import socket
 import statistics as st
 import sys
 import time
@@ -67,20 +69,40 @@ def main():
             nros[label] = os.path.join(ROOT, "bench", "%s-%s.nro" % (name, label))
             shutil.copy(builds[label], nros[label])
     got = {label: [] for label, _ in variants}
+    abnormal = []   # (runs that did not say they had ended: they count, and are said)
     for r in range(rounds):
         for label, envs in variants:
             log = "%s-%s-%d" % (name, label, r)
             print("== %s" % log, flush=True)
             status = bench.run(log, nros[label], levels, frames, common + envs, receiver=True)
             m = measures(os.path.join(ROOT, "bench", log + ".log"))
+            whole = m is not None and "verify: all" in open(os.path.join(ROOT, "bench", log + ".log"), errors="replace").read()
             if status:
-                print("stopped: that run did not end as it should (status %d)" % status)
-                report(variants, got)
-                sys.exit(1)
-            if m:
+                abnormal.append((log, status))
+                print("ABNORMAL END: %s (status %d), its levels %s" % (log, status, "all run" if whole else "NOT all run"), flush=True)
+            if m and whole:
                 got[label].append(m)
-            time.sleep(4)   # (the receiver starts again)
+            if not back():   # (the receiver starts again)
+                print("stopped: the receiver did not come back after %s" % log)
+                break
+        else:
+            continue
+        break
     report(variants, got)
+    print("\nabnormal ends: %s" % (", ".join("%s (status %d)" % a for a in abnormal) or "none"))
+
+
+def back(wait=90):
+    """The receiver is waiting again, within wait seconds."""
+    address = os.environ.get("SLY1_SWITCH", "192.168.86.35")
+    end = time.time() + wait
+    while time.time() < end:
+        try:
+            socket.create_connection((address, 28299), timeout=3).close()
+            return True
+        except OSError:
+            time.sleep(2)
+    return False
 
 
 def report(variants, got):
