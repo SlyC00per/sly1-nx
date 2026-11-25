@@ -14,6 +14,7 @@ void Report();
 // Everything of the GPU's given back, with the GS thread parked (port::ParkGsThread): before the
 // program hands this process to another (port/host/main.cpp's HandOver).
 void Shutdown();
+bool Started();   // the GPU is held by this program
 
 }  // namespace gpu
 }  // namespace port

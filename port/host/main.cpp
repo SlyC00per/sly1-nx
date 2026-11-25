@@ -150,6 +150,31 @@ std::atomic<int> g_endStatus{-1};
 bool g_endByGsThread;
 pthread_t g_firstThread;
 
+// A run that ends without giving the GPU back leaves this process holding it, and the next run in
+// it, coming to the GPU, faults or brings the whole system down (both seen, 2026-11-25). Such a run
+// writes the process's number here, and a run started in the same process after it (SLY1_NEXT)
+// does not begin: it goes back to the receiver, which is to be closed from HOME and started anew.
+const char* const kTainted = "sdmc:/switch/sly1/tainted.txt";
+u64 ProcessNumber()
+{
+    u64 pid = 0;
+    svcGetProcessId(&pid, CUR_PROCESS_HANDLE);
+    return pid;
+}
+bool ProcessTainted()
+{
+    std::FILE* f = std::fopen(kTainted, "r");
+    if (!f)
+        return false;
+    unsigned long long pid = 0;
+    const bool read = std::fscanf(f, "%llu", &pid) == 1;
+    std::fclose(f);
+    if (read && pid == ProcessNumber())
+        return true;
+    std::remove(kTainted);   // (another process's, which is gone)
+    return false;
+}
+
 [[noreturn]] void HandOver(int status, const char* next)
 {
     const bool quiet = port::audio::WaitEnded(1000);
@@ -157,6 +182,14 @@ pthread_t g_firstThread;
     std::fprintf(stderr, "sly1: %s comes next; the mixer %s, the GS thread %s\n", next, quiet ? "ended" : "DID NOT END",
                  parked ? "stopped" : "DID NOT STOP (the GPU is not given back)");
     std::fflush(stderr);
+    if (!parked && port::gpu::Started()) {
+        if (std::FILE* f = std::fopen(kTainted, "w")) {
+            std::fprintf(f, "%llu\n", (unsigned long long)ProcessNumber());
+            std::fclose(f);
+        }
+        std::fprintf(stderr, "sly1: the GPU is still held: no other run begins in this process\n");
+        std::fflush(stderr);
+    }
     port::HeapReport("before the end", false);
     if (parked) {
         port::gpu::Shutdown();
@@ -993,6 +1026,12 @@ int Main(int argc, char** argv)
         }
     }
 #if defined(__SWITCH__)
+    if (std::getenv("SLY1_NEXT") && ProcessTainted()) {
+        std::fprintf(stderr, "sly1: refused: a run before this one in this process did not give the GPU back; close the receiver from HOME and start it again\n");
+        std::fflush(stderr);
+        std::this_thread::sleep_for(std::chrono::seconds(2));   // (read at the Mac, and no run follows at once)
+        Finish(5);
+    }
     {   // The player's disc image: any file of sdmc:/switch/sly1/ that is the NTSC-U disc, whatever
         // its name (port::FindDisc: by its executable's SHA-1). With none, or one that cannot be
         // opened, the screen says so and what to do, and the program ends when a button is pressed.

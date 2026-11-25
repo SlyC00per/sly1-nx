@@ -4407,6 +4407,10 @@ bool PartJobRun(PartJob& j, int who, bool again = false)
     return true;
 }
 
+// The GS thread told to stop for good (ParkGsThread): looked at between two items and while it
+// waits for a job.
+std::atomic<bool> g_gsPark, g_gsParked;
+
 // (the render thread or the GS thread) The job is needed now: run here if not begun, waited for
 // a little if begun elsewhere (a job takes a quarter of a millisecond), then run here again.
 // (SLY1_JOB_WAIT_US=N: for N microseconds; SLY1_JOB_WAIT_US=ab: 400 and 150 in turn, 600 frames each)
@@ -4440,6 +4444,11 @@ void PartJobNeed(PartJob& j, int who)
     std::uint32_t seen = j.beat.load(std::memory_order_relaxed);
     std::uint64_t seenAt = NowNs();
     while (j.state.load(std::memory_order_acquire) != 2) {
+        if (who == 2 && g_gsPark.load(std::memory_order_relaxed)) {   // (ParkGsThread: the GS thread stops here too, or a run that hangs on a job never gives the GPU back)
+            g_gsParked.store(true);
+            for (;;)
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
         if (PartJobRun(j, who))
             continue;
         if (ahead) {
@@ -4448,6 +4457,15 @@ void PartJobNeed(PartJob& j, int who)
                     g_jobsAhead++;
                 continue;
             }
+        }
+        // The job's items are given, but the thread that gave them has not yet said so (it was set
+        // aside between the two): waited for, not run again: every such run is lost, and a run of
+        // it 13 million times was seen when a thread below the GS thread on its core was set aside
+        // there (a second helper, 2026-11-25, tried and taken out: docs/RENDERER.md).
+        if (j.given.load(std::memory_order_acquire)) {
+            if (j.state.load(std::memory_order_acquire) != 2)
+                std::this_thread::sleep_for(std::chrono::microseconds(20));
+            continue;
         }
         const std::uint64_t now = NowNs();
         if (beat) {
@@ -4516,7 +4534,9 @@ bool PartJobsDrainStep()
     bool done = false;
     if (g_drainAt < count) {
         PartJob& j = *g_listJobs[g_drainAt];
-        if (!PartJobRun(j, 1)) {
+        if (j.given.load(std::memory_order_acquire) && j.state.load(std::memory_order_acquire) != 2) {
+            std::this_thread::sleep_for(std::chrono::microseconds(20));   // (given, not said yet: PartJobNeed)
+        } else if (!PartJobRun(j, 1)) {
             if (NowNs() - j.begunAt > JobWaitNs())
                 PartJobRun(j, 1, true);
             else
@@ -5701,7 +5721,6 @@ void RenderFlush()
 
 // The GS thread told to stop between two items and stay there (ParkGsThread): before the program
 // gives the GPU back at the end of a run another program follows (port/host/main.cpp's HandOver).
-std::atomic<bool> g_gsPark, g_gsParked;
 pthread_t g_gsThreadId;
 
 bool OnGsThread() { return g_gsStarted.load(std::memory_order_acquire) && pthread_equal(pthread_self(), g_gsThreadId); }

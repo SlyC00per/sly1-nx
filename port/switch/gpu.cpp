@@ -3344,6 +3344,8 @@ void Report()
         g_renderer.Report();
 }
 
+bool Started() { return g_started; }
+
 void Shutdown()
 {
     if (!g_started)
@@ -3362,6 +3364,7 @@ namespace gpu {
 bool Start() { return false; }
 void Report() {}
 void Shutdown() {}
+bool Started() { return false; }
 }  // namespace gpu
 }  // namespace port
 

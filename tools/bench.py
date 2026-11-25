@@ -80,7 +80,7 @@ def run(name, nro, levels, frames, envs, receiver=False):
             for line in data.decode("latin1").replace("\r", "").split("\n"):
                 if line.startswith(("verify: level", "verify: all", "verify: FAILED", "tour: over", "sly1: fault", "sly1: the run's deadline")):
                     print(line[:110], flush=True)
-        status = switch_run.run(nro, log, 3600, args, address, echo)
+        status = switch_run.run(nro, log, 900, args, address, echo)   # (a run takes five minutes; one that hangs is ended at fifteen)
         if status:
             print("bench: the run did not end as it should (status %d)" % status)
         if status != 2:
