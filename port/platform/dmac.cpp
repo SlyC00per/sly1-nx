@@ -2422,6 +2422,8 @@ bool PartJobRun(PartJob& j, int who, bool again);
 std::vector<HashJob> g_hashJobs, g_hashPending;      // for the helper; the render thread's, not passed on yet
 std::vector<HashResult> g_hashResults;
 std::atomic<bool> g_hashAnyResult, g_hashStarted;
+std::uint32_t g_helperHandle;   // the helper's thread (its kernel handle)
+void UnboostHelper(int who);   // (the helper, a job ended: SLY1_JOB_BOOST)
 std::atomic<std::uint64_t> g_hashHelperNs, g_hashHelped;
 std::uint32_t g_partSerial;
 std::uint64_t g_partsLate;   // drawn again on a hash a frame late
@@ -2509,10 +2511,14 @@ void HashHelperMain()
 {
     PlaceThread(ThreadRole::Helper);
     ProfileThisThread("helper");   // (SLY1_PROFILE=helper)
+#if defined(__SWITCH__)
+    g_helperHandle = threadGetCurHandle();
+#endif
     g_hashStarted.store(true, std::memory_order_release);
     std::vector<HashJob> jobs;
     std::vector<HashResult> results;
     for (;;) {
+        UnboostHelper(0);   // (a boost that came as the job ended is not kept)
 #if defined(__SWITCH__)
         {   // SLY1_HELPER_PRIORITY=ab: below the game's threads (0x2D) and above them (0x2B) in turn,
             // 600 frames each, to compare in one played run
@@ -4268,6 +4274,7 @@ struct PartJob {
     Vif::Regs before, after;
     Collect out;
     std::atomic<int> state{0};   // 0 waiting, 1 begun by a thread, 2 done
+    std::atomic<int> heldBy{-1};   // who began it (0 the helper): the boost, SLY1_JOB_BOOST
     std::atomic<std::uint32_t> beat{0};   // items given by the runs of it so far (t_jobBeat)
     // The lane stays as the job began: a thread runs the job on a copy of its own, and the first
     // to end gives the job its items. So a thread that needs a job another has begun and not
@@ -4450,6 +4457,7 @@ bool PartJobRun(PartJob& j, int who, bool again = false)
         g_jobsAgain++;
     } else {
         j.begunAt = NowNs();
+        j.heldBy.store(who, std::memory_order_release);
     }
     const std::uint64_t t0 = NowNs();
     static thread_local Collect* mine = nullptr;
@@ -4460,6 +4468,7 @@ bool PartJobRun(PartJob& j, int who, bool again = false)
     if (j.gen.load(std::memory_order_seq_cst) != gen || j.given.exchange(true, std::memory_order_acq_rel)) {
         g_jobsLost[who]++;
         g_jobLostNs[who] += NowNs() - t0;
+        UnboostHelper(who);
         return true;   // another thread ended it first (or the job is another part's now): this run's items are dropped
     }
     std::swap(j.out, *mine);
@@ -4469,10 +4478,47 @@ bool PartJobRun(PartJob& j, int who, bool again = false)
         std::lock_guard<std::mutex> lk(g_hashLock);
         g_jobWrongKeys.push_back(j.key);
     }
+    UnboostHelper(who);
     g_jobsBy[who]++;
     j.state.store(2, std::memory_order_release);
     g_jobsOut.fetch_sub(1, std::memory_order_acq_rel);
     return true;
+}
+
+// A job the helper has begun and is set aside in (it runs below the game's threads on their core) is
+// waited for by the thread that needs it, and after 400 us run again by it: on the Switch the GS
+// thread lost 1.8 ms a frame to such runs and the helper 1.9 ms (2026-11-25). With SLY1_JOB_BOOST=1
+// (=ab: in turn, 600 frames each, off first) the thread that waits raises the helper above the game's threads until it ends that
+// job, and the helper puts itself back: the game is held up by what is left of a job, not by a
+// second run of it. (A helper above the game's for good made the game's threads take 12 ms.)
+std::atomic<std::uint64_t> g_helperBoosts{0};
+std::atomic<bool> g_helperBoosted{false};
+bool JobBoostOn()
+{
+    static const char* const e = std::getenv("SLY1_JOB_BOOST");
+    return e && e[0] != '0' && (e[0] != 'a' || gs::FramesShown() / 600 % 2 == 1);
+}
+void BoostHelper(PartJob& j)
+{
+#if defined(__SWITCH__)
+    if (!JobBoostOn() || g_helperHandle == 0 || j.heldBy.load(std::memory_order_acquire) != 0 || j.state.load(std::memory_order_acquire) == 2 ||
+        g_helperBoosted.exchange(true, std::memory_order_acq_rel))
+        return;
+    g_helperBoosts++;
+    svcSetThreadPriority(g_helperHandle, 0x2B);
+#else
+    (void)j;
+#endif
+}
+// (the helper, a job ended) back below the game's threads
+void UnboostHelper(int who)
+{
+#if defined(__SWITCH__)
+    if (who == 0 && g_helperBoosted.load(std::memory_order_acquire) && g_helperBoosted.exchange(false, std::memory_order_acq_rel))
+        svcSetThreadPriority(CUR_THREAD_HANDLE, 0x2D);
+#else
+    (void)who;
+#endif
 }
 
 // The GS thread told to stop for good (ParkGsThread): looked at between two items and while it
@@ -4526,6 +4572,8 @@ void PartJobNeed(PartJob& j, int who)
                 continue;
             }
         }
+        if (NowNs() - j.begunAt > 60000)
+            BoostHelper(j);
         // The job's items are given, but the thread that gave them has not yet said so (it was set
         // aside between the two): waited for, not run again: every such run is lost, and a run of
         // it 13 million times was seen when a thread below the GS thread on its core was set aside
@@ -4605,6 +4653,8 @@ bool PartJobsDrainStep()
         if (j.given.load(std::memory_order_acquire) && j.state.load(std::memory_order_acquire) != 2) {
             std::this_thread::sleep_for(std::chrono::microseconds(20));   // (given, not said yet: PartJobNeed)
         } else if (!PartJobRun(j, 1)) {
+            if (NowNs() - j.begunAt > 60000)
+                BoostHelper(j);
             if (NowNs() - j.begunAt > JobWaitNs())
                 PartJobRun(j, 1, true);
             else
@@ -6563,6 +6613,11 @@ void RenderThreadMain()
                                      (unsigned long long)g_partsLetGo, (unsigned long long)g_partsLetGoRecent, (unsigned long long)g_partsKeepPutOff, (unsigned long long)g_jobsByShape,
                                      (unsigned long long)g_jobsShapeTurned, (unsigned long long)g_keptByJob, (unsigned long long)g_keptByJobRefused);
                         static std::uint64_t jobsKeepNsWas, jobsKeepPartsWas;
+                        static std::uint64_t boostsWas;
+                        if (std::getenv("SLY1_JOB_BOOST")) {
+                            std::fprintf(stderr, "perfboost: to %llu, a frame: %.2f boosts of the helper (%s)\n", (unsigned long long)gs::FramesShown(), (g_helperBoosts - boostsWas) / (double)f, JobBoostOn() ? "on" : "off");
+                            boostsWas = g_helperBoosts;
+                        }
                         std::fprintf(stderr, "perfkeepms: to %llu, a frame: %.2f parts kept from jobs in %.3f ms (scratch %s)\n", (unsigned long long)gs::FramesShown(),
                                      (g_jobsKeepParts - jobsKeepPartsWas) / (double)f, (g_jobsKeepNs - jobsKeepNsWas) / 1e6 / (double)f, KeepScratchOn() ? "on" : "off");
                         {
