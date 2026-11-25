@@ -1905,3 +1905,9 @@ Four interleaved rounds in a fresh receiver, every run ended clean. Paired by ro
 `main` to branch: +0.45 +- 0.34 points at 60, late -14 +- 9: nothing to claim; the 1.9 points
 measured without the GPU are not there with it. Branch to `-O3`: +2.4 +- 0.8 (4 of 4 rounds), render
 -0.41 +- 0.08 ms, late -47 +- 8. **A gain measured without the GPU is not one until measured with it.**
+
+**`-fPIE` measured (11:09, four rounds with the GPU, built with `SLY1_ISO`, all ended clean).** `-O3`
+against `-O3` with `SLY1_PIE=ON`, paired: % at 60 +4.2 +- 0.8 (64.8 to 69.0, 4 of 4 rounds), the
+frame -0.50 +- 0.06 ms, late per 100 windows -50 +- 10; a helper's job +30 +- 2 us and the GS thread
++0.37 +- 0.08 ms, the render thread -0.14 +- 0.09, the game's threads the same. Where the half
+millisecond comes from is not known: no thread's time accounts for it. Its picture is not checked.
