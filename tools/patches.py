@@ -619,43 +619,6 @@ PATCHES = [
      "            port::NoteLevelStreamEnd(sub.remaining, sub.bytesToRead, sub.nextCount, sub.unpackCarry);\n"
      "            CloseBufferedStream(&sub);",
      "records where the level's load left its stream (instrumentation only)"),
-    # Slot 90 (func_001C5248, does a contact hold the body up: self, the contact, the end) is
-    # called by three methods that leave their own a1 and a2 in place for it, as retail's code
-    # shows; the decompilation declares the call without them, so the end index the test reads
-    # was whatever the port's register held. The two slot-64 methods take the end their caller
-    # passes (CreatePooledContact's third argument) and pass it on.
-    ("src/main/agent.cpp",
-     "void ComputeAgentContactValue(Agent* self, BodyContact* out)\n",
-     "void ComputeAgentContactValue(Agent* self, BodyContact* out, s32 end)\n",
-     "slot 90 takes the contact's end, passed through"),
-    ("src/main/agent.cpp",
-     "((s32 (*)(Agent*, void*))self->desc06()->m56)(self, out) != 0",
-     "((s32 (*)(Agent*, void*, s32))self->desc06()->m56)(self, out, end) != 0",
-     "slot 90 takes the contact's end, passed through"),
-    ("include/functions/agent.h",
-     "void ComputeAgentContactValue(Agent* self, BodyContact* out);",
-     "void ComputeAgentContactValue(Agent* self, BodyContact* out, s32 end);",
-     "slot 90 takes the contact's end, passed through"),
-    ("src/main/tint_blend_collider.cpp",
-     "typedef s32 (*TintBlendTestFn)(void* self, void* out);",
-     "typedef s32 (*TintBlendTestFn)(void* self, void* out, s32 end);",
-     "slot 90 takes the contact's end, passed through"),
-    ("src/main/tint_blend_collider.cpp",
-     "void ComputeTintBlendColliderContactValue(TintBlendCollider* self, void* out)\n",
-     "void ComputeTintBlendColliderContactValue(TintBlendCollider* self, void* out, s32 end)\n",
-     "slot 90 takes the contact's end, passed through"),
-    ("src/main/tint_blend_collider.cpp",
-     "((TintBlendTestFn)obj->desc06()->m56)(self, out)",
-     "((TintBlendTestFn)obj->desc06()->m56)(self, out, end)",
-     "slot 90 takes the contact's end, passed through"),
-    ("include/functions/tint_blend_collider.h",
-     "void ComputeTintBlendColliderContactValue(TintBlendCollider* self, void* out);",
-     "void ComputeTintBlendColliderContactValue(TintBlendCollider* self, void* out, s32 end);",
-     "slot 90 takes the contact's end, passed through"),
-    ("src/main/player.cpp",
-     "((s32 (*)(Player*, BodyContact*))self->desc06()->m56)(self, n)",
-     "((s32 (*)(Player*, BodyContact*, s32))self->desc06()->m56)(self, n, k)",
-     "slot 90 takes the contact's end: k, in $a2 at retail's call"),
     # Instrumentation, no change to the game: the level stream before its first read, under
     # SLY1_STREAM_TRACE, to compare platforms.
     ("src/main/on_off_object.cpp",
