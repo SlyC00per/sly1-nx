@@ -31,6 +31,10 @@ std::int32_t CurrentThreadId();
 void SetGameFloatMode();
 // The pad's buttons the game last read, as its word holds them, set when pressed (port/platform/pad.cpp)
 extern std::atomic<std::uint16_t> g_padHeld;
+// The host's pad, for a window's keyboard (port/apple/gpu_metal.mm): the buttons held (the PS2's
+// bits, set when pressed) in bits 0 to 15, then the right stick's x and y and the left's, a byte
+// each (0 to 255, 128 centred).
+extern std::atomic<std::uint64_t> g_hostPad;
 // SLY1_PROFILE=1|gs|render|helper: the calling thread, when it is the one named (1: gs), sampled by a
 // profiler of its own (port/platform/profiler.cpp)
 void ProfileThisThread(const char* role);

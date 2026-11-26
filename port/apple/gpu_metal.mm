@@ -17,6 +17,13 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <QuartzCore/CAMetalLayer.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_OSX
+#import <AppKit/AppKit.h>
+#endif
+
+#include <atomic>
 
 #include <algorithm>
 #include <cmath>
@@ -248,6 +255,11 @@ public:
               std::size_t indices) override;
     void Present(std::uint64_t dispfb, std::uint64_t display) override;
     void Report();
+    // The screen's layer (a window's): each frame shown is put on it.
+    void SetLayer(CAMetalLayer* layer);
+    id<MTLDevice> Device() const { return device_; }
+    std::uint32_t Width() const { return width_; }
+    std::uint32_t Height() const { return height_; }
 
 private:
     struct Small {
@@ -281,6 +293,13 @@ private:
     id<MTLDevice> device_ = nil;
     id<MTLCommandQueue> queue_ = nil;
     id<MTLRenderPipelineState> pipeline_[2] = {nil, nil};   // without a depth image, and with
+    id<MTLRenderPipelineState> copyPipeline_ = nil;         // the frame shown onto the screen's image
+    id<MTLLibrary> library_ = nil;
+    CAMetalLayer* layer_ = nil;
+    std::mutex layerLock_;
+    float lineWidth_ = 4.5f;   // a line's width in the pixels of a 720-line image (the Switch's renderer's, in play)
+    std::vector<gs::DrawVertex> lineVertices_;
+    std::vector<std::uint32_t> lineIndex_;
     id<MTLDepthStencilState> depth_[3][2];                   // the test (always, GEQUAL, GREATER) and whether the depth is written
     id<MTLSamplerState> sampler_[2][2][2];                   // bilinear or not, S clamped or not, T clamped or not
     id<MTLTexture> colour_[2] = {nil, nil}, depthImage_ = nil, white_ = nil;
@@ -356,6 +375,20 @@ bool Renderer::Create()
             std::fprintf(stderr, "gpu: Metal: the shaders: %s\n", error.localizedDescription.UTF8String);
             return false;
         }
+        library_ = library;
+        {
+            MTLRenderPipelineDescriptor* d = [MTLRenderPipelineDescriptor new];
+            d.vertexFunction = [library newFunctionWithName:@"copy_vertex"];
+            d.fragmentFunction = [library newFunctionWithName:@"copy_fragment"];
+            d.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+            copyPipeline_ = [device_ newRenderPipelineStateWithDescriptor:d error:&error];
+            if (!copyPipeline_) {
+                std::fprintf(stderr, "gpu: Metal: the screen's pipeline: %s\n", error.localizedDescription.UTF8String);
+                return false;
+            }
+        }
+        if (const char* line = std::getenv("SLY1_METAL_LINE"))   // SLY1_METAL_LINE=W: a line's width, in pixels of a 720-line image
+            lineWidth_ = std::max(1.0f, (float)std::atof(line));
         MTLVertexDescriptor* layout = [MTLVertexDescriptor vertexDescriptor];
         layout.attributes[0].format = MTLVertexFormatFloat2;
         layout.attributes[0].offset = offsetof(gs::DrawVertex, x);
@@ -720,6 +753,40 @@ void Renderer::Submit(const gs::DrawState& s, const gs::DrawVertex* v, std::size
         return;   // nothing passes
 
     EnsurePass(target, selfStep);
+    // Lines in an image bigger than the GS's: Metal draws a line one pixel wide, which is a hair
+    // there. Each is drawn as a rectangle of the width the Switch's renderer gives the game's lines
+    // (the characters' outlines: docs/PS3_PARITY.md).
+    std::uint32_t kind = s.kind < 3 ? s.kind : 2;
+    if (kind == 1 && imageWidth_ > (std::uint32_t)fieldWidth_) {
+        const float sx = imageWidth_ / fieldWidth_, sy = imageHeight_ / fieldHeight_, half = 0.5f * lineWidth_ * (float)imageHeight_ / 720.0f;
+        lineVertices_.clear();
+        lineIndex_.clear();
+        for (std::size_t k = 0; k + 1 < indices; k += 2) {
+            const gs::DrawVertex& a = v[index[k]];
+            const gs::DrawVertex& b = v[index[k + 1]];
+            const float dx = (b.x - a.x) * sx, dy = (b.y - a.y) * sy, length = std::sqrt(dx * dx + dy * dy);
+            if (!(length > 0.0f))
+                continue;
+            const float nx = -dy / length * half / sx, ny = dx / length * half / sy;
+            const std::uint32_t base = (std::uint32_t)lineVertices_.size();
+            for (int corner = 0; corner < 4; corner++) {
+                gs::DrawVertex o = corner < 2 ? a : b;
+                const float side = corner & 1 ? 1.0f : -1.0f;
+                o.x += nx * side;
+                o.y += ny * side;
+                lineVertices_.push_back(o);
+            }
+            for (std::uint32_t i : {0u, 1u, 2u, 1u, 3u, 2u})
+                lineIndex_.push_back(base + i);
+        }
+        if (lineIndex_.empty())
+            return;
+        v = lineVertices_.data();
+        count = lineVertices_.size();
+        index = lineIndex_.data();
+        indices = lineIndex_.size();
+        kind = 2;
+    }
     // the run's vertices and indices into the frame's memory
     const std::size_t vertexBytes = count * sizeof(gs::DrawVertex), indexBytes = indices * 4;
     if (vertexBytes + indexBytes + 64 > kFrameBufferBytes)
@@ -815,7 +882,7 @@ void Renderer::Submit(const gs::DrawState& s, const gs::DrawVertex* v, std::size
     [encoder_ setFragmentTexture:texture atIndex:0];
 
     static const MTLPrimitiveType kPrimitive[3] = {MTLPrimitiveTypePoint, MTLPrimitiveTypeLine, MTLPrimitiveTypeTriangle};
-    const MTLPrimitiveType primitive = kPrimitive[s.kind < 3 ? s.kind : 2];
+    const MTLPrimitiveType primitive = kPrimitive[kind];
     const int depthTest = !passDepth_ || !zte || ztst == 1 ? 0 : ztst == 2 ? 1 : 2;
     // one pass of the run: which pixels of the alpha test it is for, and whether it writes the depth
     auto pass = [&](int which, bool depthWrite) {
@@ -904,6 +971,30 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
             target = 0;
         EndPass();
         const bool dump = !dumpDir_.empty() && frames_ % (std::uint64_t)dumpEvery_ == 0;
+        {   // the frame shown onto the screen's image
+            CAMetalLayer* layer;
+            {
+                std::lock_guard<std::mutex> lk(layerLock_);
+                layer = layer_;
+            }
+            id<CAMetalDrawable> drawable = layer ? [layer nextDrawable] : nil;
+            if (drawable) {
+                EnsureCommands();
+                MTLRenderPassDescriptor* d = [MTLRenderPassDescriptor renderPassDescriptor];
+                d.colorAttachments[0].texture = drawable.texture;
+                d.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+                d.colorAttachments[0].storeAction = MTLStoreActionStore;
+                id<MTLRenderCommandEncoder> e = [commands_ renderCommandEncoderWithDescriptor:d];
+                [e setRenderPipelineState:copyPipeline_];
+                const float params[4] = {VividFactor(), 0.0f, 0.0f, 0.0f};
+                [e setFragmentBytes:params length:sizeof params atIndex:0];
+                [e setFragmentTexture:colour_[target] atIndex:0];
+                [e setFragmentSamplerState:sampler_[1][1][1] atIndex:0];
+                [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                [e endEncoding];
+                [commands_ presentDrawable:drawable];
+            }
+        }
         if (commands_) {
             std::vector<id<MTLBuffer>> blocks;
             blocks.swap(frameBlocks_);
@@ -962,10 +1053,141 @@ void Renderer::Report()
                      100.0 * cmpWithin_[1] / cmpFrames_, 100.0 * cmpWithin_[2] / cmpFrames_, (unsigned long long)cmpWorstFrame_, cmpWorst_);
 }
 
+void Renderer::SetLayer(CAMetalLayer* layer)
+{
+    std::lock_guard<std::mutex> lk(layerLock_);
+    layer_ = layer;
+}
+
 Renderer g_renderer;
 bool g_started;
 
 }  // namespace
+
+}  // namespace gpu
+}  // namespace port
+
+#if TARGET_OS_OSX
+
+// The Mac's window: a view whose layer is the screen the renderer presents to, and a keyboard
+// as the pad. W A S D the left stick, the arrows the right (the camera), I J K L the direction
+// buttons; Space cross, F square, E circle, Q triangle; 1 L1, 2 R1, 3 L2, 4 R2; Return Start,
+// Tab Select.
+namespace {
+
+bool g_keys[128];
+
+void KeysToPad()
+{
+    auto held = [](int code) { return g_keys[code]; };
+    std::uint16_t buttons = 0;
+    static const struct { int key; std::uint16_t bit; } kButtons[] = {
+        {49, 0x0040}, {3, 0x0080}, {14, 0x0020}, {12, 0x0010},      // Space, F, E, Q: cross, square, circle, triangle
+        {18, 0x0004}, {19, 0x0008}, {20, 0x0001}, {21, 0x0002},     // 1, 2, 3, 4: L1, R1, L2, R2
+        {36, 0x0800}, {48, 0x0100},                                 // Return, Tab: Start, Select
+        {34, 0x1000}, {37, 0x2000}, {40, 0x4000}, {38, 0x8000},     // I, L, K, J: up, right, down, left
+    };
+    for (const auto& b : kButtons)
+        if (held(b.key))
+            buttons |= b.bit;
+    auto axis = [&](int low, int high) { return (std::uint64_t)(held(low) == held(high) ? 0x80 : held(low) ? 0x00 : 0xFF); };
+    const std::uint64_t rx = axis(123, 124), ry = axis(126, 125), lx = axis(0, 2), ly = axis(13, 1);
+    port::g_hostPad.store(buttons | rx << 16 | ry << 24 | lx << 32 | ly << 40, std::memory_order_relaxed);
+}
+
+}  // namespace
+
+@interface SlyView : NSView
+@end
+
+@implementation SlyView
+- (BOOL)acceptsFirstResponder { return YES; }
+- (BOOL)wantsUpdateLayer { return YES; }
+- (CALayer*)makeBackingLayer { return [CAMetalLayer layer]; }
+- (void)keyDown:(NSEvent*)event
+{
+    if (event.keyCode < 128) {
+        g_keys[event.keyCode] = true;
+        KeysToPad();
+    }
+}
+- (void)keyUp:(NSEvent*)event
+{
+    if (event.keyCode < 128) {
+        g_keys[event.keyCode] = false;
+        KeysToPad();
+    }
+}
+@end
+
+@interface SlyDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
+@end
+
+@implementation SlyDelegate
+- (void)windowWillClose:(NSNotification*)notification
+{
+    (void)notification;
+    port::gpu::Report();
+    std::_Exit(0);
+}
+- (void)windowDidResignKey:(NSNotification*)notification
+{
+    (void)notification;
+    std::memset(g_keys, 0, sizeof g_keys);   // (no key's release is seen while another window has the keyboard)
+    KeysToPad();
+}
+@end
+
+namespace port {
+namespace gpu {
+
+bool WindowWanted()
+{
+    const char* e = std::getenv("SLY1_METAL");
+    return g_started && e && !std::strcmp(e, "window");
+}
+
+void RunWindow()
+{
+    @autoreleasepool {
+        NSApplication* app = [NSApplication sharedApplication];
+        [app setActivationPolicy:NSApplicationActivationPolicyRegular];
+        static SlyDelegate* delegate;
+        delegate = [SlyDelegate new];
+        app.delegate = delegate;
+        const NSRect frame = NSMakeRect(0, 0, 1280, 720);
+        NSWindow* window = [[NSWindow alloc] initWithContentRect:frame
+                                                       styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
+                                                         backing:NSBackingStoreBuffered
+                                                           defer:NO];
+        window.title = @"sly1-nx (Metal)";
+        window.contentAspectRatio = NSMakeSize(16, 9);
+        window.delegate = delegate;
+        window.releasedWhenClosed = NO;
+        SlyView* view = [[SlyView alloc] initWithFrame:frame];
+        view.wantsLayer = YES;
+        CAMetalLayer* layer = (CAMetalLayer*)view.layer;
+        layer.device = g_renderer.Device();
+        layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        layer.framebufferOnly = YES;
+        layer.drawableSize = CGSizeMake(g_renderer.Width(), g_renderer.Height());   // the frame's own size: the layer fits it to the window
+        window.contentView = view;
+        [window center];
+        [window makeKeyAndOrderFront:nil];
+        [window makeFirstResponder:view];
+        [app activateIgnoringOtherApps:YES];
+        g_renderer.SetLayer(layer);
+        [app run];
+    }
+}
+
+}  // namespace gpu
+}  // namespace port
+
+#endif
+
+namespace port {
+namespace gpu {
 
 // The Mac's build draws with Metal when SLY1_METAL asks (its tests are the reference drawing's);
 // the iPhone's always.

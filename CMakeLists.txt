@@ -289,7 +289,7 @@ else()
         target_include_directories(port_metal PRIVATE port/include)
         target_compile_options(port_metal PRIVATE -fobjc-arc -Wall -Wextra)
         target_compile_definitions(sly1_headless PRIVATE SLY1_METAL)
-        target_link_libraries(sly1_headless PRIVATE port_metal "-framework Metal" "-framework Foundation" "-framework CoreGraphics")   # (CoreGraphics: without it a command-line program is given no device)
+        target_link_libraries(sly1_headless PRIVATE port_metal "-framework Metal" "-framework Foundation" "-framework CoreGraphics" "-framework AppKit" "-framework QuartzCore")   # (CoreGraphics: without it a command-line program is given no device)
     endif()
 endif()
 endif()  # SLY1_BUILD_GAME

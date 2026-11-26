@@ -9,7 +9,8 @@ for iOS.
 
 1. **A Metal renderer** (`port/apple/gpu_metal.mm`), written and checked on the Mac, whose GPU
    is of the same family as the iPhone's. In progress: see below.
-2. **A window on the Mac**, so the Metal picture can be seen and played there.
+2. **A window on the Mac**, so the Metal picture can be seen and played there. Done: see
+   "The Mac's window".
 3. **The iOS layer** (`port/ios/`): the app, the disc image found in the app's folder, saves,
    a controller through Apple's GameController framework, suspension when the app leaves the
    screen.
@@ -38,13 +39,34 @@ What it does not do yet:
 
 - **Batches** (`DrawBatch`): the game's vertices are transformed by the translated VU1
   programs on the CPU, not by a vertex shader. Right, and slower than the Switch's path.
-- **Lines at a higher resolution.** Metal draws lines one pixel wide; the Switch's renderer
-  widens the characters' outlines for 720p. To do before the picture is upscaled.
-- **A picture on a screen.** It draws into images and reads them back; there is no window.
+- **The outlines' width in a cut scene.** Lines are drawn as rectangles 4.5 pixels wide at 720
+  lines (`SLY1_METAL_LINE=W`), the Switch renderer's width in play; its wider lines under a cut
+  scene's letterbox are not followed.
 - The Switch renderer's savings (parts kept from frame to frame, the effects at half size,
   the dynamic resolution). They may not be needed on this hardware.
 - REGION_REPEAT texture wrapping (as REPEAT; not met in the levels run so far) and 16-bit
   frame buffers (not met either). Both are counted in the run's report.
+
+## The Mac's window
+
+```sh
+SLY1_METAL=window build-fast/sly1_headless --iso DISC.iso --seconds 0
+```
+
+The game in a window of 1280 by 720 (resizable, kept 16:9), drawn by the Metal renderer, until
+the window is closed. `--level N` starts in a level. There is no sound on the Mac yet, and the
+frame rate has not been measured.
+
+The keyboard is the pad:
+
+| Keys | Pad |
+| --- | --- |
+| W A S D | left stick (move) |
+| arrows | right stick (camera) |
+| Space, F, E, Q | Cross (jump), Square (cane), Circle, Triangle |
+| 1, 2, 3, 4 | L1 (Binocucom), R1, L2, R2 |
+| Return, Tab | Start, Select |
+| I J K L | the direction buttons |
 
 ## Checking it against the reference
 

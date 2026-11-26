@@ -122,7 +122,18 @@ void Rumble(std::uint8_t small, std::uint8_t large)
 
 #else
 
-PadFrame ReadFrame() { return PadFrame(); }   // the host's pad: nothing pressed
+// The host's pad: nothing pressed, or what a window's keyboard holds (port::g_hostPad).
+PadFrame ReadFrame()
+{
+    const std::uint64_t held = port::g_hostPad.load(std::memory_order_relaxed);
+    PadFrame f;
+    f.buttons = (std::uint16_t)held;
+    f.rx = (std::uint8_t)(held >> 16);
+    f.ry = (std::uint8_t)(held >> 24);
+    f.lx = (std::uint8_t)(held >> 32);
+    f.ly = (std::uint8_t)(held >> 40);
+    return f;
+}
 void Rumble(std::uint8_t, std::uint8_t) {}
 
 #endif
@@ -133,6 +144,7 @@ bool Connected(s32 port, s32 slot) { return port == 0 && slot == 0; }
 
 // The buttons the last read gave the game, as its word holds them (the host's SLY1_GOTO watches it)
 std::atomic<std::uint16_t> port::g_padHeld{0};
+std::atomic<std::uint64_t> port::g_hostPad{0x808080800000ull};
 
 extern "C" {
 

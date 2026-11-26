@@ -1716,6 +1716,16 @@ int Main(int argc, char** argv)
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 #else
+#if defined(SLY1_METAL)
+    if (port::gpu::WindowWanted()) {   // the window's events on this thread; the run's end ends the program
+        std::thread([clock] {
+            pthread_join(clock, nullptr);
+            std::_Exit(0);
+        }).detach();
+        port::gpu::RunWindow();
+        return 0;
+    }
+#endif
     pthread_join(clock, nullptr);
     return 0;
 #endif

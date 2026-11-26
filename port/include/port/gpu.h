@@ -16,6 +16,13 @@ void Report();
 void Shutdown();
 bool Started();   // the GPU is held by this program
 
+#if defined(SLY1_METAL)
+// The Mac's window (port/apple/gpu_metal.mm; SLY1_METAL=window): whether one is asked for, and
+// its event loop, which the program's first thread runs until the window is closed.
+bool WindowWanted();
+void RunWindow();
+#endif
+
 }  // namespace gpu
 }  // namespace port
 
