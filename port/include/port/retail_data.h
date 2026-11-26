@@ -108,7 +108,9 @@ void PreemptSlow();
 // SLY1_ASPECT=W:H (or WxH, or the ratio) before the game starts, or SetAspect. The view is never
 // narrower than the PS2's.
 float WideFactor();
-float Aspect();              // the picture's width over its height (WideFactor() * 4 / 3)
+float Aspect();              // the picture's width over its height
+float TallFactor();          // a picture taller than the PS2's 4:3: its height over that one's (else 1)
+bool ShapeChanged();
 void SetAspect(float aspect);
 namespace movie {
 // The video stream's bytes on their way to the IPU (port/video/movie.cpp; tools/patches.py).
@@ -172,8 +174,11 @@ void NotePropertyRead(int property, int object, int cls, const int* descriptor, 
 // left edge, the middle or the right edge of the screen, by the third the middle is in);
 // Wide2D(-1): no element. WideX: a vertex's x (12.4, with the game's offset of 1,728) as the
 // element's place makes it; one at the screen's very edge stays.
-void Wide2D(float middle, int element = -1, float width = 0.0f);
+// In a picture taller than 4:3 the same down the screen: middleY and height of the 492.8, WideY, TallAt.
+void Wide2D(float middle, int element = -1, float width = 0.0f, float middleY = -1.0f, float height = 0.0f);
 int WideX(int x);
+int WideY(int y);
+float TallAt(float y, float middleY);
 // An x of the 640 as an element whose middle rests at that x is narrowed (one at the very edge
 // stays), for what the element places outside its draw (the portraits' characters, scissors).
 float WideAt(float x, float middle);
@@ -186,7 +191,7 @@ void BossBeat(int kind, float gameTime, float beatLength, int beat);
 void VanLog(float stick, float top, float target, float vx, float vy, float vz, float pace, float zone, int kind, int boosts, int checksum);
 
 struct WideScope {
-    WideScope(float middle, int element, float width) { Wide2D(middle, element, width); }
+    WideScope(float middle, int element, float width, float middleY = -1.0f, float height = 0.0f) { Wide2D(middle, element, width, middleY, height); }
     ~WideScope() { Wide2D(-1.0f); }
     WideScope(const WideScope&) = delete;
     WideScope& operator=(const WideScope&) = delete;

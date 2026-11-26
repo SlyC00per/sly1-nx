@@ -82,6 +82,15 @@ renderer's images are 720 lines of the width that shape gives on the Mac.
 picture fills it with nothing stretched, and a movie keeps its own black bars above and below.
 On the phone the shape is the picture's view's, whenever it changes.
 
+**A picture taller than 4:3** (the phone open flat and held upright: about 0.7:1) keeps the
+PS2's view across and shows more above and below (`port::TallFactor`, the counterpart of
+`port::WideFactor`; one of the two is always 1). The camera's vertical extent, the frustum, the
+2D elements (made shorter about the top, middle or bottom of the screen, as they are made
+narrower about a side in a wide picture), the movies, the scene-change emblem and the map page
+follow it. The camera's projection is made from the shape as it is now, and again when it
+changes. The controls stay on the lower half, below the crease. `SLY1_ASPECT=1878:2670` on the
+Mac draws it. Not looked at in this shape yet: the menus, the HUD and the Binoc-u-com.
+
 ## The Metal renderer
 
 It takes what the GS is given to draw through the same interface as the Switch's renderer

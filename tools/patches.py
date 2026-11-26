@@ -211,7 +211,7 @@ PATCHES = [
     # its own centre, so that it keeps its shape in the 16:9 picture.
     ("src/main/colored_triangle_set.cpp",
      "    BuildUniformScaleAboutPoint(0, mat, (1.0f - t) * (1280.0f / self->width) + t * (4.0f / self->width));\n",
-     "    BuildUniformScaleAboutPoint(0, mat, (1.0f - t) * (1280.0f / self->width) + t * (4.0f / self->width));\n    mat[0] /= port::WideFactor();\n",
+     "    BuildUniformScaleAboutPoint(0, mat, (1.0f - t) * (1280.0f / self->width) + t * (4.0f / self->width));\n    mat[0] /= port::WideFactor();\n    mat[5] /= port::TallFactor();\n",
      "the scene-change emblem's shape in the 16:9 picture"),
 
     # A line in the log for each fade that is to load a level (where it was asked from) and each
@@ -238,9 +238,9 @@ PATCHES = [
     # texel past them, where the GS's memory has something else (a line of colours at the edge).
     ("src/main/movie_player.cpp",
      "    AddGifXyzfEntry(&buf, 0x6C00, 0x7900, 0, 0);\n    AddGifUvEntry(&buf, (a1 << 4) | 8, (a2 << 4) | 8);\n    AddGifXyzfEntry(&buf, 0x9400, 0x8700, 0, 0);",
-     "    AddGifXyzfEntry(&buf, 0x8000 - (s32)(0x1400 * port::movie::Zoom() / port::WideFactor()), 0x8000 - (s32)(0x700 * port::movie::Zoom()), 0, 0);\n"
+     "    AddGifXyzfEntry(&buf, 0x8000 - (s32)(0x1400 * port::movie::Zoom() / port::WideFactor()), 0x8000 - (s32)(0x700 * port::movie::Zoom() / port::TallFactor()), 0, 0);\n"
      "    AddGifUvEntry(&buf, (a1 << 4) - 8, (a2 << 4) - 8);\n"
-     "    AddGifXyzfEntry(&buf, 0x8000 + (s32)(0x1400 * port::movie::Zoom() / port::WideFactor()), 0x8000 + (s32)(0x700 * port::movie::Zoom()), 0, 0);",
+     "    AddGifXyzfEntry(&buf, 0x8000 + (s32)(0x1400 * port::movie::Zoom() / port::WideFactor()), 0x8000 + (s32)(0x700 * port::movie::Zoom() / port::TallFactor()), 0, 0);",
      "a movie's picture filling the 16:9 screen"),
     # A movie's picture goes to the GS in one transfer of its rows, where the game sends 1,200 of 16
     # by 16 pixels (the IPU's blocks): the port's decoder writes rows (port/video/movie.cpp), and
@@ -377,12 +377,38 @@ PATCHES = [
      "    f32 k = 1.29870129f * port::WideFactor();\n    f32 x = g_cameraDefaultFogNear;",
      "the camera's aspect for the port's 16:9 picture"),
 
+    # The picture's shape while the game runs, and a tall picture (an upright phone: docs/IOS.md).
+    # The projection is made from the shape as it is now, not as it was when the camera was made;
+    # a picture taller than 4:3 keeps the PS2's view across and shows more above and below (the
+    # vertical extent times port::TallFactor, which is 1 for every picture as wide as 4:3 or
+    # wider). When the shape changes the camera's projection is made again.
+    ("src/main/camera.cpp",
+     "    f32 w = self->aspectScale;\n    self->projectionScaleY = t;\n    self->projectionScaleX = t * w;\n    f32 d = w * w + one;",
+     "    f32 w = self->aspectScale = 1.29870129f * port::WideFactor();\n    f32 port_tall = port::TallFactor();\n    self->projectionScaleY = t * port_tall;\n    self->projectionScaleX = t * w;\n    f32 d = w * w + port_tall * port_tall;",
+     "the projection from the picture's shape as it is now, taller than 4:3 too"),
+    ("src/main/camera.cpp",
+     "    BuildProjectionMatrix(&self->projection, 640.0f / (t * w * 4096.0f), 224.0f / (t * 4096.0f), 0.0f, 0.0f, self->nearDistance, self->farDistance);",
+     "    BuildProjectionMatrix(&self->projection, 640.0f / (t * w * 4096.0f), 224.0f / (t * port_tall * 4096.0f), 0.0f, 0.0f, self->nearDistance, self->farDistance);",
+     "the projection's vertical extent in a tall picture"),
+    ("src/main/camera.cpp",
+     "void UpdateCameraMatrices(Camera* self)\n{\n    Vec4 pos;\n",
+     "void UpdateCameraMatrices(Camera* self)\n{\n    if (self == g_camera && port::ShapeChanged()) {\n        UpdateCameraProjection(self);\n        return;\n    }\n    Vec4 pos;\n",
+     "the camera's projection made again when the picture's shape changes"),
+    ("src/main/arc_element.cpp",
+     "        f32 sy = 1.0f - ((1.0f - held->v) * self->y + held->v * (self->y + self->h)) * 0.00405844161f;",
+     "        f32 sy = 1.0f - port::TallAt((1.0f - held->v) * self->y + held->v * (self->y + self->h), self->shownY + self->h * 0.5f) * 0.00405844161f;",
+     "the portrait's character where the box shows it in a tall picture"),
+    ("src/main/arc_element.cpp",
+     "    y0 *= 0.45454547f;\n    y1 *= 0.45454547f;\n    s32 py = (s32)y0;",
+     "    y0 = port::TallAt(y0, self->shownY + self->h * 0.5f) * 0.45454547f;\n    y1 = port::TallAt(y1, self->shownY + self->h * 0.5f) * 0.45454547f;\n    s32 py = (s32)y0;",
+     "the portrait's scissor in a tall picture"),
+
     # Widescreen: the map page is laid before the camera to fill the 4:3 picture; it is made 4/3
     # wider (the second row of its matrix: the camera's axis across the screen) to fill the 16:9 one, as the PS3
     # release stretches it.
     ("src/main/warp_menu.cpp",
      "    BuildMatrixFromRotationAndTranslation((const Vec4*)((Camera*)s)->position, (const Mat3*)&((Camera*)s)->rot80, (Mat4A*)tmp);\n    ApplyPlacedObjectTransform(obj, (Camera*)s, (ScaledTransform*)tmp);",
-     "    BuildMatrixFromRotationAndTranslation((const Vec4*)((Camera*)s)->position, (const Mat3*)&((Camera*)s)->rot80, (Mat4A*)tmp);\n    for (int port_k = 0; port_k < 3; port_k++) ((f32*)tmp)[1 * 4 + port_k] *= port::WideFactor();\n    ApplyPlacedObjectTransform(obj, (Camera*)s, (ScaledTransform*)tmp);",
+     "    BuildMatrixFromRotationAndTranslation((const Vec4*)((Camera*)s)->position, (const Mat3*)&((Camera*)s)->rot80, (Mat4A*)tmp);\n    for (int port_k = 0; port_k < 3; port_k++) ((f32*)tmp)[1 * 4 + port_k] *= port::WideFactor();\n    for (int port_k = 0; port_k < 3; port_k++) ((f32*)tmp)[2 * 4 + port_k] *= port::TallFactor();\n    ApplyPlacedObjectTransform(obj, (Camera*)s, (ScaledTransform*)tmp);",
      "the map page as wide as the 16:9 picture"),
 
     # Widescreen: the 2D elements (the counters, the text, the menus) are laid out for the 4:3
@@ -392,23 +418,23 @@ PATCHES = [
     # the whole screen). Every 2D vertex goes through these four functions.
     ("src/main/game_progress.cpp",
      "void AddGifXyzEntry(PacketWriter* self, s32 a1, s32 a2, u64 a3)\n{\n",
-     "void AddGifXyzEntry(PacketWriter* self, s32 a1, s32 a2, u64 a3)\n{\n    a1 = port::WideX(a1);\n",
+     "void AddGifXyzEntry(PacketWriter* self, s32 a1, s32 a2, u64 a3)\n{\n    a1 = port::WideX(a1);\n    a2 = port::WideY(a2);\n",
      "a 2D vertex's x for the 16:9 picture (port::WideX)"),
     ("src/main/game_progress.cpp",
      "void AddGifXyzfEntry(PacketWriter* self, u32 a1, u32 a2, u32 a3, u32 a4)\n{\n",
-     "void AddGifXyzfEntry(PacketWriter* self, u32 a1, u32 a2, u32 a3, u32 a4)\n{\n    a1 = port::WideX(a1);\n",
+     "void AddGifXyzfEntry(PacketWriter* self, u32 a1, u32 a2, u32 a3, u32 a4)\n{\n    a1 = port::WideX(a1);\n    a2 = port::WideY(a2);\n",
      "a 2D vertex's x for the 16:9 picture (port::WideX)"),
     ("src/main/game_progress.cpp",
      "void AddGifXyzfNoDrawEntry(PacketWriter* self, u32 a1, u32 a2, u32 a3, u32 a4)\n{\n",
-     "void AddGifXyzfNoDrawEntry(PacketWriter* self, u32 a1, u32 a2, u32 a3, u32 a4)\n{\n    a1 = port::WideX(a1);\n",
+     "void AddGifXyzfNoDrawEntry(PacketWriter* self, u32 a1, u32 a2, u32 a3, u32 a4)\n{\n    a1 = port::WideX(a1);\n    a2 = port::WideY(a2);\n",
      "a 2D vertex's x for the 16:9 picture (port::WideX)"),
     ("src/main/game_progress.cpp",
      "void AddGifXyzfRegListEntry(PacketWriter* self, s32 a1, s32 a2, u32 a3, u32 a4)\n{\n",
-     "void AddGifXyzfRegListEntry(PacketWriter* self, s32 a1, s32 a2, u32 a3, u32 a4)\n{\n    a1 = port::WideX(a1);\n",
+     "void AddGifXyzfRegListEntry(PacketWriter* self, s32 a1, s32 a2, u32 a3, u32 a4)\n{\n    a1 = port::WideX(a1);\n    a2 = port::WideY(a2);\n",
      "a 2D vertex's x for the 16:9 picture (port::WideX)"),
     ("src/main/object_pool.cpp",
      "        if (p->mode != 0) {\n            p->vt->m09(p);\n        }",
-     "        if (p->mode != 0) {\n            port::Wide2D(p->shownX + p->w * 0.5f, i, p->w);\n            p->vt->m09(p);\n            port::Wide2D(-1.0f);\n        }",
+     "        if (p->mode != 0) {\n            port::Wide2D(p->shownX + p->w * 0.5f, i, p->w, p->shownY + p->h * 0.5f, p->h);\n            p->vt->m09(p);\n            port::Wide2D(-1.0f);\n        }",
      "each screen element drawn about the side of the screen it rests at"),
     # The caption box (element 1) is as wide as the screen: its lens and the lens's frame (the
     # Binoc-u-com) are stretched with the picture, as the PS3 release has them, so that the frame
@@ -431,7 +457,7 @@ PATCHES = [
      "the portrait's character where the narrowed box shows it"),
     ("src/main/arc_element.cpp",
      "    PushBackMemoryMark();\n    InitGifPacket(&buf);\n    AllocateTempPacketBuffer(&buf, 0x100);",
-     "    port::WideScope wideScope(self->shownX + self->w * 0.5f, self->index, self->w);\n    PushBackMemoryMark();\n    InitGifPacket(&buf);\n    AllocateTempPacketBuffer(&buf, 0x100);",
+     "    port::WideScope wideScope(self->shownX + self->w * 0.5f, self->index, self->w, self->shownY + self->h * 0.5f, self->h);\n    PushBackMemoryMark();\n    InitGifPacket(&buf);\n    AllocateTempPacketBuffer(&buf, 0x100);",
      "the portrait's black and outline narrowed as its box"),
     ("src/main/arc_element.cpp",
      "    s32 px = (s32)x0;\n    s32 pw = (s32)x1 - 1;",
@@ -439,7 +465,7 @@ PATCHES = [
      "the portrait's scissor narrowed as its box"),
     ("src/main/arc_element.cpp",
      "    PushBackMemoryMark();\n    InitGifPacket(&buf);\n    AllocateTempPacketBuffer(&buf, 0x200);",
-     "    port::WideScope wideScope(self->shownX + self->w * 0.5f, self->index, self->w);\n    PushBackMemoryMark();\n    InitGifPacket(&buf);\n    AllocateTempPacketBuffer(&buf, 0x200);",
+     "    port::WideScope wideScope(self->shownX + self->w * 0.5f, self->index, self->w, self->shownY + self->h * 0.5f, self->h);\n    PushBackMemoryMark();\n    InitGifPacket(&buf);\n    AllocateTempPacketBuffer(&buf, 0x200);",
      "the portrait's ticks narrowed as its box"),
 
     # The camera's turn by the right stick, and a setting for it (as the PS Vita release has under

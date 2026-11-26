@@ -84,6 +84,7 @@ constexpr float kCreaseMargin = 70.0f;   // below the hinge, where the folded sc
 @interface GameView : UIView
 @property (nonatomic, readonly) PictureView* picture;
 @property (nonatomic, readonly) bool halfFolded;
+@property (nonatomic, readonly) bool flatOpen;   // the hinge fully open: the phone may be held upright too
 @end
 
 @implementation GameView {
@@ -126,15 +127,18 @@ constexpr float kCreaseMargin = 70.0f;   // below the hinge, where the folded sc
     if (status != _hingeStatus || half != _halfFolded)
         std::fprintf(stderr, "ios: the hinge: status %ld at %.0f degrees: %s\n", (long)status, degrees, half ? "the picture on the upper half" : "one screen");
     _hingeStatus = status;
-    if (half != _halfFolded) {
+    const bool flat = hinge && !half && hinge.status != UIHingeStatusClosed && hinge.status != UIHingeStatusUnknown;
+    if (half != _halfFolded || flat != _flatOpen) {
         _halfFolded = half;
+        _flatOpen = flat;
         [self.window.rootViewController setNeedsUpdateOfSupportedInterfaceOrientations];
         [self setNeedsLayout];
     }
 }
 
-// The view is upright: two halves, the picture's above the controls'.
-- (bool)split { return self.bounds.size.height > self.bounds.size.width; }
+// Upright and folded half way, the view is two halves: the picture's above the controls'. (Upright
+// and flat, the picture is the whole view and the controls are over its lower part.)
+- (bool)split { return _halfFolded && self.bounds.size.height > self.bounds.size.width; }
 
 // The part of the view the controls are on.
 - (CGRect)controls
@@ -144,7 +148,7 @@ constexpr float kCreaseMargin = 70.0f;   // below the hinge, where the folded sc
     UIEdgeInsets safe = self.safeAreaInsets;
     safe.left = safe.right = 0;
     CGRect all = UIEdgeInsetsInsetRect(self.bounds, safe);
-    if ([self split]) {   // the lower half, from where it is flat: clear of the fold's curve
+    if (self.bounds.size.height > self.bounds.size.width) {   // upright: the lower half (in reach), clear of the fold's curve
         const CGFloat top = CGRectGetMidY(self.bounds) + kCreaseMargin;
         all = CGRectMake(all.origin.x, top, all.size.width, CGRectGetMaxY(all) - top);
     }
@@ -171,7 +175,7 @@ constexpr float kCreaseMargin = 70.0f;   // below the hinge, where the folded sc
         _picture.frame = place;
         const CGFloat scale = self.window.screen ? self.window.screen.nativeScale : g_screen.nativeScale;
         const CGSize pixels = CGSizeMake(std::round(place.size.width * scale), std::round(place.size.height * scale));
-        if (pixels.width >= 64 && pixels.height >= 64 && pixels.width > pixels.height) {   // (not the upright view of a moment at the start)
+        if (pixels.width >= 64 && pixels.height >= 64) {
             CAMetalLayer* layer = (CAMetalLayer*)_picture.layer;
             layer.contentsScale = scale;
             if (!CGSizeEqualToSize(layer.drawableSize, pixels)) {
@@ -249,7 +253,7 @@ constexpr float kCreaseMargin = 70.0f;   // below the hinge, where the folded sc
             }
         }
         if (!made) {   // a stick where the touch began: the left side the player's, the right the camera's
-            const int role = p.x < self.bounds.size.width * 0.45 ? 1 : 2;
+            const int role = p.x < self.bounds.size.width * 0.5 ? 1 : 2;
             bool taken = false;
             for (NSValue* k in _touches)
                 taken = taken || _touches[k][0].intValue == role;
@@ -306,7 +310,11 @@ constexpr float kCreaseMargin = 70.0f;   // below the hinge, where the folded sc
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations
 {
-    return ((GameView*)self.view).halfFolded ? UIInterfaceOrientationMaskPortrait : UIInterfaceOrientationMaskLandscape;
+    // On its side; upright when folded half way; either way when open flat, where an upright
+    // view is laid out as the half-folded one is (the picture above, the controls below).
+    GameView* view = (GameView*)self.view;
+    return view.halfFolded ? UIInterfaceOrientationMaskPortrait
+           : view.flatOpen ? UIInterfaceOrientationMaskLandscape | UIInterfaceOrientationMaskPortrait : UIInterfaceOrientationMaskLandscape;
 }
 
 - (void)viewDidLoad

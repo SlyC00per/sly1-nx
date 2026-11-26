@@ -61,12 +61,13 @@ bool g_suspended;
 // frame buffers' images follow it, at the frame's end. 0: none said.
 std::atomic<std::uint32_t> g_wantWidth{0}, g_wantHeight{0};
 
-// The images' size for a picture shown at that many pixels: its shape, and no more than 1,080 lines.
+// The images' size for a picture shown at that many pixels: its shape, and no more than 1,080
+// along its shorter side.
 void ImageSizeFor(std::uint32_t w, std::uint32_t h, std::uint32_t* width, std::uint32_t* height)
 {
-    const std::uint32_t lines = std::min<std::uint32_t>(h, 1080);
-    *height = (lines + 1) & ~1u;
-    *width = ((std::uint32_t)std::lround((double)w * lines / h) + 1) & ~1u;
+    const double scale = std::min(1.0, 1080.0 / (double)std::min(w, h));
+    *width = ((std::uint32_t)std::lround(w * scale) + 1) & ~1u;
+    *height = ((std::uint32_t)std::lround(h * scale) + 1) & ~1u;
 }
 
 // The shaders. gs_vertex: window pixels to clip space, the depth as a fraction (bigger is nearer,
@@ -460,6 +461,10 @@ bool Renderer::Create()
         // (the iPhone's: 1,080, its screens having more lines than that; SLY1_METAL_SIZE says otherwise)
         height_ = TARGET_OS_IPHONE ? 1080 : 720;
         width_ = ((std::uint32_t)std::lround((float)height_ * Aspect()) + 1) & ~1u;
+        if (width_ < height_) {   // (an upright picture: the shorter side is its width)
+            width_ = height_;
+            height_ = ((std::uint32_t)std::lround((float)width_ / Aspect()) + 1) & ~1u;
+        }
         if (const std::uint32_t w = g_wantWidth.load(), h = g_wantHeight.load(); w && h)
             ImageSizeFor(w, h, &width_, &height_);
         if (compare_) {

@@ -18,6 +18,7 @@ namespace port { void CheckDevTable(const char* where); }
 #else
 namespace port { inline void CheckDevTable(const char*) {} }
 #endif
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -324,36 +325,65 @@ void KernelDump()
 // priority preempts the running one where it is; here the running thread gives way at its next
 // loop test or kernel call. The interrupt handlers (on the clock's host thread) never do.
 namespace {
-std::atomic<float> g_wideFactor{0.0f};   // 0: not asked for yet (the arguments' --env are set after the program's globals)
+// The picture's width over its height. 0: not asked for yet (the arguments' --env are set after
+// the program's globals). Between 1:2 (an upright screen) and 3:1.
+std::atomic<float> g_aspect{0.0f};
+std::atomic<unsigned> g_shapeStamp{1};
+constexpr float kNarrowest = 0.5f, kWidest = 3.0f;
 }
-float WideFactor()
+float Aspect()
 {
-    float factor = g_wideFactor.load(std::memory_order_relaxed);
-    if (factor == 0.0f) {
-        factor = 4.0f / 3.0f;
+    float aspect = g_aspect.load(std::memory_order_relaxed);
+    if (aspect == 0.0f) {
+        aspect = 16.0f / 9.0f;
         if (const char* e = std::getenv("SLY1_ASPECT")) {
             float w = 0.0f, h = 1.0f;
             if (std::sscanf(e, "%f:%f", &w, &h) == 2 || std::sscanf(e, "%fx%f", &w, &h) == 2 || std::sscanf(e, "%f", &w) == 1)
                 if (w > 0.0f && h > 0.0f)
-                    factor = std::max(1.0f, std::min(w / h, 3.0f) * 0.75f);
+                    aspect = std::clamp(w / h, kNarrowest, kWidest);
         }
         if (std::getenv("SLY1_WIDE") && std::getenv("SLY1_WIDE")[0] == '0')
-            factor = 1.0f;
-        g_wideFactor.store(factor, std::memory_order_relaxed);
+            aspect = 4.0f / 3.0f;
+        g_aspect.store(aspect, std::memory_order_relaxed);
     }
-    return factor;
+    return aspect;
 }
-float Aspect() { return WideFactor() * (4.0f / 3.0f); }
+// A picture wider than the PS2's shows that much more at the sides, and a taller one that much
+// more above and below: one of the two factors is 1.
+float WideFactor() { return std::max(1.0f, Aspect() * 0.75f); }
+float TallFactor() { return std::max(1.0f, (4.0f / 3.0f) / Aspect()); }
 void SetAspect(float aspect)
 {
-    g_wideFactor.store(std::max(1.0f, std::min(aspect, 3.0f) * 0.75f), std::memory_order_relaxed);
+    aspect = std::clamp(aspect, kNarrowest, kWidest);
+    if (g_aspect.exchange(aspect, std::memory_order_relaxed) != aspect)
+        g_shapeStamp.fetch_add(1, std::memory_order_relaxed);
+}
+// Whether the picture's shape changed since this was last asked (the game's thread asks, once a
+// frame, and sets its camera's projection again).
+bool ShapeChanged()
+{
+    static unsigned seen = 0;
+    const unsigned now = g_shapeStamp.load(std::memory_order_relaxed);
+    if (now == seen)
+        return false;
+    seen = now;
+    return true;
 }
 
 namespace {
 float g_wideAnchor = -1.0f;   // the x the element being drawn is narrowed about, or none
+float g_tallAnchor = -1.0f;   // the line of the field's 224 it is made shorter about, in a tall picture, or none
+constexpr float k2DHeight = 492.8f, kFieldLines = 224.0f;
+float TallAnchor(float middleY) { return middleY < k2DHeight / 3 ? 0.0f : middleY > k2DHeight * 2 / 3 ? kFieldLines : kFieldLines / 2; }
 }
-void Wide2D(float middle, int element, float width)
+void Wide2D(float middle, int element, float width, float middleY, float height)
 {
+    // (the same in a tall picture, down the screen: an element as tall as the screen is stretched
+    // with it; a call that says no height leaves the element's as it was set)
+    if (middle < 0.0f || TallFactor() == 1.0f)
+        g_tallAnchor = -1.0f;
+    else if (middleY >= 0.0f)
+        g_tallAnchor = height >= k2DHeight - 1.0f ? -1.0f : TallAnchor(middleY);
     {   // SLY1_WIDE_LOG=1: each element drawn, every 60th frame (which element is which)
         static const bool log = std::getenv("SLY1_WIDE_LOG") != nullptr;
         if (log && middle >= 0.0f && gs::FramesShown() % 60 == 0)
@@ -374,6 +404,22 @@ float WideAt(float x, float middle)
         return x;
     const float anchor = middle < 640.0f / 3 ? 0.0f : middle > 640.0f * 2 / 3 ? 640.0f : 320.0f;
     return anchor + (x - anchor) / WideFactor();
+}
+float TallAt(float y, float middleY)
+{
+    if (TallFactor() == 1.0f || y <= 0.5f || y >= k2DHeight - 0.5f)
+        return y;
+    const float anchor = TallAnchor(middleY) * (k2DHeight / kFieldLines);
+    return anchor + (y - anchor) / TallFactor();
+}
+int WideY(int y)
+{
+    if (g_tallAnchor < 0.0f)
+        return y;
+    const float at = (float)y / 16.0f - 1936.0f;
+    if (at <= 0.25f || at >= kFieldLines - 0.25f)
+        return y;
+    return (int)((g_tallAnchor + (at - g_tallAnchor) / TallFactor() + 1936.0f) * 16.0f);
 }
 int WideX(int x)
 {
