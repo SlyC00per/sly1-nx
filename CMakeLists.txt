@@ -285,11 +285,12 @@ else()
         # The Metal renderer (port/apple/gpu_metal.mm), for the Mac's own build and the iPhone's
         # (docs/IOS.md). Its shaders are compiled from their source when the program starts.
         enable_language(OBJCXX)
-        add_library(port_metal STATIC port/apple/gpu_metal.mm)
+        add_library(port_metal STATIC port/apple/gpu_metal.mm port/apple/pad_gc.mm port/apple/audio_out.cpp)
         target_include_directories(port_metal PRIVATE port/include)
         target_compile_options(port_metal PRIVATE -fobjc-arc -Wall -Wextra)
         target_compile_definitions(sly1_headless PRIVATE SLY1_METAL)
-        target_link_libraries(sly1_headless PRIVATE port_metal "-framework Metal" "-framework Foundation" "-framework CoreGraphics" "-framework AppKit" "-framework QuartzCore")   # (CoreGraphics: without it a command-line program is given no device)
+        target_link_libraries(sly1_headless PRIVATE port_metal "-framework Metal" "-framework Foundation" "-framework CoreGraphics" "-framework AppKit" "-framework QuartzCore" "-framework AudioToolbox"
+                              "-framework GameController")   # (CoreGraphics: without it a command-line program is given no device)
     endif()
 endif()
 endif()  # SLY1_BUILD_GAME

@@ -26,6 +26,9 @@ void MovieRingWrite(std::uint32_t iopAddress, const std::uint8_t* from, std::uin
 // the mixer's thread, which the program starts (port/host/main.cpp) and which does not return.
 bool Wanted();
 void MixerMain();
+// On the host: somewhere for the mixer's sound to go (an Apple system's output, port/apple/
+// audio_out.cpp): write takes frames of 16-bit stereo and returns when it is time for more.
+void SetOutput(void (*write)(const std::int16_t* stereo, int frames));
 // Whether the mixer has ended and given the output back, waited for up to `ms` (after Finish).
 bool WaitEnded(int ms);
 

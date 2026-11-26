@@ -1347,6 +1347,11 @@ void MixChunk(std::int16_t* out)
 
 }  // namespace
 
+namespace {
+void (*g_output)(const std::int16_t*, int);
+}
+void SetOutput(void (*write)(const std::int16_t*, int)) { g_output = write; }
+
 void MixerMain()
 {
     g_mixing.store(true);
@@ -1393,6 +1398,10 @@ void MixerMain()
             std::lock_guard<std::mutex> lk(g_lock);
             g_wav.insert(g_wav.end(), out, out + kChunk * 2);
         }
+        if (g_output) {   // (the output's own pace)
+            g_output(out, kChunk);
+            continue;
+        }
         next += std::chrono::milliseconds(10);
         std::this_thread::sleep_until(next);
     }
@@ -1428,7 +1437,7 @@ bool Wanted()
     return true;
 #else
     g_wavPath = std::getenv("SLY1_AUDIO_WAV");
-    return g_wavPath != nullptr;   // (the host makes sound only into a file)
+    return g_wavPath != nullptr || g_output != nullptr;   // (the host makes sound into a file, or an output given it)
 #endif
 }
 

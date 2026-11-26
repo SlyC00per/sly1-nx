@@ -323,10 +323,30 @@ void KernelDump()
 // A preemption point (port/retail_data.h): on the PS2 an interrupt that readies a thread of higher
 // priority preempts the running one where it is; here the running thread gives way at its next
 // loop test or kernel call. The interrupt handlers (on the clock's host thread) never do.
+namespace {
+std::atomic<float> g_wideFactor{0.0f};   // 0: not asked for yet (the arguments' --env are set after the program's globals)
+}
 float WideFactor()
 {
-    static const float factor = std::getenv("SLY1_WIDE") && std::getenv("SLY1_WIDE")[0] == '0' ? 1.0f : 4.0f / 3.0f;
+    float factor = g_wideFactor.load(std::memory_order_relaxed);
+    if (factor == 0.0f) {
+        factor = 4.0f / 3.0f;
+        if (const char* e = std::getenv("SLY1_ASPECT")) {
+            float w = 0.0f, h = 1.0f;
+            if (std::sscanf(e, "%f:%f", &w, &h) == 2 || std::sscanf(e, "%fx%f", &w, &h) == 2 || std::sscanf(e, "%f", &w) == 1)
+                if (w > 0.0f && h > 0.0f)
+                    factor = std::max(1.0f, std::min(w / h, 3.0f) * 0.75f);
+        }
+        if (std::getenv("SLY1_WIDE") && std::getenv("SLY1_WIDE")[0] == '0')
+            factor = 1.0f;
+        g_wideFactor.store(factor, std::memory_order_relaxed);
+    }
     return factor;
+}
+float Aspect() { return WideFactor() * (4.0f / 3.0f); }
+void SetAspect(float aspect)
+{
+    g_wideFactor.store(std::max(1.0f, std::min(aspect, 3.0f) * 0.75f), std::memory_order_relaxed);
 }
 
 namespace {

@@ -60,6 +60,9 @@ namespace port { void ScreenText(const char* text); }   // (switch/screen_text.c
 
 #include "port/dmac.h"
 #include "port/gpu.h"
+#if defined(SLY1_METAL)
+#include "port/apple.h"
+#endif
 #include "port/gs.h"
 #include "port/gs_backend.h"
 #include "port/vu1.h"
@@ -1618,6 +1621,11 @@ int Main(int argc, char** argv)
 #endif
     if (!std::getenv("SLY1_NO_GPU"))
         port::gpu::Start();
+#if defined(SLY1_METAL)
+    // The Mac's window has sound (SLY1_NO_SOUND=1: not): Apple's output, given to the mixer.
+    if (port::gpu::WindowWanted() && !std::getenv("SLY1_NO_SOUND"))
+        port::apple::StartAudio();
+#endif
     // The GS on a thread of its own, after the render thread's VIF1 and VU1 (docs/RENDERER.md): on
     // the Switch, where the two have a core each (27.0 frames a second in the opening against
     // 26.2 without); SLY1_GS_THREAD=1 or 0 says otherwise.

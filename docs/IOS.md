@@ -17,8 +17,23 @@ for iOS.
 4. **The Xcode project and the first run on a phone.** Needs Xcode, which the Mac this is
    written on does not have yet.
 
-Not decided yet: the picture's shape. The phone's screens are not 16:9; the port's wide view
-can be made the screen's own shape instead of letterboxing.
+Done on the Mac, for both systems (2026-11-26): sound through an audio queue
+(`port/apple/audio_out.cpp`), a controller through the GameController framework
+(`port/apple/pad_gc.mm`), and a picture of the screen's own shape (below).
+
+## The picture's shape
+
+The phone's screens are not 16:9 (the iPhone Duo's are about 1.42:1 inside and 1.45:1 outside).
+The port's wide view is not fixed at 16:9: `port::WideFactor()` is the picture's width over the
+PS2's 4:3 one, and everything that widens the view or places the 2D elements goes by it (the
+camera, the culling, `Wide2D`, the movies' zoom). `SLY1_ASPECT=W:H` sets it before the game
+starts, and `port::SetAspect` at any time; the view is never narrower than the PS2's. The Metal
+renderer's images are 720 lines of the width that shape gives.
+
+`SLY1_ASPECT=2670:1878` on the Mac gives a window of the Duo's inner screen's shape: the level's
+picture fills it with nothing stretched, and a movie keeps its own black bars above and below.
+Changing the shape while the game runs (the phone opened or closed) is not done yet: the
+renderer's images are made once.
 
 ## The Metal renderer
 
@@ -54,8 +69,12 @@ SLY1_METAL=window build-fast/sly1_headless --iso DISC.iso --seconds 0
 ```
 
 The game in a window of 1280 by 720 (resizable, kept 16:9), drawn by the Metal renderer, until
-the window is closed. `--level N` starts in a level. There is no sound on the Mac yet, and the
-frame rate has not been measured.
+the window is closed. `--level N` starts in a level. The window has sound (`SLY1_NO_SOUND=1`:
+none; `SLY1_SOUND_VOLUME=N`: hundredths). The frame rate has not been measured.
+
+A controller the Mac knows (a DualSense, an Xbox or Switch Pro pad, over Bluetooth or USB) is
+the pad too, its buttons by their places: the bottom face button is Cross. It is read with the
+keyboard, 120 times a second. No rumble yet.
 
 The keyboard is the pad:
 

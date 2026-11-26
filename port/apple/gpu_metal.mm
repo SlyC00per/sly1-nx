@@ -36,7 +36,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include "port/apple.h"
 #include "port/gs.h"
+#include "port/retail_data.h"
 #include "port/gs_backend.h"
 #include "port/system.h"
 
@@ -435,6 +437,9 @@ bool Renderer::Create()
         // SLY1_METAL_COMPARE: the images as the GS's own (a field's 640 by 224), the textures
         // filtered as the GS's registers say, and the game's motion blur drawn (the reference has it).
         compare_ = std::getenv("SLY1_METAL_COMPARE") != nullptr;
+        // 720 lines, as wide as the picture's shape makes them (port::Aspect: 1,280 for 16:9)
+        width_ = ((std::uint32_t)std::lround(720.0f * Aspect()) + 1) & ~1u;
+        height_ = 720;
         if (compare_) {
             width_ = (std::uint32_t)kFieldWidth;
             height_ = (std::uint32_t)kFieldHeight;
@@ -1092,7 +1097,16 @@ void KeysToPad()
             buttons |= b.bit;
     auto axis = [&](int low, int high) { return (std::uint64_t)(held(low) == held(high) ? 0x80 : held(low) ? 0x00 : 0xFF); };
     const std::uint64_t rx = axis(123, 124), ry = axis(126, 125), lx = axis(0, 2), ly = axis(13, 1);
-    port::g_hostPad.store(buttons | rx << 16 | ry << 24 | lx << 32 | ly << 40, std::memory_order_relaxed);
+    std::uint64_t pad = buttons | rx << 16 | ry << 24 | lx << 32 | ly << 40;
+    // A controller with the keyboard: the buttons of both, and its sticks where the keys hold none.
+    std::uint64_t controller;
+    if (port::apple::ControllerPad(&controller)) {
+        pad |= controller & 0xFFFF;
+        for (int shift = 16; shift <= 40; shift += 8)
+            if (((pad >> shift) & 0xFF) == 0x80)
+                pad = (pad & ~(0xFFull << shift)) | (controller & (0xFFull << shift));
+    }
+    port::g_hostPad.store(pad, std::memory_order_relaxed);
 }
 
 }  // namespace
@@ -1155,13 +1169,13 @@ void RunWindow()
         static SlyDelegate* delegate;
         delegate = [SlyDelegate new];
         app.delegate = delegate;
-        const NSRect frame = NSMakeRect(0, 0, 1280, 720);
+        const NSRect frame = NSMakeRect(0, 0, g_renderer.Width(), g_renderer.Height());
         NSWindow* window = [[NSWindow alloc] initWithContentRect:frame
                                                        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                                                          backing:NSBackingStoreBuffered
                                                            defer:NO];
         window.title = @"sly1-nx (Metal)";
-        window.contentAspectRatio = NSMakeSize(16, 9);
+        window.contentAspectRatio = NSMakeSize(g_renderer.Width(), g_renderer.Height());
         window.delegate = delegate;
         window.releasedWhenClosed = NO;
         SlyView* view = [[SlyView alloc] initWithFrame:frame];
@@ -1177,6 +1191,9 @@ void RunWindow()
         [window makeFirstResponder:view];
         [app activateIgnoringOtherApps:YES];
         g_renderer.SetLayer(layer);
+        // the pad read 120 times a second: the keys held and a controller's state
+        port::apple::WatchControllers();
+        [NSTimer scheduledTimerWithTimeInterval:1.0 / 120.0 repeats:YES block:^(NSTimer*) { KeysToPad(); }];
         [app run];
     }
 }
@@ -1206,6 +1223,7 @@ void Report()
 {
     if (g_started)
         g_renderer.Report();
+    apple::AudioReport();
 }
 
 bool Started() { return g_started; }

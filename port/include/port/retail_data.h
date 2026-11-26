@@ -104,8 +104,12 @@ extern std::atomic<bool> g_preemptPending;
 void PreemptSlow();
 // The picture's width over the PS2's 4:3 one: 4/3 for the 16:9 screen (the camera's horizontal
 // extent is that much wider, the vertical kept; tools/patches.py's camera patch), 1 with
-// SLY1_WIDE=0.
+// SLY1_WIDE=0. A screen of another shape has its own (port/apple: a phone's screen is not 16:9):
+// SLY1_ASPECT=W:H (or WxH, or the ratio) before the game starts, or SetAspect. The view is never
+// narrower than the PS2's.
 float WideFactor();
+float Aspect();              // the picture's width over its height (WideFactor() * 4 / 3)
+void SetAspect(float aspect);
 namespace movie {
 // The video stream's bytes on their way to the IPU (port/video/movie.cpp; tools/patches.py).
 void VideoBytes(const void* bytes, int size);
