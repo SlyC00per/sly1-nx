@@ -260,7 +260,14 @@ if(PLATFORM STREQUAL "SWITCH")
     # (and every thread's handle kept, for stopping them at the end of a run the receiver follows)
     target_link_options(sly1 PRIVATE -Wl,--wrap=RemoveDevice -Wl,--wrap=threadCreate -Wl,--wrap=threadClose
         -Wl,--wrap=svcSleepThread -Wl,--wrap=svcWaitSynchronization -Wl,--wrap=condvarWaitTimeout)
-    nx_generate_nacp(sly1.nacp NAME "Sly Cooper" AUTHOR "sly1-nx" VERSION "${SLY1_VERSION}")
+    # The version the homebrew menu shows names the build (cmake/nacp.cmake), so that one copy of
+    # the program is told from another on the card; -DSLY1_RELEASE=ON: the version alone.
+    option(SLY1_RELEASE "The title's version without the build's commit" OFF)
+    add_custom_command(OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/sly1.nacp
+        DEPENDS ${CMAKE_BINARY_DIR}/gen/build_id.h ${CMAKE_SOURCE_DIR}/cmake/nacp.cmake
+        COMMAND ${CMAKE_COMMAND} -DID_HEADER=${CMAKE_BINARY_DIR}/gen/build_id.h -DNACPTOOL=${NX_NACPTOOL_EXE} "-DNAME=Sly Cooper" -DAUTHOR=sly1-nx
+                -DRELEASE=${SLY1_RELEASE} -DOUT=${CMAKE_CURRENT_BINARY_DIR}/sly1.nacp -P ${CMAKE_SOURCE_DIR}/cmake/nacp.cmake
+        VERBATIM)
     # (the homebrew menu's icon: the project's own mark, 256 by 256, branding/nro-icon.jpg)
     nx_create_nro(sly1 NACP sly1.nacp ICON ${CMAKE_SOURCE_DIR}/branding/nro-icon.jpg)
     # The receiver (port/switch/receiver.cpp): takes builds over the network and starts them, for
