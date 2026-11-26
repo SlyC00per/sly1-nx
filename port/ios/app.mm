@@ -76,11 +76,13 @@ constexpr float kButtonRadius = 30.0f, kStickRadius = 60.0f;
 + (Class)layerClass { return [CAMetalLayer class]; }
 @end
 
-// The screen: the picture, and the controls over it. With the phone folded half way (its hinge
-// across the middle of the view, the phone standing on its lower half) the picture is the upper
-// half's and the controls are on the lower half.
+// The screen: the picture, and the controls over it. With the phone folded half way and standing
+// on one half, the app turns upright (it is otherwise held on its side: the system would show
+// its picture small across the hinge), the hinge is across the view's middle, the picture is the
+// upper half's and the controls are on the lower half.
 @interface GameView : UIView
 @property (nonatomic, readonly) PictureView* picture;
+@property (nonatomic, readonly) bool halfFolded;
 @end
 
 @implementation GameView {
@@ -125,15 +127,19 @@ constexpr float kButtonRadius = 30.0f, kStickRadius = 60.0f;
     _hingeStatus = status;
     if (half != _halfFolded) {
         _halfFolded = half;
+        [self.window.rootViewController setNeedsUpdateOfSupportedInterfaceOrientations];
         [self setNeedsLayout];
     }
 }
+
+// The view is upright: two halves, the picture's above the controls'.
+- (bool)split { return self.bounds.size.height > self.bounds.size.width; }
 
 // The part of the view the controls are on.
 - (CGRect)controls
 {
     CGRect all = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets);
-    if (_halfFolded) {
+    if ([self split]) {
         const CGFloat middle = CGRectGetMidY(self.bounds);
         all = CGRectMake(all.origin.x, middle, all.size.width, CGRectGetMaxY(all) - middle);
     }
@@ -155,7 +161,7 @@ constexpr float kButtonRadius = 30.0f, kStickRadius = 60.0f;
     {   // The picture fills the view, or its upper half: the game's view takes its shape, and the
         // layer's image is of the screen's own pixels (docs/IOS.md, "The picture's shape").
         CGRect place = self.bounds;
-        if (_halfFolded)
+        if ([self split])
             place.size.height = std::floor(place.size.height / 2);
         _picture.frame = place;
         const CGFloat scale = self.window.screen ? self.window.screen.nativeScale : g_screen.nativeScale;
@@ -293,7 +299,10 @@ constexpr float kButtonRadius = 30.0f, kStickRadius = 60.0f;
 - (BOOL)prefersStatusBarHidden { return YES; }
 - (BOOL)prefersHomeIndicatorAutoHidden { return YES; }
 - (UIRectEdge)preferredScreenEdgesDeferringSystemGestures { return UIRectEdgeAll; }
-- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskLandscape; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations
+{
+    return ((GameView*)self.view).halfFolded ? UIInterfaceOrientationMaskPortrait : UIInterfaceOrientationMaskLandscape;
+}
 
 - (void)viewDidLoad
 {

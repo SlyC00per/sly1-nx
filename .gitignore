@@ -45,3 +45,4 @@ __pycache__/
 # The host build's save folder (the player's save data)
 /save/
 bench/
+branding/local/

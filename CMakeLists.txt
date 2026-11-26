@@ -293,7 +293,25 @@ elseif(IOS)
     target_include_directories(port_metal PRIVATE port/include)
     target_compile_options(port_metal PRIVATE -fobjc-arc -Wall -Wextra)
     target_compile_definitions(port_metal PRIVATE SLY1_METAL SLY1_IOS)
-    add_executable(sly1_ios MACOSX_BUNDLE port/host/main.cpp port/ios/app.mm $<TARGET_OBJECTS:sly1_game>)
+    # The app's icon: SLY1_IOS_ICON, a square picture of your own (branding/local/ is not
+    # committed), or else the project's mark. Made into an asset catalog in the build folder.
+    set(SLY1_IOS_ICON "" CACHE FILEPATH "A square picture for the app's icon")
+    set(SLY1_ICON_FROM "${SLY1_IOS_ICON}")
+    if(NOT SLY1_ICON_FROM AND EXISTS ${CMAKE_SOURCE_DIR}/branding/local/ios-icon.jpg)
+        set(SLY1_ICON_FROM ${CMAKE_SOURCE_DIR}/branding/local/ios-icon.jpg)
+    endif()
+    if(NOT SLY1_ICON_FROM)
+        set(SLY1_ICON_FROM ${CMAKE_SOURCE_DIR}/branding/nro-icon.jpg)
+    endif()
+    set(SLY1_ASSETS ${CMAKE_BINARY_DIR}/Assets.xcassets)
+    file(MAKE_DIRECTORY ${SLY1_ASSETS}/AppIcon.appiconset)
+    file(WRITE ${SLY1_ASSETS}/Contents.json "{\"info\":{\"author\":\"xcode\",\"version\":1}}\n")
+    file(WRITE ${SLY1_ASSETS}/AppIcon.appiconset/Contents.json
+         "{\"images\":[{\"filename\":\"icon.png\",\"idiom\":\"universal\",\"platform\":\"ios\",\"size\":\"1024x1024\"}],\"info\":{\"author\":\"xcode\",\"version\":1}}\n")
+    execute_process(COMMAND sips -s format png -z 1024 1024 ${SLY1_ICON_FROM} --out ${SLY1_ASSETS}/AppIcon.appiconset/icon.png
+                    OUTPUT_QUIET ERROR_QUIET)
+    add_executable(sly1_ios MACOSX_BUNDLE port/host/main.cpp port/ios/app.mm ${SLY1_ASSETS} $<TARGET_OBJECTS:sly1_game>)
+    set_source_files_properties(${SLY1_ASSETS} PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
     target_include_directories(sly1_ios PRIVATE port/include)
     target_compile_definitions(sly1_ios PRIVATE SLY1_METAL SLY1_IOS)
     set_source_files_properties(port/ios/app.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
@@ -310,6 +328,7 @@ elseif(IOS)
         XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${SLY1_IOS_BUNDLE_ID}"
         XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${SLY1_IOS_TEAM}"
         XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
+        XCODE_ATTRIBUTE_ASSETCATALOG_COMPILER_APPICON_NAME "AppIcon"
         XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2")
 else()
     find_package(Threads REQUIRED)

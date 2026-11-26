@@ -42,8 +42,11 @@ screen the Metal renderer presents to. The game is the Mac's program's own entry
   opened or closed while the game runs changes the game's view and the frame's images at the
   next frame (`port::gpu::SetScreenShape`).
 - **Folded half way** (`UIHingeInteraction`, iOS 27.1: the hinge partly open and under about
-  150 degrees) the picture is the upper half of the view and the controls are on the lower
-  half. The hinge's updates are in the log.
+  150 degrees) the app turns upright, which puts the hinge across the view's middle: the
+  picture is the upper half and the controls are on the lower half. (Kept on its side, the
+  system shows the app small across the hinge.) The hinge's updates are in the log.
+- **The icon** is `SLY1_IOS_ICON`, a square picture of your own, or `branding/local/ios-icon.jpg`
+  (not committed), or else the project's mark.
 - What the program prints goes to `sly1-log.txt` in the Documents folder (the run before's to
   `sly1-log-before.txt`).
 
