@@ -3,9 +3,10 @@
 *Sly Cooper and the Thievius Raccoonus* running natively on the Nintendo Switch.
 
 sly1-nx is a homebrew port of the PlayStation 2 game (NTSC-U, `SCUS_971.98`). It is not an
-emulator: the game's own code, from the matching decompilation
-[sly1-decomp](https://github.com/OpenThievius/sly1-decomp), is compiled for the Switch, and the
-port supplies what the PlayStation 2 did around it (graphics, sound, video, the pad, saving).
+emulator: the game's own code, from [OpenThievius](https://github.com/OpenThievius)'s matching
+decompilation [sly1-decomp](https://github.com/OpenThievius/sly1-decomp), is compiled for the
+Switch, and the port supplies what the PlayStation 2 did around it (graphics, sound, video, the
+pad, saving).
 
 **Version 1.0.0.** All 46 levels load and run; it was developed and tried on a Switch Lite.
 
@@ -176,6 +177,13 @@ an MPEG-2 decoder, the pad, and the memory card as a folder.
 - [docs/RECEIVER.md](docs/RECEIVER.md): running builds on a Switch from the computer.
 - `CLAUDE.md` and [docs/BRIEF.md](docs/BRIEF.md): the rules and commands for working here.
 - `sly1-decomp/docs/PORTING.md`: where every PS2-specific part of the game is.
+
+## Credits
+
+The port stands on [OpenThievius](https://github.com/OpenThievius)'s
+[sly1-decomp](https://github.com/OpenThievius/sly1-decomp), the matching decompilation of the
+game: every line of game code the port compiles comes from it, unedited. Without that work
+there would be no port.
 
 ## Licence
 
