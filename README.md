@@ -8,6 +8,13 @@ decompilation [sly1-decomp](https://github.com/OpenThievius/sly1-decomp), is com
 Switch, and the port supplies what the PlayStation 2 did around it (graphics, sound, video, the
 pad, saving).
 
+It follows the PS3 and PS Vita releases (*The Sly Collection*) wherever they changed the PS2
+game: a 16:9 picture, saving without a memory card, the touch screen for the Binocucom and an
+inverted camera setting as on the Vita. It is built from the PS2 disc image, the original
+release. It draws at 1280×720, a sharper picture than the Vita's 960×544 screen can show, and
+aims for 60 frames a second where the Vita version holds 30. That makes it the definitive way
+to play *Sly Cooper and the Thievius Raccoonus* on a handheld.
+
 **Version 1.0.0.** All 46 levels load and run; it was developed and tried on a Switch Lite.
 
 **You need your own copy of the game.** Nothing of the game is in this repository, and no
@@ -55,7 +62,8 @@ The port's 16:9 picture at 1280×720, captured on a Switch.
 - **A locked 60 frames a second.** The game aims for 60 and holds it in lighter scenes; busy
   ones drop below it. Measured on a Switch Lite over a tour of three levels, it held 60 for about
   six tenths of the time.
-- **HD textures.** The picture is 720p with the PS2's own textures.
+- **HD textures.** The PS3 and Vita releases have their own; the picture here is 720p with the
+  PS2's textures.
 - **A docked picture of its own.** Docked, the picture is the same 1280×720; the port has not
   been tried on a docked console.
 - **Other versions of the game.** Only the NTSC-U disc is recognised.
