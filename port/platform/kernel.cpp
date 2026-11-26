@@ -568,6 +568,13 @@ int EasyLevel()
 }
 }  // namespace
 
+// The sneaking step's plucked note (port/include/port/retail_data.h): the user's choice, 2026-11-25.
+float SneakStepGain()
+{
+    static const float gain = std::getenv("SLY1_PLUCK_GAIN") ? (float)std::atoi(std::getenv("SLY1_PLUCK_GAIN")) / 100.0f : 3.0f;
+    return gain;
+}
+
 float EnemyPace()
 {
     switch (EasyLevel()) {

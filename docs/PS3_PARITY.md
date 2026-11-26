@@ -55,6 +55,8 @@ asks.
 
 ## Beyond the PS3 release
 
+- **The plucked note of a sneaking step is three times as loud** (the maintainer, 2026-11-25;
+  docs/AUDIO.md, "Sneaking"). Retail's level is faint on the console's speakers.
 - **Difficulty: Normal / Easy** on the Options page (the maintainer, 2026-11-25;
   docs/DIFFICULTY.md). Normal, the default, is retail's game. Easy slows the enemies of four
   levels (Treasure in the Depths, Piranha Lake, Down Home Cooking, Burning Rubber) and doubles

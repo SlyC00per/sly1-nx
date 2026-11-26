@@ -245,3 +245,11 @@ music as retail's is the player's to say.
 `SLY1_SND_LOG` now also prints each change of the sound level, each group, and a sound's
 record and tone volumes.
 
+**Heard on the Switch (2026-11-25).** A logged run on the Paris rooftop: the level went from 20
+to 0 as the player took the ledge, and record 119 was started 25 times in 13 seconds, a
+semitone up at each step. The player heard the notes, faintly, and finds them as faint on a PS
+Vita: so the port matched, and the player asked for them louder. The game's call is patched to
+start the note at three times its volume (`port::SneakStepGain`, tools/patches.py; 1.5 for the
+game's 0.5). `SLY1_PLUCK_GAIN=100` is retail's level, any other number of hundredths another.
+On the host the mix does not clip with it (peak 18,162 of 32,767 in the ledge test).
+

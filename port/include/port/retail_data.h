@@ -143,6 +143,9 @@ void NoteTick(int object, float timer, float step);
 // SLY1_EVENT_TRACE=N: a script event raised on object N (its key, the caller as an offset from
 // TriggerScriptEvent).
 void NoteScriptEvent(int object, int key, long from);
+// How much louder than retail the plucked note of a sneaking step is started (tools/patches.py): 3,
+// or SLY1_PLUCK_GAIN in hundredths (100 is retail's).
+float SneakStepGain();
 // The Difficulty setting (docs/DIFFICULTY.md; kernel.cpp; tools/patches.py). EnemyPace: how fast the
 // level's enemies move against retail, 1 on Normal and in every level Easy leaves alone.
 // ExtraEnemyClass: the class whose objects a level's load makes a second copy of, or 0.

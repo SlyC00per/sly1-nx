@@ -566,6 +566,14 @@ PATCHES = [
      "    RunQueuedCalls(self);\n    for (BaseObject* o = (BaseObject*)self->list48.head; o != 0; o = o->next) {",
      "the Difficulty setting's extra piranhas"),
 
+    # The plucked note of a sneaking step, louder (the user, 2026-11-25; docs/AUDIO.md, "Sneaking").
+    # The game starts sound 0x77 at half volume; on the Switch's speakers it was faint, as the user
+    # also finds it on a PS Vita. port::SneakStepGain (kernel.cpp) is 3: the note at 1.5.
+    ("src/main/sound_system.cpp",
+     "        StartSoundEffect(0x77, 0, 0, 0, 0.0f, 0.0f, 0.5f, scale * 0.083333336f, 0.0f, 0, 0);",
+     "        StartSoundEffect(0x77, 0, 0, 0, 0.0f, 0.0f, 0.5f * port::SneakStepGain(), scale * 0.083333336f, 0.0f, 0, 0);",
+     "the sneaking step's plucked note, louder"),
+
     # The Options page without "Center Screen...": the PS2's picture could be moved on a television
     # that showed it off centre; the Switch's screen and its dock's picture are where they are
     # (the user, 2026-11-24). The item is left out of the page as it is built; the game's own
