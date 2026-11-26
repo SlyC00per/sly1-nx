@@ -112,6 +112,7 @@ int g_seconds = 10;
 #if defined(__SWITCH__)
 // The link to nxlink (main): its socket, on which the standard output and error are too.
 bool g_socketsUp;
+bool g_logging;   // (what is printed is put out: a link is there to read it; SLY1_QUIET=1 takes it away, for trying a release's silence)
 int g_nxlinkSocket = -1;
 
 // The link given back before the program returns to the homebrew menu, which goes on in this
@@ -253,12 +254,14 @@ bool ProcessTainted()
         std::fprintf(stderr, "sly1: the GPU is still held: no other run begins in this process\n");
         std::fflush(stderr);
     }
-    port::HeapReport("before the end", false);
+    if (g_logging)
+        port::HeapReport("before the end", false);
     if (parked) {
         port::gpu::Shutdown();
         std::fprintf(stderr, "sly1: the GPU given back\n");
         std::fflush(stderr);
-        port::HeapReport("the GPU given back", false);
+        if (g_logging)
+            port::HeapReport("the GPU given back", false);
     }
     int made = 0;
     const int ended = port::EndOtherThreads(3000, &made);
@@ -267,7 +270,8 @@ bool ProcessTainted()
     const int stopped = port::StopOtherThreads();
     std::fprintf(stderr, "sly1: %d threads stopped; closing the link\n", stopped);
     std::fflush(stderr);
-    port::HeapReport("at the end", std::getenv("SLY1_HEAP_MAP") != nullptr);   // (as at the start, if all is given back)
+    if (g_logging)
+        port::HeapReport("at the end", std::getenv("SLY1_HEAP_MAP") != nullptr);   // (as at the start, if all is given back)
     CloseLink();
     envSetNextLoad(next, next);
     std::_Exit(status);
@@ -321,6 +325,10 @@ std::chrono::steady_clock::time_point g_warmAt;
 // The run's report: the kernel's threads, the DMA counts, the frame semaphores, the card.
 void Report()
 {
+#if defined(__SWITCH__)
+    if (!g_logging)   // (nobody reads it: a run from the console's menu makes no report)
+        return;
+#endif
     port::RenderFlush();
     {
         double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - g_programStart).count();
@@ -1019,7 +1027,8 @@ int Main(int argc, char** argv)
         g_nxlinkSocket = nxlinkStdio();
         g_socketsUp = true;
     }
-    port::crashlog::Start();   // (after the link: what is printed goes on to it)
+    g_logging = g_socketsUp;
+    port::crashlog::Start(g_logging);   // (after the link: what is printed goes on to it, and without one nowhere)
     if (std::getenv("SLY1_HEAP_MAP") || __nxlink_host.s_addr != 0)   // (under nxlink or the receiver: what a run before left)
         port::HeapReport("at the start", std::getenv("SLY1_HEAP_MAP") != nullptr);
     // An exception nothing catches, or any other call of std::terminate, said with where it came
@@ -1149,6 +1158,11 @@ int Main(int argc, char** argv)
         }
     }
 #if defined(__SWITCH__)
+    if (std::getenv("SLY1_QUIET")) {   // (--env SLY1_QUIET=1: as a run from the console's menu, over a link)
+        std::fprintf(stderr, "sly1: quiet from here on, as a release run is\n");
+        g_logging = false;
+        port::crashlog::Forward(false);
+    }
     if (std::getenv("SLY1_NEXT") && ProcessTainted()) {
         std::fprintf(stderr, "sly1: refused: a run before this one in this process did not give the GPU back; close the receiver from HOME and start it again\n");
         std::fflush(stderr);

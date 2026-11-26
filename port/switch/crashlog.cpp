@@ -30,6 +30,7 @@ char g_tail[kTail];
 std::atomic<std::uint64_t> g_tailAt{0};
 std::atomic<bool> g_tailHeld{false};   // (a report is being made: what it prints is not the tail)
 int g_before = -1;
+std::atomic<bool> g_forward{false};   // (what is printed also goes on to where it went before: a link is there to read it)
 
 ssize_t TailWrite(struct _reent*, void*, const char* text, size_t size)
 {
@@ -38,7 +39,7 @@ ssize_t TailWrite(struct _reent*, void*, const char* text, size_t size)
         for (size_t i = 0; i < size; i++)
             g_tail[(at + i) % kTail] = text[i];
     }
-    if (g_before >= 0)
+    if (g_before >= 0 && g_forward.load(std::memory_order_relaxed))
         write(g_before, text, size);
     return (ssize_t)size;
 }
@@ -64,8 +65,15 @@ void Add(const char* text)
 
 }  // namespace
 
-void Start()
+void Forward(bool on)
 {
+    std::fflush(stderr);
+    g_forward.store(on);
+}
+
+void Start(bool forward)
+{
+    g_forward.store(forward);
     g_startTick = armGetSystemTick();
     mkdir("sdmc:/switch", 0777);
     mkdir("sdmc:/switch/sly1", 0777);
@@ -167,6 +175,7 @@ void Write()
     // SLY1_CRASHLOG_ECHO=1: the file read back and printed (a trial of this from the Mac: the card
     // cannot be read from there)
     if (written && std::getenv("SLY1_CRASHLOG_ECHO")) {
+        g_forward.store(true);   // (the trial reads it at the Mac, whatever the run put out)
         char full[FS_MAX_PATH + 8];
         std::snprintf(full, sizeof full, "sdmc:%s", path);
         if (std::FILE* f = std::fopen(full, "r")) {

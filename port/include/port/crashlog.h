@@ -6,8 +6,13 @@
 #if defined(__SWITCH__)
 namespace port::crashlog {
 
-// Once, after the program's output is set up: the folder, and the last lines printed kept.
-void Start();
+// Once, after the program's output is set up: the folder, and the last lines printed kept. What
+// the program prints goes on to where it went before only with `forward`: a link is there to read
+// it (nxlink, the receiver). Started from the console's own menu nothing is put out at all: the
+// lines are kept for a report and go nowhere else.
+void Start(bool forward);
+// The same choice, changed later (SLY1_QUIET's trial; a report's echo).
+void Forward(bool on);
 // A report begun: what build, when, how long in, the frame and the level. `kind` is "fault" or "hang".
 void Begin(const char* kind);
 // A line of it.

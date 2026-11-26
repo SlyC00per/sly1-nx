@@ -38,3 +38,24 @@ the title and in a level (`SLY1_FAULT_AFTER`), and every other thread paused for
 (`SLY1_STALL_AFTER`, `SLY1_HANG_SECONDS=3`), after which the game went on and ended as it should.
 Each run gave the process back clean. Not tried: a start from the homebrew menu's list, and a
 fault inside the allocator.
+
+## A release run puts nothing out (2026-11-25)
+
+For version 1.0.0 (the maintainer: no active logging but what tracks faults and hangs). The
+program still prints its few lines (a level's load, a fade, the card's requests: some 70 in a
+start, a handful at each load, none in a frame), because the report's "last lines printed" are
+those lines. What changed is where they go:
+
+- **Started from the console's menu** (no nxlink, no receiver): nowhere. Each line is copied to
+  the 12 KB kept for a report and is not passed on; before, it also went to the system's debug
+  output, a system call a line. The end-of-run report (threads, DMA counts, GPU figures) and the
+  heap's map are not made at all.
+- **Started over nxlink or by the receiver**: as before, everything goes down the link.
+
+The traces a variable switches on (`SLY1_SND_LOG` and the rest) are unchanged: they are off
+unless asked for, and a run from the menu has no way to ask.
+
+`--env SLY1_QUIET=1` over a link makes a run quiet from the end of its arguments on, as a
+release run is, to try it from the Mac; a report echoed with `SLY1_CRASHLOG_ECHO=1` is still
+sent.
+
