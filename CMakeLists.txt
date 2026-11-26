@@ -300,7 +300,7 @@ elseif(IOS)
     sly1_install_save(sly1_ios)
     target_link_libraries(sly1_ios PRIVATE port_game_asm port_platform port_metal port_render port_libm port_core
                           "-framework Metal" "-framework Foundation" "-framework CoreGraphics" "-framework UIKit" "-framework QuartzCore"
-                          "-framework AudioToolbox" "-framework GameController")
+                          "-framework AudioToolbox" "-framework GameController" "-framework UniformTypeIdentifiers")
     set_target_properties(sly1_ios PROPERTIES
         OUTPUT_NAME "Sly Cooper"
         MACOSX_BUNDLE_INFO_PLIST ${CMAKE_SOURCE_DIR}/port/ios/Info.plist.in

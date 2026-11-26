@@ -24,6 +24,7 @@ void RunWindow();
 // The screen's layer (a CAMetalLayer, the iPhone app's view's: port/ios/app.mm), which each frame
 // shown is put on; the frame buffers' size, once the renderer is made (0 before).
 void SetScreenLayer(void* layer);
+void SetScreenShape(unsigned width, unsigned height);   // the picture's size on the screen, in pixels, at any time
 void FrameSize(unsigned* width, unsigned* height);
 // The program left the screen, or is back (the iPhone's: nothing may be drawn while it is away):
 // while suspended the frame's end waits, and the game with it.

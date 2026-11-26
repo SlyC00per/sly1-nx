@@ -57,6 +57,18 @@ std::mutex g_suspendLock;
 std::condition_variable g_resumed;
 bool g_suspended;
 
+// The size the screen's picture is shown at, in its pixels (port::gpu::SetScreenShape): the
+// frame buffers' images follow it, at the frame's end. 0: none said.
+std::atomic<std::uint32_t> g_wantWidth{0}, g_wantHeight{0};
+
+// The images' size for a picture shown at that many pixels: its shape, and no more than 1,080 lines.
+void ImageSizeFor(std::uint32_t w, std::uint32_t h, std::uint32_t* width, std::uint32_t* height)
+{
+    const std::uint32_t lines = std::min<std::uint32_t>(h, 1080);
+    *height = (lines + 1) & ~1u;
+    *width = ((std::uint32_t)std::lround((double)w * lines / h) + 1) & ~1u;
+}
+
 // The shaders. gs_vertex: window pixels to clip space, the depth as a fraction (bigger is nearer,
 // as the GS has it) and w 1: the GS interpolates colour, S, T and Q across the screen and divides
 // by Q at each pixel. gs_fragment: the GS's pixel pipeline.
@@ -313,6 +325,7 @@ private:
     id<MTLTexture> colour_[2] = {nil, nil}, depthImage_ = nil, white_ = nil;
     bool colourCleared_[2] = {false, false}, depthCleared_ = false;
     std::uint32_t width_ = 1280, height_ = 720;   // a frame buffer's image
+    bool fixedSize_ = false;                      // (SLY1_METAL_SIZE: whatever the screen's is)
     Small small_[kSmallTargets];
     int smallCount_ = 0;
     std::uint32_t otherSerial_[512] = {};   // the uploads so far when a buffer this renderer does not draw into was last drawn into; 0: never
@@ -447,12 +460,15 @@ bool Renderer::Create()
         // (the iPhone's: 1,080, its screens having more lines than that; SLY1_METAL_SIZE says otherwise)
         height_ = TARGET_OS_IPHONE ? 1080 : 720;
         width_ = ((std::uint32_t)std::lround((float)height_ * Aspect()) + 1) & ~1u;
+        if (const std::uint32_t w = g_wantWidth.load(), h = g_wantHeight.load(); w && h)
+            ImageSizeFor(w, h, &width_, &height_);
         if (compare_) {
             width_ = (std::uint32_t)kFieldWidth;
             height_ = (std::uint32_t)kFieldHeight;
         } else if (const char* size = std::getenv("SLY1_METAL_SIZE")) {   // SLY1_METAL_SIZE=WxH: the frame buffers' images
             unsigned w = 0, h = 0;
             if (std::sscanf(size, "%ux%u", &w, &h) == 2 && w >= 64 && h >= 64 && w <= 8192 && h <= 8192) {
+                fixedSize_ = true;
                 width_ = w;
                 height_ = h;
             }
@@ -1028,6 +1044,20 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
         }
         if (compare_)
             Compare(target);
+        // The screen's picture has another size now (the phone opened, closed or folded half way):
+        // the frame's images are made again at it. What they held is not kept: the next frame draws it.
+        if (const std::uint32_t w = g_wantWidth.load(), h = g_wantHeight.load(); w && h && !compare_ && !fixedSize_) {
+            std::uint32_t width, height;
+            ImageSizeFor(w, h, &width, &height);
+            if (width != width_ || height != height_) {
+                width_ = width;
+                height_ = height;
+                for (int k = 0; k < 2; k++)
+                    colour_[k] = Image(width_, height_, MTLPixelFormatRGBA8Unorm, true);
+                depthImage_ = Image(width_, height_, MTLPixelFormatDepth32Float, true);
+                std::fprintf(stderr, "gpu: Metal: frame buffers of %u by %u now\n", width_, height_);
+            }
+        }
         if (dump) {
             std::vector<std::uint32_t> mine((std::size_t)width_ * height_);
             [colour_[target] getBytes:mine.data() bytesPerRow:width_ * 4 fromRegion:MTLRegionMake2D(0, 0, width_, height_) mipmapLevel:0];
@@ -1077,7 +1107,9 @@ void Renderer::SetLayer(CAMetalLayer* layer)
         layer_.device = device_;
         layer_.pixelFormat = MTLPixelFormatBGRA8Unorm;
         layer_.framebufferOnly = YES;
-        layer_.drawableSize = CGSizeMake(width_, height_);   // the frame's own size: the layer fits it to the screen
+#if TARGET_OS_OSX
+        layer_.drawableSize = CGSizeMake(width_, height_);   // the frame's own size: the layer fits it to the window
+#endif   // (the iPhone's view gives its layer the screen's own pixels: port/ios/app.mm)
     }
 }
 
@@ -1255,6 +1287,17 @@ void SetScreenLayer(void* layer)
 {
     g_screenLayer = layer;
     g_renderer.SetLayer((__bridge CAMetalLayer*)layer);
+}
+
+// The picture is shown at that many of the screen's pixels: the game's view takes that shape
+// (port::SetAspect) and the frame's images that size, from the next frame.
+void SetScreenShape(unsigned width, unsigned height)
+{
+    if (!width || !height)
+        return;
+    SetAspect((float)width / (float)height);
+    g_wantWidth.store(width);
+    g_wantHeight.store(height);
 }
 
 void FrameSize(unsigned* width, unsigned* height)

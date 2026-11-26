@@ -30,12 +30,20 @@ screen the Metal renderer presents to. The game is the Mac's program's own entry
 - **The disc image** is looked for in the app's Documents folder, by its contents, every two
   seconds until one is there; the screen says so meanwhile. The folder shows in the Files app
   (On My iPhone) and in the Finder with the phone connected. Saves are in `save/` beside it.
+  Until one is there the screen also has a button that opens the system's file browser (iCloud
+  Drive, On My iPhone, a drive): the chosen file is copied into the Documents folder, so it is
+  asked for once. A file that is not a disc image to play is not kept, and the reason is shown.
 - **The pad** is a controller when one is connected. Without one the screen is: a touch that
   begins on the left is the left stick, one on the right the camera, and the buttons are drawn
   over the picture (hidden while a controller is connected).
 - **Off the screen** (another app, the lock) nothing may be given to the GPU: the frame's end
   waits (`port::gpu::Suspend`), the game with it, and the sound is paused.
-- **The picture** is 1,080 lines of the screen's shape, fitted to the screen by the layer.
+- **The picture** has its view's shape and up to 1,080 lines, and follows the view: the phone
+  opened or closed while the game runs changes the game's view and the frame's images at the
+  next frame (`port::gpu::SetScreenShape`).
+- **Folded half way** (`UIHingeInteraction`, iOS 27.1: the hinge partly open and under about
+  150 degrees) the picture is the upper half of the view and the controls are on the lower
+  half. The hinge's updates are in the log.
 - What the program prints goes to `sly1-log.txt` in the Documents folder (the run before's to
   `sly1-log-before.txt`).
 
@@ -52,8 +60,11 @@ xcodebuild -project build-ios/sly1_nx.xcodeproj -target sly1_ios -configuration 
 or open `build-ios/sly1_nx.xcodeproj`, choose the `sly1_ios` target and a phone, and run. With
 a free Apple ID the app opens for seven days after each install.
 
-State (2026-11-26): it builds for the phone and for the Simulator. It has not been run on
-either: this Mac has no Simulator runtime, and no phone has been connected yet.
+State (2026-11-26): it runs on an iPhone Duo (A20 Pro, iOS 27.2.1): picture, sound, the
+screen's controls, leaving and coming back. Not checked on the phone yet: the picture's size
+following the screen, the half-folded layout and the file browser (written after that run;
+the half screen's shape, 2670:939, was drawn on the Mac). The game steps by a sixtieth of a
+second at least, so 120 frames a second is a change to the game's clock, not to the app.
 
 ## The picture's shape
 
@@ -62,12 +73,11 @@ The port's wide view is not fixed at 16:9: `port::WideFactor()` is the picture's
 PS2's 4:3 one, and everything that widens the view or places the 2D elements goes by it (the
 camera, the culling, `Wide2D`, the movies' zoom). `SLY1_ASPECT=W:H` sets it before the game
 starts, and `port::SetAspect` at any time; the view is never narrower than the PS2's. The Metal
-renderer's images are 720 lines of the width that shape gives.
+renderer's images are 720 lines of the width that shape gives on the Mac.
 
 `SLY1_ASPECT=2670:1878` on the Mac gives a window of the Duo's inner screen's shape: the level's
 picture fills it with nothing stretched, and a movie keeps its own black bars above and below.
-Changing the shape while the game runs (the phone opened or closed) is not done yet: the
-renderer's images are made once.
+On the phone the shape is the picture's view's, whenever it changes.
 
 ## The Metal renderer
 
@@ -99,7 +109,7 @@ What it does not do yet:
 ## The Mac's window
 
 ```sh
-SLY1_METAL=window build-fast/sly1_headless --iso DISC.iso --seconds 0
+SLY1_METAL=window build-mac/sly1_headless --iso DISC.iso --seconds 0
 ```
 
 The game in a window of 1280 by 720 (resizable, kept 16:9), drawn by the Metal renderer, until
@@ -130,7 +140,7 @@ frame, pixel by pixel:
 
 ```sh
 SLY1_METAL=1 SLY1_METAL_COMPARE=1 SLY1_GS_HALF_LINE=1 SLY1_LEVEL_FRAMES=240 \
-    build-fast/sly1_headless --iso DISC.iso --levels 5,20 --dump-fb DIR --dump-every 160
+    build-mac/sly1_headless --iso DISC.iso --levels 5,20 --dump-fb DIR --dump-every 160
 ```
 
 - `SLY1_METAL=1`: the Mac's build draws with Metal (without it nothing changes there).
