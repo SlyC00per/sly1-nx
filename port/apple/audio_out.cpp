@@ -35,6 +35,7 @@ std::vector<std::int16_t> g_ring(kRingFrames * 2);
 int g_read, g_held;   // frames
 AudioQueueRef g_queue;
 unsigned long long g_underruns;
+bool g_paused;
 
 void Fill(void*, AudioQueueRef queue, AudioQueueBufferRef buffer)
 {
@@ -64,6 +65,7 @@ void Fill(void*, AudioQueueRef queue, AudioQueueBufferRef buffer)
 void Write(const std::int16_t* stereo, int frames)
 {
     std::unique_lock<std::mutex> lk(g_lock);
+    g_room.wait(lk, [] { return !g_paused; });
     if (!g_room.wait_for(lk, std::chrono::milliseconds(200), [] { return g_held <= kAhead; }))
         return;
     for (int k = 0; k < frames && g_held < kRingFrames; k++) {
@@ -81,6 +83,21 @@ void AudioReport()
 {
     if (g_queue)
         std::fprintf(stderr, "audio: the queue found the ring short %llu times\n", g_underruns);
+}
+
+void PauseAudio(bool paused)
+{
+    if (!g_queue)
+        return;
+    {
+        std::lock_guard<std::mutex> lk(g_lock);
+        g_paused = paused;
+    }
+    if (paused)
+        AudioQueuePause(g_queue);
+    else
+        AudioQueueStart(g_queue, nullptr);
+    g_room.notify_all();
 }
 
 bool StartAudio()

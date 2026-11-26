@@ -12,7 +12,9 @@ namespace apple {
 // The sound output started (an audio queue, 48 kHz stereo) and given to the mixer
 // (port::audio::SetOutput); false when the system gives none.
 bool StartAudio();
-void AudioReport();   // for the run's report: how often the output ran out of sound
+void AudioReport();
+// The output paused or going again (the app left the screen); the mixer waits meanwhile.
+void PauseAudio(bool paused);   // for the run's report: how often the output ran out of sound
 
 // Controllers watched for from here on (once, on the thread that runs the program's events).
 void WatchControllers();

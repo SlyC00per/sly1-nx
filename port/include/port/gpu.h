@@ -21,6 +21,13 @@ bool Started();   // the GPU is held by this program
 // its event loop, which the program's first thread runs until the window is closed.
 bool WindowWanted();
 void RunWindow();
+// The screen's layer (a CAMetalLayer, the iPhone app's view's: port/ios/app.mm), which each frame
+// shown is put on; the frame buffers' size, once the renderer is made (0 before).
+void SetScreenLayer(void* layer);
+void FrameSize(unsigned* width, unsigned* height);
+// The program left the screen, or is back (the iPhone's: nothing may be drawn while it is away):
+// while suspended the frame's end waits, and the game with it.
+void Suspend(bool suspended);
 #endif
 
 }  // namespace gpu

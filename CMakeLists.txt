@@ -14,6 +14,9 @@ if(APPLE AND NOT CMAKE_OSX_ARCHITECTURES AND NOT CMAKE_TOOLCHAIN_FILE)
         set(CMAKE_OSX_ARCHITECTURES arm64 CACHE STRING "")
     endif()
 endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    set(CMAKE_OSX_DEPLOYMENT_TARGET 16.0 CACHE STRING "")
+endif()
 project(sly1_nx C CXX)
 set(SLY1_VERSION "1.0.0")
 
@@ -65,12 +68,14 @@ if(PLATFORM STREQUAL "SWITCH")
     target_link_libraries(sly1_unit PRIVATE port_core)
     nx_generate_nacp(sly1_unit.nacp NAME "sly1 unit tests" AUTHOR "sly1-nx" VERSION "0.0.1")
     nx_create_nro(sly1_unit NACP sly1_unit.nacp)
-else()
+elseif(NOT IOS)
     add_executable(sly1_unit ${UNIT_SOURCES} tests/unit/main_host.cpp)
     target_link_libraries(sly1_unit PRIVATE port_core)
     add_test(NAME unit COMMAND sly1_unit)
 endif()
-target_compile_options(sly1_unit PRIVATE -Wall -Wextra)
+if(TARGET sly1_unit)
+    target_compile_options(sly1_unit PRIVATE -Wall -Wextra)
+endif()
 
 # --- The game: sly1-decomp's code, written again for the port by tools/gen.py (docs/DESIGN.md,
 # section 3), into the build folder. The submodule is never changed. Needs Python with the libclang
@@ -144,6 +149,7 @@ endif()
 set(GAME_INCLUDES ${CMAKE_SOURCE_DIR}/port/include ${GEN_DIR}/include ${GEN_DIR}/src)
 
 add_library(sly1_game OBJECT ${GEN_UNITS})
+add_dependencies(sly1_game sly1_gen)   # (the Xcode generator wants one of the two targets that name the generated files to depend on the other)
 option(SLY1_SENTINEL "Check a word after the thread stacks at every preemption point" OFF)
 if(SLY1_SENTINEL)
     add_compile_definitions(PORT_SENTINEL)
@@ -275,13 +281,43 @@ if(PLATFORM STREQUAL "SWITCH")
     add_executable(sly1_receiver port/switch/receiver.cpp)
     nx_generate_nacp(sly1_receiver.nacp NAME "sly1-nx receiver" AUTHOR "sly1-nx" VERSION "${SLY1_VERSION}")
     nx_create_nro(sly1_receiver NACP sly1_receiver.nacp)
+elseif(IOS)
+    # The iPhone's app (docs/IOS.md): the game on a thread of its own under a UIKit application
+    # (port/ios/app.mm), drawn by the Metal renderer.
+    #   cmake -B build-ios -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DPLATFORM=HOST -DSLY1_ISO=DISC.iso \
+    #       -DSLY1_IOS_TEAM=TEAMID -DSLY1_IOS_BUNDLE_ID=an.identifier.of.your.own
+    enable_language(OBJCXX)
+    set(SLY1_IOS_TEAM "" CACHE STRING "The signing team's identifier (Xcode, Settings, Accounts)")
+    set(SLY1_IOS_BUNDLE_ID "org.sly1nx.sly1" CACHE STRING "The app's bundle identifier")
+    add_library(port_metal STATIC port/apple/gpu_metal.mm port/apple/pad_gc.mm port/apple/audio_out.cpp)
+    target_include_directories(port_metal PRIVATE port/include)
+    target_compile_options(port_metal PRIVATE -fobjc-arc -Wall -Wextra)
+    target_compile_definitions(port_metal PRIVATE SLY1_METAL SLY1_IOS)
+    add_executable(sly1_ios MACOSX_BUNDLE port/host/main.cpp port/ios/app.mm $<TARGET_OBJECTS:sly1_game>)
+    target_include_directories(sly1_ios PRIVATE port/include)
+    target_compile_definitions(sly1_ios PRIVATE SLY1_METAL SLY1_IOS)
+    set_source_files_properties(port/ios/app.mm PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+    sly1_install_save(sly1_ios)
+    target_link_libraries(sly1_ios PRIVATE port_game_asm port_platform port_metal port_render port_libm port_core
+                          "-framework Metal" "-framework Foundation" "-framework CoreGraphics" "-framework UIKit" "-framework QuartzCore"
+                          "-framework AudioToolbox" "-framework GameController")
+    set_target_properties(sly1_ios PROPERTIES
+        OUTPUT_NAME "Sly Cooper"
+        MACOSX_BUNDLE_INFO_PLIST ${CMAKE_SOURCE_DIR}/port/ios/Info.plist.in
+        MACOSX_BUNDLE_GUI_IDENTIFIER "${SLY1_IOS_BUNDLE_ID}"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${SLY1_VERSION}"
+        MACOSX_BUNDLE_BUNDLE_VERSION "1"
+        XCODE_ATTRIBUTE_PRODUCT_BUNDLE_IDENTIFIER "${SLY1_IOS_BUNDLE_ID}"
+        XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${SLY1_IOS_TEAM}"
+        XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
+        XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2")
 else()
     find_package(Threads REQUIRED)
     add_executable(sly1_headless port/host/main.cpp port/switch/gpu.cpp $<TARGET_OBJECTS:sly1_game>)
     target_include_directories(sly1_headless PRIVATE port/include)
     sly1_install_save(sly1_headless)
     target_link_libraries(sly1_headless PRIVATE port_game_asm port_platform port_render port_libm port_core Threads::Threads)
-    if(APPLE)
+    if(APPLE AND NOT IOS)
         # The Metal renderer (port/apple/gpu_metal.mm), for the Mac's own build and the iPhone's
         # (docs/IOS.md). Its shaders are compiled from their source when the program starts.
         enable_language(OBJCXX)

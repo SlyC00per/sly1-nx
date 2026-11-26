@@ -24,6 +24,7 @@
 #endif
 
 #include <atomic>
+#include <condition_variable>
 
 #include <algorithm>
 #include <cmath>
@@ -50,6 +51,11 @@ namespace {
 constexpr float kFieldWidth = 640.0f, kFieldHeight = 224.0f;   // a field of the game's frame, in the GS's pixels
 constexpr int kSmallTargets = 8;                               // the buffers other than the frame's two the game draws into
 constexpr std::size_t kFrameBufferBytes = 8u << 20;            // a block of a frame's vertices and indices
+
+// The program is off the screen (port::gpu::Suspend): the frame's end waits until it is back.
+std::mutex g_suspendLock;
+std::condition_variable g_resumed;
+bool g_suspended;
 
 // The shaders. gs_vertex: window pixels to clip space, the depth as a fraction (bigger is nearer,
 // as the GS has it) and w 1: the GS interpolates colour, S, T and Q across the screen and divides
@@ -438,8 +444,9 @@ bool Renderer::Create()
         // filtered as the GS's registers say, and the game's motion blur drawn (the reference has it).
         compare_ = std::getenv("SLY1_METAL_COMPARE") != nullptr;
         // 720 lines, as wide as the picture's shape makes them (port::Aspect: 1,280 for 16:9)
-        width_ = ((std::uint32_t)std::lround(720.0f * Aspect()) + 1) & ~1u;
-        height_ = 720;
+        // (the iPhone's: 1,080, its screens having more lines than that; SLY1_METAL_SIZE says otherwise)
+        height_ = TARGET_OS_IPHONE ? 1080 : 720;
+        width_ = ((std::uint32_t)std::lround((float)height_ * Aspect()) + 1) & ~1u;
         if (compare_) {
             width_ = (std::uint32_t)kFieldWidth;
             height_ = (std::uint32_t)kFieldHeight;
@@ -969,6 +976,10 @@ void Renderer::Compare(int target)
 
 void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
 {
+    {   // The program is off the screen: nothing may be given to the GPU. The frame's end waits here.
+        std::unique_lock<std::mutex> lk(g_suspendLock);
+        g_resumed.wait(lk, [] { return !g_suspended; });
+    }
     @autoreleasepool {
         frames_++;
         int target = TargetOf(dispfb & 0x1FF);
@@ -1062,6 +1073,12 @@ void Renderer::SetLayer(CAMetalLayer* layer)
 {
     std::lock_guard<std::mutex> lk(layerLock_);
     layer_ = layer;
+    if (layer_ && device_) {   // (whichever of the layer and the renderer comes second)
+        layer_.device = device_;
+        layer_.pixelFormat = MTLPixelFormatBGRA8Unorm;
+        layer_.framebufferOnly = YES;
+        layer_.drawableSize = CGSizeMake(width_, height_);   // the frame's own size: the layer fits it to the screen
+    }
 }
 
 Renderer g_renderer;
@@ -1208,14 +1225,20 @@ namespace gpu {
 
 // The Mac's build draws with Metal when SLY1_METAL asks (its tests are the reference drawing's);
 // the iPhone's always.
+void* g_screenLayer;   // (the screen's layer, kept for a renderer made after it was given)
+
 bool Start()
 {
+#if !TARGET_OS_IPHONE
     if (!std::getenv("SLY1_METAL"))
         return false;
+#endif
     if (!g_renderer.Create())
         return false;
     gs::SetBackend(&g_renderer);
     g_started = true;
+    if (g_screenLayer)
+        g_renderer.SetLayer((__bridge CAMetalLayer*)g_screenLayer);
     return true;
 }
 
@@ -1227,6 +1250,28 @@ void Report()
 }
 
 bool Started() { return g_started; }
+
+void SetScreenLayer(void* layer)
+{
+    g_screenLayer = layer;
+    g_renderer.SetLayer((__bridge CAMetalLayer*)layer);
+}
+
+void FrameSize(unsigned* width, unsigned* height)
+{
+    *width = g_started ? g_renderer.Width() : 0;
+    *height = g_started ? g_renderer.Height() : 0;
+}
+
+void Suspend(bool suspended)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_suspendLock);
+        g_suspended = suspended;
+    }
+    g_resumed.notify_all();
+    apple::PauseAudio(suspended);
+}
 
 void Shutdown() {}
 

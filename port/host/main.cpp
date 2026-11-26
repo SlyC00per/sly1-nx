@@ -1010,7 +1010,11 @@ int Main(int argc, char** argv);
 
 // (A start that fails returns from Main: with another program to follow, that too ends by Finish,
 // or the receiver would not come back and a night's runs would stop there.)
+#if defined(SLY1_IOS)
+int sly1_main(int argc, char** argv)   // (the app's own main is UIKit's: port/ios/app.mm)
+#else
 int main(int argc, char** argv)
+#endif
 {
     const int status = Main(argc, argv);
 #if defined(__SWITCH__)
@@ -1623,7 +1627,11 @@ int Main(int argc, char** argv)
         port::gpu::Start();
 #if defined(SLY1_METAL)
     // The Mac's window has sound (SLY1_NO_SOUND=1: not): Apple's output, given to the mixer.
+#if defined(SLY1_IOS)
+    if (!std::getenv("SLY1_NO_SOUND"))
+#else
     if (port::gpu::WindowWanted() && !std::getenv("SLY1_NO_SOUND"))
+#endif
         port::apple::StartAudio();
 #endif
     // The GS on a thread of its own, after the render thread's VIF1 and VU1 (docs/RENDERER.md): on
@@ -1725,6 +1733,7 @@ int Main(int argc, char** argv)
     }
 #else
 #if defined(SLY1_METAL)
+#if !defined(SLY1_IOS)
     if (port::gpu::WindowWanted()) {   // the window's events on this thread; the run's end ends the program
         std::thread([clock] {
             pthread_join(clock, nullptr);
@@ -1733,6 +1742,7 @@ int Main(int argc, char** argv)
         port::gpu::RunWindow();
         return 0;
     }
+#endif
 #endif
     pthread_join(clock, nullptr);
     return 0;
