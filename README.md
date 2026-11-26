@@ -17,11 +17,10 @@ ready-made program is offered for download: you build it yourself from your own 
 
 | | |
 | --- | --- |
-| ![A Stealthy Approach](docs/screenshots/stealthy-approach.png) | ![High Class Heist](docs/screenshots/high-class-heist.png) |
-| ![Muggshot's Turf, through the Binocucom](docs/screenshots/muggshots-turf.png) | ![The Swamp's Dark Center](docs/screenshots/swamps-dark-center.png) |
+| ![Sly sidling past a guard's light](docs/screenshots/sidling-past-a-guard.jpg) | ![Hiding in a barrel in the library](docs/screenshots/barrel-in-the-library.jpg) |
+| ![Climbing above Mesa City](docs/screenshots/climbing-mesa-city.jpg) | ![Hanging from a hook by the cane](docs/screenshots/cane-on-a-hook.jpg) |
 
-The port's 16:9 picture. These frames come from its software renderer on a computer, at the
-PS2's resolution and scaled up; the Switch draws the same picture at 1280×720.
+The port's 16:9 picture at 1280×720, captured on a Switch.
 
 ## Features
 
