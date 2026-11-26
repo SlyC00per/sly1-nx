@@ -3357,7 +3357,7 @@ void Shutdown()
 }  // namespace gpu
 }  // namespace port
 
-#else
+#elif !defined(SLY1_METAL)   // (an Apple build has port/apple/gpu_metal.mm's)
 
 namespace port {
 namespace gpu {

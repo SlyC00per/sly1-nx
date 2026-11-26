@@ -962,7 +962,10 @@ const Draw& RunState(std::uint64_t prim, std::uint32_t type)
 void Gather(std::uint64_t prim, std::uint32_t type)
 {
     const Draw& d = RunState(prim, type);
-    int ofx = d.ofx, ofy = d.ofy & ~15;   // the odd field's half line dropped
+    // (SLY1_GS_HALF_LINE=1: the odd field's half line kept, as the reference drawing has it: for a
+    // renderer compared with it pixel by pixel, port/apple/gpu_metal.mm)
+    static const bool halfLine = std::getenv("SLY1_GS_HALF_LINE") != nullptr;
+    int ofx = d.ofx, ofy = halfLine ? d.ofy : d.ofy & ~15;   // the odd field's half line dropped
     float sw = 1.0f / (16.0f * d.tex.tw), sh = 1.0f / (16.0f * d.tex.th);
     auto vertex = [&](const Vertex& v, const Vertex& flat) {
         DrawVertex o;
@@ -2060,6 +2063,8 @@ void WritePng(const std::string& path, const std::string& rgb, int w, int h)
 }
 
 }  // namespace
+
+void WritePngFile(const std::string& path, const std::string& rgb, int width, int height) { WritePng(path, rgb, width, height); }
 
 void SetFrameDump(const std::string& dir, int every)
 {

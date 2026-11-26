@@ -281,5 +281,15 @@ else()
     target_include_directories(sly1_headless PRIVATE port/include)
     sly1_install_save(sly1_headless)
     target_link_libraries(sly1_headless PRIVATE port_game_asm port_platform port_render port_libm port_core Threads::Threads)
+    if(APPLE)
+        # The Metal renderer (port/apple/gpu_metal.mm), for the Mac's own build and the iPhone's
+        # (docs/IOS.md). Its shaders are compiled from their source when the program starts.
+        enable_language(OBJCXX)
+        add_library(port_metal STATIC port/apple/gpu_metal.mm)
+        target_include_directories(port_metal PRIVATE port/include)
+        target_compile_options(port_metal PRIVATE -fobjc-arc -Wall -Wextra)
+        target_compile_definitions(sly1_headless PRIVATE SLY1_METAL)
+        target_link_libraries(sly1_headless PRIVATE port_metal "-framework Metal" "-framework Foundation" "-framework CoreGraphics")   # (CoreGraphics: without it a command-line program is given no device)
+    endif()
 endif()
 endif()  # SLY1_BUILD_GAME

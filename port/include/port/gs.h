@@ -60,6 +60,9 @@ void SetDisplay(std::uint64_t dispfb, std::uint64_t display);
 // The displayed frame as 8-bit RGB, width by height (the display's size); false before any.
 bool ReadDisplay(std::string& rgb, int& width, int& height);
 
+// An 8-bit RGB picture written as a PNG (the frame dump's writer, for a renderer's own pictures).
+void WritePngFile(const std::string& path, const std::string& rgb, int width, int height);
+
 // A frame was shown (the game swapped its double buffer): written to the dump folder when due.
 void FrameShown();
 
