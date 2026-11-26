@@ -66,6 +66,7 @@ const ScreenButton kButtons[] = {
     {0x0100, "SELECT", -55, 30, true},
 };
 constexpr float kButtonRadius = 30.0f, kStickRadius = 60.0f;
+constexpr float kCreaseMargin = 70.0f;   // below the hinge, where the folded screen is flat again
 
 }  // namespace
 
@@ -138,10 +139,14 @@ constexpr float kButtonRadius = 30.0f, kStickRadius = 60.0f;
 // The part of the view the controls are on.
 - (CGRect)controls
 {
-    CGRect all = UIEdgeInsetsInsetRect(self.bounds, self.safeAreaInsets);
-    if ([self split]) {
-        const CGFloat middle = CGRectGetMidY(self.bounds);
-        all = CGRectMake(all.origin.x, middle, all.size.width, CGRectGetMaxY(all) - middle);
+    // (no margin at the sides: the buttons keep their places from the view's edges on every
+    // screen, over a camera's cutout if one is there, and not pushed off centre by it)
+    UIEdgeInsets safe = self.safeAreaInsets;
+    safe.left = safe.right = 0;
+    CGRect all = UIEdgeInsetsInsetRect(self.bounds, safe);
+    if ([self split]) {   // the lower half, from where it is flat: clear of the fold's curve
+        const CGFloat top = CGRectGetMidY(self.bounds) + kCreaseMargin;
+        all = CGRectMake(all.origin.x, top, all.size.width, CGRectGetMaxY(all) - top);
     }
     return all;
 }
