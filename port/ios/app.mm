@@ -148,7 +148,10 @@ constexpr float kCreaseMargin = 70.0f;   // below the hinge, where the folded sc
     UIEdgeInsets safe = self.safeAreaInsets;
     safe.left = safe.right = 0;
     CGRect all = UIEdgeInsetsInsetRect(self.bounds, safe);
-    if (self.bounds.size.height > self.bounds.size.width) {   // upright: the lower half (in reach), clear of the fold's curve
+    if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {   // a tablet: the lower half, where the hands hold it
+        const CGFloat top = CGRectGetMidY(self.bounds);
+        all = CGRectMake(all.origin.x, top, all.size.width, CGRectGetMaxY(all) - top);
+    } else if (self.bounds.size.height > self.bounds.size.width) {   // upright: the lower half (in reach), clear of the fold's curve
         const CGFloat top = CGRectGetMidY(self.bounds) + kCreaseMargin;
         all = CGRectMake(all.origin.x, top, all.size.width, CGRectGetMaxY(all) - top);
     }
@@ -158,6 +161,11 @@ constexpr float kCreaseMargin = 70.0f;   // below the hinge, where the folded sc
 - (CGPoint)centreOf:(const ScreenButton&)b
 {
     const CGRect r = [self controls];
+    if (b.centred && UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+        // (a tablet is held by its sides: the middle is out of the thumbs' reach, so SELECT is
+        // under the left shoulder buttons and START under the right ones)
+        return CGPointMake(b.x < 0 ? CGRectGetMinX(r) + 70 : CGRectGetMaxX(r) - 70, CGRectGetMinY(r) + 114);
+    }
     const CGFloat x = b.centred ? CGRectGetMidX(r) + b.x : b.x < 0 ? CGRectGetMaxX(r) + b.x : CGRectGetMinX(r) + b.x;
     const CGFloat y = b.y < 0 ? CGRectGetMaxY(r) + b.y : CGRectGetMinY(r) + b.y;
     return CGPointMake(x, y);
