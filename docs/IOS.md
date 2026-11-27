@@ -67,8 +67,8 @@ a free Apple ID the app opens for seven days after each install.
 
 State (2026-11-26): it runs on an iPhone Duo (A20 Pro, iOS 27.2.1), an iPhone 15 Pro Max
 (iOS 17) and an iPad Pro 12.9-inch of 2018: picture, sound, the screen's controls in every
-posture, the file browser, leaving and coming back. Not tried: a controller. Not measured:
-the frame rate. The game steps by a sixtieth of a
+posture, the file browser, leaving and coming back. Not tried: a controller. The Show FPS
+counter reads 60 on all three in the levels played; no measurement over a run has been made. The game steps by a sixtieth of a
 second at least, so 120 frames a second is a change to the game's clock, not to the app.
 
 ## The picture's shape

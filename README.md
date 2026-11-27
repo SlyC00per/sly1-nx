@@ -177,8 +177,9 @@ What it has:
 
 What it does not have yet:
 
-- **A measured frame rate.** It looks like 60 on the two phones; nobody has measured it, and
-  the phones get warm.
+- **A frame rate measured over the whole game.** The game's own counter (Show FPS, in Options)
+  reads 60 on all three devices in the levels played so far; no level-by-level measurement has
+  been made, and the phones get warm.
 - **A tried controller.** The code for a Bluetooth or USB controller is there, and has not been
   used with one.
 - **Rumble**, and the Switch's crash reports.
