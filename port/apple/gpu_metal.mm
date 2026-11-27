@@ -24,6 +24,7 @@
 #endif
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 
 #include <algorithm>
@@ -323,9 +324,13 @@ private:
     std::vector<std::uint32_t> lineIndex_;
     id<MTLDepthStencilState> depth_[3][2];                   // the test (always, GEQUAL, GREATER) and whether the depth is written
     id<MTLSamplerState> sampler_[2][2][2];                   // bilinear or not, S clamped or not, T clamped or not
-    id<MTLTexture> colour_[2] = {nil, nil}, depthImage_ = nil, white_ = nil;
+    id<MTLTexture> colour_[2] = {nil, nil}, depthImage_ = nil, white_ = nil, fpsBack_ = nil, fpsLit_ = nil;
     bool colourCleared_[2] = {false, false}, depthCleared_ = false;
     std::uint32_t width_ = 1280, height_ = 720;   // a frame buffer's image
+    // The Options page's "Show FPS": frames presented since fpsSince_, and the number shown
+    std::uint32_t fpsFrames_ = 0, fpsShown_ = 0;
+    std::chrono::steady_clock::time_point fpsSince_{};
+    void DrawFps(id<MTLRenderCommandEncoder> e, std::uint32_t width, std::uint32_t height);
     bool fixedSize_ = false;                      // (SLY1_METAL_SIZE: whatever the screen's is)
     Small small_[kSmallTargets];
     int smallCount_ = 0;
@@ -496,6 +501,11 @@ bool Renderer::Create()
         white_ = Image(1, 1, MTLPixelFormatRGBA8Unorm, false);
         const std::uint32_t one = 0xFFFFFFFFu;
         [white_ replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&one bytesPerRow:4];
+        fpsBack_ = Image(1, 1, MTLPixelFormatRGBA8Unorm, false);
+        fpsLit_ = Image(1, 1, MTLPixelFormatRGBA8Unorm, false);
+        const std::uint32_t back = 0xFF000000u, lit = 0xFF33FF66u;   // (red in the low byte: the Switch's green)
+        [fpsBack_ replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&back bytesPerRow:4];
+        [fpsLit_ replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&lit bytesPerRow:4];
         std::fprintf(stderr, "gpu: Metal on %s: frame buffers of %u by %u%s\n", device_.name.UTF8String, width_, height_,
                      compare_ ? ", compared with the reference drawing" : "");
     }
@@ -995,6 +1005,61 @@ void Renderer::Compare(int target)
                      (unsigned long long)frames_, mean, 100.0 * within[0] / pixels, 100.0 * within[1] / pixels, 100.0 * within[2] / pixels);
 }
 
+// The Options page's "Show FPS", as the Switch's renderer has it (port/switch/gpu.cpp's DrawFps):
+// the frames presented a second, counted over half a second, as two or three seven-segment digits
+// in the screen's bottom left corner. Each segment is the screen's triangle drawn through a
+// scissor with a texture of one colour. The sizes are of a 720-line screen, and the corner's
+// margin clears a phone's rounded one.
+void Renderer::DrawFps(id<MTLRenderCommandEncoder> e, std::uint32_t width, std::uint32_t height)
+{
+    const auto now = std::chrono::steady_clock::now();
+    fpsFrames_++;
+    if (fpsSince_ == std::chrono::steady_clock::time_point{})
+        fpsSince_ = now;
+    const double since = std::chrono::duration<double>(now - fpsSince_).count();
+    if (since >= 0.5) {
+        fpsShown_ = (std::uint32_t)std::lround(fpsFrames_ / since);
+        fpsFrames_ = 0;
+        fpsSince_ = now;
+    }
+    const std::uint32_t value = std::min<std::uint32_t>(fpsShown_, 999);
+    const int digits = value >= 100 ? 3 : 2;
+    const float unit = std::max(1.0f, (float)std::min(width, height) / 720.0f);
+    const auto px = [&](int v) { return (int)std::lround(v * unit); };
+    constexpr int kW = 8, kH = 14, kT = 2, kGap = 3, kPad = 3, kMargin = TARGET_OS_IPHONE ? 24 : 10;
+    const int x0 = px(kMargin), y0 = (int)height - px(kMargin + kH + 2 * kPad);
+    const auto fill = [&](int x, int y, int w, int h, id<MTLTexture> colour) {
+        MTLScissorRect sc;
+        sc.x = (NSUInteger)std::clamp(x, 0, (int)width - 1);
+        sc.y = (NSUInteger)std::clamp(y, 0, (int)height - 1);
+        sc.width = (NSUInteger)std::clamp(w, 1, (int)width - (int)sc.x);
+        sc.height = (NSUInteger)std::clamp(h, 1, (int)height - (int)sc.y);
+        [e setScissorRect:sc];
+        [e setFragmentTexture:colour atIndex:0];
+        [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    };
+    const float plain[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    [e setFragmentBytes:plain length:sizeof plain atIndex:0];
+    fill(x0, y0, px(digits * kW + (digits - 1) * kGap + 2 * kPad), px(kH + 2 * kPad), fpsBack_);
+    // the segments a digit lights: bit 0 the top, 1 top right, 2 bottom right, 3 the bottom, 4 bottom left, 5 top left, 6 the middle
+    static const std::uint8_t kSegments[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
+    int place = 1;
+    for (int k = 1; k < digits; k++)
+        place *= 10;
+    for (int k = 0; k < digits; k++, place /= 10) {
+        const std::uint8_t s = kSegments[value / place % 10];
+        const int x = x0 + px(kPad + k * (kW + kGap)), y = y0 + px(kPad), half = (kH - kT) / 2;
+        const auto seg = [&](int dx, int dy, int w, int h) { fill(x + px(dx), y + px(dy), px(w), px(h), fpsLit_); };
+        if (s & 0x01) seg(0, 0, kW, kT);
+        if (s & 0x02) seg(kW - kT, 0, kT, half + kT);
+        if (s & 0x04) seg(kW - kT, half, kT, kH - half);
+        if (s & 0x08) seg(0, kH - kT, kW, kT);
+        if (s & 0x10) seg(0, half, kT, kH - half);
+        if (s & 0x20) seg(0, 0, kT, half + kT);
+        if (s & 0x40) seg(0, half, kW, kT);
+    }
+}
+
 void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
 {
     {   // The program is off the screen: nothing may be given to the GPU. The frame's end waits here.
@@ -1028,6 +1093,8 @@ void Renderer::Present(std::uint64_t dispfb, std::uint64_t)
                 [e setFragmentTexture:colour_[target] atIndex:0];
                 [e setFragmentSamplerState:sampler_[1][1][1] atIndex:0];
                 [e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+                if (ShowFps())
+                    DrawFps(e, (std::uint32_t)drawable.texture.width, (std::uint32_t)drawable.texture.height);
                 [e endEncoding];
                 [commands_ presentDrawable:drawable];
             }
