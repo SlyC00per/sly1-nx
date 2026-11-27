@@ -11,6 +11,7 @@ namespace port { void CheckDevTable(const char* where); }
 #else
 namespace port { inline void CheckDevTable(const char*) {} }
 #endif
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 

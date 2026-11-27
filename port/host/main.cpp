@@ -46,7 +46,9 @@ __attribute__((weak)) void HeapProfileReport(int level);   // (switch/heap_profi
 
 #if !defined(__SWITCH__) && !defined(_WIN32)
 #include <csignal>
+#if !defined(__EMSCRIPTEN__)
 #include <execinfo.h>
+#endif
 #include <unistd.h>
 #endif
 
@@ -886,9 +888,11 @@ void FatalSignal(int sig, siginfo_t* info, void* ctx)
         }
     }
 #endif
+#if !defined(__EMSCRIPTEN__)
     void* frames[48];
     int count = backtrace(frames, 48);
     backtrace_symbols_fd(frames, count, 2);
+#endif
     n = std::snprintf(line, sizeof line, "sly1: done, status %d\n", 128 + sig);
     write(2, line, n);
     _exit(128 + sig);

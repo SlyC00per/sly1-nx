@@ -138,7 +138,14 @@ s32* GetErrorNumberAddress(void) { return (s32*)port::Native(*(const u32*)port::
 
 // --- the linker's leftovers that a table still names: no role, no code
 
+#if defined(__EMSCRIPTEN__)
+// (WebAssembly's linker tells a function from data, and the game's code names these as bytes: it
+// passes addresses a little past each, which nothing here is at either)
+unsigned char func_00135E20[0x20];
+unsigned char func_00135E40[0x20];
+#else
 void func_00135E20() {}
 void func_00135E40() {}
+#endif
 
 }  // extern "C"

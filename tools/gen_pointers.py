@@ -464,6 +464,11 @@ class Walker:
             except Unsupported as e:
                 self.edits.unsupported.append("%s:%d: %s" % (f, c.location.line, e))
                 return
+            if target.kind != TK.POINTER and c.type.get_canonical().get_pointee().kind in FUNCS and \
+                    target.get_declaration().kind == CK.TYPEDEF_DECL:
+                # (a function pointer's typedef: its own name, so that its parameter types are
+                # the typedef's on every target, where `long` and `long long` may differ)
+                pointee = "std::remove_pointer<%s>::type" % target.spelling
             self.edits.rep(f, a, b, "", "integer to pointer")
             self.edits.wrap(f, b, end, "port::FromGameAddr<%s>((u32)(" % pointee, "))", depth,
                             "integer to pointer")

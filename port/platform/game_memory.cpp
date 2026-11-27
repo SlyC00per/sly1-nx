@@ -27,6 +27,11 @@
 extern "C" IMAGE_DOS_HEADER __ImageBase;
 #elif defined(__SWITCH__)
 #include <switch.h>
+#elif defined(__EMSCRIPTEN__)
+// (the web's build, 64-bit WebAssembly: the program's static data is its image, from the linker's
+// global base, set well above zero so that a small number is not an image address)
+extern "C" char __global_base[];
+extern "C" char __heap_base[];
 #else
 extern "C" char __executable_start[];
 extern "C" char _end[];
@@ -82,6 +87,9 @@ std::uintptr_t FindImageBase()
         at = info.addr + info.size;
     }
     size = at - g_imageBase;
+#elif defined(__EMSCRIPTEN__)
+    g_imageBase = reinterpret_cast<std::uintptr_t>(__global_base);
+    size = reinterpret_cast<std::uintptr_t>(__heap_base) - g_imageBase;
 #else
     g_imageBase = reinterpret_cast<std::uintptr_t>(__executable_start);
     size = reinterpret_cast<std::uintptr_t>(_end) - g_imageBase;

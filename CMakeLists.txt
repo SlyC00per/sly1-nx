@@ -18,6 +18,22 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
     set(CMAKE_OSX_DEPLOYMENT_TARGET 16.0 CACHE STRING "")
 endif()
 project(sly1_nx C CXX)
+
+# The web's build (docs/WEB.md): 64-bit WebAssembly with threads, by Emscripten
+# (emcmake cmake -B build-web -G Ninja -DPLATFORM=HOST -DSLY1_ISO=DISC.iso). 64-bit because the
+# pointer model keeps words that are not memory in a native pointer's upper bits (port/ptr32.h),
+# and takes any pointer below 4 GiB for a plain word: the program's data starts at 4 GiB, and
+# the memory below it is never touched.
+# SLY1_WEB_NODE=ON: the program for node, reading the disc image from the computer's files (tests).
+if(EMSCRIPTEN)
+    option(SLY1_WEB_NODE "Build for node, with the computer's file system" OFF)
+    add_compile_options(-pthread -sMEMORY64=1)
+    add_link_options(-pthread -sMEMORY64=1 -sINITIAL_MEMORY=5368709120 -sMAXIMUM_MEMORY=8589934592 -sGLOBAL_BASE=4294967296 -sSTACK_SIZE=8388608
+                     -sPROXY_TO_PTHREAD=1 -sEXIT_RUNTIME=1 -sPTHREAD_POOL_SIZE=24 --profiling-funcs)
+    if(SLY1_WEB_NODE)
+        add_link_options(-sNODERAWFS=1)
+    endif()
+endif()
 set(SLY1_VERSION "1.0.0")
 
 set(CMAKE_CXX_STANDARD 17)

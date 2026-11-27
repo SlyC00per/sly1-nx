@@ -1076,20 +1076,19 @@ static void TimelineSemaphore(const char* what, s32 id)
     port::TimelineEvent(line);
 }
 
-s32 PostSemaphore(void* a)
+s32 PostSemaphore(s32 id)   // (an id, as every file of the game declares it now)
 {
     ServiceInterrupts();
-    TimelineSemaphore("posts", (s32)port::WordArg(a));
-    if (t_self == 1 && (s32)port::WordArg(a) == 4)
+    TimelineSemaphore("posts", id);
+    if (t_self == 1 && id == 4)
         port::SampleWindow(true);
-    return Signal((s32)port::WordArg(a), t_self != kIdle);
+    return Signal(id, t_self != kIdle);
 }
 void PostSemaphoreFromInterrupt(s32 sema) { Signal(sema, false); }
 
-s32 AwaitSemaphore(void* a)
+s32 AwaitSemaphore(s32 id)
 {
     ServiceInterrupts();
-    s32 id = (s32)port::WordArg(a);
     if (t_self == 1 && id == 5)
         port::SampleWindow(false);
     std::unique_lock<std::mutex> lk(g_kernel);

@@ -230,11 +230,12 @@ s32 GetGsInterruptMask(void) { return 0; }
 
 // The EE's ten DMA channels' register blocks (VIF0, VIF1, GIF, IPU from/to, SIF0-2, SPR from/to), at
 // their hardware addresses (port/ptr32.h maps the register window to plain memory).
-u32 GetDmaChannel(u32 index)
+// (the game declares the result a pointer: the address is given as one, the word unchanged)
+void* GetDmaChannel(u32 index)
 {
     static const u32 kChannels[10] = {0x10008000, 0x10009000, 0x1000A000, 0x1000B000, 0x1000B400,
                                       0x1000C000, 0x1000C400, 0x1000C800, 0x1000D000, 0x1000D400};
-    return index < 10 ? kChannels[index] : 0;
+    return reinterpret_cast<void*>(static_cast<std::uintptr_t>(index < 10 ? kChannels[index] : 0));
 }
 s32 ResetDmaController(s32) { return 0; }
 // As the library starts a source chain (TADR unless it holds 0xFFFFFFFF, QWC 0, CHCR's mode and STR),

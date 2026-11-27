@@ -403,6 +403,19 @@ PATCHES = [
      "    y0 = port::TallAt(y0, self->shownY + self->h * 0.5f) * 0.45454547f;\n    y1 = port::TallAt(y1, self->shownY + self->h * 0.5f) * 0.45454547f;\n    s32 py = (s32)y0;",
      "the portrait's scissor in a tall picture"),
 
+    # Two functions return a pointer that two files declare `void` (retail's callers there never
+    # read the result: sly1-decomp's config/decls_expected.tsv). A linker that checks a function's
+    # type against its callers', as WebAssembly's does, refuses the call: the declarations are
+    # given the definition's type, and the calls drop the result as before.
+    ("src/main/object_properties.cpp",
+     "void EvalScriptExpression(ScriptValue* ret, R11B008Node* expr, ScriptScope* scope);",
+     "ScriptValue* EvalScriptExpression(ScriptValue* ret, R11B008Node* expr, ScriptScope* scope);",
+     "EvalScriptExpression declared with the type it is defined with"),
+    ("src/main/base_object.cpp",
+     "void SetExtraObjectProperty(ScriptValue* self, BaseObject* p, s32 key, ScriptValue* value);",
+     "ScriptValue* SetExtraObjectProperty(ScriptValue* self, BaseObject* p, s32 key, ScriptValue* value);",
+     "SetExtraObjectProperty declared with the type it is defined with"),
+
     # Widescreen: the map page is laid before the camera to fill the 4:3 picture; it is made 4/3
     # wider (the second row of its matrix: the camera's axis across the screen) to fill the 16:9 one, as the PS3
     # release stretches it.
