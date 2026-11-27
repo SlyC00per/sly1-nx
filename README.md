@@ -1,12 +1,13 @@
 # sly1-nx
 
-*Sly Cooper and the Thievius Raccoonus* running natively on the Nintendo Switch.
+*Sly Cooper and the Thievius Raccoonus* running natively on the Nintendo Switch, and on the
+iPhone and iPad.
 
 sly1-nx is a homebrew port of the PlayStation 2 game (NTSC-U, `SCUS_971.98`). It is not an
 emulator: the game's own code, from [OpenThievius](https://github.com/OpenThievius)'s matching
 decompilation [sly1-decomp](https://github.com/OpenThievius/sly1-decomp), is compiled for the
-Switch, and the port supplies what the PlayStation 2 did around it (graphics, sound, video, the
-pad, saving).
+Switch (or for iOS), and the port supplies what the PlayStation 2 did around it (graphics,
+sound, video, the pad, saving).
 
 It follows the PS3 and PS Vita releases (*The Sly Collection*) wherever they changed the PS2
 game: a 16:9 picture, saving without a memory card, the touch screen for the Binocucom and an
@@ -15,7 +16,12 @@ release. It draws at 1280×720, a sharper picture than the Vita's 960×544 scree
 aims for 60 frames a second where the Vita version holds 30. That makes it the definitive way
 to play *Sly Cooper and the Thievius Raccoonus* on a handheld.
 
-**Version 1.0.0.** All 46 levels load and run; it was developed and tried on a Switch Lite.
+**Version 1.0.0** is the Switch version. All 46 levels load and run; it was developed and
+tried on a Switch Lite.
+
+**The iPhone and iPad version** is newer and not a numbered release yet: it runs, with picture,
+sound, touch controls and saving, and is on `main`. See [iPhone and iPad](#iphone-and-ipad).
+Most of this page describes the Switch version.
 
 **You need your own copy of the game.** Nothing of the game is in this repository, and no
 ready-made program is offered for download: you build it yourself from your own disc image
@@ -145,6 +151,59 @@ good, with copies from each session and the most recent ones.
 Pressing + during the opening scene on the Paris rooftop begins a **new game**, as on the PS2;
 to go on with a save, choose it at the title.
 
+## iPhone and iPad
+
+The same game from the same source, drawn by a renderer written for Apple's GPUs. It is a work
+in progress: it has been played on an iPhone Duo (iOS 27), an iPhone 15 Pro Max (iOS 17) and a
+2018 iPad Pro, and only its first levels have been played there.
+
+What it has:
+
+- **The picture in the screen's own shape**, with nothing stretched and no black bars, at up
+  to 1,080 pixels along the shorter side. The view is wider on a wide screen and taller on a
+  tall one.
+- **Sound, music, voices and the videos**, as on the Switch.
+- **Touch controls**: the left side of the screen is the move stick, the right side the
+  camera, and the buttons are drawn over the picture. On an iPad they sit on the lower half,
+  at the edges.
+- **A folding phone's postures**: closed or open on its side; folded half way, with the picture
+  on the upper half and the controls on the lower; and open and upright, with the picture
+  filling the screen.
+- **Choosing the disc image** in the Files browser (iCloud Drive included) the first time; it
+  is copied into the app's folder and not asked for again.
+- **Saves** in the app's folder (`save/`), in the game's own format, with the same backups as
+  on the Switch.
+- **Pausing** when you leave the app, and going on when you come back.
+
+What it does not have yet:
+
+- **A measured frame rate.** It looks like 60 on the two phones; nobody has measured it, and
+  the phones get warm.
+- **A tried controller.** The code for a Bluetooth or USB controller is there, and has not been
+  used with one.
+- **Rumble**, and the Switch's crash reports.
+- **A look at every screen in an upright picture.** The menus, the counters and the Binocucom
+  have not been checked in that shape.
+
+To build it you need a Mac with Xcode, an Apple ID added to Xcode (a free one will do: the app
+then opens for seven days after each install; with a paid developer membership, a year), your
+disc image, and CMake and Python as for the Switch. iOS 16 or later.
+
+```sh
+python3 -m venv venv
+venv/bin/pip install libclang
+
+cmake -B build-ios -G Xcode -DCMAKE_SYSTEM_NAME=iOS -DPLATFORM=HOST \
+    -DSLY1_ISO="/path/to/your/Sly Cooper.iso" \
+    -DSLY1_IOS_TEAM=YOURTEAMID -DSLY1_IOS_BUNDLE_ID=an.identifier.of.your.own \
+    -DPython3_EXECUTABLE=$PWD/venv/bin/python
+```
+
+Then open `build-ios/sly1_nx.xcodeproj` in Xcode, choose the `sly1_ios` target and your device
+(with Developer Mode turned on in its Settings, under Privacy & Security), and run. The first
+screen asks for your disc image. [docs/IOS.md](docs/IOS.md) has the rest, including the same
+renderer in a window on the Mac.
+
 ## If something goes wrong
 
 A crash or a freeze leaves a report in `/switch/sly1/crashes/` (`fault-…txt` or `hang-…txt`).
@@ -164,8 +223,9 @@ data comes from your own disc image, read as the game runs. No disc image, execu
 extracted asset, texture, compiler or SDK file is in this repository, and none is ever
 committed to it (`tools/proprietary.py` checks what is committed).
 
-A built `sly1.nro` holds the game's compiled code and the vertex programs translated from your
-disc. That is why none is offered for download, and why you should not pass yours on.
+A built `sly1.nro`, or a built iOS app, holds the game's compiled code and the vertex programs
+translated from your disc. That is why none is offered for download, and why you should not
+pass yours on.
 
 ## How it works, and where to read more
 
@@ -179,6 +239,7 @@ an MPEG-2 decoder, the pad, and the memory card as a folder.
 - [docs/PS3_PARITY.md](docs/PS3_PARITY.md): every way the port differs from the PS2 game.
 - [docs/DESIGN.md](docs/DESIGN.md): the port's design.
 - [docs/RENDERER.md](docs/RENDERER.md): the renderer, and the work on the frame rate.
+- [docs/IOS.md](docs/IOS.md): the iPhone and iPad version, its Metal renderer and the Mac's window.
 - [docs/AUDIO.md](docs/AUDIO.md) and [docs/VIDEO.md](docs/VIDEO.md): sound, music and videos.
 - [docs/DIFFICULTY.md](docs/DIFFICULTY.md): what the Easy setting changes.
 - [docs/CRASHES.md](docs/CRASHES.md): the crash and freeze reports.

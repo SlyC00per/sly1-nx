@@ -41,6 +41,8 @@ screen the Metal renderer presents to. The game is the Mac's program's own entry
 - **The picture** has its view's shape and up to 1,080 lines, and follows the view: the phone
   opened or closed while the game runs changes the game's view and the frame's images at the
   next frame (`port::gpu::SetScreenShape`).
+- **On an iPad** the controls are on the lower half of the screen, at its edges, with SELECT
+  and START under the shoulder buttons.
 - **Folded half way** (`UIHingeInteraction`, iOS 27.1: the hinge partly open and under about
   150 degrees) the app turns upright, which puts the hinge across the view's middle: the
   picture is the upper half and the controls are on the lower half. (Kept on its side, the
@@ -63,10 +65,10 @@ xcodebuild -project build-ios/sly1_nx.xcodeproj -target sly1_ios -configuration 
 or open `build-ios/sly1_nx.xcodeproj`, choose the `sly1_ios` target and a phone, and run. With
 a free Apple ID the app opens for seven days after each install.
 
-State (2026-11-26): it runs on an iPhone Duo (A20 Pro, iOS 27.2.1): picture, sound, the
-screen's controls, leaving and coming back. Not checked on the phone yet: the picture's size
-following the screen, the half-folded layout and the file browser (written after that run;
-the half screen's shape, 2670:939, was drawn on the Mac). The game steps by a sixtieth of a
+State (2026-11-26): it runs on an iPhone Duo (A20 Pro, iOS 27.2.1), an iPhone 15 Pro Max
+(iOS 17) and an iPad Pro 12.9-inch of 2018: picture, sound, the screen's controls in every
+posture, the file browser, leaving and coming back. Not tried: a controller. Not measured:
+the frame rate. The game steps by a sixtieth of a
 second at least, so 120 frames a second is a change to the game's clock, not to the app.
 
 ## The picture's shape
